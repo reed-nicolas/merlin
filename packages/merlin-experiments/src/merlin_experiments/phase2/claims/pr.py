@@ -39,6 +39,8 @@ from typing import Any
 from merlin.perf import fill_transient as FT
 from merlin.perf import residency_claim as RC
 
+from .oracle_acceptance import require_sha256, selected_acceptance
+
 _FAMILY = "PR"
 _CLAIM = "DIFFERENTIAL"
 _LEVEL = "L2_intra_layer"
@@ -112,13 +114,33 @@ _PROPOSED_ACCEPTANCE: dict[str, Any] = {
     },
 }
 
+# Keep the v1 declaration for historical frozen capsules.  New target-selected
+# Phase 0 capsules freeze concrete tier and metric names under v2.
+_CURRENT_ACCEPTANCE_BASE = copy.deepcopy(_PROPOSED_ACCEPTANCE)
+_CURRENT_ACCEPTANCE_BASE["analyzer"] = "perf_pr_claim.analyze_pr_claim/v2"
+_CURRENT_ACCEPTANCE_BASE["fit"]["dependent_metric"] = "$target_oracle_metric:L3"
+_CURRENT_ACCEPTANCE_BASE["evidence"]["correctness_simulator"] = "$target_oracle:L2"
+_CURRENT_ACCEPTANCE_BASE["evidence"]["timing_simulator"] = "$target_oracle:L3"
+_CURRENT_ACCEPTANCE_BASE["evidence"]["correctness_cycles_citable"] = _CURRENT_ACCEPTANCE_BASE["evidence"].pop(
+    "spike_cycles_citable"
+)
+_CURRENT_ACCEPTANCE_BASE["evidence"]["timing_oracle_kind"] = "$target_oracle_kind:L3"
+_CURRENT_ACCEPTANCE_BASE["evidence"]["timing_fidelity"] = "elaborated_rtl"
+_CURRENT_ACCEPTANCE_BASE["evidence"]["required_identity_sha256_fields"] = [
+    "simulator_binary_sha256", "elaborated_firrtl_sha256", "program_elf_sha256"
+]
+
 
 class _Refusal(ValueError):
     pass
 
 
-def supported_acceptance() -> dict[str, Any]:
-    """A copy of the only claim contract this analyzer can decide (proposed, not yet frozen)."""
+def supported_acceptance(declaration: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """The exact historical or target-selected contract this analyzer implements."""
+    if declaration is None:
+        return copy.deepcopy(_PROPOSED_ACCEPTANCE)
+    if declaration.get("analyzer") == _CURRENT_ACCEPTANCE_BASE["analyzer"]:
+        return selected_acceptance(_CURRENT_ACCEPTANCE_BASE, declaration)
     return copy.deepcopy(_PROPOSED_ACCEPTANCE)
 
 
@@ -174,11 +196,18 @@ def _descriptor_point(raw: object) -> dict[str, Any]:
         raise _Refusal(f"PR descriptor {name!r} changes its family, level, lever, or claim")
 
     acceptance = performance.get("acceptance")
-    if acceptance is not None and not _exact_declaration_equal(acceptance, _PROPOSED_ACCEPTANCE):
-        raise _Refusal(
-            f"PR descriptor {name!r} declares an acceptance contract this analyzer does not "
-            "implement; a profile edit is an analyzer-version edit"
-        )
+    if acceptance is not None:
+        if not isinstance(acceptance, Mapping):
+            raise _Refusal(f"PR descriptor {name!r} acceptance must be a mapping")
+        try:
+            supported = supported_acceptance(acceptance)
+        except ValueError as exc:
+            raise _Refusal(str(exc)) from exc
+        if not _exact_declaration_equal(acceptance, supported):
+            raise _Refusal(
+                f"PR descriptor {name!r} declares an acceptance contract this analyzer does not "
+                "implement; a profile edit is an analyzer-version edit"
+            )
 
     comparand = _mapping(performance.get("comparand"), f"PR descriptor {name} comparand")
     if (
@@ -280,7 +309,7 @@ def _descriptor_point(raw: object) -> dict[str, Any]:
         "operand_dtype": lhs_dtype,
         "accum_dtype": accum_dtype,
         "epilogue": [],
-        "acceptance_declared": acceptance is not None,
+        "acceptance": copy.deepcopy(acceptance) if acceptance is not None else None,
     }
 
 
@@ -296,9 +325,13 @@ def _validate_descriptors(descriptors: object) -> tuple[list[dict[str, Any]], di
         values = {repr(point[field]) for point in points}
         if len(values) != 1:
             raise _Refusal(f"PR cohort control changed fixed field {field!r}")
-    frozen = {point["acceptance_declared"] for point in points}
+    frozen = {point["acceptance"] is not None for point in points}
     if len(frozen) != 1:
         raise _Refusal("PR cohort mixes descriptors that do and do not declare an acceptance block")
+    if frozen == {True} and any(
+        not _exact_declaration_equal(point["acceptance"], points[0]["acceptance"]) for point in points[1:]
+    ):
+        raise _Refusal("PR cohort changes its frozen acceptance contract across members")
 
     bands: dict[str, list[dict[str, Any]]] = {}
     for point in points:
@@ -346,12 +379,15 @@ def _validate_descriptors(descriptors: object) -> tuple[list[dict[str, Any]], di
 
 
 def _refused(reason: str, *, preflight: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    declaration = preflight.get("declaration") if preflight is not None else None
     return {
         "schema_version": _SCHEMA_VERSION,
         "family": _FAMILY,
         "claim": _CLAIM,
         "status": RC.REFUSED,
-        "method": copy.deepcopy(_PROPOSED_ACCEPTANCE["fit"]),
+        "method": copy.deepcopy(
+            declaration["fit"] if isinstance(declaration, Mapping) else _PROPOSED_ACCEPTANCE["fit"]
+        ),
         "contract_frozen": (bool(preflight.get("contract_frozen")) if preflight is not None else False),
         "declaration": (copy.deepcopy(preflight.get("declaration")) if preflight is not None else None),
         "cohort": (copy.deepcopy(preflight.get("cohort")) if preflight is not None else None),
@@ -395,19 +431,22 @@ def preflight_pr_claim(descriptors: object, *, replicates: Sequence[str]) -> dic
             "expected_identities": [],
             "refusal_reasons": [str(exc)],
         }
+    declaration = points[0]["acceptance"] or supported_acceptance()
+    correctness_simulator = str(declaration["evidence"]["correctness_simulator"])
+    timing_simulator = str(declaration["evidence"]["timing_simulator"])
     expected = [
         {"family": _FAMILY, "capsule": point["capsule"], "simulator": simulator, "replicate": replicate, "tier": tier}
         for point in points
         for replicate in identities
-        for simulator, tier in (("spike", "L2"), ("verilator", "L3"))
+        for simulator, tier in ((correctness_simulator, "L2"), (timing_simulator, "L3"))
     ]
     return {
         "schema_version": _SCHEMA_VERSION,
         "family": _FAMILY,
         "claim": _CLAIM,
         "status": "READY",
-        "contract_frozen": bool(points[0]["acceptance_declared"]),
-        "declaration": supported_acceptance(),
+        "contract_frozen": points[0]["acceptance"] is not None,
+        "declaration": copy.deepcopy(declaration),
         "cohort": cohort,
         "replicates": list(identities),
         "expected_identities": expected,
@@ -416,9 +455,13 @@ def preflight_pr_claim(descriptors: object, *, replicates: Sequence[str]) -> dic
 
 
 def _validate_results(
-    results: object, points: Sequence[Mapping[str, Any]], replicates: Sequence[str]
+    results: object, points: Sequence[Mapping[str, Any]], replicates: Sequence[str], declaration: Mapping[str, Any]
 ) -> dict[str, dict[str, Any]]:
     rows = _sequence(results, "PR result rows")
+    evidence = _mapping(declaration.get("evidence"), "PR acceptance evidence")
+    correctness_simulator = str(evidence["correctness_simulator"])
+    timing_simulator = str(evidence["timing_simulator"])
+    current_contract = declaration.get("analyzer") == _CURRENT_ACCEPTANCE_BASE["analyzer"]
     expected_capsules = {str(point["capsule"]) for point in points}
     family_rows = [
         row
@@ -436,7 +479,11 @@ def _validate_results(
     for row in family_rows:
         identity = _mapping(row.get("identity"), "PR result identity")
         key = (identity.get("capsule"), identity.get("simulator"), identity.get("replicate"))
-        if key[0] not in expected_capsules or key[1] not in ("spike", "verilator") or key[2] not in set(replicates):
+        if (
+            key[0] not in expected_capsules
+            or key[1] not in (correctness_simulator, timing_simulator)
+            or key[2] not in set(replicates)
+        ):
             raise _Refusal(f"PR result has an undeclared identity: {dict(identity)!r}")
         if key in indexed:
             raise _Refusal(f"PR result repeats identity {key!r}")
@@ -449,14 +496,15 @@ def _validate_results(
         )
 
     observed: dict[str, dict[str, Any]] = {}
+    timing_identities: list[Mapping[str, Any]] = []
     for point in points:
         capsule = str(point["capsule"])
         cycles_by_replicate: list[int] = []
         counter_readings: list[Any] = []
         for replicate in replicates:
             for simulator, tier, purpose, citable in (
-                ("spike", "L2", "correctness_screen", False),
-                ("verilator", "L3", "performance_certification", True),
+                (correctness_simulator, "L2", "correctness_screen", False),
+                (timing_simulator, "L3", "performance_certification", True),
             ):
                 key = (capsule, simulator, replicate)
                 row = indexed.get(key)
@@ -474,12 +522,39 @@ def _validate_results(
                 ):
                     raise _Refusal(f"PR result {key!r} is not a correct successful measurement")
                 cycles = row.get("cycles")
-                if simulator == "spike":
+                if simulator == correctness_simulator:
                     if cycles is not None:
-                        raise _Refusal(f"PR Spike L2 result {key!r} exposes citable cycles")
+                        raise _Refusal(f"PR correctness L2 result {key!r} exposes citable cycles")
                     continue
                 if isinstance(cycles, bool) or not isinstance(cycles, int) or cycles <= 0:
-                    raise _Refusal(f"PR Verilator L3 result {key!r} lacks positive integer cycles")
+                    raise _Refusal(f"PR {timing_simulator} L3 result {key!r} lacks positive integer cycles")
+                if current_contract:
+                    oracle = _mapping(row.get("oracle"), f"PR result {key!r} oracle")
+                    if (
+                        oracle.get("kind") != evidence["timing_oracle_kind"]
+                        or oracle.get("derived_from_rtl") is not True
+                        or oracle.get("fidelity") != evidence["timing_fidelity"]
+                    ):
+                        raise _Refusal(f"PR result {key!r} does not prove its selected elaborated-RTL oracle")
+                    timing_identity = _mapping(row.get("timing_identity"), f"PR result {key!r} timing identity")
+                    required_fields = {
+                        "simulator",
+                        "oracle_kind",
+                        "fidelity",
+                        *evidence["required_identity_sha256_fields"],
+                    }
+                    if set(timing_identity) != required_fields or (
+                        timing_identity.get("simulator") != timing_simulator
+                        or timing_identity.get("oracle_kind") != evidence["timing_oracle_kind"]
+                        or timing_identity.get("fidelity") != evidence["timing_fidelity"]
+                    ):
+                        raise _Refusal(f"PR result {key!r} timing identity names a different engine or fidelity")
+                    try:
+                        for field in evidence["required_identity_sha256_fields"]:
+                            require_sha256(timing_identity.get(field), f"PR result {key!r} {field}")
+                    except ValueError as exc:
+                        raise _Refusal(str(exc)) from exc
+                    timing_identities.append(timing_identity)
                 cycles_by_replicate.append(cycles)
                 counter_readings.append(row.get("counter_values"))
         observed[capsule] = {
@@ -488,6 +563,10 @@ def _validate_results(
             "replicate_cycles": tuple(cycles_by_replicate),
             "counter_readings": counter_readings,
         }
+    if current_contract:
+        for field in ("simulator_binary_sha256", "elaborated_firrtl_sha256"):
+            if len({identity[field] for identity in timing_identities}) != 1:
+                raise _Refusal(f"PR timing rows do not share one exact {field} identity")
     return observed
 
 
@@ -645,7 +724,7 @@ def analyze_pr_claim(
     try:
         counters = _counter_set(counters)
         points, _cohort = _validate_descriptors(descriptors)
-        observed = _validate_results(results, points, list(preflight["replicates"]))
+        observed = _validate_results(results, points, list(preflight["replicates"]), preflight["declaration"])
         members = [
             _member(str(point["capsule"]), observed[str(point["capsule"])], counters, partition) for point in points
         ]
@@ -664,7 +743,7 @@ def analyze_pr_claim(
         "family": _FAMILY,
         "claim": _CLAIM,
         "status": status,
-        "method": copy.deepcopy(_PROPOSED_ACCEPTANCE["fit"]),
+        "method": copy.deepcopy(preflight["declaration"]["fit"]),
         "contract_frozen": bool(preflight["contract_frozen"]),
         "declaration": copy.deepcopy(preflight["declaration"]),
         "cohort": copy.deepcopy(preflight["cohort"]),
@@ -672,7 +751,7 @@ def analyze_pr_claim(
             "l2_correctness_rows_validated": len(points) * len(preflight["replicates"]),
             "l2_cycles_consumed": 0,
             "l3_positive_cycle_rows_consumed": len(points) * len(preflight["replicates"]),
-            "timing_source": "verilator_L3_only",
+            "timing_source": f"{preflight['declaration']['evidence']['timing_simulator']}_L3_only",
             "replicates": list(preflight["replicates"]),
             "overlap_engines": list(getattr(counters, "engines", ()) or ()),
         },

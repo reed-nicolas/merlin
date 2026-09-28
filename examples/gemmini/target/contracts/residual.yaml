@@ -24,6 +24,32 @@ family: tensor_resident
 # ride the systolic family default; declared here only where they differ from it). Fork-free .insn on
 # stock LLVM — no gemmini-forked toolchain.
 endpoint_kind: inline_asm_insn
+# Source-location anchors for extracting this target's RTL facts. These do not
+# declare legal instruction codes, capacity, or executable support.
+rtl_extraction:
+  firrtl_role_probe:
+    array: {name: mesh, parent_module_contains: Mesh, child_module_prefix: Tile}
+    memory: {name: scratchpad, declaration_contains: "smem mem : UInt<", source_contains: Scratchpad.scala, datapath_name: input}
+    interfaces:
+      - {module: ReservationStation, name: rocc_cmd, evidence: "module ReservationStation (RoCC decode/dispatch)"}
+      - {module: FrontendTLB, name: dma_tlb, evidence: "module FrontendTLB"}
+  scala_funct_block:
+    start_comment: "// funct values"
+    stop_declaration: CONFIG_EX
+  accumulator_memory:
+    module: AccumulatorMem
+    memory_name: accumulator
+    address_port: io_write_bits_addr
+    data_prefix: io_write_bits_data_
+    data_suffix: _0
+    mask_prefix: io_write_bits_mask_
+    firrtl_data_field: io.write.bits.data
+  boolean_feature_gate:
+    feature: max_pool
+    module: StoreController
+    node: pooling_is_enabled
+    dynamic_operand_contains: pool
+    config_field: has_max_pool
 runner:
   suite: gemmini-capsule-bench
   dtype: i8xi8_i32
@@ -62,6 +88,7 @@ encoding:
   # StoreController rs1[1:0]==2 -> ST). Cross-checked by mlc_bridge.crosscheck_config_subtype. Kept here as
   # the reviewed cache of the 3 subtypes the compiler emits (the 4th decoded value, 3=CONFIG_BERT, is unused).
   config_subtype: {0: CONFIG_EX, 1: CONFIG_LD, 2: CONFIG_ST}
+  corpus_issue_order: [FLUSH, CONFIG_EX, CONFIG_LD, MVIN, CONFIG_ST, PRELOAD, COMPUTE_PRELOADED, MVOUT]
   # WHICH CLASSES A HARDWARE LOOP DOES THE WORK OF. A capsule declares the instruction classes its
   # operation needs; a design with a loop FSM performs several of them with ONE instruction, so a
   # program that uses the loop is not missing them. Without this a convolution lowered the way this
@@ -104,7 +131,10 @@ compute_units:
     kind: systolic
     dtypes: [int8]
     ops: [matmul]
-    scaling: per_channel
+    # The elaborated command register carries one bounded acc_scale value per
+    # store command. The derived readout facet therefore admits tensor-wide
+    # scaling, not an independent scale for each output channel.
+    scaling: per_tensor
     requant: {ref: gemmini.accumulator_scale}
     # Semantic-family capability (ARR denominator): a GEMM accelerator — int8 contraction on the mesh
     # (matmul + conv2d via im2col), the fused relu/requant/bias epilogue (elementwise_map on readout),
@@ -126,7 +156,7 @@ compute_units:
       # merlin/python/merlin/targetgen/eligibility.py). `batch` is already derived true, so it is NOT
       # re-declared here: over-declaring a derived axis is how a contract stops tracking its target.
       - {family: contraction, dtypes: [int8], ranks: [2, 3, 4]}
-      # Epilogue-only: the mesh's readout applies per-channel scaling + requant on the way OUT of
+      # Epilogue-only: the mesh's readout applies per-tensor scaling + requant on the way OUT of
       # the accumulator, so an elementwise map exists ONLY fused behind a contraction. Declaring it
       # standalone would make every standalone elementwise region an unclearable false_fallback.
       - {family: elementwise_map, dtypes: [int8], composed_with: [contraction]}

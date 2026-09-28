@@ -141,13 +141,63 @@ def test_spike_cycles_are_excluded_and_cannot_fill_an_elaborated_rtl_cell() -> N
     assert result["accounting"]["excluded_spike_rows"] == 1
 
 
-def test_verilator_cannot_be_predeclared_as_final_timing_authority() -> None:
+def test_historical_v4_keeps_its_exact_gsim_timing_authority() -> None:
     with pytest.raises(STATS.EvidenceError, match="must be GSIM"):
         STATS.predeclare(
             trials=_trials(),
             capsules=[{"family": "f", "capsule": "c"}],
             replicates=("r0", "r1", "r2"),
             primary_simulator="verilator",
+            schema=STATS.SCHEMA,
+        )
+
+
+def test_target_selected_v5_requires_certificate_and_exact_row_identities() -> None:
+    options = dict(
+        trials=_trials(),
+        capsules=[{"family": "f", "capsule": "c"}],
+        replicates=("r0", "r1"),
+        primary_simulator="verilator",
+    )
+    with pytest.raises(STATS.EvidenceError, match="pinned certificate"):
+        STATS.predeclare(**options)
+    binding = {
+        "simulator": "verilator",
+        "simulator_binary_sha256": "a" * 64,
+        "elaborated_firrtl_sha256": "b" * 64,
+        "certificate_sha256": "c" * 64,
+    }
+    declaration = STATS.predeclare(**options, oracle_binding=binding)
+    assert declaration["schema"] == STATS.TARGET_SELECTED_SCHEMA
+    assert {row["simulator"] for row in declaration["matrix"]} == {"verilator"}
+    unbound = STATS.evaluate(declaration, _rows(declaration), trial_evidence=_evidence())
+    assert unbound["status"] == "refused"
+    assert unbound["accounting"]["failed_cells"] == len(declaration["matrix"])
+    assert all("selected binary/FIRRTL/ELF identity" in issue["reason"] for issue in unbound["cell_ledger"])
+    rows = _rows(declaration)
+    for row in rows:
+        row["oracle"].update(
+            {
+                "simulator_binary_sha256": binding["simulator_binary_sha256"],
+                "elaborated_firrtl_sha256": binding["elaborated_firrtl_sha256"],
+                "program_elf_sha256": "e" * 64,
+            }
+        )
+        row["qualification"] = {"admitted": True, "certificate_sha256": "d" * 64}
+    wrong_certificate = STATS.evaluate(declaration, rows, trial_evidence=_evidence())
+    assert wrong_certificate["status"] == "refused"
+    assert all("pinned timing certificate" in issue["reason"] for issue in wrong_certificate["cell_ledger"])
+
+
+@pytest.mark.parametrize("simulator", ["spike", "elaborated_rtl", "unknown"])
+def test_target_selected_v5_rejects_abstract_or_correctness_only_oracles(simulator: str) -> None:
+    with pytest.raises(STATS.EvidenceError, match="concrete RTL engine"):
+        STATS.predeclare(
+            trials=_trials(),
+            capsules=[{"family": "f", "capsule": "c"}],
+            replicates=("r0", "r1"),
+            primary_simulator=simulator,
+            schema=STATS.TARGET_SELECTED_SCHEMA,
         )
 
 

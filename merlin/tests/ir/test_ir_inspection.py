@@ -123,6 +123,27 @@ def test_whole_model_xdsl_preprocessing_records_each_rewrite_without_changing_ou
     ]
     final = audit.record["stages"][-1]
     assert final["sha256"] == hashlib.sha256(observed[0].encode()).hexdigest()
+    assert final["bytes"] == len(observed[0].encode())
+    (receipt_descriptor,) = audit.record["accounting_receipts"]
+    assert audit.record["source_transform_map"] == {
+        "status": "recorded",
+        "scope": "one defined, single-block func.func; top-level non-return operations",
+        "receipt": receipt_descriptor["file"],
+        "sha256": receipt_descriptor["sha256"],
+    }
+    assert receipt_descriptor["name"] == "source-transform-map"
+    assert receipt_descriptor["schema"] == "source_transform_map_v1"
+    assert receipt_descriptor["representation"] == "accounting-only"
+    assert receipt_descriptor["executable"] is False
+    receipt_bytes = (audit.directory / receipt_descriptor["file"]).read_bytes()
+    assert hashlib.sha256(receipt_bytes).hexdigest() == receipt_descriptor["sha256"]
+    receipt = json.loads(receipt_bytes)
+    assert receipt["source_sha256"] == hashlib.sha256(module.encode()).hexdigest()
+    assert receipt["preprocessed_sha256"] == final["sha256"]
+    assert receipt["source_op_count"] == receipt["preprocessed_op_count"] == 0
+    assert receipt["operations"] == []
+    if mode != "compact":
+        assert (audit.directory / final["file"]).read_bytes() == observed[0].encode()
     for stage in audit.record["stages"]:
         if mode != "compact":
             assert (audit.directory / stage["file"]).is_file()
@@ -141,7 +162,43 @@ def test_whole_model_xdsl_preprocessing_failure_keeps_completed_prefix(tmp_path,
         with IrAudit(tmp_path, enabled="compact", producer="preprocessing", source=__file__) as audit:
             passes_xdsl.preprocess_text("module {}", audit=audit)
     assert audit.record["outcome"] == "failed"
+    assert audit.record["source_transform_map"]["status"] == "unavailable"
     assert [stage["name"] for stage in audit.record["stages"]] == ["xdsl-parsed", "xdsl-pruned"]
+
+
+def test_multi_function_audit_explicitly_marks_transform_map_unavailable(tmp_path):
+    from merlin.llvmlower.passes_xdsl import preprocess_text
+
+    source = """module {
+      func.func @first(%x: f32) -> f32 { return %x : f32 }
+      func.func @second(%x: f32) -> f32 { return %x : f32 }
+    }"""
+    plain = preprocess_text(source)
+    with IrAudit(tmp_path, enabled="exact", producer="preprocessing", source=__file__) as audit:
+        observed = preprocess_text(source, audit=audit)
+    assert observed == plain
+    assert audit.record["outcome"] == "completed"
+    assert audit.record["source_transform_map"]["status"] == "unavailable"
+    assert "multiple defined functions" in audit.record["source_transform_map"]["reason"]
+    assert "accounting_receipts" not in audit.record
+
+
+def test_audit_refuses_modified_accounting_receipt(tmp_path):
+    with pytest.raises(ValueError, match="accounting receipt changed"):
+        with IrAudit(tmp_path, enabled="exact", producer="preprocessing", source=__file__) as audit:
+            descriptor = audit.accounting("map", {"schema": "test_v1", "count": 1})
+            (audit.directory / descriptor["file"]).write_text('{"schema":"test_v1","count":2}')
+    assert audit.record["outcome"] == "failed"
+    assert audit.record["failure_type"] == "AccountingReceiptChanged"
+
+
+def test_audit_refuses_duplicate_accounting_receipt_name(tmp_path):
+    with IrAudit(tmp_path, enabled="exact", producer="preprocessing", source=__file__) as audit:
+        first = audit.accounting("map", {"schema": "test_v1"})
+        with pytest.raises(ValueError, match="name already exists"):
+            audit.accounting("map", {"schema": "test_v1"})
+    assert json.loads((audit.directory / first["file"]).read_text()) == {"schema": "test_v1"}
+    assert len(audit.record["accounting_receipts"]) == 1
 
 
 @pytest.mark.parametrize("emit", [pipeline.EMIT_TRANSLATE, pipeline.EMIT_DUMP])

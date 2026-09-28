@@ -99,7 +99,7 @@ def build_application_completeness(
             compute_by_operation.setdefault(ancestor["operation_id"], []).append(computation)
             ancestor = by_id.get(ancestor.get("parent_operation_id"))
     source = join_frontend_trace(frontend_trace, application_graph, capture_sha256=application["capture_sha256"])
-    obligations, by_operation = [], {}
+    obligations, by_operation, compute_by_id = [], {}, {}
     for signature_index, entry in enumerate(entries):
         if entry["observed_signature"]["disposition"] in {"structural", "component"}:
             continue
@@ -108,7 +108,11 @@ def build_application_completeness(
             operation_id = operation["operation_id"] if operation else None
             trace = source["normalized_operations"].get(str(ordinal)) or {}
             precision = _precision(entry, operation, compute_by_operation)
-            precision["numerical_contracts"] = operation_numerical_contracts(entry, software_spec, host_capabilities)
+            support = entry["observed_signature"]["disposition"] == "support_required"
+            if not support:
+                precision["numerical_contracts"] = operation_numerical_contracts(
+                    entry, software_spec, host_capabilities
+                )
             accelerator = entry["accelerator_admission"]
             host = entry["host_admission"]
             choices = [
@@ -131,22 +135,50 @@ def build_application_completeness(
                 "quantized_source_operation_ids": trace.get("quantized_node_ids") or [],
                 "prepared_source_operation_ids": trace.get("prepared_node_ids") or [],
                 "status": "resolved" if operation is not None and precision["status"] == "resolved" else "unknown",
+                "role": "support_lowering" if support else "compute_placement",
                 "placement": "unselected",
                 "accelerator_admission": accelerator,
                 "host_admission": host,
                 "capability": {"status": "unknown", "reason": "placement is not selected"},
                 "precision": precision,
-                "required_placement_choices": choices,
+                "required_placement_choices": [] if support else choices,
                 "lowering_status": "unverified",
             }
+            if support:
+                # Typed source observations are not a lowering receipt. The compiler
+                # must later bind an actual lowered program and shape/value mapping
+                # to this exact operation before whole-program coverage can pass.
+                source_values = [*operation["operands"], *operation["results"]] if operation else []
+                obligation["support_lowering_evidence"] = {
+                    "status": "not_available",
+                    "source_capture_sha256": application["capture_sha256"],
+                    "source_operation_id": operation_id,
+                    "operand_types": precision["ordered_storage_types"],
+                    "result_types": precision["result_types"],
+                    "operand_shapes": [value.get("shape") for value in operation["operands"]] if operation else None,
+                    "result_shapes": [value.get("shape") for value in operation["results"]] if operation else None,
+                    "source_shape_status": (
+                        "static"
+                        if operation
+                        and all(
+                            isinstance(value.get("shape"), list)
+                            and all(type(dimension) is int and dimension >= 0 for dimension in value["shape"])
+                            for value in source_values
+                        )
+                        else "dynamic_or_unknown"
+                    ),
+                    "reason": "no selected compiler lowering and typed shape/value preservation receipt",
+                }
             obligations.append(obligation)
             if operation_id:
                 by_operation[operation_id] = obligation
+                if not support:
+                    compute_by_id[operation_id] = obligation
     transfers = []
     transfer_by_edge = {}
     for edge in normalized["edges"] if normalized else []:
-        producer = by_operation.get(edge.get("producer_operation_id"))
-        consumer = by_operation.get(edge.get("consumer_operation_id"))
+        producer = compute_by_id.get(edge.get("producer_operation_id"))
+        consumer = compute_by_id.get(edge.get("consumer_operation_id"))
         if producer is None or consumer is None:
             continue
         # This is a conditional candidate edge, not evidence of actual dispatch.
@@ -190,7 +222,11 @@ def build_application_completeness(
                 "mlir_operation": operation["mlir_operation"],
                 "disposition": disposition,
                 "accounting": (
-                    "non_independent_compute" if disposition in {"structural", "component"} else "placement_obligation"
+                    "non_independent_compute"
+                    if disposition in {"structural", "component"}
+                    else "support_lowering_obligation"
+                    if disposition == "support_required"
+                    else "placement_obligation"
                 ),
                 "obligation_id": by_operation.get(operation["operation_id"], {}).get("id"),
                 "parent_operation_id": operation.get("parent_operation_id"),
@@ -206,6 +242,13 @@ def build_application_completeness(
                 "type": edge["type"],
                 "accounting": "conditional_transfer"
                 if edge["id"] in transfer_by_edge
+                else "support_dependency"
+                if edge.get("producer_operation_id") in by_operation
+                and edge.get("consumer_operation_id") in by_operation
+                and (
+                    edge.get("producer_operation_id") not in compute_by_id
+                    or edge.get("consumer_operation_id") not in compute_by_id
+                )
                 else "block_argument_or_non_independent_endpoint",
                 "transfer_id": transfer_by_edge.get(edge["id"]),
             }
@@ -244,7 +287,7 @@ def build_application_completeness(
             },
             "scope": (
                 "every normalized MLIR operation and SSA operand use; block argument binding "
-                "and structural semantics are not verified transfers"
+                "and support-lowering dependencies are not independent transfer endpoints"
             ),
         },
         "operation_obligations": obligations,

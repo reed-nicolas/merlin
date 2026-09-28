@@ -178,7 +178,23 @@ Files: `llvmlower/codegen.py`, `runtime/abi/mlir_runtime.c`, `runtime/baremetal/
   through the dispatch table == torch — same fidelity as the monolithic compile, via the
   unified per-kernel path (`test_dispatch_runtime.py`). A by-value scalar kernel arg (a
   `cumsum` accumulator-init `i64`) must be passed by value, not as a descriptor
-  (`abi.ScalarArg`) — the one ABI subtlety the per-kernel split exposes.
+  (`abi.ScalarArg`) — a scalar ABI subtlety the per-kernel split exposes.
+- **Host buffer layout** (`merlin.llvmlower.abi.HostModel`) — ordinary
+  `(pointer, shape)` arguments remain dense row-major. For a buffer whose
+  physical pitch differs, pass `StridedMemRefArg(pointer, shape, strides,
+  storage_elements, dtype, access, offset=0)`, with strides, offset and capacity
+  in *elements* and `access` equal to `input`, `output` or `inout`. Merlin checks
+  the declared footprint, packs inputs into dense scratch before the native
+  call and scatters outputs back afterward. This is necessary because the
+  current statically shaped lowering can assume dense layout even when its
+  MLIR C-interface descriptor carries other strides. It is not zero-copy, and
+  a raw pointer's true allocation size and dtype cannot be verified here;
+  callers must own that memory and match the compiled signature. Writable
+  layouts must have provably distinct logical addresses; overlapping staged
+  argument footprints and obvious overlap with a dense argument are rejected.
+  Legacy dense tuples have no capacity or dtype, so less-obvious overlap with
+  them cannot be detected; callers must not alias those buffers with a staged
+  output.
 - Python simulator (`merlin.runtime`) — the fast correctness oracle for the synthetic path.
 - **Merlin C runtime** (`merlin/runtime/c/`) — generic descriptor builder + arg table +
   weights blob + bump allocator (`baremetal/spike/merlin_malloc.c`). Drives the whole

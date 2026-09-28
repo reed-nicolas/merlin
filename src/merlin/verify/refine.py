@@ -127,11 +127,9 @@ def validate_pass(
     (:func:`merlin.verify.linalg_semantics.encode_linalg`), so the only artifacts in the query are
     the two the compiler actually handled.
 
-    Both sides are encoded over THE SAME symbolic leaves, bound by BLOCK-ARGUMENT POSITION: the pass
-    preserves the function signature, so argument ``i`` of the source is argument ``i`` of the
-    output, and that is a structural invariant of the pass rather than a naming convention. Encoding
-    them over independent symbols would make the query trivially satisfiable and the verdict
-    worthless.
+    Both sides are encoded over THE SAME symbolic leaves. In-tree ``interface.*`` binds by
+    block-argument position. The frozen ``merlin_iface`` text grammar binds only explicit ``argN``
+    leaf names to source argument N. Encoding independent symbols would make the verdict worthless.
 
     Results are paired IN ORDER — ``func.return`` operand order on the source side, ``commit`` order
     on the interface side, which is the same order because the emitted function returns its commits
@@ -158,6 +156,14 @@ def validate_pass(
     from .linalg_semantics import encode_linalg
     from .smt_ops import SolverOp
 
+    merlin_iface = isinstance(interface_module, str)
+    if merlin_iface:
+        # Parsing constructs IR operations. Do it before entering ImplicitBuilder, where those
+        # operations would otherwise be inserted into the SMT block as they are constructed.
+        from .merlin_iface_semantics import parse_merlin_iface
+
+        interface_module = parse_merlin_iface(interface_module)
+
     blk = Block()
     with ImplicitBuilder(blk):
         enc = Encoder()
@@ -167,7 +173,18 @@ def validate_pass(
         spec = encode_linalg(enc, source_module, acc_width=acc_width)
 
         # TARGET side: the interface program the pass emitted, over those same leaves.
-        got = encode_interface(enc, interface_module, acc_width=acc_width, shared=spec.inputs)
+        if merlin_iface:
+            from .merlin_iface_semantics import encode_merlin_iface
+
+            source_func = next(op for op in source_module.walk() if op.name == "func.func")
+            if len(source_func.body.block.args) != len(spec.inputs):
+                raise UnsupportedSemantics(
+                    "merlin_iface argN binding requires every source argument to be a rank-2 tensor"
+                )
+
+            got = encode_merlin_iface(enc, interface_module, acc_width=acc_width, shared=spec.inputs)
+        else:
+            got = encode_interface(enc, interface_module, acc_width=acc_width, shared=spec.inputs)
         if not got.outputs:
             raise UnsupportedSemantics("the interface module commits no outputs; nothing to validate")
 

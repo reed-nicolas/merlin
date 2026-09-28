@@ -7,6 +7,9 @@ absent. The host execution is the verification oracle preceding spike RVV runs.
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import os
+from pathlib import Path
 
 import pytest
 
@@ -69,6 +72,60 @@ def test_dequant_lowering_emits_pure_upstream():
     assert "linalg.generic" in out
     assert "llvm.emit_c_interface" in out
     assert "arith.sitofp" in out
+
+
+def test_transform_map_accounts_for_dequant_rewrite_without_changing_output():
+    from merlin.llvmlower.passes_xdsl import preprocess_text, preprocess_text_with_transform_map
+
+    upstream, stats, receipt = preprocess_text_with_transform_map(SLICE)
+    assert (upstream, stats) == preprocess_text(SLICE)
+    assert receipt["schema"] == "source_transform_map_v1"
+    assert receipt["source_op_count"] == 5
+    assert receipt["preprocessed_op_count"] == 6
+    assert receipt["operations"][0]["preprocessed_op_indices"] == [0, 1]
+    assert receipt["operations"][0]["result_map"] == [
+        {"source_result_index": 0, "preprocessed_op_index": 1,
+         "preprocessed_result_index": 0}]
+    assert sorted(index for row in receipt["operations"]
+                  for index in row["preprocessed_op_indices"]) == list(range(6))
+
+
+def test_transform_map_accounts_for_real_r20_quant_expansion(tmp_path):
+    import json
+
+    from merlin.common.ir_audit import IrAudit
+    from merlin.llvmlower.passes_xdsl import preprocess_text, preprocess_text_with_transform_map
+
+    source_path = os.environ.get("MERLIN_TRANSFORM_MAP_R20_SOURCE")
+    if not source_path or not Path(source_path).is_file():
+        pytest.skip("real r20 frontend-source.mlir not supplied")
+    source = Path(source_path).read_text(encoding="utf-8")
+    upstream, stats, receipt = preprocess_text_with_transform_map(source)
+    assert (upstream, stats) == preprocess_text(source)
+    with IrAudit(tmp_path, enabled="exact", producer="r20-transform-map", source=source_path) as audit:
+        audited = preprocess_text(source, audit=audit)
+    assert audited == (upstream, stats)
+    assert audit.record["outcome"] == "completed"
+    (descriptor,) = audit.record["accounting_receipts"]
+    assert descriptor["representation"] == "accounting-only"
+    assert descriptor["executable"] is False
+    assert json.loads((audit.directory / descriptor["file"]).read_text()) == receipt
+    assert stats == {"dead_tensor_ops_pruned": 0, "quant_ext_lowered": 2,
+                     "c_interface_funcs": 1}
+    assert receipt["source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
+    assert receipt["preprocessed_sha256"] == hashlib.sha256(upstream.encode()).hexdigest()
+    assert (receipt["source_op_count"], receipt["preprocessed_op_count"]) == (78, 88)
+    assert [row["source_op_index"] for row in receipt["operations"]] == list(range(78))
+    assert sorted(index for row in receipt["operations"]
+                  for index in row["preprocessed_op_indices"]) == list(range(88))
+    for raw_index, emitted, output_index in ((4, list(range(4, 10)), 9),
+                                             (60, list(range(65, 71)), 70)):
+        row = receipt["operations"][raw_index]
+        assert row["source_op_name"] == "quant_ext.quantize_per_tensor"
+        assert row["preprocessed_op_indices"] == emitted
+        assert row["result_map"] == [{"source_result_index": 0,
+                                      "preprocessed_op_index": output_index,
+                                      "preprocessed_result_index": 0}]
 
 
 def test_weights_pack_against_real_manifest():

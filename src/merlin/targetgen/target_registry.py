@@ -100,6 +100,18 @@ class TargetInfo:
     def load_contract(self) -> dict[str, Any]:
         if self.name in _OBSERVED_CONTRACTS.get():
             return copy.deepcopy(_OBSERVED_CONTRACTS.get()[self.name])
+        # An experiment may select a capability contract alongside an OOT support provider.
+        # Keep executable plugin ownership at the provider's own contract (below), but make all
+        # capability consumers read the same explicitly selected view as RTL extraction.
+        override = os.environ.get("MERLIN_TARGET_CONTRACT")
+        if override:
+            path = Path(override)
+            if not path.is_file():
+                raise TargetContractMissing(f"{self.name!r}: selected capability contract does not exist: {path}")
+            selected = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if not isinstance(selected, dict):
+                raise ValueError(f"{path}: selected capability contract must be a mapping")
+            return selected
         return self._load_provider_contract()
 
     def _load_provider_contract(self) -> dict[str, Any]:

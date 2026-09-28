@@ -132,18 +132,21 @@ runtime:
   rtl_sim_config: GemminiRocketConfig
 # Datatype -> compute-unit -> op capability (parsed by merlin.targetgen.compute_units). The C0 systolic
 # mesh is int8 (i8 x i8 -> i32). The input/accumulator dtypes are themselves CIRCT-extracted facts
-# (datapaths), so the (in,weight)->acc `accumulate` matrix is NOT re-declared here. `requant` is an
-# OPAQUE reference to Gemmini's own accumulator-scale lowering (rounding-shift / FP-scale-multiply) —
-# Merlin does not model that arithmetic here.
+# (datapaths), so the (in,weight)->acc `accumulate` matrix is NOT re-declared here. The schema's
+# `requant` slot is an opaque reference to Gemmini's accumulator-scale operation. It does NOT grant
+# Merlin's distinct integer-shift `requant` epilogue; the selected readout facets settle that stage.
 compute_units:
   - name: systolic_mesh
     kind: systolic
     dtypes: [int8]
     ops: [matmul]
-    scaling: per_channel
+    # The elaborated command register carries one bounded acc_scale value per
+    # store command. The derived readout facet therefore admits tensor-wide
+    # scaling, not an independent scale for each output channel.
+    scaling: per_tensor
     requant: {ref: gemmini.accumulator_scale}
     # Semantic-family capability (ARR denominator): a GEMM accelerator — int8 contraction on the mesh
-    # (matmul + conv2d via im2col), the fused relu/requant/bias epilogue (elementwise_map on readout),
+    # (matmul + conv2d via im2col), fused relu/acc-scale/bias on readout,
     # mvin/mvout DMA (movement), and max pooling fused on the store path (reduction).
     #
     # ⚠️ WHAT IS ENCODABLE IS NOT WHAT IS BUILT, and this is the one place that distinction bites.
@@ -171,7 +174,7 @@ compute_units:
       # Declaring a narrower rank set than the target can execute is the same denominator loss the
       # mx_gemmini rank bug was (see merlin/python/merlin/targetgen/eligibility.py).
       - {family: contraction, dtypes: [int8], ranks: [2, 3, 4]}
-      # Epilogue-only: per-channel scaling + requant apply on the way OUT of the accumulator, so an
+      # Epilogue-only: accumulator scaling applies on the way OUT of the accumulator, so an
       # elementwise map exists ONLY fused behind a contraction. Standalone would be a false_fallback.
       - {family: elementwise_map, dtypes: [int8], composed_with: [contraction]}
       - {family: movement, dtypes: [int8]}

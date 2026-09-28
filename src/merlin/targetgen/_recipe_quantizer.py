@@ -159,7 +159,13 @@ def _has_floating_recipe_work(exported: Any, recipe: Mapping[str, Any]) -> bool:
     )
 
 
-def build_quantizer(recipe: Mapping[str, Any], *, layer_plan: Mapping[str, Any], eps: float = DEFAULT_OBSERVER_EPSILON):
+def build_quantizer(
+    recipe: Mapping[str, Any],
+    *,
+    layer_plan: Mapping[str, Any],
+    eps: float = DEFAULT_OBSERVER_EPSILON,
+    fold_candidates: list | None = None,
+):
     """The PT2E quantizer a static recipe describes, limited to placed operations.
 
     ATen operator names alone cannot license quantization: an unsupported module may call
@@ -351,6 +357,17 @@ def build_quantizer(recipe: Mapping[str, Any], *, layer_plan: Mapping[str, Any],
             self.left_in_float = 0
             self.refused_by_placement: list[dict[str, str | None]] = []
             self.software_decisions = software_decisions
+            self.fold_candidates = fold_candidates or []
+
+        def transform_for_annotation(self, graph_module: Any) -> Any:
+            # TorchAO calls this after folding Conv+BN and before inserting
+            # observers, while the exact FX nodes and their rewired users are
+            # still available to prove each folded source identity.
+            if self.fold_candidates:
+                from m2m.capture.trace import attach_pt2e_conv_bn_folds
+
+                attach_pt2e_conv_bn_folds(graph_module, self.fold_candidates)
+            return graph_module
 
         def annotate(self, graph_module: Any) -> Any:
             nodes = list(graph_module.graph.nodes)
@@ -637,7 +654,13 @@ def apply_recipe(
     epsilon = policy.get("observer_epsilon", DEFAULT_OBSERVER_EPSILON)
     if type(epsilon) not in (int, float) or not math.isfinite(epsilon) or epsilon <= 0:
         raise RecipeError("observer epsilon must be finite and positive")
-    quantizer = build_quantizer(recipe, layer_plan=layer_plan, eps=epsilon)
+    fold_candidates = []
+    if original_frontend_snapshot is not None:
+        from m2m.capture.trace import pt2e_conv_bn_fold_candidates
+
+        fold_candidates = pt2e_conv_bn_fold_candidates(exported, original_frontend_snapshot)
+    quantizer = build_quantizer(recipe, layer_plan=layer_plan, eps=epsilon,
+                                fold_candidates=fold_candidates)
     prepared = prepare_pt2e(exported, quantizer)
     samples = calibration_inputs if calibration_inputs is not None else (tuple(example_inputs),)
     calibrated = 0

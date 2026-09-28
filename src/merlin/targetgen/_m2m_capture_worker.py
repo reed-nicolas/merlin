@@ -251,7 +251,7 @@ def _output_abi(outputs):
 
 
 def _integerized_agreement(before, after, *, atol: float, rtol: float) -> dict:
-    """Compare the portable PT2E graph with its integer rewrite on the capture input."""
+    """Compare two independently supplied executions on the capture input."""
     import torch
 
     left, left_abi = _output_abi(before)
@@ -528,6 +528,16 @@ def main(argv=None) -> int:
     # every capture, so the capsule can never be silent about whether its inputs were real.
     provenance = _loader_provenance(loader, mdl, inputs)
     mdl = mdl.eval()
+    # A PT2E recipe returns a new GraphModule. Loader-owned streams such as
+    # ResNet's session_images live on the original module, while write_bundle
+    # must still receive the integerized graph. Freeze the loader's session
+    # declaration before replacing the module; its tensor values are the same
+    # inputs whose conversion and golden this worker records below.
+    session = (
+        loader.get_session_spec(mdl, tuple(inputs))
+        if a.materialize_bundle and hasattr(loader, "get_session_spec")
+        else None
+    )
     original_snapshot = {
         "status": "unavailable",
         "stage": "original",
@@ -574,6 +584,11 @@ def main(argv=None) -> int:
 
     weights_path = str(out / "weights.safetensors")
     recipe = json.loads(Path(a.recipe).read_text(encoding="utf-8")) if a.recipe else None
+    if recipe is not None:
+        from merlin.targetgen.quant_recipe import digest as recipe_digest
+
+        if recipe.get("recipe_sha256") != recipe_digest(recipe):
+            raise ValueError("selected quantization recipe digest does not match its content")
     q = None if (recipe is not None or a.already_quantized) else _quant_for(a.dtype, a.scheme or None)
     quant_stats = (
         {"applied": False, "why": "the loader declares its numeric graph already materialized"}
@@ -646,18 +661,85 @@ def main(argv=None) -> int:
     integerization_receipt = None
     if q is not None and q.scheme == "int8_static_act_int8_weight" and not a.already_quantized:
         # A static PT2E capture is a W8A8 claim only if every selected
-        # contraction becomes true integer arithmetic. Keep the portable graph's
-        # output as an independent semantic reference before rewriting it.
+        # contraction becomes true integer arithmetic. Portable Q/DQ output
+        # remains a diagnostic; an authored integer engine selects the separate
+        # framework-side integer reference as the exact functional gate.
         from m2m.capture.pt2e_integerize import integerize_pt2e
 
+        selected_engine = recipe.get("software_numerical_engine") if recipe is not None else None
+        if selected_engine not in (None, "integer_reference"):
+            raise ValueError(f"static int8 capture cannot realize numerical engine {selected_engine!r}")
         with torch.no_grad():
             portable_output = mdl(*inputs)
+        independent = None
+        independent_error = None
+        independent_source = None
+        if selected_engine == "integer_reference":
+            try:
+                from m2m.capture import pt2e_integer_reference as integer_reference
+
+                source = Path(integer_reference.__file__).resolve()
+                if not source.is_file():
+                    raise RuntimeError("selected integer reference source is unavailable")
+                independent_source = {"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+                independent = integer_reference.run_pt2e_integer_reference(mdl, tuple(inputs))
+                if not all(
+                    hasattr(independent, field)
+                    for field in ("contraction_count", "conv2d_count", "linear_count", "matmul_count")
+                ):
+                    raise RuntimeError("selected integer reference lacks complete contraction accounting")
+            except Exception as exc:  # noqa: BLE001 -- record a failed selected reference, never substitute portable
+                independent_error = f"{type(exc).__name__}: {exc}"[:2000]
         mdl, integerization_receipt = integerize_pt2e(mdl, tuple(inputs))
         with torch.no_grad():
             integer_output = mdl(*inputs)
-        integerization_receipt["golden_agreement"] = _integerized_agreement(
+        portable_agreement = _integerized_agreement(
             portable_output, integer_output, atol=a.agreement_atol, rtol=a.agreement_rtol
         )
+        portable_agreement["reference"] = "portable_pt2e"
+        integerization_receipt["portable_agreement"] = portable_agreement
+        if selected_engine == "integer_reference":
+            if independent is None:
+                golden_agreement = {
+                    "status": "failed", "reference": "pt2e_integer",
+                    "reason": independent_error or "selected integer reference returned no result",
+                }
+            else:
+                golden_agreement = _integerized_agreement(
+                    independent.output, integer_output, atol=0.0, rtol=0.0
+                )
+                executed = independent.contraction_count
+                selected = quant_stats.get("annotated_contractions") if isinstance(quant_stats, dict) else None
+                seen = integerization_receipt["quantized_contractions_seen"]
+                if executed != seen or selected != seen:
+                    golden_agreement["status"] = "failed"
+                    golden_agreement["reason"] = "selected, observed and independently executed contraction counts differ"
+                reference_leaves, reference_abi = _output_abi(independent.output)
+                reference_bytes = (
+                    json.dumps(
+                        {"schema": "merlin.capture.integer_reference.v1", "output_abi": reference_abi,
+                         "outputs": [_to_native(value) for value in reference_leaves]},
+                        sort_keys=True, separators=(",", ":"),
+                    ) + "\n"
+                ).encode("utf-8")
+                reference_path = out / "integer-reference.json"
+                reference_path.write_bytes(reference_bytes)
+                golden_agreement.update(
+                    reference="pt2e_integer",
+                    source=independent_source,
+                    output={"path": reference_path.name, "sha256": hashlib.sha256(reference_bytes).hexdigest()},
+                    executed_contractions={
+                        "conv2d": independent.conv2d_count,
+                        "linear": independent.linear_count,
+                        "matmul": independent.matmul_count,
+                        "total": executed,
+                        "selected": selected,
+                        "observed": seen,
+                    },
+                )
+            integerization_receipt["golden_agreement"] = golden_agreement
+        else:
+            integerization_receipt["golden_agreement"] = portable_agreement
     trace_options = {"capture_trace": True, "original_frontend_snapshot": original_snapshot} if trace_supported else {}
     res = m2m.convert(
         mdl,
@@ -802,7 +884,6 @@ def main(argv=None) -> int:
 
         # Reuse the actual typed conversion and its prepared ExportedProgram.
         # A second export can reorder lifted constants or sever source lineage.
-        session = loader.get_session_spec(mdl, tuple(inputs)) if hasattr(loader, "get_session_spec") else None
         write_bundle(
             mdl,
             tuple(inputs),

@@ -89,8 +89,8 @@ def compact_text(module, *, elements_limit: int = 64, tensor_sink=None) -> str:
     return output.getvalue()
 
 
-def record_stage(audit, name: str, module) -> None:
-    """Serialize only when requested, using the shared audit's exact-byte attribution."""
+def record_stage(audit, name: str, module, *, generic: bool = False) -> None:
+    """Serialize in the caller's executable syntax for exact-byte attribution."""
     if audit.directory is None:
         return
     from ._common import text
@@ -105,7 +105,7 @@ def record_stage(audit, name: str, module) -> None:
     inspection = compact_text(module, tensor_sink=tensor_sink) if audit.mode in {"compact", "both"} else None
     audit.stage(
         name,
-        text(module),
+        text(module, generic=generic),
         inspection=inspection,
         inspection_tensors=tensors if inspection is not None else None,
     )

@@ -58,6 +58,7 @@ _INOPERABLE_CAUSES: tuple[tuple[str, str], ...] = (
     ("Creating new namespace failed", "userns_creation_denied"),
     ("No permissions to creating new namespace", "userns_creation_denied"),
     ("loopback: Failed RTM_NEWADDR", "netns_denied"),
+    ("loopback: Failed to create NETLINK_ROUTE socket", "netns_denied"),
     ("Operation not permitted", "operation_not_permitted"),
     ("Permission denied", "permission_denied"),
 )
@@ -67,7 +68,7 @@ _INOPERABLE_CAUSES: tuple[tuple[str, str], ...] = (
 _PROBE_PAYLOAD: tuple[str, ...] = ("/bin/true",)
 
 
-def _probe_argv(binary: str) -> list[str]:
+def _probe_argv(binary: str, *, network_isolation: bool = False) -> list[str]:
     """A minimal but REPRESENTATIVE sandbox: the same operation classes the real argv uses.
 
     It is not enough to ask the binary for its version — a version print does not unshare anything, so
@@ -78,6 +79,8 @@ def _probe_argv(binary: str) -> list[str]:
     an absent ``/lib64`` is not read as a broken sandbox.
     """
     argv = [binary, "--die-with-parent", "--unshare-pid"]
+    if network_isolation:
+        argv.append("--unshare-net")
     for required in ("/usr", "/bin"):
         argv += ["--ro-bind", required, required]
     for optional in ("/lib", "/lib64", "/etc"):
@@ -168,12 +171,15 @@ def probe_sandbox(
     *,
     timeout: float = 20.0,
     use_cache: bool = True,
+    network_isolation: bool = False,
 ) -> SandboxProbe:
     """Determine whether a sandbox can actually be CONSTRUCTED on this host, right now.
 
     Runs a trivial command inside a minimal sandbox and reports the outcome as one of the four named
     conditions. Cached per (binary, argv) for the life of the process, because the answer is a host
     property and the probe forks — pass ``use_cache=False`` to force a fresh observation.
+    Set ``network_isolation`` when the actual launch includes ``--unshare-net``;
+    network namespace setup can be denied even when the base sandbox works.
     """
     resolved = str(binary) if binary is not None else shutil.which(SANDBOX_BINARY_NAME)
     if not resolved:
@@ -181,7 +187,7 @@ def probe_sandbox(
     if not Path(resolved).exists():
         return SandboxProbe(status=SANDBOX_ABSENT, reason="binary_missing", binary=resolved)
 
-    argv = _probe_argv(resolved)
+    argv = _probe_argv(resolved, network_isolation=network_isolation)
     key = (resolved, tuple(argv))
     if use_cache and key in _CACHE:
         return _CACHE[key]
@@ -233,13 +239,17 @@ def probe_sandbox(
 
 
 def require_working_sandbox(
-    binary: str | Path | None = None, *, context: str = "", timeout: float = 20.0
+    binary: str | Path | None = None,
+    *,
+    context: str = "",
+    timeout: float = 20.0,
+    network_isolation: bool = False,
 ) -> SandboxProbe:
     """Return the probe if the sandbox works; otherwise raise :class:`SandboxUnavailable`.
 
     The raising form exists so a caller cannot accidentally treat a falsy-but-not-OK probe as usable.
     """
-    probe = probe_sandbox(binary, timeout=timeout)
+    probe = probe_sandbox(binary, timeout=timeout, network_isolation=network_isolation)
     if not probe.usable:
         raise SandboxUnavailable(probe, context)
     return probe

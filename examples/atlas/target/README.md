@@ -6,6 +6,20 @@
 Neither an ISA name nor the host package's FP32 strategy certifies FP8/BF16
 operation support.
 
+[`contracts/target_contract.yaml`](contracts/target_contract.yaml) is the loadable
+prototype capability declaration. Its matching
+[`contracts/residual.yaml`](contracts/residual.yaml) feeds fact-backed derivation.
+The current registry reads the first path for reference discovery, while the
+manifest deriver reads the second path from the resolved target base. Until
+those APIs share one authored input, their parsed declarations are kept equal
+apart from `facts_source: rtl` and checked by a targetgen regression test.
+The declaration carries the curated MXU FP8/BF16 candidate and runner identity;
+it has no copied mesh size, memory capacity, opcode table, operand block-scaling
+claim or executable backend. Registry loading and schema validation alone do not
+qualify those capabilities. Keep the selected OOT provider authoritative for
+execution, and supply one coherent selected source bundle and fresh facts for
+derivation and audit.
+
 The minimal software spec describes selected numerical/domain rules, operation
 placement/signature constraints, unresolved quantization parameters and explicit
 transfer candidates. It intentionally does not repeat backend configuration,
@@ -53,8 +67,26 @@ structure and independent numerical characterization supply separate evidence.
 The selected HW-MLIR also exposes 8-bit `scaleE8M0` command ports, matching the
 source's E8M0-named pack/pop controls. That carrier observation does not establish
 the block scope, exponent transformation, or a TorchAO scale representation.
-Consequently `software-spec.yaml` leaves scale encoding and block size unresolved;
-do not promote the diagnostic FP8 recipe into a realizable model format yet.
+The direct source audit now checks all three `ScalarCore` scale command port
+widths and the `ScalingFactorRegFile` port geometry: an `i5` write index, `i8`
+write data, and exactly 32 contiguous `i8` outputs. A changed/missing port
+fails this structural check. These ports do not prove register behavior, wiring
+through every command path, or any numerical scale interpretation.
+In the selected Atlas source, `ScalarCore` reads that register for
+`MXU_POP_FP8`; both MXU sequencers use the byte when packing a BF16
+accumulator row to FP8. `VFP8PACK` has its own BF16-to-FP8 pack path. Matrix
+operand/weight push and compute do not establish an E8M0 scale applied to
+incoming FP8 values. The 32 scale registers are software-selectable entries,
+not evidence of a 32-element quantization block. The OOT backend's current
+`scaling: block_e8m0` declaration and `must_supply_e8m0_block_scales`
+obligation are intent to review, not an RTL-qualified operand format.
+Consequently `software-spec.yaml` leaves model-operand scale encoding and
+block size unresolved. To resolve them, review the intended tensor-to-FP8
+conversion and any scale compensation at each BF16/FP8 boundary, bind an
+executable backend route, and compare non-unit-scale cases with the selected
+RTL. The generated Phase 0 quantization contract may list a readout-derived
+candidate, but until those checks pass it emits no model capture recipe; do
+not promote the diagnostic FP8 candidate into a realizable model format.
 
 Produce evidence from one selected elaboration, not a mixture of standalone
 spec-generated hardware and Chipyard memory/hierarchy sources:

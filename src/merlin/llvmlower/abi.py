@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
+from itertools import product
 from typing import Any, Sequence
 
 _SCALAR_CTYPE = {
@@ -42,6 +43,105 @@ class ScalarArg:
         return ct(int(self.value) if self.dtype.startswith("i") else float(self.value))
 
 
+@dataclass(frozen=True)
+class StridedMemRefArg:
+    """A ranked buffer with explicit physical strides, staged at the host ABI.
+
+    ``storage_elements`` is the accessible capacity starting at ``pointer``;
+    ``offset`` and ``strides`` are element indices, not bytes. The caller owns
+    the backing allocation and must keep it alive during the native call. This
+    checks the declared footprint, but cannot prove that an arbitrary pointer
+    really owns the declared capacity. ``access`` must be ``input``, ``output``
+    or ``inout``: inputs are packed before the call; outputs are scattered back
+    afterward. Current statically shaped host lowering assumes dense row-major
+    memrefs, so this is intentionally *not* a zero-copy pitched descriptor.
+    """
+
+    pointer: int
+    shape: Sequence[int]
+    strides: Sequence[int]
+    storage_elements: int
+    dtype: str
+    access: str
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        maximum = (1 << 63) - 1
+        if not isinstance(self.pointer, int) or isinstance(self.pointer, bool) or self.pointer <= 0:
+            raise ValueError("memref pointer must be a nonzero integer address")
+        if self.pointer >= (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)):
+            raise ValueError("memref pointer exceeds the host pointer width")
+        shape, strides = tuple(self.shape), tuple(self.strides)
+        if len(shape) != len(strides):
+            raise ValueError("memref shape and strides must have the same rank")
+        for label, values, lower in (("shape", shape, 0), ("strides", strides, 1)):
+            if any(not isinstance(v, int) or isinstance(v, bool) or not lower <= v <= maximum for v in values):
+                raise ValueError(f"memref {label} must contain int64 values >= {lower}")
+        for label, value in (("storage_elements", self.storage_elements), ("offset", self.offset)):
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= maximum:
+                raise ValueError(f"memref {label} must be a nonnegative int64 value")
+        if not isinstance(self.dtype, str) or self.dtype not in _SCALAR_CTYPE:
+            raise ValueError(f"unsupported memref element dtype {self.dtype!r}")
+        if not isinstance(self.access, str) or self.access not in {"input", "output", "inout"}:
+            raise ValueError("memref access must be input, output, or inout")
+        address_limit = 1 << (ctypes.sizeof(ctypes.c_void_p) * 8)
+        last_byte = self.pointer + self.storage_elements * ctypes.sizeof(_SCALAR_CTYPE[self.dtype]) - 1
+        if self.storage_elements and last_byte >= address_limit:
+            raise ValueError("memref declared storage exceeds the host pointer address space")
+        # A zero-extent memref accesses no element. For a nonempty memref,
+        # include the last element of every dimension in the maximum address.
+        nonempty = all(shape)
+        last = self.offset + sum((size - 1) * stride for size, stride in zip(shape, strides)) if nonempty else self.offset
+        if last > maximum or (last >= self.storage_elements if nonempty else self.offset > self.storage_elements):
+            raise ValueError("memref logical footprint exceeds declared storage_elements")
+        if nonempty and self.access != "input":
+            # Sufficient (not necessary) injectivity condition. Every active
+            # dimension must step beyond the entire span of smaller strides.
+            # Reject ambiguous output scatter instead of silently overwriting
+            # several logical results at the same physical element.
+            covered_span = 0
+            for stride, size in sorted((stride, size) for size, stride in zip(shape, strides) if size > 1):
+                if stride <= covered_span:
+                    raise ValueError("writable memref strides may alias logical elements")
+                covered_span += (size - 1) * stride
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "strides", strides)
+
+
+def _addressed_bytes(arg: StridedMemRefArg) -> tuple[int, int]:
+    """Conservative byte interval spanning all logical elements."""
+    item_bytes = ctypes.sizeof(_SCALAR_CTYPE[arg.dtype])
+    first = arg.pointer + arg.offset * item_bytes
+    if any(size == 0 for size in arg.shape):
+        return first, first
+    last = arg.offset + sum((size - 1) * stride for size, stride in zip(arg.shape, arg.strides))
+    return first, arg.pointer + (last + 1) * item_bytes
+
+
+def _validate_staged_aliases(arg_buffers: list) -> None:
+    """Fail before native execution when staged copyback could alter another arg."""
+    staged = [entry for entry in arg_buffers if isinstance(entry, StridedMemRefArg)]
+    for index, left in enumerate(staged):
+        if left.access == "input":
+            continue
+        lo, hi = _addressed_bytes(left)
+        if lo == hi:
+            continue
+        for other_index, right in enumerate(staged):
+            if other_index == index:
+                continue
+            other_lo, other_hi = _addressed_bytes(right)
+            if lo < other_hi and other_lo < hi:
+                raise ValueError("staged memref arguments have overlapping physical storage")
+        for entry in arg_buffers:
+            if isinstance(entry, (StridedMemRefArg, ScalarArg)):
+                continue
+            if isinstance(entry, (tuple, list)) and len(entry) == 2:
+                pointer = entry[0]
+                if isinstance(pointer, int) and lo <= pointer < hi:
+                    raise ValueError("staged writable memref overlaps a dense argument address")
+
+
 def make_descriptor(rank: int):
     class MemRefDescriptor(ctypes.Structure):
         _fields_ = [
@@ -63,6 +163,31 @@ def descriptor(buf_ptr: int, shape: Sequence[int]):
     for i in range(rank - 2, -1, -1):
         strides[i] = strides[i + 1] * shape[i + 1]
     return desc_t(buf_ptr, buf_ptr, 0, (ctypes.c_int64 * rank)(*shape), (ctypes.c_int64 * rank)(*strides))
+
+
+def _copy_pitched(arg: StridedMemRefArg, dense, *, to_dense: bool) -> None:
+    """Copy logical elements, never padding, between declared storage and dense scratch."""
+    if any(extent == 0 for extent in arg.shape):
+        return
+    item_bytes = ctypes.sizeof(_SCALAR_CTYPE[arg.dtype])
+    dense_ptr = ctypes.addressof(dense)
+    if not arg.shape:
+        pairs = [(0, arg.offset, 1)]
+    elif arg.strides[-1] == 1:
+        # Preserve contiguous inner rows as one transfer, including on pitched
+        # 2-D/ND buffers. The generic branch handles arbitrary positive strides.
+        width = arg.shape[-1]
+        pairs = ((row * width, arg.offset + sum(i * s for i, s in zip(outer, arg.strides)), width)
+                 for row, outer in enumerate(product(*(range(n) for n in arg.shape[:-1]))))
+    else:
+        pairs = ((linear, arg.offset + sum(i * s for i, s in zip(index, arg.strides)), 1)
+                 for linear, index in enumerate(product(*(range(n) for n in arg.shape))))
+    for dense_index, physical_index, count in pairs:
+        dense_address = dense_ptr + dense_index * item_bytes
+        physical_address = arg.pointer + physical_index * item_bytes
+        ctypes.memmove(dense_address if to_dense else physical_address,
+                       physical_address if to_dense else dense_address,
+                       count * item_bytes)
 
 
 def _trampoline_source(name: str, n_args: int) -> str:
@@ -125,19 +250,36 @@ class HostModel:
 
     def __call__(self, arg_buffers: list) -> None:
         """arg_buffers: ordered args including outputs (appended last). Each entry is a
-        ``(pointer, shape)`` tensor (memref descriptor, by ref) or a :class:`ScalarArg`
+        ``(pointer, shape)`` dense tensor, :class:`StridedMemRefArg` pitched
+        tensor (staged through dense storage), or a :class:`ScalarArg`
         (passed by value)."""
+        _validate_staged_aliases(arg_buffers)
         cargs: list = []
         keep: list = []
+        scratch: list = []
+        copyback: list = []
         for entry in arg_buffers:
             if isinstance(entry, ScalarArg):
                 cargs.append(entry.to_ctype())
             else:
-                ptr, shape = entry
-                d = descriptor(ptr, shape)
+                if isinstance(entry, StridedMemRefArg):
+                    element_count = 1
+                    for extent in entry.shape:
+                        element_count *= extent
+                    dense = (_SCALAR_CTYPE[entry.dtype] * element_count)()
+                    if entry.access in {"input", "inout"}:
+                        _copy_pitched(entry, dense, to_dense=True)
+                    scratch.append(dense)
+                    if entry.access in {"output", "inout"}:
+                        copyback.append((entry, dense))
+                    d = descriptor(ctypes.addressof(dense), entry.shape)
+                else:
+                    ptr, shape = entry
+                    d = descriptor(ptr, shape)
                 keep.append(d)
                 cargs.append(ctypes.byref(d))
         self._descs = keep  # keep alive
+        self._scratch = scratch
         if self.trampoline is not None:
             if len(keep) != len(arg_buffers):
                 raise ValueError("the trampoline path does not support scalar args")
@@ -145,3 +287,5 @@ class HostModel:
             self._call(ctypes.cast(self.fn, ctypes.c_void_p), ctypes.cast(arr, ctypes.c_void_p))
         else:
             self.fn(*cargs)
+        for entry, dense in copyback:
+            _copy_pitched(entry, dense, to_dense=False)

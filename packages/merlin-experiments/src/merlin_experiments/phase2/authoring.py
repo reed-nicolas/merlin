@@ -383,6 +383,7 @@ def run_stage(
     functional_runs_root: Path,
     functional_run_id: str,
     functional_submission_sha256: str,
+    published_compiler_root: Path | None = None,
     target_experiment: TargetExperiment,
     sandbox_inputs: PC.PackageSandboxInputs | PC.FrozenPackageSandboxInputs,
     stage_root: Path,
@@ -466,7 +467,12 @@ def run_stage(
     )
     discovered = CORPUS.discover_performance_corpus(target_experiment, families=families, capsules=capsules)
     stage_root.mkdir(parents=True)
-    base = PC.materialize_perf_workspace(functional, stage_root / "_frozen_functional")
+    base = PC.materialize_perf_workspace(
+        functional,
+        stage_root / "_frozen_functional",
+        published_root=published_compiler_root,
+        target=target_experiment.target,
+    )
     frozen_corpus = CORPUS.freeze_performance_corpus(discovered, stage_root / "_frozen_corpus")
     formal_claim = RECORD.prepare_formal_claim(frozen_corpus.capsules, replicates)
     replicates = len(RECORD.preflight_cohort(formal_claim))

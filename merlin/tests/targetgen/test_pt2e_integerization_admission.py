@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -98,6 +99,31 @@ def test_static_pt2e_receipt_accepts_complete_proof():
         {"integerization_receipt": _receipt(), "quantization_stats": {"annotated_contractions": 1}},
         agreement_tolerance=(0.03125, 0.02),
     )
+
+
+def test_selected_integer_reference_requires_exact_byte_bound_proof(tmp_path: Path):
+    reference = tmp_path / "integer-reference.json"
+    reference.write_text('{"outputs": [1]}\n')
+    receipt = _receipt()
+    proof = receipt["golden_agreement"]
+    proof.update(
+        reference="pt2e_integer", atol=0.0, rtol=0.0, max_abs=0.0, max_rel=0.0,
+        source={"path": "pt2e_integer_reference.py", "sha256": "a" * 64},
+        output={"path": reference.name, "sha256": hashlib.sha256(reference.read_bytes()).hexdigest()},
+        executed_contractions={"conv2d": 0, "linear": 1, "matmul": 0,
+                               "total": 1, "selected": 1, "observed": 1},
+    )
+    proof["outputs"][0].update(atol=0.0, rtol=0.0, max_abs=0.0, max_rel=0.0)
+    meta = {"recipe": {"software_numerical_engine": "integer_reference"},
+            "integerization_receipt": receipt, "quantization_stats": {"annotated_contractions": 1}}
+    source._require_pt2e_integerization_receipt(
+        _ONE_INTEGER_MM, meta, agreement_tolerance=(0.03125, 0.02), capture_root=tmp_path,
+    )
+    reference.write_text('{"outputs": [2]}\n')
+    with pytest.raises(source.M2MUnavailable, match="artifact does not match"):
+        source._require_pt2e_integerization_receipt(
+            _ONE_INTEGER_MM, meta, agreement_tolerance=(0.03125, 0.02), capture_root=tmp_path,
+        )
 
 
 def test_static_pt2e_receipt_cannot_hide_an_annotated_contraction():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 
 from merlin.perf import workload_gen as WG  # noqa: E402
 from merlin.perf.profile import TRAITS, derive_profile  # noqa: E402
@@ -458,13 +459,16 @@ def _accum_for_encoding(target: str, operand: str, fallback: str | None) -> str:
     )
 
 
-def _resolve_target_oracle_evidence(performance: dict, target: str) -> dict:
+def _resolve_target_oracle_evidence(
+    performance: dict, target: str, *, oracle_selection: dict[str, str] | None = None
+) -> dict:
     """Resolve ``$target_oracle:<tier>`` evidence placeholders from the target's own oracle route.
 
-    The shared profile must not name one target's simulator binary.  At generation time the target is
-    known, so its contract supplies ordinary tiers and its RTL-engine policy supplies the concrete L3
-    implementation selected for an elaborated-RTL fidelity.  The resolved names are frozen into the
-    capsule acceptance contract together with the placeholders they came from.
+    The shared profile must not name one target's simulator binary. An explicit
+    recipe may select concrete engines over abstract contract tiers without
+    probing the build host; concrete contract tiers are used directly. Legacy
+    profiles use the target's contract and RTL-engine policy. Resolved engine,
+    metric and oracle-kind names are frozen with their source placeholders.
     """
     acceptance = performance.get("acceptance")
     evidence = acceptance.get("evidence") if isinstance(acceptance, dict) else None
@@ -472,7 +476,9 @@ def _resolve_target_oracle_evidence(performance: dict, target: str) -> dict:
         return performance
     prefix = "$target_oracle:"
     pending = {key: value for key, value in evidence.items() if isinstance(value, str) and value.startswith(prefix)}
-    if not pending:
+    kind_placeholder = evidence.get("timing_oracle_kind")
+    kind_pending = isinstance(kind_placeholder, str) and kind_placeholder.startswith("$target_oracle_kind:")
+    if not pending and not kind_pending:
         return performance
     from merlin.targetgen.target_experiment import load_capability_manifest
 
@@ -484,16 +490,27 @@ def _resolve_target_oracle_evidence(performance: dict, target: str) -> dict:
         if not tier:
             raise ValueError(f"{target}: empty tier in performance evidence placeholder {placeholder!r}")
         concrete = None
-        if tier == "L3":
+        if oracle_selection is not None:
+            concrete = oracle_selection.get(tier) or declared.get(tier)
+            if not isinstance(concrete, str) or not concrete or concrete == "elaborated_rtl":
+                raise ValueError(f"{target}: explicit Phase 0 inputs have no concrete {tier} oracle")
+            declared_engine = declared.get(tier)
+            if declared_engine and declared_engine != "elaborated_rtl" and concrete != declared_engine:
+                raise ValueError(
+                    f"{target}: selected {tier} oracle {concrete!r} conflicts with target contract {declared_engine!r}"
+                )
+        elif tier == "L3":
             # L3 is a fidelity and may have several implementations. Resolve it through the same
-            # target-neutral policy grading uses, so a faster available engine changes the frozen
-            # evidence by derivation rather than by editing the shared profile.
-            from merlin.targetgen.capsule_runner import describe_l3_engine
+            # target-neutral metadata policy grading uses. The evaluator imports optional AET;
+            # Phase 0's frozen derivation wheel does not and must not import that owner merely
+            # to name the engine. An unavailable metadata route still fails below rather than
+            # substituting the generic fidelity label for a concrete simulator.
+            from merlin.targetgen.oracle_policy import selected_l3_engine_report
 
-            selection = describe_l3_engine(target)
+            selection = selected_l3_engine_report(target)
             if selection.get("available") and selection.get("engine"):
                 concrete = str(selection["engine"])
-        if concrete is None and declared.get(tier):
+        if oracle_selection is None and concrete is None and declared.get(tier):
             concrete = str(declared[tier])
         if not concrete or concrete == "elaborated_rtl":
             raise ValueError(
@@ -502,11 +519,33 @@ def _resolve_target_oracle_evidence(performance: dict, target: str) -> dict:
             )
         evidence[key] = concrete
         resolved_from[key] = placeholder
+    if kind_pending:
+        kind_tier = kind_placeholder.partition(":")[2]
+        simulator = evidence.get("timing_simulator")
+        if kind_tier != "L3" or evidence.get("timing_tier") != kind_tier:
+            raise ValueError(f"{target}: timing oracle kind must name the selected L3 tier")
+        if (
+            not isinstance(simulator, str)
+            or not simulator
+            or simulator.startswith("$")
+            or simulator == "elaborated_rtl"
+        ):
+            raise ValueError(f"{target}: selected L3 timing simulator cannot name an oracle kind")
+        evidence["timing_oracle_kind"] = f"rtl_{simulator}"
+        resolved_from["timing_oracle_kind"] = kind_placeholder
     evidence["resolved_from"] = resolved_from
+    fit = acceptance.get("fit")
+    if isinstance(fit, dict) and fit.get("dependent_metric") == "$target_oracle_metric:L3":
+        simulator = evidence.get("timing_simulator")
+        if not isinstance(simulator, str) or evidence.get("timing_tier") != "L3":
+            raise ValueError(f"{target}: selected L3 timing oracle cannot name an affine metric")
+        fit["dependent_metric"] = f"{simulator}_L3_cycles"
     return performance
 
 
-def _materialize_performance_entry(entry: dict, binding) -> dict:
+def _materialize_performance_entry(
+    entry: dict, binding, *, oracle_selection: dict[str, str] | None = None
+) -> dict:
     """Resolve a performance member onto a runnable direct corpus path.
 
     Dtypes come from workload_gen's capability-manifest accessor and must agree
@@ -550,7 +589,12 @@ def _materialize_performance_entry(entry: dict, binding) -> dict:
     entry["source"] = "direct"
     entry["operand_dtype"] = operand_dtype
     performance = copy.deepcopy(entry["performance"])
-    performance = _resolve_target_oracle_evidence(performance, target)
+    if oracle_selection is None:
+        performance = _resolve_target_oracle_evidence(performance, target)
+    else:
+        performance = _resolve_target_oracle_evidence(
+            performance, target, oracle_selection=oracle_selection
+        )
     performance["emitter"] = copy.deepcopy(performance["emitter"])
     performance["emitter"]["resolved"] = {
         "source": "direct",
@@ -570,6 +614,98 @@ def _materialize_performance_entry(entry: dict, binding) -> dict:
     return entry
 
 
+def _scope_requirement_sweeps(
+    sweeps: list[dict], requirement: dict | None, digest: str | None,
+    skipped: list | None, blocked: list | None,
+) -> list[dict]:
+    """Derive one exact claim cohort per supported captured scope signature.
+
+    The template declares a family *pattern*. Each requirement row becomes its
+    own digest-named family so an affine analyzer never mixes different chains.
+    Eight regions is this builder's current cost/census cap, not a device limit.
+    Unsupported rows are explicit debt, never silently truncated to one match.
+    """
+    expanded = []
+    for sweep in sweeps:
+        if not isinstance(sweep, dict):
+            raise ValueError(f"sweep entry {sweep!r} is not a mapping")
+        pattern = sweep.get("requires_scope_pattern")
+        if pattern is None:
+            expanded.append(sweep)
+            continue
+        family = str(sweep.get("id") or "")
+        if pattern != {"prefix": ["movement", "contraction"],
+                       "repeated_tail": "elementwise_map", "min_tail": 1}:
+            raise ValueError(f"performance sweep {family}: unsupported scope pattern")
+        scope = ((requirement or {}).get("scope") or {})
+        performance_scope = scope.get("performance") or {}
+        if performance_scope.get("schema") != "merlin.phase0.performance_scope.v1":
+            if blocked is not None:
+                blocked.append({
+                    "family": family, "sweep": family, "status": "blocked_unimplemented",
+                    "reason": "selected requirement lacks exact SW/emitter-derived Phase 2 scope",
+                    "requirement_sha256": digest,
+                })
+            continue
+        from .performance_scope import validate_performance_scope
+
+        performance_scope = validate_performance_scope(scope)
+        required = performance_scope.get("required") or []
+        matched = 0
+        seen_families: set[str] = set()
+        for row in sorted(required, key=lambda item: str(item.get("signature")) if isinstance(item, dict) else ""):
+            if not isinstance(row, dict) or not isinstance(row.get("signature"), str):
+                continue
+            signature = row["signature"]
+            families = signature.split(" -> ")
+            if not (len(families) >= 3 and families[:2] == pattern["prefix"]
+                    and all(part == pattern["repeated_tail"] for part in families[2:])):
+                continue
+            matched += 1
+            if row.get("length") != len(families) or not digest:
+                reason = "scope requirement length or frozen digest is invalid"
+            elif len(families) > 8:
+                reason = "scope chain exceeds this builder's eight-region cost/census cap, not a hardware limit"
+            else:
+                reason = None
+            if reason is not None:
+                if blocked is not None:
+                    blocked.append({"family": family, "sweep": family, "status": "blocked_unimplemented",
+                                    "reason": reason, "signature": signature, "requirement_sha256": digest})
+                continue
+            derived_family = f"{family}_{hashlib.sha256(signature.encode()).hexdigest()[:12]}"
+            if derived_family in seen_families:
+                raise ValueError(f"scope sweep {family}: duplicate or colliding signature {signature!r}")
+            seen_families.add(derived_family)
+            selected = copy.deepcopy(sweep)
+            del selected["requires_scope_pattern"]
+            selected["id"] = derived_family
+            selected["base"]["scope_families"] = families
+            performance = selected["base"]["performance"]
+            performance["family"] = derived_family
+            performance["requirement_basis"] = {
+                "sha256": digest, "axis": "scope.performance.required", "pattern_family": family,
+                "signature": signature,
+                "occurrences": row.get("occurrences"),
+            }
+            selected["source_reference"] = (
+                str(selected.get("source_reference") or "") + f"; selected scope.performance.required: {signature}"
+            )
+            expanded.append(selected)
+        if matched == 0:
+            if performance_scope.get("status") == "unresolved" and blocked is not None:
+                blocked.append({
+                    "family": family, "sweep": family, "status": "blocked_unimplemented",
+                    "reason": "exact source/SW/emitter Phase 2 scope remains unresolved",
+                    "required_pattern": pattern, "requirement_sha256": digest,
+                })
+            elif skipped is not None:
+                skipped.append({"family": family, "sweep": family, "status": "skipped_inapplicable",
+                                "reason": "selected frozen requirement has no eligible scope-chain signature",
+                                "required_pattern": pattern, "requirement_sha256": digest})
+    return expanded
+
+
 def expand_sweeps(
     profile: dict,
     binding,
@@ -580,6 +716,8 @@ def expand_sweeps(
     errors: list | None = None,
     traits: dict | None = None,
     evidence=None,
+    selected_requirement: dict | None = None,
+    requirement_sha256: str | None = None,
 ) -> list[dict]:
     """Return the profile's capsule entries with any ``sweeps:`` block expanded.
 
@@ -611,7 +749,10 @@ def expand_sweeps(
             raise ValueError("selected evidence target differs from binding target")
         if trait_facts is None:
             trait_facts = evidence.performance_facts
-    sweeps = profile.get("sweeps") or []
+    sweeps = _scope_requirement_sweeps(
+        profile.get("sweeps") or [], selected_requirement, requirement_sha256,
+        skipped, blocked_unimplemented,
+    )
     if not sweeps:
         return entries
     # Compatibility for the public/holdout disjointness checker, which passes
@@ -647,6 +788,27 @@ def expand_sweeps(
         is_performance = base.get("cat") in {"perf", "_perf"} or performance is not None
         gate_decision = None
         if is_performance:
+            if base.get("op") == "scope_chain":
+                mlir_dtype = getattr(binding, "mlir_dtype", None)
+                operand = mlir_dtype(binding.operand_dtype) if callable(mlir_dtype) else ""
+                accumulator = mlir_dtype(binding.accum_dtype) if callable(mlir_dtype) else ""
+                if not (
+                    operand.startswith("i") and operand[1:].isdigit()
+                    and accumulator.startswith("i") and accumulator[1:].isdigit()
+                    and int(accumulator[1:]) > int(operand[1:])
+                ):
+                    if skipped is not None:
+                        skipped.append({
+                            "family": sweep_id, "sweep": sweep_id, "status": "skipped_inapplicable",
+                            "reason": (
+                                "scope-chain builder requires signed integer operands "
+                                "and a wider accumulator"
+                            ),
+                            "operand_dtype": getattr(binding, "operand_dtype", None),
+                            "accum_dtype": getattr(binding, "accum_dtype", None),
+                            "requirement_basis": performance.get("requirement_basis"),
+                        })
+                    continue
             if legacy_traits_supplied:
                 raise ValueError(
                     f"performance sweep {sweep_id}: legacy ad-hoc `traits` cannot gate performance; "
@@ -857,7 +1019,12 @@ def expand_sweeps(
                 seen.add(entry["name"])
                 if is_performance:
                     try:
-                        _materialize_performance_entry(entry, binding)
+                        if "_performance_oracles" in profile:
+                            _materialize_performance_entry(
+                                entry, binding, oracle_selection=profile["_performance_oracles"]
+                            )
+                        else:
+                            _materialize_performance_entry(entry, binding)
                     except Exception as exc:  # noqa: BLE001 - persisted as a generation error
                         if errors is None:
                             raise

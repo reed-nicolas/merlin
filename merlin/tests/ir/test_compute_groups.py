@@ -226,6 +226,34 @@ def test_a_group_is_stated_in_the_words_a_capsule_is_built_from() -> None:
         CG.capsule_entry(host)
 
 
+def test_unscaled_accumulator_cast_stays_on_host() -> None:
+    # Real int8 captures use this shape to turn a raw i32 matmul result into f32. A readout
+    # declaring acc_scale does not make that conversion a scaled i8 store without a scale stage.
+    text = """builtin.module {
+  func.func @forward(%x: tensor<4x8xi8>, %w: tensor<8x16xi8>) -> tensor<4x16xf32> {
+    %zero = arith.constant 0 : i32
+    %e0 = tensor.empty() : tensor<4x16xi32>
+    %init = linalg.fill ins(%zero : i32) outs(%e0 : tensor<4x16xi32>) -> tensor<4x16xi32>
+    %mm = linalg.matmul ins(%x, %w : tensor<4x8xi8>, tensor<8x16xi8>)
+      outs(%init : tensor<4x16xi32>) -> tensor<4x16xi32>
+    %e1 = tensor.empty() : tensor<4x16xf32>
+    %float = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+      affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]}
+      ins(%mm : tensor<4x16xi32>) outs(%e1 : tensor<4x16xf32>) {
+      ^bb0(%acc: i32, %out: f32):
+        %converted = arith.sitofp %acc : i32 to f32
+        linalg.yield %converted : f32
+      } -> tensor<4x16xf32>
+    func.return %float : tensor<4x16xf32>
+  }
+}"""
+    device, host = _groups(text)
+    assert device.stages == [CG.CONTRACTION]
+    assert (device.stopped_by, device.refusal) == (CG.CAST, CG.READOUT_REQUIRES_SCALE)
+    assert host.stages == [CG.CAST]
+    assert CG.capsule_entry(device)["epilogue"] == []
+
+
 def test_the_plan_carries_a_first_refusal_census_of_why_growth_stopped() -> None:
     plan = CG.plan(mq.parse(_module(weight_dequantize="per_channel")), "synthetic", oracle=_Oracle())
     census = plan["absorption_refusals"]

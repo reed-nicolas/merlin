@@ -22,6 +22,7 @@ _BOUNDARIES = frozenset(("linalg_to_interface", "interface_to_command_buffer"))
 _SEMANTIC_FILES = (
     "cb_semantics.py",
     "linalg_semantics.py",
+    "merlin_iface_semantics.py",
     "receipts.py",
     "refine.py",
     "smt_export.py",
@@ -38,6 +39,9 @@ def _identity(value: Any, *, command_buffer: bool = False) -> dict[str, str]:
     if command_buffer:
         data = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
         kind = "canonical_json"
+    elif isinstance(value, str):
+        data = value.encode("utf-8")
+        kind = "merlin_iface_text_utf8"
     else:
         data = module_text(value).encode("utf-8")
         kind = "xdsl_generic_ir"
@@ -45,6 +49,13 @@ def _identity(value: Any, *, command_buffer: bool = False) -> dict[str, str]:
 
 
 def _ir_signature(module: Any) -> dict[str, Any]:
+    if isinstance(module, str):
+        from .merlin_iface_semantics import merlin_iface_signature
+
+        try:
+            return merlin_iface_signature(module)
+        except UnsupportedSemantics as exc:
+            return {"grammar": "merlin_iface", "parse_error": str(exc)}
     funcs = [op for op in module.walk() if op.name == "func.func"]
     if len(funcs) != 1:
         return {"function_count": len(funcs)}
@@ -71,6 +82,8 @@ def _cb_signature(cb: dict) -> dict[str, Any]:
 def _verifier_digest() -> str:
     root = Path(__file__).parent
     data = b"".join(name.encode() + b"\0" + (root / name).read_bytes() + b"\0" for name in _SEMANTIC_FILES)
+    bridge = root.parent / "targetgen" / "contract" / "interface_emit.py"
+    data += b"targetgen/contract/interface_emit.py\0" + bridge.read_bytes() + b"\0"
     return _sha(data)
 
 
@@ -169,12 +182,18 @@ def verify_transformation(
     }
     assumptions = (
         "rank-2 positive concrete integer tensor extents; signed bitvectors; modular accumulation",
-        "input tensors bound by block-argument position"
-        if not is_cb
-        else "input tensors bound by command-buffer role and order",
+        "input tensors bound by command-buffer role and order"
+        if is_cb
+        else (
+            "merlin_iface leaves named argN bound to source argument N"
+            if isinstance(target, str)
+            else "input tensors bound by block-argument position"
+        ),
         "contraction init must have defined contents; a bare tensor.empty init abstains"
         if not is_cb
         else "interface.resident_pack preserves values; physical layout is outside this value proof",
+        *(("merlin_iface.resident_pack preserves values; physical layout is outside this value proof",)
+          if isinstance(target, str) and not is_cb else ()),
     )
     tool: dict[str, str | None] = {}
     status = "unavailable"

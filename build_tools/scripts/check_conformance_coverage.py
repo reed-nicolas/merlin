@@ -425,6 +425,7 @@ def audit(target: str, *, spec_path: Path | None = None) -> dict:
         "application_demands": gap.get("application_demands") or {"coverage_status": "unverified"},
         "composition": gap.get("composition") or {"status": "not_measured"},
         "memory_mapping": gap.get("memory_mapping") or {"status": "not_measured"},
+        "accumulator_output_boundary": gap.get("accumulator_output_boundary") or {"status": "not_measured"},
         "shape_geometry": gap.get("shape_geometry") or {"status": "not_measured"},
         "host_only": gap.get("host_only") or {"status": "not_measured"},
         # THE THREE AXES THAT WERE DERIVED AND NEVER PRINTED. Measuring an axis and not reporting it
@@ -548,6 +549,7 @@ def _load_ratchet(p: Path | None) -> set[str]:
 AXES: tuple[tuple[str, str], ...] = (
     ("composition", "composition"),
     ("memory_mapping", "memory"),
+    ("accumulator_output_boundary", "accumulator_output"),
     ("host_only", "host_only"),
     ("shape_geometry", "geometry"),
     ("host_lane", "host_lane"),
@@ -917,6 +919,17 @@ def main(argv=None) -> int:
                     )
             elif mem:
                 print(f"   memory regime : {mem.get('status')} — {mem.get('detail', '')}")
+            acc = r.get("accumulator_output_boundary") or {}
+            if acc.get("status") == "ok":
+                print(
+                    f"   output capacity: {acc['n_covered']} / {acc['n_required']} "
+                    f"boundary ({acc.get('capacity_rows')} accumulator rows)"
+                )
+                for kind in acc["uncovered"]:
+                    mark = " " if _debt(r["target"], kind, "accumulator_output") in ratchet else "*"
+                    print(f"     {mark} {kind} has no capsule crossing the derived capacity")
+            elif acc:
+                print(f"   output capacity: {acc.get('status')} — {acc.get('detail', '')}")
             ho = r.get("host_only") or {}
             if ho.get("status") == "ok":
                 print(

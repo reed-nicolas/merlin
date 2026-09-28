@@ -79,7 +79,7 @@ def classify(rows_live: int | None, rows_total: int | None, capacity_rows: int |
     return FITS_DOUBLE if rows_live * 2 <= capacity_rows else FITS_SINGLE
 
 
-def operand_store(target: str, *, dtype: str | None = None):
+def operand_store(target: str, *, dtype: str | None = None, facts: dict | None = None):
     """``(Store, capacity_rows)`` for the target's operand store, or ``(None, None)``.
 
     Picks the NARROWEST-row store, because that is the one operands live in: a separate accumulator
@@ -99,7 +99,7 @@ def operand_store(target: str, *, dtype: str | None = None):
     try:
         from merlin.targetgen import address_space as AS
 
-        space = AS.derive_address_space(target)
+        space = AS.derive_address_space(target, facts=facts)
     except Exception:  # noqa: BLE001 — unresolvable target
         return None, None
     resolved = AS.operand_store(space, dtype=dtype)
@@ -135,7 +135,9 @@ def _rows(store, shape, dtype) -> int | None:
         return None
 
 
-def capsule_regime(capsule_dir: str | Path, target: str, *, store=None, capacity=None) -> dict:
+def capsule_regime(
+    capsule_dir: str | Path, target: str, *, store=None, capacity=None, facts: dict | None = None
+) -> dict:
     """The regime one capsule's declared tensors put the target in.
 
     Uses the capsule's OWN declared inputs, which is what the grader materialises, rather than anything
@@ -154,7 +156,7 @@ def capsule_regime(capsule_dir: str | Path, target: str, *, store=None, capacity
     # so the store has to be resolved AFTER the capsule is read, not before. Caller-supplied values are
     # still honoured -- a caller that resolved for this dtype should not pay for it per capsule.
     if store is None:
-        store, capacity = operand_store(target, dtype=_dominant_dtype(doc))
+        store, capacity = operand_store(target, dtype=_dominant_dtype(doc), facts=facts)
     if store is None or not capacity:
         return {"regime": UNKNOWN, "why": f"{target!r} declares no operand-store capacity we can derive"}
 
@@ -185,7 +187,7 @@ def capsule_regime(capsule_dir: str | Path, target: str, *, store=None, capacity
     return out
 
 
-def corpus_regimes(corpus_roots, target: str, *, labels=None, exclude=None) -> dict:
+def corpus_regimes(corpus_roots, target: str, *, labels=None, exclude=None, facts: dict | None = None) -> dict:
     """``regime -> [capsule names]`` for a corpus, plus the largest working set observed."""
     import yaml
 
@@ -197,8 +199,10 @@ def corpus_regimes(corpus_roots, target: str, *, labels=None, exclude=None) -> d
     capacity = None
     by: dict[str, list[str]] = {}
     largest = {"name": None, "rows": 0, "fraction_of_capacity": 0.0}
+    from merlin.targetgen.conformance import _capsule_paths
+
     for root in roots:
-        for cy in sorted(Path(root).glob("*/capsule.yaml")):
+        for cy in _capsule_paths(root):
             try:
                 cap = yaml.safe_load(cy.read_text(encoding="utf-8")) or {}
             except yaml.YAMLError:
@@ -208,7 +212,7 @@ def corpus_regimes(corpus_roots, target: str, *, labels=None, exclude=None) -> d
             name = cap.get("name") or cy.parent.name
             if name in exclude:
                 continue
-            got = capsule_regime(cy.parent, target)
+            got = capsule_regime(cy.parent, target, facts=facts)
             by.setdefault(got["regime"], []).append(name)
             if got.get("capacity_rows") and capacity is None:
                 capacity = got["capacity_rows"]

@@ -57,6 +57,25 @@ def _plan(root):
     return PM.build_measurement_plan(inputs)
 
 
+def test_target_selected_verilator_contract_refuses_gsim_plan_before_execution():
+    acceptance = {
+        "analyzer": "perf_pk_claim.analyze_pk_claim/v4",
+        "evidence": {
+            "correctness_simulator": "spike",
+            "timing_simulator": "verilator",
+            "timing_oracle_kind": "rtl_verilator",
+            "resolved_from": {"timing_simulator": "$target_oracle:L3"},
+        },
+        "fit": {"dependent_metric": "verilator_L3_cycles"},
+    }
+    member = SimpleNamespace(
+        family="PK", capsule="point", descriptor={"performance": {"acceptance": acceptance}}
+    )
+    inputs = SimpleNamespace(phase="tuning", corpus=SimpleNamespace(capsules=(member,)))
+    with pytest.raises(PM.PC.CampaignGateError, match="frozen oracles select spike at L2 and verilator at L3"):
+        PM.build_measurement_plan(inputs)
+
+
 def test_installed_owner_import_has_no_native_dependencies(monkeypatch):
     forbidden = {
         "perf_agent_stage",

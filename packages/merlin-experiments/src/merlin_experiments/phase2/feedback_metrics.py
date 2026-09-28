@@ -34,6 +34,7 @@ _BATCHED_OPERATION = "gemv_batched"
 # A whole-program comparison with two declared contractions and an intervening host map. The
 # host map contributes no MACs; both contraction stages do, regardless of which lane emits them.
 _HOST_ISLAND_OPERATION = "host_island_seam"
+_SCOPE_CHAIN_OPERATION = "scope_chain"
 #: The SAME contraction under another declared name: `linear` is bound to `build_matmul` in
 #: `corpus_spec.BUILDERS`, declares the identical rank-2 `lhs`/`weight` attributes, and emits a plain
 #: MATMUL that `work_volume` counts. Only this tuple refused it, so twelve members whose emitted
@@ -49,6 +50,7 @@ _WORK_OPERATIONS = (
     _ATTENTION_QK_OPERATION,
     _BATCHED_OPERATION,
     _HOST_ISLAND_OPERATION,
+    _SCOPE_CHAIN_OPERATION,
 )
 
 ARM_WORKSPACE = "m{index:03d}_{arm}"
@@ -279,6 +281,27 @@ def declared_capsule_macs(descriptor: Mapping[str, Any]) -> tuple[int | None, st
             "the intervening host map contributes no MACs"
         )
 
+    if operation.get("op") == _SCOPE_CHAIN_OPERATION:
+        lhs = shapes.get(str(attributes.get("lhs")))
+        weight = shapes.get(str(attributes.get("weight")))
+        if lhs is None or weight is None or len(lhs) != 2 or len(weight) != 2 or lhs[1] != weight[1]:
+            return None, "the scope-chain operands do not form a transposed rank-2 contraction"
+        if any(type(attributes.get(axis)) is not int or attributes[axis] != extent
+               for axis, extent in zip(("M", "K", "N"), (lhs[0], lhs[1], weight[0]))):
+            return None, "the scope-chain extents disagree with its declared operand shapes"
+        families = attributes.get("scope_families")
+        if not (
+            isinstance(families, list) and len(families) >= 3
+            and families[:2] == ["movement", "contraction"]
+            and all(family == "elementwise_map" for family in families[2:])
+            and attributes.get("scope_signature") == " -> ".join(families)
+            and attributes.get("map_count") == len(families) - 2
+        ):
+            return None, "the scope-chain declaration lacks a coherent selected family list"
+        return lhs[0] * lhs[1] * weight[0], (
+            "declared transposed contraction M x K x N; movement and maps contribute no MACs"
+        )
+
     weight = shapes.get(str(attributes.get("weight")))
     if weight is None or len(weight) != 2:
         return None, "the declared weight operand is not a rank-2 shape"
@@ -430,6 +453,13 @@ def declared_reduction_depths(descriptor: Mapping[str, Any]) -> tuple[tuple[int,
         if lhs[1] != first[0] or first[1] != second[0]:
             return None, "the declared host-island stages do not contract"
         return (lhs[1], first[1]), "declared reduction depths of both host-island contractions"
+
+    if op == _SCOPE_CHAIN_OPERATION:
+        macs, basis = declared_capsule_macs(descriptor)
+        if macs is None:
+            return None, basis
+        lhs = shapes[str(attributes["lhs"])]
+        return (lhs[1],), "declared scope-chain contraction reduction depth"
 
     weight = shapes.get(str(attributes.get("weight")))
     if weight is None or len(weight) != 2:

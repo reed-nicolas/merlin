@@ -29,6 +29,10 @@ claim unconditional at the supported shape.
 is the whole point: assuming they are zero would reintroduce the author's model through the back
 door, and would silently validate a pass that dropped a *non-zero* zero point — the exact defect the
 op exists to express. A zero point that is not a resolvable integer constant is an ABSTENTION.
+
+One ``linalg.generic`` subset is encoded: rank-2 signed i8 operands, i32 accumulation, ordinary
+matmul affine maps and iterators, and a body that sign-extends, multiplies, adds the accumulator,
+and yields the sum. Every structural part is checked; provenance tags are not evidence of semantics.
 """
 
 from __future__ import annotations
@@ -37,12 +41,13 @@ from typing import Any
 
 from .smt_semantics import Encoded, Encoder, Tensor, UnsupportedSemantics, _elem_width, _shape
 
-#: Ops with a value semantics here. Listed so a reader can see the encoded surface at a glance; the
-#: walk below is still the authority, and anything absent raises rather than falling through.
+#: Top-level ops with a value semantics here. ``linalg.generic`` is conditional on its exact body,
+#: maps, iterators, and types; this is a candidate inventory, not a promise about all generics.
 ENCODABLE_OPS = frozenset(
     {
         "linalg.quantized_matmul",
         "linalg.matmul",
+        "linalg.generic",
         "linalg.fill",
         "tensor.empty",
         "arith.constant",
@@ -146,6 +151,69 @@ def _add_init(enc: Encoder, acc: Tensor, init) -> Tensor:
     return Tensor(acc.rows, acc.cols, acc.width, out)
 
 
+def _generic_matmul(op, acc_width: int) -> tuple:
+    """Recognize the *computed* i8 matmul, including its region, without reading tags.
+
+    This deliberately accepts one small semantic subset. Other generic bodies may compute
+    convolution, transposed matmul, different integer arithmetic, or arbitrary maps; treating any
+    of those as ``A @ B`` would turn a translation receipt into a false proof. In particular the
+    ``prov.*`` and ``library_call`` labels are ignored here.
+    """
+    from xdsl.dialects.linalg.attrs import IteratorType
+    from xdsl.ir.affine import AffineDimExpr, AffineMap
+
+    if acc_width != 32:
+        raise UnsupportedSemantics("linalg.generic signed i8 matmul is encoded only with i32 accumulation")
+    if len(op.inputs) != 2 or len(op.outputs) != 1 or len(op.results) != 1:
+        raise UnsupportedSemantics("linalg.generic is not a two-input, one-init, one-result contraction")
+    lhs, rhs = op.inputs
+    init = op.outputs[0]
+    if [_elem_width(v.type) for v in (lhs, rhs, init, op.results[0])] != [8, 8, acc_width, acc_width]:
+        raise UnsupportedSemantics("linalg.generic is not signed i8 x i8 -> accumulator-width integer matmul")
+    if op.results[0].type != init.type:
+        raise UnsupportedSemantics("linalg.generic result type differs from its initialized output")
+
+    maps = tuple(x.data for x in op.indexing_maps)
+    d0, d1, d2 = (AffineDimExpr(i) for i in range(3))
+    expected = (
+        AffineMap(3, 0, (d0, d2)),
+        AffineMap(3, 0, (d2, d1)),
+        AffineMap(3, 0, (d0, d1)),
+    )
+    if maps != expected:
+        raise UnsupportedSemantics("linalg.generic indexing maps are not rank-2 matmul maps")
+    if tuple(x.data for x in op.iterator_types) != (
+        IteratorType.PARALLEL, IteratorType.PARALLEL, IteratorType.REDUCTION
+    ):
+        raise UnsupportedSemantics("linalg.generic iterators are not two parallel and one reduction")
+    if len(op.regions) != 1 or len(op.regions[0].blocks) != 1:
+        raise UnsupportedSemantics("linalg.generic requires a single scalar body block")
+    block = op.regions[0].block
+    args = list(block.args)
+    if len(args) != 3 or [str(arg.type) for arg in args] != ["i8", "i8", f"i{acc_width}"]:
+        raise UnsupportedSemantics("linalg.generic body argument types do not match signed matmul")
+    body_ops = list(block.ops)
+    if [x.name for x in body_ops] != [
+        "arith.extsi", "arith.extsi", "arith.muli", "arith.addi", "linalg.yield"
+    ]:
+        raise UnsupportedSemantics("linalg.generic body is not signed widen, multiply, add, yield")
+    ex_lhs, ex_rhs, mul, add, yld = body_ops
+    if (list(ex_lhs.operands), list(ex_rhs.operands)) != ([args[0]], [args[1]]):
+        raise UnsupportedSemantics("linalg.generic body does not widen both input elements")
+    if [str(ex_lhs.results[0].type), str(ex_rhs.results[0].type)] != [f"i{acc_width}"] * 2:
+        raise UnsupportedSemantics("linalg.generic body widens to a different integer width")
+    if set(mul.operands) != {ex_lhs.results[0], ex_rhs.results[0]} or len(mul.operands) != 2:
+        raise UnsupportedSemantics("linalg.generic body product does not use both widened inputs")
+    if set(add.operands) != {mul.results[0], args[2]} or len(add.operands) != 2:
+        raise UnsupportedSemantics("linalg.generic body sum does not use product and accumulator")
+    if list(yld.operands) != [add.results[0]]:
+        raise UnsupportedSemantics("linalg.generic body yields a different value")
+    for arith_op in (mul, add):
+        if str(arith_op.results[0].type) != f"i{acc_width}" or arith_op.overflow_flags.data:
+            raise UnsupportedSemantics("linalg.generic body has an unsupported arithmetic width or overflow flag")
+    return lhs, rhs, init
+
+
 def encode_linalg(enc: Encoder, module, *, acc_width: int = 32) -> Encoded:
     """Interpret a ``linalg`` source module, returning its returned values and its symbolic inputs.
 
@@ -235,14 +303,18 @@ def encode_linalg(enc: Encoder, module, *, acc_width: int = 32) -> Encoded:
                 )
             literal = enc.const(consts[scalar], width)
             env[op.results[0]] = Tensor(rows, cols, width, {(r, c): literal for r in range(rows) for c in range(cols)})
-        elif name in ("linalg.quantized_matmul", "linalg.matmul"):
+        elif name in ("linalg.quantized_matmul", "linalg.matmul", "linalg.generic"):
             res_width = _elem_width(op.results[0].type)
             if res_width != acc_width:
                 raise UnsupportedSemantics(
                     f"{name} returns an i{res_width} tensor but the accumulator is i{acc_width}; "
                     f"refusing rather than silently re-widening the contraction"
                 )
-            if name == "linalg.quantized_matmul":
+            if name == "linalg.generic":
+                lhs, rhs, init_value = _generic_matmul(op, acc_width)
+                zp_lhs = zp_rhs = 0
+                init = env.get(init_value)
+            elif name == "linalg.quantized_matmul":
                 if len(op.operands) != 5:
                     raise UnsupportedSemantics(
                         f"linalg.quantized_matmul with {len(op.operands)} operands; expected "
@@ -251,6 +323,7 @@ def encode_linalg(enc: Encoder, module, *, acc_width: int = 32) -> Encoded:
                 zp_lhs = _zero_point(op.operands[2], "lhs")
                 zp_rhs = _zero_point(op.operands[3], "rhs")
                 init = env.get(op.operands[4])
+                lhs, rhs = op.operands[:2]
             else:
                 if len(op.operands) != 3:
                     raise UnsupportedSemantics(
@@ -258,10 +331,11 @@ def encode_linalg(enc: Encoder, module, *, acc_width: int = 32) -> Encoded:
                     )
                 zp_lhs = zp_rhs = 0
                 init = env.get(op.operands[2])
+                lhs, rhs = op.operands[:2]
             if init is None:
                 raise UnsupportedSemantics(f"{name} init operand is undefined here")
             acc = _contract(
-                enc, _tensor(op.operands[0], "lhs"), _tensor(op.operands[1], "rhs"), zp_lhs, zp_rhs, acc_width
+                enc, _tensor(lhs, "lhs"), _tensor(rhs, "rhs"), zp_lhs, zp_rhs, acc_width
             )
             env[op.results[0]] = _add_init(enc, acc, init)
         elif name == "func.return":

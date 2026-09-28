@@ -172,7 +172,7 @@ def test_the_host_work_is_work_this_target_genuinely_refuses():
 def test_the_derived_inventory_is_discharged_layer_for_layer():
     """The full derivation — accelerator cells from the manifest, host families from what real captures
     actually contain — checked row by row against the capsule."""
-    spec = MM.spec(TARGET, _real_captures())
+    spec = MM.spec(TARGET, _real_captures(), capture_dtype="int8")
     present = {(r.resolved_family(), r.in_dtype) for r in _regions()}
     families = {f for f, _ in present}
     unmet = []

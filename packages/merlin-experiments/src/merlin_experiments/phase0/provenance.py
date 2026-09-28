@@ -70,13 +70,102 @@ def _redact_local_paths(text: str) -> str:
     return text
 
 
+def _verify_frontend_evidence_dir(directory: Path) -> None:
+    """Refuse an evidence-bearing capsule whose declared emitted members changed."""
+    evidence_path = directory / "frontend-evidence.json"
+    if evidence_path.is_symlink() or not evidence_path.is_file():
+        raise ValueError("frontend evidence is absent or symlinked")
+    evidence = json.loads(evidence_path.read_bytes())
+    if evidence.get("schema") != "merlin.capsule_frontend_evidence.v2":
+        raise ValueError("frontend evidence has an unsupported schema")
+    capsule_path = directory / "capsule.yaml"
+    if capsule_path.is_symlink() or not capsule_path.is_file():
+        raise ValueError("frontend evidence capsule declaration is absent or symlinked")
+    capsule = yaml.safe_load(capsule_path.read_bytes()) or {}
+    if not isinstance(capsule, dict) or capsule.get("frontend_trace") != evidence:
+        raise ValueError("frontend evidence differs from capsule declaration")
+    members = (
+        ("path", "sha256", "frontend-trace.json"),
+        ("source_mlir", "source_mlir_sha256", "frontend-source.mlir"),
+        ("packaged_mlir", "packaged_mlir_sha256", None),
+        ("interface_mlir", "interface_mlir_sha256", "capsule.interface.mlir"),
+    )
+    for path_key, digest_key, expected in members:
+        name = evidence.get(path_key)
+        if not isinstance(name, str) or Path(name).name != name or (expected is not None and name != expected):
+            raise ValueError(f"frontend evidence has an unsafe {path_key} member")
+        if path_key == "packaged_mlir" and name not in {"capsule.interface.mlir", "capsule.linalg.mlir"}:
+            raise ValueError("frontend evidence has an unsupported packaged MLIR member")
+        path = directory / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"frontend evidence member is absent or symlinked: {name}")
+        payload = path.read_bytes()
+        actual = hashlib.sha256(payload).hexdigest()
+        if actual != evidence.get(digest_key):
+            raise ValueError(f"frontend evidence member changed: {name}")
+        count_key = {"source_mlir": "source_mlir_bytes", "packaged_mlir": "packaged_mlir_bytes"}.get(path_key)
+        if count_key and len(payload) != evidence.get(count_key):
+            raise ValueError(f"frontend evidence member byte count changed: {name}")
+    portability = evidence.get("source_portability")
+    if not isinstance(portability, dict):
+        raise ValueError("frontend source portability receipt is absent")
+    if (
+        portability.get("raw_sha256") != evidence.get("raw_source_mlir_sha256")
+        or portability.get("emitted_sha256") != evidence.get("source_mlir_sha256")
+    ):
+        raise ValueError("frontend source portability receipt is inconsistent")
+    declared_mlir = json.loads((directory / "frontend-trace.json").read_bytes()).get("mlir") or {}
+    if evidence.get("raw_source_trace_bound"):
+        if (
+            declared_mlir.get("sha256") != evidence["raw_source_mlir_sha256"]
+            or declared_mlir.get("bytes") != evidence.get("raw_source_mlir_bytes")
+        ):
+            raise ValueError("frontend raw source differs from its selected trace")
+    sidecars = evidence.get("weights_sidecars")
+    if sidecars is not None and (
+        not isinstance(sidecars, dict)
+        or set(sidecars) != {"capsule.weights.safetensors", "capsule.weights.safetensors.manifest.json"}
+    ):
+        raise ValueError("frontend evidence weights sidecars are incomplete")
+    for name, digest in (sidecars or {}).items():
+        if name not in {"capsule.weights.safetensors", "capsule.weights.safetensors.manifest.json"}:
+            raise ValueError("frontend evidence has an unsupported weights sidecar")
+        path = directory / name
+        if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError(f"frontend evidence member changed: {name}")
+    capture_receipt = evidence.get("capture_receipt")
+    if capture_receipt is not None:
+        if not isinstance(capture_receipt, dict) or capture_receipt.get("path") != "source-capture-receipt.json":
+            raise ValueError("frontend evidence has an unsafe capture receipt member")
+        if (capsule.get("materialized_capture") or {}).get("receipt_sha256") != capture_receipt.get("sha256"):
+            raise ValueError("frontend capture receipt differs from capsule declaration")
+        path = directory / capture_receipt["path"]
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != capture_receipt.get("sha256")
+        ):
+            raise ValueError("frontend evidence member changed: source-capture-receipt.json")
+
+
 def _scrub_capsule_dir(d) -> None:
     """Scrub every tracked-shippable text file in a written capsule dir of non-deterministic / local paths:
-    strip the absolute ``prov.weights_file`` from ``*.mlir`` and redact local-path tokens from ``*.mlir`` +
-    ``*.py``. Only rewrites a file when its content actually changes (keeps regenerations byte-stable)."""
+    ordinary capsules retain legacy scrubbing; evidence-bearing MLIR must already be portable and
+    byte-bound, so any would-be rewrite refuses instead of invalidating its source lineage."""
     if d is None:
         return
-    for p in sorted(Path(d).iterdir()):
+    directory = Path(d)
+    evidence_path = directory / "frontend-evidence.json"
+    has_evidence = evidence_path.exists() or evidence_path.is_symlink()
+    if has_evidence:
+        _verify_frontend_evidence_dir(directory)
+        for path in sorted(directory.glob("*.mlir")):
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"evidence-bound MLIR is absent or symlinked: {path.name}")
+            contents = path.read_text(encoding="utf-8")
+            if _redact_local_paths(_strip_weights_attr(contents)) != contents:
+                raise ValueError(f"evidence-bound MLIR needs an undeclared portability rewrite: {path.name}")
+    for p in sorted(directory.iterdir()):
         if p.suffix not in (".mlir", ".py") or not p.is_file():
             continue
         text = p.read_text(encoding="utf-8")

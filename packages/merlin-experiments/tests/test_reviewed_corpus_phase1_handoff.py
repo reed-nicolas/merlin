@@ -8,6 +8,7 @@ observations, not native qualification.
 
 import importlib.util
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -35,6 +36,7 @@ from merlin_experiments.spec import SpecError
 
 from merlin.benchharness import hash_tree
 from merlin.targetgen import capsule_runner as CR
+from merlin.targetgen import package_records
 from merlin.targetgen.sandbox import bwrap as BW
 from merlin.targetgen.target_experiment import load_target_experiment
 
@@ -358,6 +360,47 @@ def test_reviewed_derivation_formal_freeze_and_phase2_admission_share_exact_byte
     # Re-admission consumes the same frozen evidence, not a new certification.
     assert binding.verify(handoff.run / "submission") == admitted
 
+    # A relocated local publication may supply the bytes, but the functional
+    # grade remains the original frozen run. Publication metadata never enters
+    # the performance candidate's compiler snapshot.
+    publisher = tmp_path / "publication-source"
+    shutil.copytree(frozen.submission_dir, publisher)
+    (publisher / ".merlin").mkdir()
+    (publisher / ".merlin/provenance.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "target": bridge.target.target,
+                "provider_role": "candidate_compiler",
+                "source_payload": package_records.payload_inventory(frozen.submission_dir),
+            }
+        )
+    )
+    relocated = tmp_path / "independent-publication-clone"
+    with monkeypatch.context() as scoped:
+        scoped.setattr(subprocess, "Popen", bridge.original_popen)
+        git = ["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid"]
+        commands = (
+            git + ["init", "-q", str(publisher)],
+            git + ["-C", str(publisher), "add", "."],
+            git + ["-C", str(publisher), "commit", "-qm", "synthetic local publication"],
+            git + ["clone", "-q", str(publisher), str(relocated)],
+        )
+        for command in commands:
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                env={
+                    **os.environ,
+                    "GIT_ALLOW_PROTOCOL": "file",
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "core.hooksPath",
+                    "GIT_CONFIG_VALUE_0": os.devnull,
+                },
+            )
+
     # The checkpoint owner now consumes this exact formal submission as its
     # optimization baseline. Agent, simulator and OS-isolation observations above
     # remain synthetic and must never be presented as hardware qualification.
@@ -367,9 +410,13 @@ def test_reviewed_derivation_formal_freeze_and_phase2_admission_share_exact_byte
     lifecycle_helper = importlib.util.module_from_spec(lifecycle_spec)
     lifecycle_spec.loader.exec_module(lifecycle_helper)
     lifecycle = lifecycle_helper.build_lifecycle(
-        tmp_path / "phase2", monkeypatch, functional_run=frozen, target_name=bridge.target.target
+        tmp_path / "phase2", monkeypatch, functional_run=frozen, target_name=bridge.target.target,
+        published_compiler_root=relocated,
     )
     result_path = lifecycle.run()
+    projected = lifecycle.config.root / "published-functional-base"
+    assert hash_tree(projected) == hash_tree(frozen.submission_dir)
+    assert not (projected / ".merlin").exists()
     result = json.loads(result_path.read_bytes())
     assert len(result["measurement_manifests"]) == 6
     assert result["statistics"]["status"] == "admitted"
@@ -378,6 +425,10 @@ def test_reviewed_derivation_formal_freeze_and_phase2_admission_share_exact_byte
     events = list(lifecycle.events)
     assert lifecycle.run() == result_path
     assert lifecycle.events == events
+    (relocated / "compiler.py").chmod(0o644)
+    (relocated / "compiler.py").write_text("# publication payload changed after checkpoint\n")
+    with pytest.raises(Exception, match="published compiler source bytes differ"):
+        lifecycle.run()
 
 
 def _execute_reviewed_authoring(bridge, tmp_path, monkeypatch):

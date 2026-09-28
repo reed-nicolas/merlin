@@ -120,6 +120,13 @@ final result does not prove that intermediate partial sums avoided wrapping.
 
 The host manifest now lists only typed matmul/batch-matmul candidates found in
 its pinned schedule. No standalone normalization or activation is claimed.
+Exact `ops` selectors do not widen to a shared semantic family: a declaration
+for `linalg.matmul` does not cover a captured `linalg.generic` contraction.
+Inspect `coverage/operation-accounting.json` against the selected schedule
+before reviewing the host declaration. A transform-interpreter success alone
+does not establish that a selector matched. Even a native whole-program result
+matching its saved golden is finite host-execution evidence, not per-operation
+RVV support, accelerator execution, or a reviewed host numerical contract.
 Typed load/readout candidates describe bit-preserving crossings; they remain
 unreviewed and never imply that FP32-to-int8 quantization, dispatch, or DMA
 execution was already implemented. The selected hardware readout recipe supplies
@@ -181,6 +188,12 @@ python examples/gemmini/target/probe_native_kernel.py \
   --output-root out/artifacts/probes/gemmini-kernel-1
 ```
 
+When refreshed, independently validated facts are stored outside the selected
+source bundle, pass `--facts-evidence /generated/gemmini/facts-1`. The probe
+checks that the facts validation binds the selected source hash and that the
+Phase 0 manifest binds both facts and source/core HW bytes. Without the option,
+the existing flat source bundle layout remains supported.
+
 The output root must resolve beneath this checkout's ignored `out/` tree and
 must not overlap either input bundle. `receipt.json` binds the selected source,
 corpus manifest, probe, support files, tool binaries, and per-case program,
@@ -191,6 +204,9 @@ input and output hashes. Each case directory contains `command_buffer.json`,
 root, add `--audit-existing` to re-execute the saved ELF on Spike; a saved
 Verilator console is reused only when its hash and the ELF hash match the prior
 receipt. Without that flag, both engines execute the newly compiled program.
+For a frozen experiment run, point `--corpus` at its `phase0/capsules` directory;
+the probe binds the adjacent `phase0/evidence-manifest.json`. Standalone corpora
+with `capsules/_evidence/evidence-manifest.json` remain readable.
 
 The current check covers exactly two fixed int8-input/int32-output shapes:
 16×32 by 32×16 (256 outputs) and 16×31 by 31×15 (240 outputs). Their generated
@@ -229,3 +245,61 @@ not a proof of RTL behavior. Spike's `libgemmini.so` is a separately hashed
 functional model: neither this build check nor agreement with its output makes
 Spike RTL-derived. A different Chipyard build, toolchain, or kernel receipt
 requires a new attestation.
+On a read-only Chipyard tree, the attester copies the selected FIRRTL and projects
+only the two hierarchy-output annotation filenames into its ignored artifact;
+it records both annotation hashes and the exact path changes, then still requires
+byte-for-byte equality of generated core RTL, Verilator C++, and the executable.
+
+### Diagnose one headline-derived kernel window
+
+`probe_headline_kernel.py` takes a captured `frontend-trace.json` and its exact
+`model.mlir`, one prepared-graph source node ID, selected RTL facts, and a
+capability contract. It refuses a stale trace or ambiguous operation. The
+generated capsule records the original operation ordinal, operand types,
+model/trace hashes and full matrix geometry, then derives a small integer
+window from the RTL mesh edge. It accepts a traced `linalg.matmul`, or a
+traced `linalg.generic` only when the exact captured MLIR has the signed
+i8×i8→i32 matmul maps, iterators, provenance and reduction body. Other generic
+loops are not treated as contractions. For example, TinyLlama's `k_proj` body
+`g:prepared:root:n280` in the 8-token prefill capture has source geometry
+8×2048×256; the selected 16-wide mesh gives an 8×32×16 diagnostic window.
+No dimensions are copied into the generator.
+
+```sh
+python examples/gemmini/target/probe_headline_kernel.py \
+  --capture "$HEADLINE_ROOT/tinyllama-prefill" \
+  --source-node-id g:prepared:root:n280 \
+  --rtl-facts "$RTL_ROOT/facts.json" \
+  --support-contract "$MERLIN_TARGET_PATH/contracts/target_contract.yaml" \
+  --output-root out/artifacts/probes/headline-tiny-kproj-1
+```
+
+The default generates `capsule.yaml`, `capsule.interface.mlir` and
+`generation.json` without running a simulator. Add `--native` for independent
+scalar-versus-Gemmini Spike output checks; add `--rtl` to execute the same ELF
+on Verilator. Native mode requires the explicitly selected OOT support contract,
+`MERLIN_TARGET_PATH` pointing to that support package, and `MERLIN_CHIPYARD`
+pointing to the selected Chipyard toolchain/simulator build. The example's
+Phase 0 contract supplies the authored corpus issue order; the probe checks
+that its shared compute-unit and encoding declarations agree with the OOT
+provider contract and records both contract hashes.
+Before native execution, the probe checks that the source projection, capsule
+and interface still match `generation.json`. The numerical receipt records the
+SHA-256 of all three generated files, so a result cannot be silently reassigned
+to a different generated diagnostic.
+Each simulator has a 180-second wall timeout. The source capture supplies
+geometry only: FP32/BF16 model captures do not establish an int8 model path.
+An actual quantized capture and integerization evidence are required before
+claiming the model invokes a corresponding int8 contraction, though they are
+not required to check this synthetic Gemmini kernel's arithmetic.
+
+For an integerized capture, inspect `frontend-trace.json`'s
+`mlir.operations` for an `linalg.generic` with a prepared-graph source ID and
+`tensor<...xi8>` operands. Pass that ID to `--source-node-id`; the probe checks
+the parsed operation, not just those trace labels. For the selected ResNet50
+W8A8 diagnostic capture, `g:prepared:root:n361` names a 12544×147×64
+body; the 16-wide RTL mesh derives a 16×19×16 synthetic window. A native
+Spike run of that window matched scalar arithmetic, but neither the model's
+own values nor a whole-model accelerator route were executed. The selected
+local Chipyard build did not expose Verilator or GSIM, so this is a functional
+Spike check, not an RTL-simulator certificate.

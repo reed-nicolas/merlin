@@ -44,9 +44,16 @@ def _ledger_observation(application: dict | None, model_sha256: str) -> tuple[di
     lanes = Counter()
     selected_lanes = {}
     unresolved = 0
+    support_pending = 0
     for row in obligations:
         if not isinstance(row, dict):
             unresolved += 1
+            continue
+        if row.get("role") == "support_lowering":
+            # The Phase 0 source observation is not an executable/compiler
+            # lowering receipt. Support nodes have no independent lane or
+            # arithmetic contract, and cannot be transfer endpoints here.
+            support_pending += 1
             continue
         lane = _placement(row)
         numerical = ((row.get("precision") or {}).get("numerical_contracts") or {}).get(lane) or {}
@@ -63,6 +70,8 @@ def _ledger_observation(application: dict | None, model_sha256: str) -> tuple[di
                 selected_lanes[operation_id] = lane
     if unresolved:
         blockers.append(f"{unresolved} operation placement/precision/numerical obligations remain unresolved")
+    if support_pending:
+        blockers.append(f"{support_pending} typed support-lowering/shape obligations lack compiler verification")
     transfers = completeness.get("transfer_obligations")
     if not isinstance(transfers, list):
         blockers.append("typed host/device transfer obligations are absent")
@@ -94,11 +103,19 @@ def _ledger_observation(application: dict | None, model_sha256: str) -> tuple[di
         if transfer_counts["required_crossing"]
         else "same_lane_or_none"
     )
+    support_edges = sum(
+        edge.get("accounting") == "support_dependency"
+        for edge in (completeness.get("graph_accounting") or {}).get("edges") or []
+        if isinstance(edge, dict)
+    )
+    if support_edges:
+        blockers.append(f"{support_edges} support-mediated SSA dependencies lack compiler-owned route evidence")
     summary = {
         "status": "screened_not_compiled" if not blockers else "incomplete",
         "n_operations": application.get("n_mlir_operations"),
         "candidate_lanes": dict(sorted(lanes.items())),
         "unresolved_obligations": unresolved,
+        "support_lowering": {"pending": support_pending, "support_dependencies": support_edges},
         "conditional_ssa_edges": {
             "status": transfer_status,
             "count": len(transfers),
@@ -106,7 +123,9 @@ def _ledger_observation(application: dict | None, model_sha256: str) -> tuple[di
             "same_lane": transfer_counts["same_lane"],
             "required_crossing": transfer_counts["required_crossing"],
         },
-        "qualification": "declaration screening only; no per-operation compiler or numerical witness",
+        "qualification": (
+            "declaration screening only; support lowering and compiler-owned routes require separate evidence"
+        ),
     }
     return summary, blockers
 

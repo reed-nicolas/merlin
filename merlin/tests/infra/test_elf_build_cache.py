@@ -180,6 +180,15 @@ def test_the_real_build_path_refuses_a_target_with_no_backend():
     assert BC.build_path("no_such_target_is_registered") is None
 
 
+def test_build_path_follows_imported_package_when_checkout_root_is_absent(tmp_path, monkeypatch):
+    """Installed wheels have no legacy merlin/python links or checkout markers."""
+    monkeypatch.setenv("MERLIN_REPO_ROOT", str(tmp_path))
+    paths = BC.build_path()
+    assert paths is not None
+    assert Path(BC.__file__).resolve() in paths
+    assert all(path.is_relative_to(Path(BC.__file__).resolve().parents[2]) for path in paths)
+
+
 def test_no_key_when_a_support_source_cannot_be_read(key_of, recipe):
     recipe.support_sources[0].unlink()
     assert key_of() is None

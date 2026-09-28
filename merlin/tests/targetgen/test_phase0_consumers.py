@@ -11,9 +11,12 @@ from merlin.targetgen import capsule_runner, corpus_spec, group_capsules, store_
 def _target(monkeypatch, tmp_path):
     target = SimpleNamespace(target="fixture", sim_via="synthetic", capsule_corpus=tmp_path)
     binding = object()
+    (tmp_path / "public.yaml").write_text("capsules: []\n")
     selected = SimpleNamespace(
         target="fixture",
         profile="authored-profile",
+        definition=tmp_path / "experiment.yaml",
+        recipe=tmp_path / "public.yaml",
         descriptor=tmp_path / "target.yaml",
         profile_inputs=lambda: {
             "recipe": tmp_path / "public.yaml",
@@ -67,6 +70,26 @@ def test_group_writer_uses_canonical_profile_and_writer_owners(monkeypatch, tmp_
         "built": {"accepted": str(tmp_path / "accepted")},
         "refused_by_generator": {"refused": "ValueError: synthetic refusal"},
     }
+
+
+def test_group_writer_uses_selected_arithmetic_and_rejects_entry_drift(monkeypatch, tmp_path):
+    binding = _target(monkeypatch, tmp_path)
+    semantics = {"internal_arithmetic": {"mac_result_bits": 20}}
+    monkeypatch.setattr(profiles, "load_profile", lambda *args, **kwargs: {"datapath": {"numerical_semantics": semantics}})
+    monkeypatch.setattr(corpus_spec, "derive_binding", lambda *args: binding)
+    received = []
+    monkeypatch.setattr(writer, "_write_capsule", lambda entry, *_args: received.append(entry) or tmp_path / entry["name"])
+    result = group_capsules.write(
+        "fixture",
+        {"entries": [
+            {"name": "selected", "entry": {"name": "selected"}},
+            {"name": "drift", "entry": {"name": "drift", "numerical_semantics": {"other": True}}},
+        ]},
+        tmp_path,
+    )
+    assert [entry["numerical_semantics"] for entry in received] == [semantics]
+    assert "selected" in result["built"]
+    assert "selected software spec" in result["refused_by_generator"]["drift"]
 
 
 def test_store_probe_uses_shared_writer_without_real_execution(monkeypatch, tmp_path):

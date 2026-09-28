@@ -96,12 +96,19 @@ def admit_host_operation(selected: dict | None, row: dict, signature: dict) -> d
         )
         decisions = []
         for declaration in document["operations"]:
-            # Direct frontend or MLIR selectors refer to exactly observed identities.
+            # A named selector is narrower than a semantic family. A package
+            # schedule matching linalg.matmul must not admit an unrelated
+            # linalg.generic merely because both describe contractions. Family
+            # selectors remain available when no exact ops were declared.
+            identities = (row.get("frontend_op"), row["mlir_operation"])
+            exact_ops = declaration.get("ops") or []
+            if exact_ops and not any(identity in exact_ops for identity in identities):
+                continue
             operation = next(
                 (
                     identity
-                    for identity in (row.get("frontend_op"), row["mlir_operation"])
-                    if identity in declaration.get("ops", [])
+                    for identity in identities
+                    if identity in exact_ops
                 ),
                 row["mlir_operation"],
             )

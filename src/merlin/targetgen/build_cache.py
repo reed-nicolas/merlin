@@ -115,17 +115,19 @@ _ENTRIES_ENV = "MERLIN_ELF_BUILD_CACHE_ENTRIES"
 #: Spellings of "off". A value that is neither one of these nor a usable directory is a PATH.
 _OFF = frozenset({"0", "off", "no", "false", "none", "disabled"})
 
-#: Repo-relative sources whose bytes turn the inputs into an executable. Directories are expanded to
-#: their ``.py`` files, so a module added to the lowering path is covered without editing this list.
+#: Import-root-relative sources whose bytes turn the inputs into an executable. Directories are
+#: expanded to their ``.py`` files, so a module added to the lowering path is covered without editing
+#: this list. The import root works in both the source checkout and an installed wheel; legacy
+#: ``merlin/python`` compatibility links do not exist in installed distributions.
 #: The target's own backend package is DERIVED in :func:`build_path`, never named here.
 _BUILD_MODULES = (
-    "merlin/python/merlin/llvmlower",
-    "merlin/python/merlin/targetgen/contract",
-    "merlin/python/merlin/targetgen/runtime_build.py",
-    "merlin/python/merlin/targetgen/build_cache.py",
-    "merlin/python/merlin/runtime/commandbuffer.py",
-    "merlin/python/merlin/runtime/fp8_formats.py",
-    "merlin/python/merlin/runtime/backends/base.py",
+    "merlin/llvmlower",
+    "merlin/targetgen/contract",
+    "merlin/targetgen/runtime_build.py",
+    "merlin/targetgen/build_cache.py",
+    "merlin/runtime/commandbuffer.py",
+    "merlin/runtime/fp8_formats.py",
+    "merlin/runtime/backends/base.py",
 )
 
 
@@ -191,9 +193,9 @@ def build_path(target: "str | None" = None) -> "tuple[Path, ...] | None":
     declarations disable reuse, never silently fall back to a partial key. This grants no execution
     or sandbox access; it only identifies code that must invalidate a cached executable.
     """
-    from merlin.common.paths import repo_root
+    from merlin.common.paths import python_source_dir
 
-    root = Path(repo_root())
+    root = python_source_dir()
     files: list[Path] = []
     for rel in _BUILD_MODULES:
         p = root / rel

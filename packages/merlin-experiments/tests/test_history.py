@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 
-from merlin_experiments.history import runs
+from merlin_experiments.history import lineage, runs
 
 
 def record(root, target, experiment, name):
@@ -164,3 +164,89 @@ def test_cli_navigates_frozen_phase_handoffs_without_reading_live_inputs(tmp_pat
     (directory / "resolved-plan.json").write_bytes(payload + b" ")
     assert main(["lineage", str(directory)]) == 2
     assert "plan changed" in capsys.readouterr().err
+
+
+def test_lineage_uses_frozen_definition_path_not_mutable_source_path(tmp_path):
+    directory = record(tmp_path, "alpha", "functional", "run")
+    source = tmp_path / "examples/experiment.yaml"
+    frozen = directory / "phase0/private/source/experiment.yaml"
+    plan = json.loads((directory / "resolved-plan.json").read_text())
+    plan.update(
+        definition=str(source),
+        inputs={"definition": {"path": str(frozen), "sha256": "a" * 64}},
+    )
+    payload = json.dumps(plan).encode()
+    (directory / "resolved-plan.json").write_bytes(payload)
+    orchestration = json.loads((directory / "orchestration.json").read_text())
+    orchestration["plan_sha256"] = hashlib.sha256(payload).hexdigest()
+    (directory / "orchestration.json").write_text(json.dumps(orchestration))
+    assert lineage(directory)["definition"] == {
+        "path": str(frozen),
+        "sha256": "a" * 64,
+        "identity": "frozen_input",
+        "source_path": str(source),
+    }
+
+
+def test_phase0_descriptor_snapshot_is_bound_to_frozen_input_bytes(tmp_path):
+    directory = record(tmp_path, "gemmini", "functional", "run")
+    phase0 = directory / "phase0"
+    snapshots = phase0 / "software" / "source-snapshots"
+    snapshots.mkdir(parents=True)
+    content = b"target: gemmini\n"
+    digest = hashlib.sha256(content).hexdigest()
+    snapshot = snapshots / f"0000-{digest}.bin"
+    snapshot.write_bytes(content)
+    manifest = phase0 / "evidence-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "role": "descriptor",
+                        "path": str(snapshot.relative_to(phase0)),
+                        "sha256": digest,
+                    }
+                ]
+            }
+        )
+    )
+    plan = json.loads((directory / "resolved-plan.json").read_text())
+    plan["inputs"] = {
+        "phase0:descriptor": {
+            "path": str(phase0 / "private/source/_declared_inputs/descriptor.yaml"),
+            "sha256": digest,
+        }
+    }
+    plan["phases"] = {
+        "0": {
+            "adapter": "capsule_derivation",
+            "inputs": {"descriptor": str(snapshot)},
+            "engine_output": str(phase0),
+        }
+    }
+    payload = json.dumps(plan).encode()
+    (directory / "resolved-plan.json").write_bytes(payload)
+    record_data = json.loads((directory / "orchestration.json").read_text())
+    record_data["plan_sha256"] = hashlib.sha256(payload).hexdigest()
+    (directory / "orchestration.json").write_text(json.dumps(record_data))
+
+    descriptor = lineage(directory)["phases"]["0"]["inputs"]["descriptor"]
+    assert descriptor == {
+        "path": str(snapshot),
+        "sha256": digest,
+        "identity": "frozen_equivalent_snapshot",
+    }
+    snapshot.write_bytes(b"changed\n")
+    assert lineage(directory)["phases"]["0"]["inputs"]["descriptor"]["identity"] == "historical_unverified"
+    snapshot.unlink()
+    snapshot.symlink_to(manifest)
+    assert lineage(directory)["phases"]["0"]["inputs"]["descriptor"]["identity"] == "historical_unverified"
+    snapshot.unlink()
+    snapshot.write_bytes(content)
+    manifest.write_text(
+        json.dumps(
+            {"sources": [{"role": "recipe", "path": str(snapshot.relative_to(phase0)), "sha256": digest}]}
+        )
+    )
+    assert lineage(directory)["phases"]["0"]["inputs"]["descriptor"]["identity"] == "historical_unverified"

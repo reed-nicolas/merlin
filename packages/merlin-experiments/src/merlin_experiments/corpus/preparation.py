@@ -367,11 +367,14 @@ def derive_release_admission(staged) -> dict:
     models = {str(cap["name"]) for cap in public if cap.get("kind") == "model"}
     resource = set(staged.graded_resource_exclude)
     required = set(staged.graded_required_models)
-    if resource & required or resource | required != models:
-        raise SpecError(
-            "release resource policy must classify every staged public model exactly once "
-            "as excluded or required admitted"
-        )
+    policy = resource | required
+    issues = []
+    if overlap := sorted(resource & required):
+        issues.append("models both excluded and required admitted: " + ", ".join(overlap))
+    if unclassified := sorted(models - policy):
+        issues.append("unclassified public models: " + ", ".join(unclassified))
+    if stale := sorted(policy - models):
+        issues.append("policy names absent from staged public models: " + ", ".join(stale))
     operations = [cap for cap in public if cap.get("kind") != "model"]
     _, withheld = capsule_runner._split_ineligible(operations, staged.target)
     capability = sorted({str(row["capsule"]) for row in withheld})
@@ -381,6 +384,12 @@ def derive_release_admission(staged) -> dict:
     hidden_ops = [cap for cap in hidden if cap.get("kind") != "model"]
     _, hidden_withheld = capsule_runner._split_ineligible(hidden_ops, staged.target)
     hidden_excluded = {str(row["capsule"]) for row in hidden_withheld}
+    if not hidden:
+        issues.append("hidden grading cohort is empty; supply an operator-owned private baseline")
+    elif len(hidden) == len(hidden_excluded):
+        issues.append("hidden grading cohort has no capability-admitted capsules")
+    if issues:
+        raise SpecError("release admission blocked: " + "; ".join(issues))
     return {
         "capability_exclude_capsules": capability,
         "expected_cohort": {

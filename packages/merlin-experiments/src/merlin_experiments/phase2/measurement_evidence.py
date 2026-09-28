@@ -20,10 +20,52 @@ ARMS = ("baseline", "candidate")
 REPLICATES = ("r000", "r001")
 SIMULATORS = ("spike", "gsim")
 PHASES = ("tuning", "held_out")
+TARGET_SELECTED_ANALYZERS = frozenset(
+    {"perf_pk_claim.analyze_pk_claim/v4", "perf_pr_claim.analyze_pr_claim/v2"}
+)
 
 
 class MeasurementEvidenceError(ValueError):
     """Paired measurement evidence differs from the caller's declared inputs."""
+
+
+def require_supported_oracle_selection(capsules: Sequence[object]) -> None:
+    """Refuse a new frozen oracle selection this GSIM paired executor cannot honor.
+
+    Historical PK v3 and PR v1 declarations retain their recorded interpretation.
+    A new target-selected declaration cannot be silently measured with the old
+    Spike/GSIM producer or certified by its GSIM-only equivalence gate.
+    """
+    for member in capsules:
+        descriptor = getattr(member, "descriptor", None)
+        performance = descriptor.get("performance") if isinstance(descriptor, Mapping) else None
+        acceptance = performance.get("acceptance") if isinstance(performance, Mapping) else None
+        if not isinstance(acceptance, Mapping):
+            continue
+        evidence = acceptance.get("evidence")
+        selected = acceptance.get("analyzer") in TARGET_SELECTED_ANALYZERS or (
+            isinstance(evidence, Mapping) and "resolved_from" in evidence
+        )
+        if not selected:
+            continue
+        fit = acceptance.get("fit")
+        label = f"{getattr(member, 'family', '?')}/{getattr(member, 'capsule', '?')}"
+        if not isinstance(evidence, Mapping) or not isinstance(fit, Mapping):
+            raise MeasurementEvidenceError(f"{label}: target-selected oracle contract is incomplete")
+        correctness, timing = evidence.get("correctness_simulator"), evidence.get("timing_simulator")
+        if (
+            not isinstance(correctness, str)
+            or not isinstance(timing, str)
+            or evidence.get("timing_oracle_kind") != f"rtl_{timing}"
+            or fit.get("dependent_metric") != f"{timing}_L3_cycles"
+            or evidence.get("resolved_from") is None
+        ):
+            raise MeasurementEvidenceError(f"{label}: target-selected oracle contract is malformed")
+        if (correctness, timing) != SIMULATORS:
+            raise MeasurementEvidenceError(
+                f"{label}: frozen oracles select {correctness} at L2 and {timing} at L3; "
+                "the installed paired executor and certificate gate support only Spike/GSIM"
+            )
 
 
 @dataclass(frozen=True, order=True)
@@ -40,7 +82,31 @@ class ResultIdentity:
         return "/".join((self.phase, self.arm, self.family, self.capsule, self.simulator, self.replicate))
 
 
-def completion_report(results: Sequence[Mapping[str, Any]], expected: Sequence[ResultIdentity]) -> dict[str, Any]:
+def _simulator_name(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value.isascii()
+        and value[0].isalpha()
+        and all(character.isalnum() or character == "_" for character in value)
+    )
+
+
+def completion_report(
+    results: Sequence[Mapping[str, Any]],
+    expected: Sequence[ResultIdentity],
+    *,
+    correctness_simulator: str = SIMULATORS[0],
+    timing_simulator: str = SIMULATORS[1],
+) -> dict[str, Any]:
+    if (
+        not _simulator_name(correctness_simulator)
+        or not _simulator_name(timing_simulator)
+        or correctness_simulator == timing_simulator
+        or timing_simulator in {"spike", "unknown", "elaborated_rtl"}
+    ):
+        raise PC.CampaignGateError("paired oracle selection must name two distinct concrete simulators")
+    simulators = (correctness_simulator, timing_simulator)
     wanted = tuple(expected)
     if not wanted or len(set(wanted)) != len(wanted):
         raise PC.CampaignGateError("expected identities are empty or duplicated")
@@ -52,7 +118,7 @@ def completion_report(results: Sequence[Mapping[str, Any]], expected: Sequence[R
         if (
             identity.phase not in PHASES
             or identity.arm not in ARMS
-            or identity.simulator not in SIMULATORS
+            or identity.simulator not in simulators
             or identity.replicate not in REPLICATES
         ):
             raise PC.CampaignGateError(f"invalid result identity: {identity.label}")
@@ -67,7 +133,7 @@ def completion_report(results: Sequence[Mapping[str, Any]], expected: Sequence[R
         row = observed.get(identity)
         if row is None:
             continue
-        if identity.simulator == "spike":
+        if identity.simulator == correctness_simulator:
             valid = row.get("correct") is True and row.get("cycles") is None and not row.get("citable")
         else:
             provenance, cycles = row.get("provenance"), row.get("cycles")
@@ -162,42 +228,69 @@ def _read_measurement(manifest_path: Path, expected_sha256: str | None = None, *
     return manifest, cells, observed
 
 
-def statistics_rows(results: Sequence[Mapping[str, Any]], *, trial: str) -> list[dict[str, Any]]:
-    """Project every GSIM cell; this projection alone does not admit evidence."""
+def statistics_rows(
+    results: Sequence[Mapping[str, Any]],
+    *,
+    trial: str,
+    timing_simulator: str = SIMULATORS[1],
+    identity_evidence: bool = False,
+) -> list[dict[str, Any]]:
+    """Project every selected timing cell; this projection alone does not admit evidence."""
+    if not _simulator_name(timing_simulator) or timing_simulator in {"spike", "unknown", "elaborated_rtl"}:
+        raise MeasurementEvidenceError("statistics projection lacks a concrete timing simulator")
     rows = []
     for cell in results:
-        if cell.get("simulator") != "gsim":
+        if cell.get("simulator") != timing_simulator:
             continue
         provenance = cell.get("provenance") or {}
-        rows.append(
-            {
-                "identity": {
-                    "trial": trial,
-                    "subject": cell.get("arm"),
-                    "family": f"{cell.get('phase')}:{cell.get('family')}",
-                    "capsule": cell.get("capsule"),
-                    "simulator": "gsim",
-                    "replicate": cell.get("replicate"),
-                },
-                "tier": provenance.get("tier"),
-                "correct": cell.get("correct"),
-                "cycle_accurate": provenance.get("cycle_accurate"),
-                "cycles": cell.get("cycles"),
-                "oracle": {
-                    "kind": provenance.get("oracle_kind"),
-                    "derived_from_rtl": provenance.get("derived_from_rtl"),
-                },
-            }
-        )
+        row = {
+            "identity": {
+                "trial": trial,
+                "subject": cell.get("arm"),
+                "family": f"{cell.get('phase')}:{cell.get('family')}",
+                "capsule": cell.get("capsule"),
+                "simulator": timing_simulator,
+                "replicate": cell.get("replicate"),
+            },
+            "tier": provenance.get("tier"),
+            "correct": cell.get("correct"),
+            "cycle_accurate": provenance.get("cycle_accurate"),
+            "cycles": cell.get("cycles"),
+            "oracle": {
+                "kind": provenance.get("oracle_kind"),
+                "derived_from_rtl": provenance.get("derived_from_rtl"),
+            },
+        }
+        if identity_evidence:
+            row["oracle"].update(
+                {
+                    "simulator_binary_sha256": provenance.get("simulator_binary_sha256"),
+                    "elaborated_firrtl_sha256": provenance.get("elaborated_firrtl_sha256"),
+                    "program_elf_sha256": provenance.get("elf_sha256"),
+                }
+            )
+            row["qualification"] = cell.get("qualification")
+        rows.append(row)
     return rows
 
 
 def read_statistics_rows(
-    manifest_path: Path, *, trial: str, manifest_sha256: str | None = None
+    manifest_path: Path,
+    *,
+    trial: str,
+    manifest_sha256: str | None = None,
+    timing_simulator: str = SIMULATORS[1],
+    identity_evidence: bool = False,
 ) -> list[dict[str, Any]]:
     """Rehash recorded result bytes before projection; callers separately admit the manifest."""
-    _manifest, cells, _digest = _read_measurement(manifest_path, manifest_sha256)
-    return statistics_rows(cells, trial=trial)
+    manifest, cells, _digest = _read_measurement(manifest_path, manifest_sha256)
+    if timing_simulator != SIMULATORS[1] or identity_evidence:
+        plan = manifest.get("measurement_plan") or {}
+        if not isinstance(plan, Mapping) or plan.get("primary_simulator") != timing_simulator:
+            raise MeasurementEvidenceError("statistics timing simulator differs from the pinned measurement plan")
+    return statistics_rows(
+        cells, trial=trial, timing_simulator=timing_simulator, identity_evidence=identity_evidence
+    )
 
 
 def verify_paired_measurement(

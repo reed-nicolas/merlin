@@ -86,6 +86,27 @@ def test_a_present_but_refusing_binary_passes_presence_and_fails_operability(tmp
     assert "uid map" in probe.describe()
 
 
+def test_network_isolated_probe_catches_a_netns_only_denial(tmp_path: Path) -> None:
+    """A PID-only probe must not qualify an evaluator that also unshares the network."""
+    binary = tmp_path / "netns-sensitive-bwrap"
+    binary.write_text(
+        "#!/bin/sh\n"
+        "case \" $* \" in\n"
+        "  *' --unshare-net '*) "
+        "echo 'bwrap: loopback: Failed to create NETLINK_ROUTE socket: Operation not permitted' >&2; "
+        "exit 1 ;;\n"
+        "esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    assert PF.probe_sandbox(binary, use_cache=False).usable
+    probe = PF.probe_sandbox(binary, network_isolation=True, use_cache=False)
+    assert probe.status == PF.SANDBOX_INOPERABLE
+    assert probe.reason == "netns_denied"
+    assert "--unshare-net" in probe.argv
+
+
 def test_an_undetermined_probe_never_reads_as_a_pass(tmp_path: Path) -> None:
     """UNKNOWN is not usable. A sandbox not shown to work has not been shown to work."""
     unknown = _probe(PF.SANDBOX_UNKNOWN, "probe_timed_out")

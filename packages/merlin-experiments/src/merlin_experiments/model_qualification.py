@@ -9,6 +9,7 @@ Native-host-only checks preserve finite input scope and never stand in for accel
 from __future__ import annotations
 
 import argparse
+import contextvars
 import hashlib
 import io
 import json
@@ -46,6 +47,21 @@ def _json(path: Path, document: dict) -> None:
     with path.open("x", encoding="utf-8") as stream:
         json.dump(document, stream, sort_keys=True, indent=2, allow_nan=False)
         stream.write("\n")
+
+
+def _selected_source_certifier(selected: Path, certify, active: contextvars.ContextVar[bool]):
+    """Guard the source passed to certification, not its verified build copy."""
+
+    def checked(package_dir, *args, **kwargs):
+        if Path(package_dir).resolve(strict=True) != selected.resolve(strict=True):
+            raise ValueError("mesh runtime selected a different compiler package")
+        token = active.set(True)
+        try:
+            return certify(package_dir, *args, **kwargs)
+        finally:
+            active.reset(token)
+
+    return checked
 
 
 def _ir_observation(text: str) -> dict:
@@ -191,6 +207,12 @@ def _compiler_check(package, model: Path, name: str, output: Path, *, timeout: f
     """Use the existing bounded candidate executor and PID-isolated sandbox base."""
     from merlin.perf.analysis_worker import run_sandboxed_entrypoint
     from merlin.targetgen.sandbox.bwrap import base_argv
+    from merlin.targetgen.sandbox.preflight import require_working_sandbox
+
+    require_working_sandbox(
+        context="model compiler requires network-isolated bwrap",
+        network_isolation=True,
+    )
 
     scratch = output / "compiler-scratch"
     scratch.mkdir(exist_ok=True)
@@ -420,11 +442,14 @@ def _worker(request: dict, root: Path) -> dict:
             from merlin.targetgen import package_runtime
 
             original_entrypoint = package_runtime.run_entrypoint
+            original_certify = package_runtime.certify
+            certify_was_explicit = "certify" in vars(package_runtime)
+            selected_certification = contextvars.ContextVar("selected_model_certification", default=False)
+            certify_patched = False
             try:
-
                 def isolated_entrypoint(pkg, name, input_mlir, output_json=None, *, timeout=600, **_kwargs):
-                    if pkg.directory.absolute() != package.directory.absolute():
-                        raise ValueError("mesh runtime selected a different compiler package")
+                    if not selected_certification.get():
+                        raise ValueError("compiler entrypoint ran outside selected certification")
                     completed = _compiler_check(
                         pkg,
                         Path(input_mlir),
@@ -439,6 +464,10 @@ def _worker(request: dict, root: Path) -> dict:
                     return completed
 
                 (root / "runtime").mkdir()
+                package_runtime.certify = _selected_source_certifier(
+                    package.directory, original_certify, selected_certification
+                )
+                certify_patched = True
                 package_runtime.run_entrypoint = isolated_entrypoint
                 with ExitStack() as context:
                     if selection is not None:
@@ -485,6 +514,11 @@ def _worker(request: dict, root: Path) -> dict:
                 }
             finally:
                 package_runtime.run_entrypoint = original_entrypoint
+                if certify_patched:
+                    if certify_was_explicit:
+                        package_runtime.certify = original_certify
+                    else:
+                        del package_runtime.certify
     from .phase1.model_routes import summarize_model_routes
 
     model_routes = summarize_model_routes(workflow, accounting, observations, native_lowerings)
@@ -683,6 +717,17 @@ def qualify(
             if path.is_symlink():
                 raise ValueError("compiler package contains a symlink")
     before = _native_compiler_identity() if native_host_only else hash_tree(package)
+    support_root = None
+    support_before = None
+    if execute and target is not None:
+        from merlin.targetgen.target_registry import resolve
+
+        support_root = resolve(target).external_root
+        if support_root is not None:
+            support_root = _plain(support_root, directory=True)
+            if any(path.is_symlink() for path in support_root.rglob("*")):
+                raise ValueError("selected OOT support provider contains a symlink")
+            support_before = {"path": str(support_root), **hash_tree(support_root)}
     evidence_before = None
     if evidence_bundle is not None:
         evidence_bundle = _plain(evidence_bundle, directory=True)
@@ -709,6 +754,8 @@ def qualify(
         "workflow": workflow,
         "evidence_bundle": str(evidence_bundle) if evidence_bundle else None,
         "evidence_identity": evidence_before,
+        "support_provider": support_before,
+        "certification_output_root": str(output / "certification-output") if execute else None,
         "tool_environment": {
             name: os.environ[name]
             for name in (
@@ -719,6 +766,9 @@ def qualify(
                 "MERLIN_COMPILER_VENV",
                 "MERLIN_MLC_DIR",
                 "MERLIN_TARGET_PATH",
+                "MERLIN_CHIPYARD",
+                "MERLIN_MESH_SIM",
+                "MERLIN_REQUIRED_RTL_ENGINE",
                 "MERLIN_CLANG",
                 "MERLIN_MLIR_OPT",
                 "MERLIN_MLIR_TRANSLATE",
@@ -742,6 +792,13 @@ def qualify(
         str(output),
     ]
     environment = dict(os.environ)
+    worker_tmp = output / "worker-tmp"
+    worker_tmp.mkdir(mode=0o700)
+    environment["TMPDIR"] = str(worker_tmp)
+    if execute:
+        # The K-ladder's shape-keyed run IDs are stable, so a global out/runs
+        # root would silently reuse or overwrite another qualification's files.
+        environment["MERLIN_OUT_ROOT"] = request["certification_output_root"]
     environment["PYTHONPATH"] = os.pathsep.join(
         str(Path(value or ".").absolute()) for value in environment.get("PYTHONPATH", "").split(os.pathsep)
     )
@@ -773,6 +830,8 @@ def qualify(
     after = _native_compiler_identity() if native_host_only else hash_tree(package)
     if before != after:
         state, error = "inputs_changed", "selected compiler package bytes changed during qualification"
+    if support_root is not None and support_before != {"path": str(support_root), **hash_tree(support_root)}:
+        state, error = "inputs_changed", "selected OOT support provider bytes changed during qualification"
     if workflow != inspect_workflow(bundle):
         state, error = "inputs_changed", "selected model/session input bytes changed during qualification"
     if evidence_bundle is not None and evidence_before != hash_tree(evidence_bundle):

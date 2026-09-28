@@ -167,9 +167,13 @@ calibration source/count and per-operation SW decisions. Observer defaults are
 framework transformation policy, not RTL semantics, and need not clutter the
 SW spec. The adapter defaults to min/max observation for FP8 because TorchAO PT2E's
 histogram observer requires an integer dtype; an explicit FP8 histogram request is
-refused. `integerization_receipt` records true integer contractions and comparison
-against the portable quantized graph; `recipe_agreement` separately compares
-against the original floating model. A single example-input calibration does not
+refused. `integerization_receipt` records true integer contractions. When the SW
+spec selects `integer_reference`, its `golden_agreement` compares the rewritten
+graph exactly against an independent PT2E integer interpreter; the
+`integer-reference.json` outputs and reference source identity are byte-bound by
+the capture receipt. `portable_agreement` separately compares with TorchAO's
+portable Q/DQ graph and may differ because its arithmetic is not integerized.
+`recipe_agreement` compares against the original floating model. A single example-input calibration does not
 establish model accuracy. Preserve the original FP32 capture as reference lineage,
 and derive a fresh corpus from the actual quantized capture before claiming its
 precision coverage. Scoped dynamic module transforms are not currently supported
@@ -229,6 +233,7 @@ Each new run writes the following beneath `<run>/phase0/`:
 | `software/frontend/`, `coverage/application-graphs/` | Original/quantized/prepared PyTorch graphs, exact lowering lineage and typed MLIR producer–consumer edges when available |
 | `software/host-capabilities.json` | Selected host compiler identities and explicit operation/precision declarations; a dtype profile alone is not operation support |
 | `coverage/operation-accounting.json` | Per-application and combined operation partitions, provenance groups, signature/ordinal traceability and declared-versus-observed support |
+| `coverage/phase1-capsule-coverage.json` → `phase1_witness_basis` | Finite source-operation and typed-edge witness universe, a compact inventoried selection from the selected cohort, uncovered obligations and the selection's minimum-proof status |
 | `coverage/README.md` | Automatically rendered summary of those same operation and quantization views |
 | `software/quantization-contract.json` | All authored formats, matching hardware recipes, parameter unknowns and operation-scoped quantization decisions |
 | `coverage/generation.json` | Written/omitted capsules, failures, synthesis input identity and diagnostic status |
@@ -269,6 +274,17 @@ contract and SW signature constraints; it is not proof that a compiler lowered t
 The declared support universe also retains operations absent from the selected workloads.
 Do not use the observed subset to claim support for an entire untested ATen overload.
 
+The exact normalized graph keeps separate obligations for independent computation and
+support lowering. A `tensor.empty`, reshape, slice, constant or copy-like node remains
+in the node/SSA denominator, but is not an independent accelerator arithmetic demand:
+it needs a compiler-owned typed lowering and shape/value-preservation receipt. Until
+that receipt is verified, `support_lowering` and support-mediated SSA dependencies stay
+open. They are not assigned a host/device lane or counted as direct transfers merely
+because their source signature appears in a capsule. This avoids adding every lowered
+helper operation to the target's SW spec or claiming a nonexistent host fallback.
+Historical v1 coverage reports remain inspectable, but verified admission requires a
+newly frozen v2 report with these role-specific checks.
+
 Host and accelerator admission are independent: both may accept an operation, or neither
 may have sufficient evidence. Requested placement and actual execution are separate
 records. `host_required` means a host obligation, not demonstrated host compilation.
@@ -294,6 +310,16 @@ Select a generated detailed sidecar through the existing conformance requirement
 Its byte copy, parsed accounting, content digest and declared-roster comparison travel
 together. A missing sidecar is reported as `not_available`, never as zero uncovered work.
 Held-out claim models are not added to this derivation inventory.
+When a detailed inventory is selected, synthesis refuses a capture whose name
+matches a held-out claim model after case and punctuation normalization; use
+separate iteration workloads rather than renaming a validation capture.
+Public synthesized capsule descriptions report counts and signatures, not source
+model names. An exact integer-operation capsule uses a deterministic source ordinal
+within the digest-bound detailed inventory together with the capture hash, so the
+group matcher can still account for every occurrence. Keep the full name-to-ordinal
+mapping in that inventory; publishing the inventory itself still exposes its
+source names. An older frozen corpus that exposed names must be regenerated
+rather than relabeled after the fact.
 
 You can inspect a diagnostic subset before a complete requirement is ready, using
 the existing inventory producer. It automatically exports the evidence bundle and
@@ -349,9 +375,30 @@ host work, or an unresolved/unsupported obligation. A capsule count is not an op
 coverage proof. Inspect omissions, independent goldens and placement checks, then follow
 the [generation and reviewed-release guide](generating_capsules.md).
 
-Verified whole-workload admission checks exact source lineage, reviewed operation and
-precision declarations, typed transfer obligations and coverage in the **actual admitted
-cohort**. A larger generated source pool is not proof that a selected cohort covers them.
+Verified whole-workload admission checks exact source lineage, reviewed independent
+compute placement/numerics, support-lowering and shape receipts, typed transfer
+obligations, and coverage in the **actual admitted cohort**. A larger generated source
+pool is not proof that a selected cohort covers them.
+The Phase 0 `phase1_witness_basis` selects a small set of capsule witnesses for the
+finite source-operation signatures and conditional typed edges recorded in that
+report. It lists the complete scoped universe and obligations without a witness.
+When a distinct obligation uniquely requires each selected capsule and those
+capsules cover the witnessable universe, the report proves an exact minimum;
+otherwise its selected size is only an upper bound. The generated corpus is not
+pruned. For the Gemmini int8 r18 diagnostic, four source capsules are an exact
+minimum for the 1,106 source-operation and typed-edge witness records; all 43
+Phase 1 capsules remain in the selected cohort. This four-capsule calculation
+does not cover numerical, ISA, precision, tail, shape or other conformance axes,
+or establish that a compiler can execute even the selected four.
+
+This witness set is a plan for Phase 1 verification, not a correctness guarantee.
+Phase 0 freezes the finite support domain, selected input identities and open proof
+obligations. Phase 1 must discharge those obligations against emitted compiler
+artifacts and bound target execution, including operation placement, typed support
+routes, transfers and numerical behavior. Whole-module formal-proof eligibility is
+reported separately; witness coverage does not establish it. A universal claim
+also requires sound compositional proofs for the supported domain and hardware
+conformance, beyond any finite capsule selection.
 The completeness record establishes test obligations, not a working target compiler:
 Phase 1 still has to lower, execute and numerically qualify its generated implementation.
 Existing hardware-source and independent-reference qualification requirements remain

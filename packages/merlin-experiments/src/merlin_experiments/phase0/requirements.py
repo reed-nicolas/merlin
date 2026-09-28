@@ -19,8 +19,10 @@ from merlin_experiments.spec import load_spec
 
 from .declarations import from_definition
 from .evidence import _materialize_evidence, export_evidence, select_evidence
+from .performance_scope import derive_performance_scope
 from .profiles import selected_software_spec_path, synthesis_input_identity
 from .software_screen import diagnostic_entry, intersect_requirement, screen_entry
+from .typed_scope import typed_required_instances
 
 
 def _json(value) -> bytes:
@@ -110,6 +112,31 @@ def capture_selections(selections: list[str]) -> dict[str, Path]:
     return result
 
 
+def _validate_capture_recipes(captures: dict[str, Path], selected_recipe_hashes: set[str]) -> None:
+    """A realized quantized graph must use a recipe this provider actually derived."""
+    for label, path in sorted(captures.items()):
+        meta_path = path.with_name("meta.json")
+        if meta_path.is_symlink():
+            raise ValueError(f"{label}: capture metadata may not be a symlink")
+        meta = json.loads(meta_path.read_bytes())
+        if not isinstance(meta, dict):
+            raise ValueError(f"{label}: capture metadata must be a mapping")
+        stats = meta.get("quantization_stats") or {}
+        if not isinstance(stats, dict):
+            raise ValueError(f"{label}: quantization statistics must be a mapping")
+        actual = stats.get("recipe_sha256")
+        if actual is not None and (
+            not isinstance(actual, str)
+            or len(actual) != 64
+            or any(char not in "0123456789abcdef" for char in actual)
+            or actual not in selected_recipe_hashes
+        ):
+            raise ValueError(
+                f"{label}: capture used a different quantization recipe from the selected provider; "
+                "regenerate the capture from its selected Phase 0 recipe"
+            )
+
+
 def derive(
     definition: str | Path,
     captures: dict[str, Path],
@@ -180,8 +207,43 @@ def derive(
     digest = hashlib.sha256(json.dumps(full, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     if digest != requirement["application_demands"]["full_inventory_sha256"]:
         raise ValueError("capture bytes changed while deriving requirements")
+    # Retain the exact operation IDs and SSA types behind the family-only raw
+    # scope census. This is source evidence, not an accelerator-eligible Phase 2
+    # requirement; placement and compiler correspondence remain unresolved.
+    requirement["scope"]["typed_required_instances"] = typed_required_instances(requirement["scope"], full)
+    from merlin.targetgen.quantization_spec import build_quantization_contract, capture_recipe_candidates
+
+    quantization = build_quantization_contract(
+        selected.software_spec,
+        {
+            "contract": selected.contract,
+            "quantization_candidates": selected.quantization_snapshot.get("quantization_candidates", []),
+            "readout_facets": selected.readout_facets,
+            "readout_numerics": selected.readout_numerics,
+        },
+    )
+    selected_recipes = capture_recipe_candidates(selected.software_spec, quantization)
+    _validate_capture_recipes(captures, {row["recipe"]["recipe_sha256"] for row in selected_recipes})
     requirement["application_demands"]["sidecar"] = "application-demands.json"
     requirement = intersect_requirement(requirement, selected.software_spec, selected.contract)
+    # The recipe's tier ladder is an authored PLAN, not evidence that an oracle
+    # was constructed. Keep it separate from ``oracle_tiers`` (which remains
+    # observed-only) so synthesis can cap unaffordable members to a declared
+    # functional screen without claiming that screen executed at derivation.
+    recipe_doc = yaml.safe_load(declaration.recipe.read_text(encoding="utf-8")) or {}
+    planned_tiers = (
+        (recipe_doc.get("datapath") or {}).get("required_oracle_tiers") if isinstance(recipe_doc, dict) else None
+    )
+    if planned_tiers is not None and (
+        not isinstance(planned_tiers, list)
+        or any(
+            not isinstance(tier, str) or not tier.startswith("L") or not tier[1:].isdigit()
+            for tier in planned_tiers
+        )
+    ):
+        raise ValueError("selected recipe required_oracle_tiers must be a list of fidelity tiers")
+    requirement["oracle_tiers_declared"] = list(planned_tiers or [])
+    requirement["scope"]["performance"] = derive_performance_scope(requirement["scope"], selected.software_spec)
     requirement["derivation"]["phase0_execution"] = {
         "agentic": False,
         "policy": "deterministic from selected inputs",
@@ -189,8 +251,7 @@ def derive(
         "oracle_tiers": "not constructed during derivation; establish in execution qualification",
         "historical_corpus": "not selected",
         "headline_workloads": "held out",
-        "contract_sha256": hashlib.sha256(_json(selected.contract)).hexdigest(),
-        "raw_facts_sha256": selected.raw_facts_sha256,
+        **selected.derivation_identity,
     }
     root = Path(output_root).absolute()
     outputs = {

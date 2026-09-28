@@ -62,6 +62,7 @@ def test_dequant_granularity_lowers_generically(kind):
     text = str(mod)
     assert "quant_ext." not in text  # fully rewritten to standard dialects
     gen = next(o for o in mod.walk() if o.name == "linalg.generic")
+    assert gen.attributes["prov.transforms"].data == f"dequant_{kind}"
     # scale operand (2nd input) indexing map encodes the granularity
     assert str(gen.indexing_maps.data[1]) == expected_scale_map
     # dequant body: (sitofp(w) - sitofp(zp)) * scale
@@ -83,6 +84,34 @@ def test_multiple_granularities_in_one_module():
     assert lower_quant_ext(mod) == 2
     mod.verify()
     assert "quant_ext." not in str(mod)
+
+
+@pytest.mark.parametrize(
+    "kind,attrs,scale_type",
+    [
+        ("per_tensor", "", "tensor<f32>"),
+        ("per_channel", "axis = 0 : i64", "tensor<2xf32>"),
+    ],
+)
+def test_dequant_f32_scale_to_bf16_result_verifies(kind, attrs, scale_type):
+    # A real BF16 model carries f32 quantization scales. Its output type must not
+    # turn an f32 scale into the rhs of a BF16 arith.mulf.
+    mod = _mod(
+        kind,
+        attrs,
+        "tensor<2x8xi8>",
+        scale_type,
+        "tensor<i64>" if kind == "per_tensor" else "tensor<2xi64>",
+        "tensor<2x8xbf16>",
+    )
+    assert lower_quant_ext(mod) == 1
+    mod.verify()
+    body = next(op for op in mod.walk() if op.name == "linalg.generic").body.blocks[0]
+    assert [op.name for op in body.ops] == [
+        "arith.sitofp", "arith.sitofp", "arith.subf", "arith.mulf", "arith.truncf", "linalg.yield"
+    ]
+    mul = next(op for op in body.ops if op.name == "arith.mulf")
+    assert all(str(value.type) == "f32" for value in mul.operands)
 
 
 def test_per_tensor_quantize_lowers_to_exact_standard_qdq_expression():
@@ -111,6 +140,26 @@ def test_per_tensor_quantize_lowers_to_exact_standard_qdq_expression():
     ]
     assert str(gen.indexing_maps.data[1]) == "affine_map<(d0, d1) -> ()>"
     assert str(gen.indexing_maps.data[2]) == "affine_map<(d0, d1) -> ()>"
+
+
+def test_per_tensor_quantize_promotes_bf16_activation_to_f32():
+    # PT2E quantize_per_tensor first converts BF16 activations to f32. The
+    # reciprocal scale is already f32; multiplying it by BF16 is invalid MLIR.
+    mod = parse_mlir_text("""module {
+  func.func @q(%x: tensor<2x8xbf16>, %s: tensor<f32>, %z: tensor<i64>) -> tensor<2x8xi8> {
+    %r = "quant_ext.quantize_per_tensor"(%x, %s, %z)
+      <{quant_min = -128 : i64, quant_max = 127 : i64}>
+      : (tensor<2x8xbf16>, tensor<f32>, tensor<i64>) -> tensor<2x8xi8>
+    return %r : tensor<2x8xi8>
+  }
+}""")
+    assert lower_quant_ext(mod) == 1
+    mod.verify()
+    body = [op for op in mod.walk() if op.name == "linalg.generic"][-1].body.blocks[0]
+    names = [op.name for op in body.ops]
+    assert names[:3] == ["arith.extf", "arith.mulf", "math.roundeven"]
+    mul = next(op for op in body.ops if op.name == "arith.mulf")
+    assert all(str(value.type) == "f32" for value in mul.operands)
 
 
 def test_dead_qdq_cone_is_pruned_without_touching_unknown_side_effects():

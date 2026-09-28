@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import importlib.util
+import inspect
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -91,11 +92,15 @@ class BuildOnlyService:
                     or file_digest(item) != expected):
                 raise ValueError("build-only source/tool pin changed: " + str(path))
 
-    def render(self, cb, *, target, inputs, warm_profile=None):
+    def render(self, cb, *, target, inputs, warm_profile=None, blobs=None):
         self.verify(target)
         if inputs is None or not isinstance(inputs, dict) or not inputs:
             raise ValueError("build-only service requires explicit logical inputs")
         kwargs = {"inputs": inputs}
+        # A generic **kwargs forwarding wrapper is not proof that the PURE
+        # renderer behind it accepts sidecars. Require an explicit capability.
+        if blobs is not None and "blobs" in inspect.signature(self.renderer).parameters:
+            kwargs["blobs"] = blobs
         if warm_profile is not None:
             kwargs["warm_profile"] = warm_profile
         result = self.renderer(cb, **kwargs)

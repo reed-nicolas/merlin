@@ -997,6 +997,7 @@ def build_facts(
     chipyard_root: str | Path | None = None,
     target: str | None = None,
     source_bundle: Path | str | None = None,
+    generic_output: Path | str | None = None,
 ) -> dict[str, Any]:
     """Extract selected sources; an explicit source bundle is authoritative."""
     if source_bundle is None:
@@ -1010,6 +1011,11 @@ def build_facts(
 
     selected = load_selection(source_bundle, target=target)
     consistency = production_consistency(selected)
+    selected["_generic_hw_output"] = str(
+        Path(generic_output)
+        if generic_output is not None
+        else rtl_cache_dir(selected["target"]) / "genericized" / f"{selected['sources']['core_hw']['sha256']}.mlir"
+    )
     with selected_sources(selected), discovery_imports(mlc_bridge.mlc_dir()):
         record = _build_facts(Path(selected["sources"]["soc_hw"]["path"]), isa_path, chipyard_root, target)
     record["inputs"]["source_bundle_path"] = selected["selection_path"]
@@ -1310,8 +1316,10 @@ def dump_facts(out_path: Path | str | None = None, **kw) -> dict[str, Any]:
     """Build facts and write the GENERATED artifact to ``out_path`` (default: the purgeable cache dir,
     NOT merlin/); cache-hit (no rebuild) when input SHAs are unchanged. This is the writer
     :func:`merlin.targetgen.rtl.facts.ensure_facts` calls to fill a cold cache."""
-    rec = build_facts(**kw)
     out = Path(out_path) if out_path is not None else rtl_cache_dir(kw["target"]) / "facts.json"
+    if kw.get("source_bundle") is not None:
+        kw.setdefault("generic_output", out.parent / "core.hw.generic.mlir")
+    rec = build_facts(**kw)
     if out.is_file():
         try:
             old = json.loads(out.read_text())

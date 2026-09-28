@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from merlin_experiments.phase0 import evidence, sweeps
+from merlin_experiments.phase0.provenance import _scrub_capsule_dir
 
 from merlin.perf import profile
 from merlin.runtime.backends import base
@@ -44,6 +45,79 @@ def test_exact_raw_bytes_and_derived_hashes_are_distinct(monkeypatch, tmp_path):
     mutable = selected.loaded_facts
     mutable["facts"]["arrays"][0]["rows"] = 999
     assert selected.loaded_facts["facts"]["arrays"][0]["rows"] == 4
+
+
+def test_selected_readout_scale_conflict_is_a_bound_diagnostic(monkeypatch, tmp_path):
+    body = {
+        "arrays": [{"rows": 4, "cols": 4}],
+        "memories": [],
+        "interfaces": [
+            {
+                "name": "register_bundle_layouts",
+                "bundles": {"StoreConfig": {"fields": {"acc_scale": {"width": 32}}}},
+                "unresolved": {},
+            }
+        ],
+    }
+    _, raw, code = _selection(monkeypatch, tmp_path, body=body)
+    contract = code.parent / "contracts/target_contract.yaml"
+    contract.write_text(
+        "name: fixture\ncompute_units:\n"
+        "- {name: unit, kind: systolic, dtypes: [int8], ops: [matmul], scaling: per_channel}\n"
+    )
+    selected = evidence.select_evidence("fixture", facts_path=raw)
+    (finding,) = [row for row in selected.diagnostics if row["component"] == "readout-scaling"]
+    assert finding["status"] == "contradiction"
+    assert finding["finding"]["kind"] == "scaling_exceeds_readout"
+    assert finding["finding"]["derived"] == ["tensor"]
+    assert finding["raw_facts_sha256"] == selected.raw_facts_sha256
+    assert finding["contract_sha256"] == evidence._canonical_digest(selected.contract)
+    assert finding["readout_facet_sha256"] == evidence._canonical_digest(selected.readout_facets[0])
+
+    contract.write_text(
+        "name: fixture\ncompute_units:\n"
+        "- {name: unit, kind: systolic, dtypes: [int8], ops: [matmul], scaling: per_tensor}\n"
+    )
+    corrected = evidence.select_evidence("fixture", facts_path=raw)
+    assert not [row for row in corrected.diagnostics if row["component"] == "readout-scaling"]
+    assert corrected.raw_facts_sha256 == selected.raw_facts_sha256
+    assert corrected.contract != selected.contract
+
+
+def test_derivation_identity_binds_provider_bytes_but_not_checkout_location(monkeypatch, tmp_path):
+    selected, _, _ = _selection(monkeypatch, tmp_path)
+    relocated = evidence.EvidenceSelection(
+        selected.target,
+        tuple(
+            evidence.EvidenceSource(
+                tmp_path / "elsewhere" / source.path.relative_to(tmp_path / "support"),
+                source.role,
+                source.content,
+            )
+            if source.role == "support-source"
+            else source
+            for source in selected.source_snapshots
+        ),
+        selected.views_json,
+        selected.raw_facts,
+    )
+    assert relocated.derivation_identity == selected.derivation_identity
+
+    changed = evidence.EvidenceSelection(
+        relocated.target,
+        tuple(
+            evidence.EvidenceSource(source.path, source.role, source.content + b"# changed\n")
+            if source.role == "support-source" and source.path.name == "backend.py"
+            else source
+            for source in relocated.source_snapshots
+        ),
+        relocated.views_json,
+        relocated.raw_facts,
+    )
+    assert (
+        changed.derivation_identity["support_sources_sha256"]
+        != selected.derivation_identity["support_sources_sha256"]
+    )
 
 
 def test_export_and_reload_never_reopen_original_inputs(monkeypatch, tmp_path):
@@ -120,7 +194,9 @@ def test_selected_application_accounting_is_digest_bound_and_replayed_without_fr
     assert accounting["overall"]["pytorch_provenance"]["original_pytorch_invocation_count"] is None
     assert "coverage/operation-accounting.json" in manifest["consumers"]["operation_accounting"]
     assert "hardware/effective-views/isa-taxonomy.json" in manifest["consumers"]["corpus_binding"]
-    assert (output / "coverage/README.md").is_file()
+    coverage_readme = (output / "coverage/README.md").read_text()
+    assert "unreviewed inputs remain unknown" in coverage_readme
+    assert "reviewed declaration screens" not in coverage_readme
     sidecar.write_text("{}")
     with pytest.raises(ValueError, match="inventory differs"):
         evidence.select_evidence("fixture", descriptor=descriptor, facts_path=facts_path, conformance_spec=requirement)
@@ -285,6 +361,34 @@ def test_frontend_graph_catalog_and_receipt_survive_source_deletion(monkeypatch,
     (output / index["frontend_trace"]).write_text("{}")
     with pytest.raises(ValueError, match="evidence member changed"):
         evidence.load_exported_evidence(output)
+
+
+def test_op_frontend_lineage_records_exact_no_sidecar_reference_omission(tmp_path):
+    from merlin.targetgen.capsule_source import _portable_weights_reference, _write_frontend_evidence
+
+    weight = str(tmp_path / "weights.safetensors")
+    raw = f'builtin.module attributes {{prov.weights_file = "{weight}", prov.level = "linalg"}} {{}}\n'
+    portable, edit = _portable_weights_reference(raw, weight, sidecar=False)
+    assert edit["kind"] == "weights_reference_omission" and edit["edit_count"] == 1
+    trace = tmp_path / "selected-trace.json"
+    trace.write_text(json.dumps({"mlir": {"sha256": hashlib.sha256(raw.encode()).hexdigest(), "bytes": len(raw)}}))
+    capsule = tmp_path / "capsule"
+    capsule.mkdir()
+    (capsule / "capsule.interface.mlir").write_text(portable)
+    (capsule / "capsule.linalg.mlir").write_text(portable)
+    artifact = SimpleNamespace(
+        linalg_mlir=raw,
+        weights_path=weight,
+        meta={"frontend_trace": {"path": str(trace), "sha256": hashlib.sha256(trace.read_bytes()).hexdigest()}},
+    )
+    receipt = _write_frontend_evidence(artifact, capsule, portable, packaged_path="capsule.linalg.mlir")
+    (capsule / "capsule.yaml").write_text(json.dumps({"frontend_trace": receipt}))
+    _scrub_capsule_dir(capsule)
+    assert receipt["source_mlir_sha256"] == hashlib.sha256((capsule / "frontend-source.mlir").read_bytes()).hexdigest()
+    assert receipt["raw_source_mlir_sha256"] == hashlib.sha256(raw.encode()).hexdigest()
+    assert receipt["raw_source_trace_bound"] is True
+    assert receipt["source_portability"]["kind"] == "weights_reference_omission"
+    assert receipt["packaged_mlir_sha256"] == hashlib.sha256((capsule / "capsule.linalg.mlir").read_bytes()).hexdigest()
 
 
 def test_absent_facts_are_diagnostic_without_regeneration(monkeypatch, tmp_path):

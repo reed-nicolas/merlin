@@ -584,3 +584,76 @@ else:
     finally:
         path.chmod(0o700 if kind == "directory" else 0o600)
     assert list(tmp_path.iterdir()) == [path]
+
+
+def test_target_selected_cells_project_only_the_frozen_timing_oracle():
+    identity = ME.ResultIdentity("tuning", "baseline", "PK", "point", "verilator", "r000")
+    screen = {
+        **{key: getattr(identity, key) for key in ("phase", "arm", "family", "capsule", "replicate")},
+        "simulator": "spike",
+        "correct": True,
+        "cycles": None,
+        "citable": False,
+    }
+    timing = {
+        **screen,
+        "simulator": "verilator",
+        "cycles": 120,
+        "citable": True,
+        "provenance": {
+            "tier": "L3",
+            "simulator": "verilator",
+            "oracle_kind": "rtl_verilator",
+            "derived_from_rtl": True,
+            "cycle_accurate": True,
+            "elf_sha256": "e" * 64,
+        },
+        "qualification": {"admitted": True},
+    }
+    report = ME.completion_report(
+        [screen, timing],
+        [dataclasses.replace(identity, simulator="spike"), identity],
+        correctness_simulator="spike",
+        timing_simulator="verilator",
+    )
+    assert report["complete"] is True
+    projected = ME.statistics_rows([screen, timing], trial="trial_00", timing_simulator="verilator")
+    assert len(projected) == 1 and projected[0]["identity"]["simulator"] == "verilator"
+    with pytest.raises(ME.PC.CampaignGateError, match="invalid result identity"):
+        ME.completion_report([screen, timing], [identity])
+
+
+def test_counter_reader_never_substitutes_another_rtl_engine_for_explicit_selection():
+    result = {"per_sim": {"gsim": {"cycles": 11}, "verilator": {"cycles": 13}}}
+    assert MS._rtl_counter_row(result, timing_simulator="verilator") == {"cycles": 13}
+    assert MS._rtl_counter_row(result, timing_simulator="other_rtl") is None
+
+
+def test_checkpoint_certificate_preflight_refuses_new_verilator_selection(monkeypatch):
+    from merlin_experiments.phase2 import checkpoint_admission as admission
+
+    member = SimpleNamespace(
+        family="PK",
+        capsule="point",
+        descriptor={
+            "performance": {
+                "acceptance": {
+                    "analyzer": "perf_pk_claim.analyze_pk_claim/v4",
+                    "fit": {"dependent_metric": "verilator_L3_cycles"},
+                    "evidence": {
+                        "correctness_simulator": "spike",
+                        "timing_simulator": "verilator",
+                        "timing_oracle_kind": "rtl_verilator",
+                        "resolved_from": {"timing_simulator": "$target_oracle:L3"},
+                    },
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        admission.P2_CORPUS,
+        "discover_performance_corpus",
+        lambda *_args, **_kwargs: SimpleNamespace(capsules=(member,)),
+    )
+    with pytest.raises(admission.ExperimentError, match="frozen oracles select spike at L2 and verilator at L3"):
+        admission._verify_tuning_certificate(SimpleNamespace(), SimpleNamespace())

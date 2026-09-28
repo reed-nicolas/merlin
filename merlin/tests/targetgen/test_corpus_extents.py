@@ -98,6 +98,26 @@ def test_the_attention_builder_reads_both_spellings_too():
     assert f"{2 * TILE}x{4 * TILE}" in mlir, "the bare M/K spelling did not reach the emitted attention shapes"
 
 
+@pytest.mark.parametrize("spelling", ["bare", "tiles"])
+def test_attention_query_and_key_lengths_can_differ(spelling):
+    entry = {
+        "name": "rectangular_attention",
+        "kind": "model_slice",
+        "source_role": "derived_sweep",
+        "source_reference": "rectangular attention score test",
+        "M": TILE,
+        "K": 2 * TILE,
+    }
+    entry.update({"N": 65 * TILE} if spelling == "bare" else {"N_tiles": 65})
+    capsule, mlir = CS.build_attention_qk(entry, _binding())
+    assert capsule["inputs"][0]["shape"] == [TILE, 2 * TILE]
+    assert capsule["inputs"][1]["shape"] == [65 * TILE, 2 * TILE]
+    assert f"tensor<{TILE}x{65 * TILE}xi32>" in mlir
+    from merlin.targetgen.capsule_golden import golden
+
+    assert len(golden(capsule)["Y0"][0]) == 65 * TILE
+
+
 def test_batched_builder_and_integer_golden_preserve_the_batch_axis():
     """Source conversion must not regenerate the old flattened ``[B*M,N]`` contract."""
     from merlin.targetgen.capsule_golden import golden

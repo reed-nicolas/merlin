@@ -2,11 +2,17 @@
 
 import re
 import sys
+from copy import deepcopy
 from types import ModuleType
+from types import SimpleNamespace
 
 import pytest
+import yaml
+from merlin_experiments.phase0 import sweeps
 from merlin_experiments.phase2.claims import affine, dispatch, paired, pk, pr
+from merlin_experiments.phase2.claims.oracle_acceptance import selected_acceptance
 
+from merlin.common.paths import repo_root
 from merlin.perf.claim_reach import analyzer_identity
 
 
@@ -14,7 +20,9 @@ from merlin.perf.claim_reach import analyzer_identity
     ("declared", "owner"),
     [
         (pk._ACCEPTANCE_BASE["analyzer"], pk),
+        (pk._CURRENT_ACCEPTANCE_BASE["analyzer"], pk),
         (pr.supported_acceptance()["analyzer"], pr),
+        (pr._CURRENT_ACCEPTANCE_BASE["analyzer"], pr),
         (affine.ANALYZER, affine),
         (paired.ANALYZER, paired),
     ],
@@ -33,6 +41,42 @@ def test_frozen_identity_resolves_canonical_owner_not_legacy_shadow(declared, ow
 def test_unknown_declared_owner_stays_unavailable():
     with pytest.raises(dispatch.DispatchError, match="unavailable"):
         dispatch.resolve([{"performance": {"acceptance": {"analyzer": "absent_claim_owner.decide/v1"}}}])
+
+
+@pytest.mark.parametrize("module", [pk, pr])
+def test_dispatch_validates_full_target_selected_oracle_contract(module):
+    template = module._CURRENT_ACCEPTANCE_BASE
+    declared = deepcopy(template)
+    declared["evidence"]["correctness_simulator"] = "reference_sim"
+    declared["evidence"]["timing_simulator"] = "selected_rtl"
+    declared["evidence"]["timing_oracle_kind"] = "rtl_selected_rtl"
+    declared["fit"]["dependent_metric"] = "selected_rtl_L3_cycles"
+    frozen = selected_acceptance(template, declared)
+    dispatch.verify_supported_acceptance(module, frozen, "fixture")
+    frozen["evidence"]["resolved_from"].pop("timing_oracle_kind")
+    with pytest.raises(dispatch.StageGateError, match="differs from the supported claim contract"):
+        dispatch.verify_supported_acceptance(module, frozen, "fixture")
+
+
+@pytest.mark.parametrize(("family", "module"), [("PK", pk), ("PR", pr)])
+def test_phase0_selected_oracle_contract_matches_phase2_analyzer(family, module, monkeypatch):
+    from merlin.targetgen import target_experiment
+
+    monkeypatch.setattr(target_experiment, "load_capability_manifest", lambda _target: SimpleNamespace(
+        contract={"runner": {"tier_sim": {"L2": "reference_sim", "L3": "elaborated_rtl"}}},
+    ))
+    document = yaml.safe_load((repo_root() / "experiments/templates/phase0/performance.yaml").read_text())
+    declaration = deepcopy(next(row for row in document["sweeps"] if row["id"] == family)["base"]["performance"])
+    resolved = sweeps._resolve_target_oracle_evidence(
+        declaration, "fixture", oracle_selection={"L2": "reference_sim", "L3": "selected_rtl"}
+    )["acceptance"]
+    assert resolved["evidence"]["resolved_from"] == {
+        "correctness_simulator": "$target_oracle:L2",
+        "timing_simulator": "$target_oracle:L3",
+        "timing_oracle_kind": "$target_oracle_kind:L3",
+    }
+    assert resolved == module.supported_acceptance(resolved)
+    dispatch.verify_supported_acceptance(module, resolved, family)
 
 
 def test_explicit_external_module_is_not_rewritten(monkeypatch):

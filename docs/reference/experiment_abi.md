@@ -106,6 +106,18 @@ out/runs/gemmini_contract/<…>/contract_smoke_g0/
   results.yaml                # K-ladder summary (schema-valid)
 ```
 
+Large constant operands may also appear in `generated/` as
+`harness_blob_<symbol>.bin` with a matching `.S` and `.o`. The target renderer
+supplies the exact padded operand bytes and alignment; the shared runner
+validates the declaration, assembles the blob and links it into the executable.
+`generated/harness_blobs.json` records each linked symbol, byte count, alignment
+and SHA-256 of the exact binary payload.
+`harness.c` then contains a small `extern` declaration instead of millions of
+numeric initializers. Small operands and renderers without this optional
+capability continue to use inline C. These executable-build sidecars are
+distinct from model-weight safetensors used for MLIR inspection; neither is
+embedded in the inspectable lowering IR.
+
 Both packages certify g0/g1/g2 (g2 = float `acc_scale` requant → i8) on spike **and** verilator,
 matching the known anchors (C0=308, C1=308, Q0=250 cycles).
 

@@ -14,6 +14,13 @@ Simulator availability, numerical agreement, and hardware/source qualification
 are separate checks. A process exiting successfully is not proof that it wrote
 every result or executed the requested accelerator operation.
 
+The model compiler evaluator requires a network-isolated `bwrap` worker. Its
+preflight tests network-namespace construction as well as the base sandbox;
+some hosts permit the latter but deny loopback setup with a `NETLINK_ROUTE`
+error. That outcome is `sandbox inoperable (netns_denied)`, not a compiler
+refusal or an accelerator fallback. Move qualification to a worker that can
+construct the required sandbox; do not remove `--unshare-net` to obtain a pass.
+
 ## Select the support package and engine explicitly
 
 Choose a target-owned support provider with `MERLIN_TARGET_PATH`; compiler

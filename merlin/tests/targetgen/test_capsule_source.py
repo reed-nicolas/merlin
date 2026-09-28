@@ -192,6 +192,19 @@ def test_linalg_to_iface_fails_closed_on_shape_mismatch():
     [
         (
             {
+                "name": "PT0_transpose",
+                "kind": "model_slice",
+                "cat": "model_slices",
+                "source_role": "handauthored_compiler_test",
+                "source_reference": "pytorch transpose",
+                "op": "transpose",
+                "M": 8,
+                "K": 16,
+            },
+            "f32",
+        ),
+        (
+            {
                 "name": "PM0_matmul",
                 "kind": "model_slice",
                 "cat": "model_slices",
@@ -229,7 +242,7 @@ def test_write_pytorch_capsule_is_schema_valid(entry, dtype, tmp_path):
 
     d = CSrc.write_pytorch_capsule(entry, _float_binding(dtype), tmp_path)
     cap = CC.load_capsule(d)  # raises on schema violation
-    assert cap["source_role"] == "pytorch_model_slice"
+    assert cap["source_role"] == entry.get("source_role", "pytorch_model_slice")
     for f in ("capsule.interface.mlir", "capsule.pytorch.py", "capsule.linalg.mlir", "golden.yaml"):
         assert (d / f).exists(), f
     g = yaml.safe_load((d / "golden.yaml").read_text())
@@ -240,6 +253,10 @@ def test_write_pytorch_capsule_is_schema_valid(entry, dtype, tmp_path):
         assert inp["name"] in prov and prov[inp["name"]]["shape"] == inp["shape"]
     out = g["outputs"][entry.get("out", "Y0")]
     assert isinstance(out, list) and isinstance(out[0], list)
+    if entry["op"] == "transpose":
+        from merlin.targetgen.boundary import HOST_ONLY, profile_capsule
+
+        assert profile_capsule(d, "t", capability_contract={"name": "t", "compute_units": []}).kind == HOST_ONLY
 
 
 def test_write_pytorch_capsule_rejects_unknown_op(tmp_path):

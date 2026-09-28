@@ -660,6 +660,28 @@ def load_profile(
     prof = yaml.safe_load(public.read_text(encoding="utf-8")) or {}
     if not isinstance(prof, dict):
         raise ValueError(f"{public}: recipe must be a mapping")
+    if recipe is not None:
+        # Explicit overrides resolve abstract contract fidelities. Concrete
+        # contract tier names need no override; neither route probes the build
+        # host, which would make identical derivations depend on installation.
+        oracles = prof.get("performance_oracles", {})
+        if not isinstance(oracles, dict) or any(
+            not isinstance(tier, str)
+            or not tier.startswith("L")
+            or not tier[1:]
+            or not all("0" <= digit <= "9" for digit in tier[1:])
+            or not isinstance(engine, str)
+            or not engine
+            or not ("A" <= engine[0] <= "Z" or "a" <= engine[0] <= "z")
+            or not all(
+                "A" <= char <= "Z" or "a" <= char <= "z" or "0" <= char <= "9" or char == "_"
+                for char in engine[1:]
+            )
+            or engine == "elaborated_rtl"
+            for tier, engine in oracles.items()
+        ):
+            raise ValueError(f"{public}: performance_oracles must map tiers to concrete simulator names")
+        prof["_performance_oracles"] = copy.deepcopy(oracles)
     if prof.get("capsule_policy", "compatibility") not in {"compatibility", "derived_only"}:
         raise ValueError(f"{public}: capsule_policy must be compatibility or derived_only")
     if prof.get("capsule_policy") == "derived_only" and (prof.get("capsules") or prof.get("sweeps")):

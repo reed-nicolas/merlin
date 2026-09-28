@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import string
 from dataclasses import dataclass
+from hashlib import sha256
+from typing import Any, Callable
 
 from ..frontends.linalg_mlir import make_context, parse_mlir_text  # noqa: F401
 
@@ -127,7 +129,9 @@ _QUANT_KINDS = {
 }
 
 
-def lower_quant_ext(module) -> int:
+def lower_quant_ext(
+    module, *, on_rewrite: Callable[[Any, tuple[Any, ...], Any], None] | None = None
+) -> int:
     """Rewrite supported quant_ext quantize/dequantize ops; returns the count.
 
     Generic dequant → f32 (or bf16) via a linalg.generic; the scale/zp indexing map is derived
@@ -142,7 +146,16 @@ def lower_quant_ext(module) -> int:
     """
     from xdsl.dialects import arith, tensor
     from xdsl.dialects import math as mathd
-    from xdsl.dialects.builtin import AffineMapAttr, ArrayAttr, FloatAttr, IntegerType, TensorType
+    from xdsl.dialects.builtin import (
+        AffineMapAttr,
+        ArrayAttr,
+        Float64Type,
+        FloatAttr,
+        IntegerType,
+        TensorType,
+        f32,
+        f64,
+    )
     from xdsl.dialects.linalg import ops as linalg_ops
     from xdsl.ir import Block, Region
     from xdsl.ir.affine import AffineMap
@@ -182,14 +195,34 @@ def lower_quant_ext(module) -> int:
         )
         iters = ArrayAttr([linalg_ops.IteratorTypeAttr(linalg_ops.IteratorType.PARALLEL) for _ in range(rank)])
 
-        elem = out_t.element_type  # f32 or bf16 — arithmetic in the output type
+        elem = out_t.element_type
+        scale_elem = scale.type.element_type
+        # PT2E may request a BF16/FP16 result while retaining an f32 scale. MLIR arithmetic
+        # requires same-type operands. Keep same-type captures unchanged; for mixed precision,
+        # compute at the wider precision and round exactly once to the result element type.
+        # In particular, truncating the scale *before* multiplication would add a rounding
+        # absent from the captured quantization expression.
+        if elem == scale_elem:
+            compute_elem = elem
+        elif isinstance(elem, Float64Type) or isinstance(scale_elem, Float64Type):
+            compute_elem = f64
+        else:
+            compute_elem = f32
         body = Block(arg_types=[w.type.element_type, scale.type.element_type, zp.type.element_type, elem])
         wv, sv, zv, _ = body.args
-        wf = arith.SIToFPOp(wv, elem)
-        zf = arith.SIToFPOp(zv, elem)
+        wf = arith.SIToFPOp(wv, compute_elem)
+        zf = arith.SIToFPOp(zv, compute_elem)
         sub = arith.SubfOp(wf.result, zf.result)
-        mul = arith.MulfOp(sub.result, sv)
-        body.add_ops([wf, zf, sub, mul, linalg_ops.YieldOp(mul.result)])
+        scale_cast = arith.ExtFOp(sv, compute_elem) if scale_elem != compute_elem else None
+        mul = arith.MulfOp(sub.result, scale_cast.result if scale_cast is not None else sv)
+        result_cast = arith.TruncFOp(mul.result, elem) if elem != compute_elem else None
+        body.add_ops([wf, zf, sub])
+        if scale_cast is not None:
+            body.add_op(scale_cast)
+        body.add_op(mul)
+        if result_cast is not None:
+            body.add_op(result_cast)
+        body.add_op(linalg_ops.YieldOp(result_cast.result if result_cast is not None else mul.result))
 
         generic = linalg_ops.GenericOp(
             inputs=(w, scale, zp),
@@ -199,10 +232,12 @@ def lower_quant_ext(module) -> int:
             iterator_types=iters,
             result_types=(out_t,),
         )
-        carry_provenance(generic, op, "dequant_per_channel")
+        carry_provenance(generic, op, f"dequant_{kind}")
 
         block.insert_op_before(empty, op)
         block.insert_op_before(generic, op)
+        if on_rewrite is not None:
+            on_rewrite(op, (empty, generic), generic)
         op.results[0].replace_all_uses_with(generic.results[0])
         block.detach_op(op)
 
@@ -221,6 +256,12 @@ def lower_quant_ext(module) -> int:
         )
         iters = ArrayAttr([linalg_ops.IteratorTypeAttr(linalg_ops.IteratorType.PARALLEL) for _ in range(rank)])
         elem = value.type.element_type
+        scale_elem = scale.type.element_type
+        # quantized_decomposed.quantize_per_tensor promotes half-precision activations to
+        # f32 before reciprocal-scale multiplication, round-even, zero point, and clamp.
+        # A captured BF16 activation with an f32 scale otherwise produces mixed-type
+        # arith.mulf (and rounds the quotient at BF16 precision).
+        compute_elem = f64 if isinstance(elem, Float64Type) or isinstance(scale_elem, Float64Type) else f32
         qelem = out_t.element_type
         qmin_attr = op.properties.get("quant_min") or op.attributes.get("quant_min")
         qmax_attr = op.properties.get("quant_max") or op.attributes.get("quant_max")
@@ -251,17 +292,26 @@ def lower_quant_ext(module) -> int:
         carry_provenance(inv_generic, op, "quant_reciprocal")
 
         empty = tensor.EmptyOp((), out_t)
-        qmin_c = arith.ConstantOp(FloatAttr(float(qmin), elem))
-        qmax_c = arith.ConstantOp(FloatAttr(float(qmax), elem))
+        qmin_c = arith.ConstantOp(FloatAttr(float(qmin), compute_elem))
+        qmax_c = arith.ConstantOp(FloatAttr(float(qmax), compute_elem))
         body = Block(arg_types=[elem, scale.type.element_type, zp.type.element_type, qelem])
         xv, inv_sv, zv, _ = body.args
-        scaled = arith.MulfOp(xv, inv_sv)
+        value_cast = arith.ExtFOp(xv, compute_elem) if elem != compute_elem else None
+        scale_cast = arith.ExtFOp(inv_sv, compute_elem) if scale_elem != compute_elem else None
+        scaled = arith.MulfOp(
+            value_cast.result if value_cast is not None else xv,
+            scale_cast.result if scale_cast is not None else inv_sv,
+        )
         rounded = mathd.RoundEvenOp(scaled.result)
-        zpf = arith.SIToFPOp(zv, elem)
+        zpf = arith.SIToFPOp(zv, compute_elem)
         shifted = arith.AddfOp(rounded.result, zpf.result)
         low = arith.MaximumfOp(shifted.result, qmin_c.results[0])
         high = arith.MinimumfOp(low.result, qmax_c.results[0])
         converted = arith.FPToSIOp(high.result, qelem)
+        if value_cast is not None:
+            body.add_op(value_cast)
+        if scale_cast is not None:
+            body.add_op(scale_cast)
         body.add_ops([scaled, rounded, zpf, shifted, low, high, converted, linalg_ops.YieldOp(converted.result)])
         generic = linalg_ops.GenericOp(
             inputs=(value, inv_generic.results[0], zp),
@@ -275,6 +325,8 @@ def lower_quant_ext(module) -> int:
         block = op.parent_block()
         for new_op in (inv_empty, inv_generic, empty, qmin_c, qmax_c, generic):
             block.insert_op_before(new_op, op)
+        if on_rewrite is not None:
+            on_rewrite(op, (inv_empty, inv_generic, empty, qmin_c, qmax_c, generic), generic)
         op.results[0].replace_all_uses_with(generic.results[0])
         block.detach_op(op)
     return len(dequant_rewrites) + len(quant_rewrites)
@@ -552,28 +604,164 @@ def add_c_interface(module) -> int:
     return n
 
 
-def preprocess_text(mlir_text: str, *, audit=None) -> tuple[str, dict]:
-    """Run Merlin xDSL passes, optionally observing each completed rewrite without changing it."""
-    from ..frontends.linalg_mlir import parse_mlir_text
-    from ..xdsl_dialects._common import text as module_to_text
+def _preprocess_module(module, *, audit=None, on_quant_rewrite=None) -> dict:
     from ..xdsl_dialects.ir_inspection import record_stage
 
-    module = parse_mlir_text(mlir_text)
     if audit is not None:
-        record_stage(audit, "xdsl-parsed", module)
+        record_stage(audit, "xdsl-parsed", module, generic=True)
     stats = {}
     for statistic, stage, transform in (
         ("dead_tensor_ops_pruned", "xdsl-pruned", prune_dead_pure_tensor_ops),
         ("quant_ext_lowered", "xdsl-quant-lowered", lower_quant_ext),
         ("c_interface_funcs", "xdsl-c-interface", add_c_interface),
     ):
-        stats[statistic] = transform(module)
+        stats[statistic] = (
+            transform(module, on_rewrite=on_quant_rewrite)
+            if statistic == "quant_ext_lowered" and on_quant_rewrite is not None
+            else transform(module)
+        )
         if audit is not None:
-            record_stage(audit, stage, module)
+            record_stage(audit, stage, module, generic=True)
+    return stats
+
+
+def preprocess_text(mlir_text: str, *, audit=None) -> tuple[str, dict]:
+    """Run Merlin xDSL passes, optionally observing each completed rewrite without changing it."""
+    from ..frontends.linalg_mlir import parse_mlir_text
+    from ..xdsl_dialects._common import text as module_to_text
+
+    module = parse_mlir_text(mlir_text)
+    transform_map = None
+    if audit is not None and audit.directory is not None:
+        supported = _SourceTransformMap.supports(module)
+        audit.record["source_transform_map"] = {
+            "status": "pending" if supported else "unavailable",
+            "scope": "one defined, single-block func.func; top-level non-return operations",
+        }
+        if not supported:
+            audit.record["source_transform_map"]["reason"] = (
+                "module has zero or multiple defined functions, or a multi-block function"
+            )
+        audit._flush()
+        if supported:
+            transform_map = _SourceTransformMap(mlir_text, module)
+    stats = _preprocess_module(
+        module,
+        audit=audit,
+        on_quant_rewrite=transform_map.record if transform_map is not None else None,
+    )
     # Generic form preserves source attributes on every operation and avoids
     # custom-printer grammar skew at the upstream MLIR boundary (notably yield
     # and rank-changing tensor operations). This is serialization, not lowering.
-    return module_to_text(module, generic=True), stats
+    upstream = module_to_text(module, generic=True)
+    if transform_map is not None:
+        descriptor = audit.accounting("source-transform-map", transform_map.finish(upstream))
+        audit.record["source_transform_map"] = {
+            "status": "recorded",
+            "scope": "one defined, single-block func.func; top-level non-return operations",
+            "receipt": descriptor["file"],
+            "sha256": descriptor["sha256"],
+        }
+        audit._flush()
+    return upstream, stats
+
+
+def preprocess_text_with_transform_map(mlir_text: str) -> tuple[str, dict, dict]:
+    """Preprocess one entry and receipt-map every top-level source op/result.
+
+    This is an accounting map, not a semantics proof. The normal audited path
+    records the same map as an accounting sidecar without a second parse/rewrite.
+    A rewrite must explicitly register every generated helper and its result
+    replacement; an unowned emitted operation causes refusal.
+    """
+    from ..frontends.linalg_mlir import parse_mlir_text
+    from ..xdsl_dialects._common import text as module_to_text
+
+    module = parse_mlir_text(mlir_text)
+    transform_map = _SourceTransformMap(mlir_text, module)
+    stats = _preprocess_module(module, on_quant_rewrite=transform_map.record)
+    upstream = module_to_text(module, generic=True)
+    return upstream, stats, transform_map.finish(upstream)
+
+
+class _SourceTransformMap:
+    """Track raw top-level operation identities through the structural rewrite."""
+
+    @staticmethod
+    def supports(module) -> bool:
+        functions = [op for op in module.body.block.ops if op.name == "func.func" and op.body.blocks]
+        return len(functions) == 1 and len(functions[0].body.blocks) == 1
+
+    def __init__(self, mlir_text: str, module):
+        self.source_sha256 = sha256(mlir_text.encode()).hexdigest()
+        functions = [op for op in module.body.block.ops if op.name == "func.func" and op.body.blocks]
+        if len(functions) != 1 or len(functions[0].body.blocks) != 1:
+            raise ValueError("transform map requires exactly one single-block function")
+        self.function = functions[0]
+        self.original = [op for op in self.function.body.block.ops if op.name != "func.return"]
+        self.source_by_id = {id(op): index for index, op in enumerate(self.original)}
+        self.generated_owner: dict[int, int] = {}
+        self.replacements: dict[int, Any] = {}
+
+    def record(self, source, generated: tuple[Any, ...], result_owner) -> None:
+        index = self.source_by_id.get(id(source))
+        if index is None or index in self.replacements:
+            raise ValueError("quantization rewrite lacks a unique top-level source operation")
+        if len(source.results) != len(result_owner.results):
+            raise ValueError("quantization rewrite changes source result count")
+        for old, new in zip(source.results, result_owner.results):
+            if old.type != new.type:
+                raise ValueError("quantization rewrite changes source result type")
+        for op in generated:
+            if id(op) in self.source_by_id or id(op) in self.generated_owner:
+                raise ValueError("generated operation has conflicting source ownership")
+            self.generated_owner[id(op)] = index
+        self.replacements[index] = result_owner
+
+    def finish(self, upstream: str) -> dict:
+        processed = [op for op in self.function.body.block.ops if op.name != "func.return"]
+        emitted_by_source: list[list[int]] = [[] for _ in self.original]
+        processed_index_by_id = {id(op): index for index, op in enumerate(processed)}
+        for index, op in enumerate(processed):
+            owner = self.source_by_id.get(id(op), self.generated_owner.get(id(op)))
+            if owner is None:
+                raise ValueError(f"preprocessed operation {index} has no raw source owner")
+            emitted_by_source[owner].append(index)
+        operations = []
+        for index, source in enumerate(self.original):
+            replacement = self.replacements.get(index, source)
+            emitted = emitted_by_source[index]
+            if id(replacement) not in processed_index_by_id and emitted:
+                raise ValueError(f"source operation {index} lost its result replacement")
+            result_map = []
+            if id(replacement) in processed_index_by_id:
+                result_map = [
+                    {
+                        "source_result_index": result_index,
+                        "preprocessed_op_index": processed_index_by_id[id(replacement)],
+                        "preprocessed_result_index": result_index,
+                    }
+                    for result_index in range(len(source.results))
+                ]
+            elif source.results and any(result.uses for result in source.results):
+                raise ValueError(f"source operation {index} was elided with live results")
+            operations.append(
+                {
+                    "source_op_index": index,
+                    "source_op_name": source.op_name.data if source.name == "builtin.unregistered" else source.name,
+                    "preprocessed_op_indices": emitted,
+                    "result_map": result_map,
+                }
+            )
+        return {
+            "schema": "source_transform_map_v1",
+            "source_sha256": self.source_sha256,
+            "preprocessed_sha256": sha256(upstream.encode()).hexdigest(),
+            "entry": self.function.sym_name.data,
+            "source_op_count": len(self.original),
+            "preprocessed_op_count": len(processed),
+            "operations": operations,
+        }
 
 
 # --- textual variant -----------------------------------------------------------

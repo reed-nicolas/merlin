@@ -35,6 +35,11 @@ def main(argv: list[str] | None = None, *, resolve_context=None, invocation: tup
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--functional-run-id", required=True)
     parser.add_argument(
+        "--published-compiler-root",
+        type=Path,
+        help="relocated Merlin publication whose source payload exactly matches the graded Phase 1 submission",
+    )
+    parser.add_argument(
         "--perf-capsules", default="all", help="comma-separated performance capsules to measure, or 'all'"
     )
     parser.add_argument(

@@ -670,6 +670,24 @@ def test_pb_materializes_from_generic_execution_capabilities_and_skips_without_t
 # One shared perf template. Target profiles may keep functional sweeps but may
 # neither copy a perf sweep nor hand-author a perf capsule.
 # ---------------------------------------------------------------------------------------------
+def test_shared_performance_oracles_are_tier_placeholders_not_engine_names() -> None:
+    document = yaml.safe_load((for_target("gemmini").performance_template).read_text(encoding="utf-8"))
+    performance = [row["base"]["performance"] for row in document["sweeps"]]
+    performance.extend(row["performance"] for row in document.get("blocked_unimplemented", []))
+    for family in performance:
+        acceptance = family.get("acceptance") or {}
+        evidence = acceptance.get("evidence") or {}
+        if "correctness_simulator" in evidence:
+            assert evidence["correctness_simulator"] == "$target_oracle:L2"
+        if "timing_simulator" in evidence:
+            assert evidence["timing_simulator"] == "$target_oracle:L3"
+        if "timing_oracle_kind" in evidence:
+            assert evidence["timing_oracle_kind"] == "$target_oracle_kind:L3"
+        if "dependent_metric" in (acceptance.get("fit") or {}):
+            assert acceptance["fit"]["dependent_metric"] == "$target_oracle_metric:L3"
+        assert "spike_cycles_citable" not in evidence
+
+
 def _minimal_shared_perf():
     return {
         "sweeps": [

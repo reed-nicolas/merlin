@@ -3,12 +3,13 @@ title: Inspecting whole-model MLIR lowering
 kind: guide
 status: current
 owner: ir
-last_verified: 2026-09-23
+last_verified: 2026-09-28
 related: [llvm_toolchain, llvm_integration, triton_kernels]
 code_refs:
   - src/merlin/llvmlower/cli.py
   - src/merlin/llvmlower/lower.py
   - src/merlin/common/ir_audit.py
+  - src/merlin/llvmlower/passes_xdsl.py
   - src/merlin/xdsl_dialects/ir_inspection.py
 ---
 
@@ -67,6 +68,13 @@ For example, a fresh DeepJSCC capture completed with six named stages (input,
 upstream, upstream-scheduled, llvm-translated, llvm-normalized, llvm-final) and
 52 native pass views. This demonstrates inspectability of that shared lowering
 route, not accelerator offload or model-level numerical correctness.
+For a single defined, single-block function, audited xDSL preprocessing also writes
+`source-transform-map.json`. The audit index binds its bytes and hash. It maps each
+top-level source operation to its surviving or generated preprocessing operations and
+maps source results through quantization expansion. This is accounting for the
+preprocessing seam, not an executable IR stage or proof of semantic equivalence.
+For other function shapes the index explicitly marks the map unavailable. The map
+does not account for later pruning, grouping, target placement or physical buffer ABI.
 Without the flag, the lowering API's normal intermediate outputs still exist but no
 audit index is created. The Python API returns the same `LowerResult.audit_index` field.
 

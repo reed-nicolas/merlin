@@ -91,6 +91,112 @@ def _ensure_contract_on_path(descriptor: Path) -> None:
         os.environ["MERLIN_TARGET_PATH"] = os.pathsep.join([str(pkg), cur]) if cur else str(pkg)
 
 
+def _verify_derivation_evidence(conformance_spec: str | Path, evidence) -> None:
+    """Refuse a derived corpus when its selected provider/facts changed."""
+    requirement = yaml.safe_load(Path(conformance_spec).read_text(encoding="utf-8")) or {}
+    if not isinstance(requirement, dict):
+        raise ValueError("derived conformance requirement must be a mapping")
+    execution = (requirement.get("derivation") or {}).get("phase0_execution") or {}
+    expected = evidence.derivation_identity
+    missing = sorted(key for key in expected if key not in execution)
+    if missing:
+        raise ValueError(
+            "derived requirement lacks selected capability identity "
+            f"({', '.join(missing)}); rerun corpus derive with the selected provider"
+        )
+    changed = sorted(key for key, value in expected.items() if execution[key] != value)
+    if changed:
+        raise ValueError(
+            "stale capability evidence: "
+            f"{', '.join(changed)} changed since corpus derivation; "
+            "rerun corpus derive with the selected provider and facts"
+        )
+
+
+def _frozen_application_captures(root: Path, manifest: dict) -> dict[str, Path]:
+    """Resolve saved capture bytes from this run's exported evidence only."""
+    captures = {}
+    for source in manifest.get("sources") or []:
+        role = source.get("role")
+        if not isinstance(role, str) or not role.startswith("application-capture:"):
+            continue
+        label = role.partition(":")[2]
+        member = Path(source["path"])
+        if not label or label in captures or member.is_absolute() or ".." in member.parts:
+            raise ValueError("invalid or duplicate frozen application capture")
+        path = root / member
+        if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != source["sha256"]:
+            raise ValueError(f"frozen application capture differs from exported evidence: {label}")
+        captures[label] = path
+    return captures
+
+
+def _with_selected_model_recipe(
+    entry: dict,
+    *,
+    evidence_root: Path | None,
+    target: str,
+    binding,
+) -> dict:
+    """Use the frozen SW-scoped recipe when an integer model has no explicit choice."""
+    if (
+        evidence_root is None
+        or (entry.get("kind") != "model" and entry.get("op") != "model")
+        or entry.get("materialized_capture")
+        or entry.get("quant_recipe")
+        or entry.get("quant_scheme")
+        or not binding.integer
+    ):
+        return entry
+    return {
+        **entry,
+        "quant_recipe": _selected_capture_recipe(
+            evidence_root,
+            target=target,
+            operand_dtype=str(entry.get("operand_dtype") or binding.operand_dtype),
+            accumulator_dtype=str(binding.accum_dtype),
+        ),
+    }
+
+
+def _prepare_model_capture_entry(
+    entry: dict,
+    *,
+    evidence_root: Path | None,
+    target: str,
+    binding,
+) -> dict:
+    """Check a selected static model capture tool before any capsule writer starts."""
+    if entry.get("kind") != "model" and entry.get("op") != "model":
+        return entry
+    if entry.get("materialized_capture"):
+        return entry
+
+    from merlin.targetgen import capsule_source as source
+
+    try:
+        selected = _with_selected_model_recipe(entry, evidence_root=evidence_root, target=target, binding=binding)
+    except Exception:  # noqa: BLE001 -- the writer records this entry's recipe failure as before
+        return entry
+    recipe = selected.get("quant_recipe") or source.derived_recipe(
+        getattr(binding, "target", None), str(selected.get("operand_dtype") or binding.operand_dtype)
+    )
+    if source._static_pt2e_model(
+        "model",
+        scheme=None if recipe is not None else selected.get("quant_scheme"),
+        recipe=recipe,
+        already_quantized=selected.get("capture_quantization") == "already_materialized",
+    ):
+        capture = source.PytorchRefSource()
+        integerizer = capture.m2m_dir / "m2m/capture/pt2e_integerize.py"
+        if capture.available() and not integerizer.is_file():
+            raise ValueError(
+                f"selected model2MLIR checkout {capture.m2m_dir} lacks {integerizer}; "
+                "static int8 model capture requires m2m.capture.pt2e_integerize"
+            )
+    return selected
+
+
 def generate_target(
     target: str,
     *,
@@ -158,6 +264,7 @@ def generate_target(
         if authored:
             raise ValueError(f"derived-only Phase 0 refuses authored capsule membership: {authored}")
     evidence = None
+    evidence_manifest = None
     if evidence_input is not None or software_spec is not None or profile.get("_software_spec_path"):
         from .evidence import export_evidence, load_exported_evidence, select_evidence
 
@@ -186,8 +293,10 @@ def generate_target(
                     str(row.get("reason", row)) if isinstance(row, dict) else str(row) for row in evidence.diagnostics
                 )
             )
+        if profile.get("capsule_policy") == "derived_only":
+            _verify_derivation_evidence(conformance_spec, evidence)
         artifact_root = Path(evidence_root) if evidence_root is not None else Path(output_root) / "_evidence"
-        export_evidence(evidence, artifact_root)
+        evidence_manifest = export_evidence(evidence, artifact_root)
     declared_claims = [str(model) for model in (getattr(te, "workload_spec", None) or {}).get("models") or ()]
     claim_plan = profile.get("_claim_model_evaluation")
     if profile.get("_synth_verification", {}).get("status") == "verified":
@@ -225,6 +334,10 @@ def generate_target(
     _sweep_skips: list = []
     _runtime_blocked: list = []
     _performance_errors: list = []
+    requirement_bytes = Path(conformance_spec).read_bytes() if conformance_spec is not None else None
+    selected_requirement = yaml.safe_load(requirement_bytes) if requirement_bytes is not None else None
+    if selected_requirement is not None and not isinstance(selected_requirement, dict):
+        raise ValueError("selected conformance requirement must be a mapping")
     entries = expand_sweeps(
         profile,
         binding,
@@ -232,6 +345,8 @@ def generate_target(
         skipped=_sweep_skips,
         blocked_unimplemented=_runtime_blocked,
         errors=_performance_errors,
+        selected_requirement=selected_requirement,
+        requirement_sha256=hashlib.sha256(requirement_bytes).hexdigest() if requirement_bytes is not None else None,
         **({"evidence": evidence} if evidence is not None else {}),
     )
     assert_no_claim_capsules(entries, declared_claims)
@@ -240,9 +355,6 @@ def generate_target(
     if semantics is not None:
         semantics = copy.deepcopy(semantics)
         if evidence is not None:
-            import hashlib
-            import json
-
             model_sources = [
                 (str(source.path), source.sha256)
                 for source in evidence.source_snapshots
@@ -266,11 +378,39 @@ def generate_target(
             )
             screened.append(diagnostic_entry(entry, decision) if decision["status"] == "unsupported" else entry)
         entries = screened
+    entries = [
+        _prepare_model_capture_entry(
+            entry,
+            evidence_root=artifact_root if evidence is not None else None,
+            target=hardware_target,
+            binding=binding,
+        )
+        for entry in entries
+    ]
     for _s in _sweep_skips:
         _why = _s.get("reason") or f"gate {(_s.get('gate') or {}).get('outcome')}"
         print(f"  [skip] performance family {_s['family']}: {_why}")
     template = copy.deepcopy(profile.get("_performance_template") or {})
     declared_families = [dict(row) for row in (template.get("families") or [])]
+    # A requirement-selected pattern may derive several exact claim cohorts.
+    # Keep both identities: the shared template's digest-bound pattern and each
+    # concrete family with the frozen requirement row that produced it.
+    derived_families: dict[str, dict] = {}
+    for entry in entries:
+        performance = entry.get("performance") or {}
+        basis = performance.get("requirement_basis") or {}
+        family = performance.get("family")
+        if basis.get("axis") == "scope.performance.required" and family:
+            record = {
+                "family": family, "claim": performance.get("claim"),
+                "derived_from_pattern": basis.get("pattern_family"), "requirement_basis": copy.deepcopy(basis),
+                "fit_axes": ["K"], "comparison_roles": ["prediction", "measurement"],
+            }
+            if family in derived_families and derived_families[family] != record:
+                raise ValueError(f"derived performance family {family!r} has divergent requirement provenance")
+            derived_families[family] = record
+    template["derived_families"] = [derived_families[name] for name in sorted(derived_families)]
+    declared_families.extend(template["derived_families"])
     family_counts = {row["family"]: {"admitted_members": 0, "written_members": 0} for row in declared_families}
     for entry in entries:
         family = (entry.get("performance") or {}).get("family")
@@ -294,23 +434,22 @@ def generate_target(
     for e in entries:
         family = (e.get("performance") or {}).get("family")
         try:
-            if (
-                evidence is not None
-                and (e.get("kind") == "model" or e.get("op") == "model")
-                and not e.get("materialized_capture")
-                and not e.get("quant_recipe")
-                and not e.get("quant_scheme")
-                and binding.integer
-            ):
+            if evidence is not None and e.get("micro_model"):
+                captures = _frozen_application_captures(artifact_root, evidence_manifest)
+                declared = set((evidence.application_inventory or {}).get("applications") or {})
+                if set(captures) != declared:
+                    raise ValueError("micro-model capture roster differs from frozen application inventory")
                 e = {
                     **e,
-                    "quant_recipe": _selected_capture_recipe(
-                        artifact_root,
-                        target=hardware_target,
-                        operand_dtype=str(e.get("operand_dtype") or binding.operand_dtype),
-                        accumulator_dtype=str(binding.accum_dtype),
-                    ),
+                    "_frozen_application_captures": captures,
+                    "_frozen_software_spec": copy.deepcopy(evidence.software_spec),
                 }
+            e = _with_selected_model_recipe(
+                e,
+                evidence_root=artifact_root if evidence is not None else None,
+                target=hardware_target,
+                binding=binding,
+            )
             if evidence is not None and evidence.software_spec:
                 decision = screen_entry(
                     evidence.software_spec,
@@ -341,7 +480,7 @@ def generate_target(
                 ):
                     w = _write_capsule(e, binding, out_root, facts.get("sha256", ""))
         except Exception as exc:  # noqa: BLE001 — reported, never swallowed
-            detail = f"{type(exc).__name__}: {str(exc)[:300]}"
+            detail = _capture_failure_reason(exc)
             if isinstance(exc, UnprovableForbid) and str(e.get("source_role") or "") == SYNTH_ROLE:
                 # See `UnprovableForbid`. The capsule is removed rather than left on disk: a directory
                 # the corpus does not list is exactly the kind of half-written state the seal cannot
@@ -444,6 +583,18 @@ def generate_target(
             )
             if evidence_mode == "verified":
                 failures.append((e.get("name", "?"), "required capsule writer produced no artifact"))
+    # A performance sweep can fail before it becomes an entry (for example,
+    # while resolving a selected oracle). Such failures are recorded in the
+    # manifest, but must also fail the run after the other capsules are written;
+    # otherwise the controller reports success while a required claim cohort
+    # has zero members. Writer failures already appear in both lists.
+    failed_names = {name for name, _ in failures}
+    for error in _performance_errors:
+        name = str(error.get("member") or error.get("family") or "<performance sweep>")
+        if name not in failed_names:
+            kind = str(error.get("error_type") or "unknown error")
+            failures.append((name, f"performance materialization failed ({kind}); inspect MANIFEST.yaml"))
+            failed_names.add(name)
     if failures:
         print(f"  [FAIL] {len(failures)} capsule(s) could not be written:")
         for name, why in failures:
@@ -514,9 +665,6 @@ def generate_target(
         superseded=superseded,
     )
     if evidence is not None:
-        import hashlib
-        import json
-
         from merlin_experiments.phase1.source_inputs import fingerprint
 
         from .coverage_commitment import observe_cohort, selected_inputs, write_inputs
@@ -529,11 +677,13 @@ def generate_target(
         generated_manifest = yaml.safe_load((out_root / "MANIFEST.yaml").read_text()) or {}
         selections = (generated_manifest.get("phase_corpora") or {}).get(hardware_target) or {}
         cohort_reports = {}
+        selected_reports = {}
         for phase in ("phase1", "phase2"):
             members = (selections.get(phase) or {}).get("generated_members") or []
             report = observe_cohort(
                 coverage_inputs, [out_root / member for member in members], target=hardware_target, phase=phase
             )
+            selected_reports[phase] = report
             report_path = coverage_root / f"{phase}-capsule-coverage.json"
             raw = (json.dumps(report, sort_keys=True, indent=2) + "\n").encode()
             report_path.write_bytes(raw)
@@ -543,6 +693,20 @@ def generate_target(
                 "status": report["status"],
                 "n_capsules": report["cohort"]["n_capsules"],
             }
+        from .phase2_guards import build_guard_link
+
+        guard_link = build_guard_link(
+            out_root, coverage_inputs, selected_reports["phase1"], selected_reports["phase2"]
+        )
+        guard_path = coverage_root / "phase2-functional-guards.json"
+        guard_raw = (json.dumps(guard_link, sort_keys=True, indent=2) + "\n").encode()
+        guard_path.write_bytes(guard_raw)
+        guard_record = {
+            "path": str(guard_path),
+            "sha256": hashlib.sha256(guard_raw).hexdigest(),
+            "status": guard_link["status"],
+            "n_guards": len(guard_link["guards"]),
+        }
         receipt = {
             "schema": "merlin.phase0_generation.v1",
             "target": hardware_target,
@@ -558,10 +722,12 @@ def generate_target(
             "operation_admission": admission,
             "unprovable_forbids": unprovable_forbids,
             "failures": [{"capsule": n, "reason": why} for n, why in failures],
+            "performance_materialization_errors": len(_performance_errors),
             "qualification": "not_established",
             "corpus_manifest": str(out_root / "MANIFEST.yaml"),
             "coverage_inputs": coverage_input_record,
             "cohort_coverage": cohort_reports,
+            "phase2_functional_guards": guard_record,
             "capsule_commitments": [
                 {"member": path.relative_to(out_root).as_posix(), "sha256": fingerprint(path)}
                 for path in sorted(written)

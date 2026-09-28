@@ -32,3 +32,37 @@ audit_checks:
     extraction: {collection: datapaths, name: accumulator, field: elem_bits}
     comparison: distinct_quantity
     gap: The 13-bit custom product carrier is neither BF16 storage nor a selectable tensor quantization format.
+  - id: scale_register_bank_carrier
+    kind: hw_register_bank_geometry
+    module: ScalingFactorRegFile
+    write_index_port: io_writeIdx
+    write_data_port: io_writeData
+    output_prefix: io_regs_
+    expected_entries: 32
+    expected_index_type: i5
+    expected_data_type: i8
+    gap: Port geometry does not establish write/read behavior or the numerical interpretation of scale bytes.
+  - id: mxu0_scale_command_carrier
+    kind: hw_port_type
+    module: ScalarCore
+    port: io_mxu0Cmd_bits_scaleE8M0
+    expected_type: i8
+    expected_direction: out
+    comparison: distinct_quantity
+    gap: An E8M0-named command port does not establish software scale encoding or block scope.
+  - id: mxu1_scale_command_carrier
+    kind: hw_port_type
+    module: ScalarCore
+    port: io_mxu1Cmd_bits_scaleE8M0
+    expected_type: i8
+    expected_direction: out
+    comparison: distinct_quantity
+    gap: An E8M0-named command port does not establish software scale encoding or block scope.
+  - id: vpu_scale_command_carrier
+    kind: hw_port_type
+    module: ScalarCore
+    port: io_vpuCmd_bits_scaleE8M0
+    expected_type: i8
+    expected_direction: out
+    comparison: distinct_quantity
+    gap: An E8M0-named command port does not establish software scale encoding or block scope.

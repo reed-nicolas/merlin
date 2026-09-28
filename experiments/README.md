@@ -117,8 +117,12 @@ certificate. Native cohort admission is reused unchanged; oracle readiness and
 grading still happen in the native phase engine. No command approves data for you.
 `corpus coverage` verifies the completed run's input/output receipt and reports
 which public source-pool cells and other conformance axes its capsules present.
-Its explicit requirement is separately hashed. It does not establish numerical
-correctness, graded admission, or whole-model compilation.
+It reads the run's frozen facts and capability contract when those inputs exist;
+older runs without them report the affected axes as unmeasured, never by reopening
+ambient target tooling. Its explicit requirement is separately hashed. Source-pool
+coverage can include functional capsules, so it is not the selected Phase 2
+performance-cohort coverage. It does not establish numerical correctness, graded
+admission, or whole-model compilation.
 
 For Phase 1, the catalog examples require a reviewed release and a newly generated
 bundle. Keep the authored definition unchanged and select both inputs explicitly:
@@ -260,9 +264,17 @@ merlin experiment resume /absolute/path/to/run
 `lineage` projects the recorded definition and selected input digests, selected
 corpus selection, functional-compiler handoff identity and engine output locations
 from the hash-bound frozen plan. It is read-only and reports historical inputs
-without a fingerprint as unverified. It does not revalidate current source bytes,
-inspect private corpus members or turn a successful process into a scientific
-verdict. Use `status` for attempts and native/AET records for actual evaluation.
+without a fingerprint as unverified. Apart from the Phase 0 descriptor check
+below, it does not revalidate current source bytes, inspect private corpus
+members or turn a successful process into a scientific verdict. Use `status`
+for attempts and native/AET records for actual evaluation.
+
+For Phase 0, the selected descriptor may be a generated evidence snapshot rather
+than the declared-input path in the frozen plan. `frozen_equivalent_snapshot`
+means its bytes were checked against the plan's descriptor digest and its
+descriptor entry in `phase0/evidence-manifest.json`; it is an input-identity
+link, not a capsule-qualification verdict. A missing, changed or symlinked
+snapshot remains `historical_unverified`.
 
 Only `run` and `resume` execute experiment-definition phases. A run may launch paid agents, compile
 models, or use hardware according to its declared phase. `preflight` checks the

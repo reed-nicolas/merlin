@@ -23,8 +23,6 @@ from __future__ import annotations
 
 import inspect
 
-import pytest
-
 
 def test_the_package_survives_every_hop_to_the_oracle():
     from merlin.compile_cli import compile_model, compile_rvv, run_matmul_on_mesh
@@ -51,6 +49,7 @@ def test_an_unreachable_oracle_is_not_a_refusal():
         "spike binary not found",
         "OOT backend build failed: cmake error",
         "oracle unavailable",
+        "parse entrypoint exited 1: bwrap: loopback: Failed to create NETLINK_ROUTE socket: Operation not permitted",
     ):
         assert _oracle_unreachable(decline), f"should read as unmeasured: {decline!r}"
 

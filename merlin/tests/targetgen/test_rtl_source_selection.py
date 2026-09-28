@@ -3,8 +3,10 @@
 import json
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 
+from merlin.targetgen.rtl import circt_introspect, source_selection
 from merlin.targetgen.rtl.extract_module import extract
 from merlin.targetgen.rtl.introspect import census_facts
 from merlin.targetgen.rtl.source_selection import (
@@ -108,3 +110,37 @@ circuit Top :%[[]]
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_selected_generic_hw_is_generated_with_facts_not_into_source_bundle(tmp_path, monkeypatch):
+    source_root = tmp_path / "selected"
+    source_root.mkdir()
+    member = source_root / "core.hw.mlir"
+    member.write_text("module {}\n")
+    bundle = source_root / "source-selection.json"
+    bundle.write_text(
+        json.dumps(
+            {
+                "schema": SCHEMA,
+                "target": "demo",
+                "sources": {
+                    role: {"path": str(member), "sha256": digest(member)}
+                    for role in ("core_hw", "soc_hw", "firrtl", "hierarchy")
+                },
+            }
+        )
+    )
+    facts = tmp_path / "derived" / "facts.json"
+    monkeypatch.setattr(source_selection, "production_consistency", lambda selected: {"sources": []})
+    monkeypatch.setattr("merlin.integrations.modelir.discovery_imports", lambda root: nullcontext())
+    monkeypatch.setattr("merlin.targetgen.rtl.mlc_bridge.mlc_dir", lambda: None)
+
+    def inspect_selected(*args):
+        selected = active_selection("demo")
+        assert selected["_generic_hw_output"] == str(facts.parent / "core.hw.generic.mlir")
+        assert selected["_generic_hw_output"] != str(member.with_suffix(".generic.mlir"))
+        return {"inputs": {}, "generator": {}, "facts": {}}
+
+    monkeypatch.setattr(circt_introspect, "_build_facts", inspect_selected)
+    monkeypatch.setattr("merlin.targetgen.rtl.facts.write_facts_guarded", lambda out, record: None)
+    circt_introspect.dump_facts(facts, target="demo", source_bundle=bundle)

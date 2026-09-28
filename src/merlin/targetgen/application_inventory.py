@@ -30,11 +30,40 @@ _INT_MM_ITERATORS = [
 _INT_MM_BODY = ["arith.extsi", "arith.extsi", "arith.muli", "arith.addi", "linalg.yield"]
 
 
+def exact_int_mm_generic_operation(op) -> bool:
+    """Recognize the actual signed i8×i8→i32 reduction body, not a generic-op label."""
+    from merlin.common import mlir_query as query
+
+    if query.op_name(op) != "linalg.generic" or query.attr_str(op, "prov.op") != "int_matmul":
+        return False
+    maps = op.properties.get("indexing_maps")
+    iterators = op.properties.get("iterator_types")
+    if (
+        maps is None or [str(value) for value in maps] != _INT_MM_MAPS
+        or iterators is None or [str(value) for value in iterators] != _INT_MM_ITERATORS
+        or [query.op_name(child) for child in op.walk()][1:] != _INT_MM_BODY
+        or len(op.operands) != 3 or len(op.results) != 1
+    ):
+        return False
+    operands = [query.type_shape_dtype(value.type) for value in op.operands]
+    results = [query.type_shape_dtype(value.type) for value in op.results]
+    if [dtype for _shape, dtype in [*operands, *results]] != ["i8", "i8", "i32", "i32"]:
+        return False
+    a, weight, out = (shape for shape, _dtype in operands)
+    result = results[0][0]
+    return (
+        len(a) == len(weight) == len(out) == len(result) == 2
+        and all(dim > 0 for shape in (a, weight, out, result) for dim in shape)
+        and a[1] == weight[0] and out == result == [a[0], weight[1]]
+    )
+
+
 def verify_capture_receipt(path: str | Path) -> dict:
     """Verify the capture's materialized artifact bytes against its adjacent receipt.
 
-    This says nothing about source closure: the receipt records that separately. Older diagnostic
-    captures remain inventoryable and explicitly report ``unverified``.
+    This says nothing about source closure. A producer's self-declared closure flag
+    is not an independent execution attestation and must never be projected into
+    Phase 0 admission. Older diagnostic captures remain inventoryable.
     """
     capture = Path(path)
     receipt_path = capture.parent / "capture_receipt.json"
@@ -100,10 +129,29 @@ def verify_capture_receipt(path: str | Path) -> dict:
                     metadata_identity = {"sha256": expected, "bytes": size}
                 except (ValueError, UnicodeDecodeError):
                     pass
+    recipe = metadata.get("recipe") if isinstance(metadata, dict) else None
+    engine = recipe.get("software_numerical_engine") if isinstance(recipe, dict) else None
+    if engine == "integer_reference":
+        agreement = (metadata.get("integerization_receipt") or {}).get("golden_agreement") or {}
+        pointer = agreement.get("output") or {}
+        reference = artifacts.get("integer-reference.json")
+        source = agreement.get("source") or {}
+        tool_sources = (doc.get("tool") or {}).get("source_sha256") or {}
+        if (
+            not isinstance(pointer, dict)
+            or pointer.get("path") != "integer-reference.json"
+            or not isinstance(reference, dict)
+            or pointer.get("sha256") != reference.get("sha256")
+            or not isinstance(source, dict)
+            or source.get("sha256") != tool_sources.get("m2m/capture/pt2e_integer_reference.py")
+        ):
+            errors.append("independent integer reference or its source is not bound by the capture receipt")
     result = {
         "status": "verified_materialized" if not errors else "unverified",
         "receipt_sha256": digest,
-        "source_closure_verified": doc.get("source_closure_verified") is True,
+        # Only a separately verified sealed-execution issuer may establish this.
+        # The materialized receipt is producer-authored, even when all its bytes match.
+        "source_closure_verified": False,
         "errors": errors,
     }
     if (
@@ -123,6 +171,8 @@ def verify_capture_receipt(path: str | Path) -> dict:
             "capture": dict(artifacts["model.mlir"]),
             "capture_receipt_sha256": digest,
             "source_quantization": metadata.get("scheme"),
+            "software_numerical_engine": engine,
+            "reference_artifact": artifacts.get("integer-reference.json"),
             "integerization_receipt": metadata.get("integerization_receipt"),
         }
     return result
@@ -197,6 +247,33 @@ def verified_static_integerization(projection: dict | None, *, receipt_sha256: s
             return False
         values = [row.get(key) for key in ("max_abs", "max_rel", "atol", "rtol")]
         if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in values):
+            return False
+    engine = projection.get("software_numerical_engine")
+    if engine not in (None, "integer_reference"):
+        return False
+    if engine == "integer_reference":
+        source = agreement.get("source") or {}
+        pointer = agreement.get("output") or {}
+        reference = projection.get("reference_artifact") or {}
+        executed = agreement.get("executed_contractions") or {}
+        by_kind = receipt.get("quantized_by_kind") or {}
+        if (
+            agreement.get("reference") != "pt2e_integer"
+            or any(row.get(key) != 0.0 for row in [agreement, *outputs] for key in ("atol", "rtol", "max_abs"))
+            or not isinstance(source, dict) or not is_sha256(source.get("sha256"))
+            or not isinstance(pointer, dict) or pointer.get("path") != "integer-reference.json"
+            or not isinstance(reference, dict) or pointer.get("sha256") != reference.get("sha256")
+            or not is_sha256(reference.get("sha256"))
+            or type(reference.get("bytes")) is not int or reference["bytes"] <= 0
+            or not isinstance(executed, dict)
+            or any(executed.get(key) != count for key in ("total", "selected", "observed"))
+            or not isinstance(by_kind, dict)
+            or any(
+                not isinstance(by_kind.get(kind), dict)
+                or executed.get(kind) != by_kind[kind].get("seen")
+                for kind in ("conv2d", "linear", "matmul")
+            )
+        ):
             return False
     return True
 

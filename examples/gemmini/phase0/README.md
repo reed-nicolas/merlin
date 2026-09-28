@@ -14,6 +14,7 @@ Phase 1 develops the functional compiler; Phase 2 uses a separate performance co
 | [Host capabilities](../target/host-capabilities.yaml) | Separately pinned host compiler and reviewed operation/precision support |
 | [Recipe](recipe.yaml) | Derived-only policy, comparison tolerances and oracle tiers; no authored capsule list |
 | [Descriptor](../target/descriptor.yaml) | Independent iteration roster, held-out validation roster and experiment resources |
+| [Selected capability contract](../target/contracts/target_contract.yaml) | Example-specific command order and runner profile bound to the OOT support package |
 | Shared performance template | Phase 2 objectives and families, not additional functional capability |
 
 The selected configuration has signed 8-bit operands, a 20-bit MAC result and
@@ -69,6 +70,37 @@ captures and layer frequencies do not select or tune the derivation corpus.
 
 With installed `merlin-experiments`, explicit captures and fresh facts:
 
+Select the *same* out-of-tree support package and capability contract for
+derivation and the subsequent Phase 0 run. For example, set
+`MERLIN_TARGET_PATH` to the Gemmini support directory and
+`MERLIN_TARGET_CONTRACT` to
+`examples/gemmini/target/contracts/target_contract.yaml` before both commands.
+The support package's raw contract alone omits the example's corpus command
+issue order and cannot materialize this corpus. The generated requirement binds
+raw facts, the contract, effective readout facets and support-source bytes;
+changing a provider requires a fresh
+derivation, not a resumed corpus run. The selected Gemmini readout supports
+`acc_scale` but not the distinct integer-shift `requant` epilogue, so the latter
+must remain an explicit rejected/host obligation rather than a fabricated
+accelerator capability.
+
+The recipe declares stable performance oracle names (`spike` for L2 and
+`verilator` for L3). Capsule derivation does not probe which simulators happen
+to be installed; execution still verifies the selected engine and hardware
+revision. Before freezing a run that will execute those members, select
+`MERLIN_EXT_CHIPYARD` for the Chipyard tree containing the concrete Gemmini L3
+simulator, and set
+`MERLIN_M2M_DIR` to the selected Model2MLIR source tree and
+`MERLIN_M2M_PYTHON` to its pinned interpreter for generated
+PyTorch-sourced capsules. The L3 performance members cannot execute if the
+simulator cannot be resolved; a missing exporter also leaves source capsules unwritten.
+Static-int8 source capsules additionally require
+`m2m/capture/pt2e_integerize.py` in that selected tree. Check the exact
+module and interpreter together before freezing; a different checkout with
+the same project name is not interchangeable.
+Record these dependencies in the frozen run rather than relying on a later
+resume to supply them.
+
 ```sh
 merlin experiment corpus derive gemmini-functional \
   --application-capture "coverage_mlp=$CAPTURE_ROOT/coverage_mlp/model.mlir" \
@@ -80,10 +112,38 @@ merlin experiment corpus derive gemmini-functional \
 
 Inspect `requirements.yaml`, `application-demands.json`, `synthesis-plan.json`,
 `synthesis.yaml` when a candidate plan is expressible, and `derivation.json`.
+For an output-memory check, follow
+`requirements.yaml` → `accumulator_output_boundary` → the generated
+`SY_accumulator_output_boundary` entry in `synthesis.yaml` → its `capsule.yaml`,
+`capsule.interface.mlir` and `golden.yaml` in the Phase 0 run. The bound comes
+from the selected RTL facts' addressable accumulator, not a model shape: the
+capsule writes one row through the first output tile beyond that capacity.
+Coverage checks the materialized operand shapes, so a missing boundary remains
+an uncovered obligation. A passing golden alone does not qualify the compiler;
+the Phase 1 grade must also execute that capsule against the selected oracle.
 The producer requires the complete declared roster and binds the selected SW spec,
 recipe, workload policy and requirement bytes. A successful diagnostic derivation
 is **not** a compiler certificate or reviewed corpus. Missing mappings remain
 obligations; an unexpressible plan is retained as a blocked artifact.
+
+For a concrete composition audit, inspect
+`requirements.yaml` → `scope.typed_required_instances.instances`. Each record
+names the originating capture, its SHA-256, exact MLIR operation IDs and the
+typed SSA edges between regions. Compare those operations with the selected
+software spec and each generated capsule's `capsule.interface.mlir` and
+`capsule.yaml` software-screen decision.
+Raw source adjacency is not device placement: a chain containing host-side
+casts or maps cannot become a Phase 2 performance obligation merely because a
+synthetic capsule has the same sequence of semantic families. Explicit SW
+admission, a matching implementation and measured execution are separate gates.
+The derived `scope.performance` section records eligible, SW-refused and
+unresolved exact chains separately. Phase 1 keeps `scope.required` as the raw
+source-demand census; Phase 2 selects only `scope.performance.required`.
+An unresolved chain blocks that performance claim instead of being counted as
+covered by a merely similar synthetic program.
+The current PN writer uses a synthetic scalar map, so even matching operation
+names and dtypes are not enough to establish source-body equivalence; a future
+source-bound emitter must supply that correspondence before PN is eligible.
 
 ### Realize the selected precision, then derive again
 
@@ -107,9 +167,12 @@ Capture each iteration workload into a new scoped directory:
 Repeat for the other three loaders. The recipe scopes eligible contractions;
 normalization, embeddings and unsupported operations are not blanket-quantized.
 Inspect each `meta.json` for `quantization_stats`, calibration count/source,
-`recipe_agreement` and `integerization_receipt`. Integer realization, agreement
-with the portable quantized graph, and error against the original FP32 model
-are separate observations. A single synthetic calibration example is a smoke
+`recipe_agreement` and `integerization_receipt`. The generated recipe selects
+the SW spec's `integer_reference` engine: `golden_agreement` must exactly match
+the byte-bound independent integer output in `integer-reference.json`.
+`portable_agreement` against TorchAO's Q/DQ graph is diagnostic, and
+`recipe_agreement` measures error against the original FP32 model. These are
+separate observations. A single synthetic calibration example is a smoke
 input, not workload-accuracy validation or proof of accelerator execution.
 
 Derive a fresh corpus plan from these exact realized bundles:
@@ -126,6 +189,9 @@ merlin experiment corpus derive gemmini-functional \
 Preserve the bootstrap plan and FP32 bundles. For the next step, select
 `REALIZED_DERIVATION_ROOT`, not the initial FP32 derivation. New recipe, framework,
 source or calibration bytes require newly captured bundles and a fresh plan.
+Derivation checks each quantized capture's recorded recipe digest against the
+recipes derived from the *currently selected* provider and SW spec; captures
+from an older provider cannot be reused just because their MLIR parses.
 
 `evidence/evidence-manifest.json` links to the exact input bytes and consumer views:
 
@@ -147,7 +213,7 @@ recipe's integerization implementation; Phase 0 must fail instead of falling
 back to a different capture path.
 
 ```sh
-MERLIN_MODEL2MLIR="$MODEL2MLIR_ROOT" MERLIN_M2M_PYTHON="$CAPTURE_PYTHON" \
+MERLIN_M2M_DIR="$MODEL2MLIR_ROOT" MERLIN_M2M_PYTHON="$CAPTURE_PYTHON" \
   merlin experiment run gemmini-functional --phase 0 \
   --phase0-rtl-facts "$RTL_ROOT/facts.json" \
   --phase0-conformance-spec "$REALIZED_DERIVATION_ROOT/requirements.yaml" \
@@ -165,27 +231,49 @@ The separate `phase1-capsule-coverage.json` and `phase2-capsule-coverage.json`
 reports inventory only each selected cohort's exact bytes. Interface-command
 observations and source-model MLIR witnesses remain distinct; a performance
 cohort cannot borrow functional source coverage or claim whole-model validation.
+Open `capsules/model/SY_micro_model/capsule.pytorch.py` to inspect the derived
+A→H→A layer order. Its header lists accelerator capabilities that the emitted
+standalone statements cannot exercise; for Gemmini, a float GELU, transpose or
+reduction must not be read as proof of an int8 fused epilogue, transfer or pool.
+`frontend-source.mlir`, `frontend-trace.json`, `capsule.interface.mlir`, and
+`capsule.weights.safetensors` beside it show the captured source, trace, selected
+interface and separate weights. The trace and host golden are capture evidence,
+not a receipt that the target compiler executed the mixed-lane model.
 
-### Diagnostic release-admission gap (r17)
+### Review and release
 
-The local `gemmini-r17` direct-generator probe wrote 86 capsules with no writer
-failures, but it is **not** a releasable Phase 0 run: it has no frozen
-`resolved-plan.json`/successful run receipt, and its manifest records zero
-generated or hand-authored hidden members. Its functional coverage report is
-`incomplete` (4 source-closure, 972 operation-placement and 1,027 typed-edge
-blockers, plus unresolved axes/review). Those counts describe a selected
-diagnostic corpus, not a verified compiler or PyTorch operator population.
+A successful controller receipt proves that the selected generator finished; it
+does not establish capsule coverage or target execution. Check
+`coverage/generation.json` for zero writer failures **and** zero omissions, then
+inspect `phase1-capsule-coverage.json` and `phase2-capsule-coverage.json`
+separately. The derived micro-model composition test reads the run's frozen
+iteration captures, not an ambient `out/artifacts/recaptures` directory.
+The memory-mapping axis reads the exact CIRCT facts bytes recorded in
+`capsules/_phase0/coverage-inputs.json`; a missing or changed facts snapshot
+leaves that axis unmeasured. This is pre-compiler corpus coverage, not evidence
+that a compiled program used the on-chip store correctly.
+Host-only and host-lane coverage likewise classify each capsule against the
+selected capability contract, without consulting an ambient provider. Mixed
+host/device composition stays unmeasured until an emitted boundary is bound to
+that same selected source; a declared legal boundary is not an execution proof.
 
-Release preparation now materializes only file symlinks that resolve *inside*
-the declared curated harness, recording the original link-bound source digest
-and copied link paths; outside, directory and broken links still fail closed.
-This removes one staging obstacle, not an admission decision. The descriptor's
-current model resource policy still lists nine models absent from r17 and leaves
-four generated `SY_source_*` models unclassified. A reviewer must make an
-explicit per-model resource decision against a fresh frozen run; neither the
-policy nor hidden cohort may be inferred or synthesized from r17. Only then can
-the complete Phase 1/2 coverage and source/host/target-execution obligations be
-re-evaluated for a new release.
+Verified admission also requires reviewed software and host semantics, complete
+capture source closure, independent numerical and compiler checks, resolved
+operation/transfer obligations, and an operator-owned hidden cohort. These
+cannot be inferred from a diagnostic run or supplied by changing a status
+field. Review the generated model inventory and `grading.resource_bound` for
+the *selected* cohort; if policy changes, freeze a new run rather than editing
+an old receipt. With a separately selected private hidden category, prepare a
+candidate release using:
+
+```sh
+merlin experiment corpus prepare "$NEW_RUN_ROOT" --generated-only \
+  --private-baseline "$PRIVATE_HIDDEN_ROOT" --output "$NEW_RELEASE_ROOT"
+```
+
+Preparation reports unmatched public models and a missing or withheld hidden
+cohort; it does not choose exclusions for the operator. Acknowledging a seal
+does not repair incomplete coverage or missing execution receipts.
 
 Review coverage, placement and independent numerical checks before preparing
 [the reviewed Phase 0 handoff](../../../experiments/README.md#reviewed-phase-0-handoff).
@@ -193,3 +281,39 @@ Changing a status field cannot qualify old artifacts. New inputs require newly
 frozen runs; preserve old outputs unchanged. See [the artifact map](../artifacts/README.md)
 and [whole-model walkthrough](../whole-model/README.md) for member MLIR, external
 tensors and intermediate lowering snapshots.
+
+### Check a generated kernel on the oracle ladder
+
+With `merlin-experiments` and its AET dependency installed, select the same
+support provider, example contract and exact facts used by derivation. The
+compiler interpreter and LLVM tools are independent of the PyTorch capture
+interpreter. An installed Merlin checkout does not imply they are installed or
+selected; check `python -c 'import aet'` and resolve these paths before grading.
+
+```sh
+MERLIN_TARGET_PATH="$TARGET_SUPPORT_ROOT" \
+MERLIN_TARGET_CONTRACT="$PWD/examples/gemmini/target/contracts/target_contract.yaml" \
+MERLIN_RTL_FACTS="$RTL_ROOT/facts.json" \
+MERLIN_EXT_CHIPYARD="$SIMULATOR_CHIPYARD_ROOT" \
+MERLIN_COMPILER_PYTHON="$COMPILER_PYTHON" \
+MERLIN_CLANG="$LLVM_BIN/clang-23" \
+MERLIN_MLIR_TRANSLATE="$LLVM_BIN/mlir-translate" \
+MERLIN_OBJDUMP="$LLVM_BIN/llvm-objdump" \
+python -m merlin.targetgen.capsule_runner \
+  --package "$COMPILER_PACKAGE" \
+  --capsule "$RUN_ROOT/phase0/capsules/layers/SY_int_mm_m8_k32_n32_1a2863611f" \
+  --runs-root "$CAPSULE_RUN_ROOT" --target gemmini --timeout 600
+```
+
+The member name above is an example from one realized capture, not a stable
+authored input; choose a member present in your run. Its `capsule_result.json`
+must show measured passes for every mandatory tier. L2 is Spike's functional
+model, while L3 is elaborated RTL; L0/L1 or a generated ELF alone are not an RTL
+verdict. Record the selected simulator/build provenance separately: a passing
+kernel result with `UNKNOWN` hardware pins is diagnostic, not a pinned release
+claim. `testbench_timeout` at L3 means that tier is **unmeasured**, even when
+the same capsule passed L0–L2 with zero numerical mismatches. Use a measured
+small source-derived capsule to exercise RTL, and keep large model-derived
+shapes as separate functional-model checks when their RTL cost exceeds the
+budget; neither result substitutes for the other's coverage obligation. This
+check does not qualify a complete model or the Phase 0 corpus.

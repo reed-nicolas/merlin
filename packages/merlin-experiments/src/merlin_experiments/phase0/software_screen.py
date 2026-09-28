@@ -8,6 +8,67 @@ from merlin.targetgen.semantic_families import from_op
 from merlin.targetgen.software_spec import admit_operation
 
 
+def _screen_scope_chain(spec: dict, entry: dict, capsule: dict | None) -> dict:
+    """Admit an emitted region chain one operation at a time, not by container name.
+
+    The builder emits separate movement, contraction and map regions. Adjacency
+    does not establish fused placement: each region needs an accelerator SW
+    declaration of its own. The pre-emission entry lacks an operation inventory.
+    """
+    attrs = ((capsule or {}).get("operation") or {}).get("attributes") or {}
+    families, operations = attrs.get("scope_families"), attrs.get("scope_region_ops")
+    if capsule is None or not isinstance(families, list) or not isinstance(operations, list):
+        return {
+            "status": "unknown",
+            "constraints_status": "unknown",
+            "decisions": [],
+            "reason": "scope chain requires the emitted per-region operation inventory",
+        }
+    selected = entry.get("scope_families")
+    if (
+        len(families) < 3
+        or len(families) != len(operations)
+        or families != selected
+        or attrs.get("scope_signature") != " -> ".join(families)
+        or any(from_op(op) != family for op, family in zip(operations, families, strict=True))
+    ):
+        return {
+            "status": "unsupported",
+            "constraints_status": "refused",
+            "decisions": [],
+            "reason": "emitted scope regions differ from the selected operation-family chain",
+        }
+    operands = [row for row in capsule.get("inputs") or [] if row.get("role") in {"input", "weight"}]
+    operand_dtypes = {row.get("dtype") for row in operands}
+    operand_dtype = next(iter(operand_dtypes)) if len(operand_dtypes) == 1 else None
+    accumulator_dtype = attrs.get("output_dtype")
+    dimensions = {axis: attrs[axis] for axis in ("M", "K", "N") if type(attrs.get(axis)) is int}
+    decisions = []
+    for index, (op, family) in enumerate(zip(operations, families, strict=True)):
+        signature = {
+            "family": family,
+            "operand_dtype": operand_dtype if family != "elementwise_map" else accumulator_dtype,
+            "accum_dtype": accumulator_dtype,
+            "rank": 2,
+            "dimensions": dimensions,
+        }
+        decision = admit_operation(spec, op, signature, "accelerator")
+        decisions.append({"role": "region", "index": index, "family": family, **decision})
+    refused = [row for row in decisions if row["status"] == "unsupported"]
+    unknown = [row for row in decisions if row["status"] == "unknown"]
+    return {
+        "status": "unsupported" if refused else "unknown" if unknown else "admitted",
+        "constraints_status": "refused"
+        if refused
+        else "unknown"
+        if any(row.get("constraints_status") != "matched" for row in decisions)
+        else "matched",
+        "reason": "; ".join(f"region {row['index']} ({row['op']}): {row['reason']}" for row in refused or unknown)
+        or "all emitted region SW constraints match",
+        "decisions": decisions,
+    }
+
+
 def screen_entry(
     spec: dict,
     entry: dict,
@@ -28,6 +89,8 @@ def screen_entry(
     op = operation.get("op") or entry.get("op", "unknown")
     attrs = operation.get("attributes") or {}
     kind = (capsule or {}).get("kind") or entry.get("kind")
+    if kind == "model_slice" and op == "scope_chain":
+        return _screen_scope_chain(spec, entry, capsule)
     performance = (capsule or {}).get("performance") or entry.get("performance") or {}
     knobs = (performance.get("emitter") or {}).get("knobs") or {}
     declared_regions = knobs.get("accelerator_regions") if knobs.get("operation") == op else None
@@ -121,9 +184,9 @@ def diagnostic_entry(entry: dict, decision: dict) -> dict:
     result = copy.deepcopy(entry)
     result["cat"] = "_diagnostic"
     result["software_screen"] = copy.deepcopy(decision)
-    result["source_reference"] = "Backend probe explicitly refused by the selected SW spec; diagnostic only. " + str(
-        entry.get("source_reference") or ""
-    )
+    prefix = "Backend probe explicitly refused by the selected SW spec; diagnostic only. "
+    source_reference = str(entry.get("source_reference") or "")
+    result["source_reference"] = source_reference if source_reference.startswith(prefix) else prefix + source_reference
     return result
 
 

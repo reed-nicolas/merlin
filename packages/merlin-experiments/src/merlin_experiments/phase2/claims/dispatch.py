@@ -70,6 +70,8 @@ def supported_acceptance(module: Any, declaration: Mapping[str, Any], family: st
     evidence = declaration.get("evidence")
     timing_simulator = evidence.get("timing_simulator") if isinstance(evidence, Mapping) else None
     try:
+        if parameters and parameters[0].name == "declaration":
+            return supported(declaration)
         return supported(str(timing_simulator)) if parameters else supported()
     except (TypeError, ValueError) as exc:
         raise StageGateError(f"frozen {family} acceptance selects an unsupported timing engine") from exc
@@ -177,6 +179,7 @@ def _registry() -> dict[str, Callable[..., dict]]:
         from . import pk as PK
 
         table[PK._ACCEPTANCE_BASE["analyzer"]] = PK.analyze_pk_claim
+        table[PK._CURRENT_ACCEPTANCE_BASE["analyzer"]] = PK.analyze_pk_claim
     except Exception:  # noqa: BLE001 - an absent analyzer is reported at dispatch, not at import
         pass
     try:
@@ -206,11 +209,10 @@ def _registry() -> dict[str, Callable[..., dict]]:
         # and the contract drift apart silently.
         from . import pr as PR
 
-        for attr in ("_ACCEPTANCE_BASE", "ACCEPTANCE_BASE", "_ACCEPTANCE", "_PROPOSED_ACCEPTANCE"):
+        for attr in ("_CURRENT_ACCEPTANCE_BASE", "_ACCEPTANCE_BASE", "ACCEPTANCE_BASE", "_ACCEPTANCE", "_PROPOSED_ACCEPTANCE"):
             base = getattr(PR, attr, None)
             if isinstance(base, dict) and isinstance(base.get("analyzer"), str):
                 table[base["analyzer"]] = PR.analyze_pr_claim
-                break
     except Exception:  # noqa: BLE001
         pass
     return table

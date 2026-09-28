@@ -132,18 +132,21 @@ def measurement_identity(
     return identity, refusals
 
 
-def _rtl_counter_row(pass_result: Mapping) -> Mapping | None:
+def _rtl_counter_row(pass_result: Mapping, *, timing_simulator: str | None = None) -> Mapping | None:
     per_sim = pass_result.get("per_sim")
     if not isinstance(per_sim, Mapping):
         return None
+    if timing_simulator is not None:
+        selected = per_sim.get(timing_simulator)
+        return selected if isinstance(selected, Mapping) else None
     rtl = per_sim.get("gsim")
     if not isinstance(rtl, Mapping):
         rtl = per_sim.get("verilator")
     return rtl if isinstance(rtl, Mapping) else None
 
 
-def _counter_report(pass_result: Mapping) -> Mapping | None:
-    rtl = _rtl_counter_row(pass_result)
+def _counter_report(pass_result: Mapping, *, timing_simulator: str | None = None) -> Mapping | None:
+    rtl = _rtl_counter_row(pass_result, timing_simulator=timing_simulator)
     counters = rtl.get("counters") if isinstance(rtl, Mapping) else None
     return counters if isinstance(counters, Mapping) else None
 
@@ -249,6 +252,7 @@ def link_counter_passes(
     physical_unit: str,
     counter_binding: object = None,
     rtl_facts_sha256: str | None = None,
+    timing_simulator: str | None = None,
 ) -> dict:
     """Link two independent RTL runs without assigning semantics to raw unit counters."""
     refusals: list[str] = []
@@ -269,7 +273,7 @@ def link_counter_passes(
 
     rtl_rows: list[Mapping] = []
     for label, result in (("occupancy", occupancy_pass), ("physical-byte", byte_pass)):
-        rtl = _rtl_counter_row(result)
+        rtl = _rtl_counter_row(result, timing_simulator=timing_simulator)
         if not isinstance(rtl, Mapping):
             refusals.append(f"{label} pass has no RTL simulator result")
             rtl_rows.append({})
@@ -285,7 +289,10 @@ def link_counter_passes(
         elif conditions[0] != conditions[1]:
             refusals.append("counter passes report different measurement conditions")
 
-    reports = [_counter_report(occupancy_pass), _counter_report(byte_pass)]
+    reports = [
+        _counter_report(occupancy_pass, timing_simulator=timing_simulator),
+        _counter_report(byte_pass, timing_simulator=timing_simulator),
+    ]
     expected_selections = (("joint_occupancy", None), ("unit", physical_unit))
     for index, (label, report) in enumerate(zip(("occupancy", "physical-byte"), reports)):
         if report is None:
@@ -407,6 +414,7 @@ def collect_linked_counter_passes(
     physical_unit: str,
     counter_binding: object = None,
     rtl_facts_sha256: str | None = None,
+    timing_simulator: str | None = None,
 ) -> dict:
     """Execute occupancy and byte-family passes under disjoint instrumentation environments."""
     with counter_environment(enabled=True, unit=None):
@@ -419,6 +427,7 @@ def collect_linked_counter_passes(
         physical_unit=physical_unit,
         counter_binding=counter_binding,
         rtl_facts_sha256=rtl_facts_sha256,
+        timing_simulator=timing_simulator,
     )
     result = dict(occupancy)
     result["counter_passes"] = {"occupancy": occupancy, "physical_bytes": physical_bytes}

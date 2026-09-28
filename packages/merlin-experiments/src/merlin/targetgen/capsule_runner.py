@@ -29,11 +29,14 @@ import os
 import sys
 import time
 import traceback as _traceback
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import yaml
-from aet.core.run_paths import RunPaths
+
+if TYPE_CHECKING:
+    from aet.core.run_paths import RunPaths
 
 from . import oracle_policy as _oracle_policy
 from . import tier_policy as _tier_policy
@@ -4998,9 +5001,10 @@ def run_capsule(
                     capsule,
                     tier,
                     declared_tiers=_tier_seq,
-                    # roots left default: `verify_extends` reads the certificates this target has on
-                    # disk, which is exactly the evidence that decides whether the sibling really earned
-                    # the deeper tier. RunnerConfig carries no corpus roots to pass instead.
+                    # A named sibling must be present in this selected suite run, not an ambient
+                    # certificate under the checkout's default output roots. Cost history remains
+                    # separately selected by the affordability policy.
+                    extends_roots=[paths.run_path.parent],
                 )
                 if not _ceil.allowed:
                     tiers[tier] = TierResult(

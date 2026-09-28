@@ -8,6 +8,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from merlin.targetgen.application_inventory import application_demand_inventory
+from merlin.targetgen.frontend_trace import join_frontend_trace
 from merlin.targetgen.operation_accounting import build_operation_accounting
 from merlin.targetgen.software_spec import admit_operation, screen_transfer_contract
 from merlin.targetgen.target_experiment import HostLane, HostLaneMatrix
@@ -156,6 +157,93 @@ def _inputs(path):
 
 
 class Phase0SupportAccounting(unittest.TestCase):
+    def test_exact_mlir_roster_does_not_hide_unlowered_prepared_calls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inventory, _, _, trace, _ = _inputs(Path(directory) / "model.mlir")
+            selected = inventory["applications"]["iteration"]
+            prepared = trace["graphs"]["prepared"]
+            prepared["nodes"].append(
+                {
+                    "id": "g:prepared:root:n4",
+                    "ordinal": 4,
+                    "op": "call_function",
+                    "target": "aten.relu.default",
+                    "results": [],
+                }
+            )
+            prepared["call_count"] = 3
+            prepared["sha256"] = _sha({key: value for key, value in prepared.items() if key != "sha256"})
+            transition = trace["transformations"][1]
+            transition.update(status="diagnostic", unresolved_destination_ids=["g:prepared:root:n4"])
+            trace["mlir"]["source_correspondence"].append(
+                {"node_id": "g:prepared:root:n4", "mlir_ordinals": [], "status": "unresolved"}
+            )
+            trace.update(status="diagnostic", blockers=["prepared call has no final MLIR correspondence"])
+
+            joined = join_frontend_trace(trace, selected["operation_graph"], capture_sha256=selected["capture_sha256"])
+            self.assertEqual(joined["status"], "partial")
+            self.assertEqual(joined["raw_mlir_correspondence"]["status"], "verified")
+            self.assertEqual(joined["normalization_correspondence"]["status"], "verified")
+            obligations = joined["prepared_lowering_obligations"]
+            self.assertEqual(obligations["status"], "unresolved")
+            self.assertEqual(obligations["unresolved_calls"][0]["node_id"], "g:prepared:root:n4")
+            self.assertFalse(any("MLIR roster differs" in error for error in joined["errors"]))
+
+    def test_unresolved_frontend_transition_exposes_typed_obligations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inventory, _, _, trace, _ = _inputs(Path(directory) / "model.mlir")
+            selected = inventory["applications"]["iteration"]
+            graph = trace["graphs"]["quantized"]
+            graph["nodes"][0]["results"] = [{"id": "g:quantized:root:n2:v0", "dtype": "int64", "shape": [1]}]
+            graph["nodes"][1].update(
+                target="aten.to.dtype",
+                results=[{"id": "g:quantized:root:n3:v0", "dtype": "float32", "shape": [1]}],
+            )
+            graph["edges"] = [
+                {
+                    "producer_node_id": "g:quantized:root:n2",
+                    "consumer_node_id": "g:quantized:root:n3",
+                    "producer_value_id": "g:quantized:root:n2:v0",
+                    "dtype": "int64",
+                    "shape": [1],
+                }
+            ]
+            graph["sha256"] = _sha({key: value for key, value in graph.items() if key != "sha256"})
+            transition = trace["transformations"][1]
+            transition["relations"] = transition["relations"][:1]
+            transition.update(
+                status="diagnostic",
+                unresolved_source_ids=["g:quantized:root:n3"],
+                unresolved_destination_ids=["g:prepared:root:n3"],
+            )
+            trace.update(status="diagnostic", blockers=["quantized -> prepared correspondence incomplete"])
+            joined = join_frontend_trace(trace, selected["operation_graph"], capture_sha256=selected["capture_sha256"])
+            self.assertEqual(joined["status"], "partial")
+            unresolved = joined["transition_obligations"][1]
+            self.assertEqual(unresolved["producer_unresolved_ids_status"], "matched")
+            self.assertEqual(
+                unresolved["unresolved_source_calls"],
+                [
+                    {
+                        "node_id": "g:quantized:root:n3",
+                        "op": "call_function",
+                        "target": "aten.to.dtype",
+                        "input_dtypes": ["int64"],
+                        "result_dtypes": ["float32"],
+                    }
+                ],
+            )
+            self.assertEqual(unresolved["unresolved_destination_calls"][0]["node_id"], "g:prepared:root:n3")
+            self.assertNotIn("eliminated", json.dumps(unresolved))
+
+            # A producer's claimed uncovered set cannot contradict the relation roster.
+            transition["unresolved_source_ids"] = []
+            mismatch = join_frontend_trace(
+                trace, selected["operation_graph"], capture_sha256=selected["capture_sha256"]
+            )
+            self.assertEqual(mismatch["transition_obligations"][1]["producer_unresolved_ids_status"], "mismatch")
+            self.assertTrue(any("producer unresolved call IDs disagree" in error for error in mismatch["errors"]))
+
     def test_dynamic_ssa_extent_is_explicitly_unproved(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.mlir"
@@ -177,6 +265,15 @@ class Phase0SupportAccounting(unittest.TestCase):
             self.assertEqual(graph["n_operations"], 4)
             self.assertEqual(graph["shape_domain"]["status"], "unknown")
             self.assertTrue(graph["shape_domain"]["dynamic_value_ids"])
+            support = accounting["applications"]["dynamic"]["completeness"]["operation_obligations"][0]
+            self.assertEqual(support["role"], "support_lowering")
+            self.assertEqual(support["support_lowering_evidence"]["status"], "not_available")
+            self.assertNotIn("numerical_contracts", support["precision"])
+            self.assertEqual(support["required_placement_choices"], [])
+            self.assertEqual(
+                next(node for node in graph["nodes"] if node["mlir_operation"] == "tensor.empty")["accounting"],
+                "support_lowering_obligation",
+            )
 
     def test_normalization_preserves_exact_source_metadata_on_support_operations(self):
         from merlin.targetgen.application_graph import application_graph_inventory
@@ -207,6 +304,33 @@ class Phase0SupportAccounting(unittest.TestCase):
             self.assertEqual(original["source_node_ids"], normalized["source_node_ids"])
             self.assertEqual(original["attributes"], normalized["attributes"])
             self.assertEqual(graph["normalization_correspondence"]["status"], "serialization_equivalent")
+
+    def test_support_to_support_ssa_use_is_not_an_independent_lane_transfer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.mlir"
+            path.write_text("""builtin.module {
+              func.func @main() -> tensor<2xf32> {
+                %zero = arith.constant 0.0 : f32
+                %value = tensor.splat %zero : tensor<2xf32>
+                func.return %value : tensor<2xf32>
+              }
+            }""")
+            inventory = application_demand_inventory(
+                {"support": path},
+                "test_device",
+                detailed=True,
+                capability_contract={"name": "test_device", "compute_units": []},
+                include_graph=True,
+            )
+            completeness = build_operation_accounting(inventory)["applications"]["support"]["completeness"]
+            graph = completeness["graph_accounting"]
+            assert graph["n_operations"] == 5
+            assert len(completeness["operation_obligations"]) == 2
+            assert all(row["role"] == "support_lowering" for row in completeness["operation_obligations"])
+            assert completeness["transfer_obligations"] == []
+            assert [edge["accounting"] for edge in graph["edges"] if edge["accounting"] == "support_dependency"] == [
+                "support_dependency"
+            ]
 
     def test_joined_typed_partitions_and_conditional_transfer_are_honest(self):
         with tempfile.TemporaryDirectory() as directory:

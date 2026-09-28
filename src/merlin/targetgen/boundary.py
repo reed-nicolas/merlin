@@ -36,7 +36,7 @@ many dispatches it issues — which is exactly the residency property such a cap
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 #: An accelerator-eligible region, in the sequence vocabulary this module classifies.
@@ -266,12 +266,16 @@ def _accel_dispatches(commands) -> int:
     return n
 
 
-def _sequence_from_linalg(module, target: str) -> tuple[list[str], int]:
+def _sequence_from_linalg(module, target: str, *, capability_contract: dict | None = None) -> tuple[list[str], int]:
     """``[A|H|?]`` per linalg region, in program order, plus how many stayed unresolved."""
-    from merlin.targetgen.eligibility import capability_map_for_target, is_eligible
+    from merlin.targetgen.eligibility import capability_map_for_target, capability_map_from_contract, is_eligible
     from merlin.targetgen.model_coverage import regions_from_module
 
-    cap_map = capability_map_for_target(target)
+    cap_map = (
+        capability_map_from_contract(capability_contract)
+        if capability_contract is not None
+        else capability_map_for_target(target)
+    )
     seq: list[str] = []
     unresolved = 0
     for region in regions_from_module(module):
@@ -353,7 +357,7 @@ def profile_iface_text(text: str) -> BoundaryProfile:
     )
 
 
-def profile_path(path: str | Path, target: str) -> BoundaryProfile:
+def profile_path(path: str | Path, target: str, *, capability_contract: dict | None = None) -> BoundaryProfile:
     """Classify the capsule interface at ``path``."""
     p = Path(path)
     try:
@@ -376,7 +380,7 @@ def profile_path(path: str | Path, target: str) -> BoundaryProfile:
         module = load_module(p)
     except Exception as e:  # noqa: BLE001
         return BoundaryProfile(grammar="linalg", detail=f"unparseable: {type(e).__name__}: {e}")
-    seq, unresolved = _sequence_from_linalg(module, target)
+    seq, unresolved = _sequence_from_linalg(module, target, capability_contract=capability_contract)
     # AN ELIGIBLE REGION IS NOT A CROSSING WE CAN EMIT. Eligibility says the capability manifest admits
     # the work; it says nothing about whether any path in this repo can compile the seam that carries it.
     # On a device_native target the boundary is a DRAM address contract honoured by the harness, not a
@@ -386,7 +390,11 @@ def profile_path(path: str | Path, target: str) -> BoundaryProfile:
     # [A,H,A] into [H] and reports a host-only capsule, which is a stronger false claim than the one it
     # replaces.
     n_eligible = sum(1 for x in seq if x == ACCEL)
-    unbuildable = _unbuildable_seam(target) if n_eligible else None
+    unbuildable = (
+        "an emitted boundary is not bound to the selected capability contract"
+        if capability_contract is not None and n_eligible
+        else (_unbuildable_seam(target) if n_eligible else None)
+    )
     # WHY THIS IS NOT RELAXED WHEN THE PLACEMENT IS DERIVABLE. It is tempting to say that a
     # `device_native` boundary is a DRAM address contract the harness honours, so the crossings are
     # decided by the eligibility already computed here and the verdict could be a shape rather than
@@ -443,12 +451,14 @@ def capsule_interface(capsule_dir: str | Path) -> Path | None:
     return None
 
 
-def profile_capsule(capsule_dir: str | Path, target: str) -> BoundaryProfile:
+def profile_capsule(
+    capsule_dir: str | Path, target: str, *, capability_contract: dict | None = None
+) -> BoundaryProfile:
     """Classify one capsule directory. A capsule declaring no interface is UNKNOWN, never ``H``."""
     iface = capsule_interface(capsule_dir)
     if iface is None:
         return BoundaryProfile(detail="capsule declares no readable interface MLIR")
-    return profile_path(iface, target)
+    return profile_path(iface, target, capability_contract=capability_contract)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -531,7 +541,65 @@ def required_boundaries(captures: dict, target: str) -> dict:
     }
 
 
-def host_lane_coverage(spec_doc: dict, corpus_roots, *, labels=None, exclude=None) -> dict:
+def host_only_coverage(
+    spec_doc: dict, corpus_roots, *, labels=None, exclude=None, capability_contract: dict | None = None
+) -> dict:
+    """Require each non-admitted family to have its own all-host capsule."""
+    import yaml
+
+    from merlin.targetgen.conformance import _capsule_paths
+
+    families = (spec_doc.get("host_only") or {}).get("families")
+    if families is None:
+        return {
+            "status": "not_measured",
+            "detail": "this spec predates the negative-lane axis; regenerate it to derive the requirement",
+        }
+    if not families:
+        return {
+            "status": "undeterminable",
+            "families": [],
+            "detail": "every family this target's captures contain is admitted by its manifest, "
+            "so no negative lane is derivable here. NOT the same as a negative lane that passed",
+        }
+    want = set(families)
+    covered_by: dict[str, list[str]] = {}
+    roots = [corpus_roots] if isinstance(corpus_roots, (str, Path)) else list(corpus_roots)
+    labelset = set(labels or {"public"})
+    skip = set(exclude or ())
+    target = str(spec_doc.get("target") or "")
+    for root in roots:
+        for cy in _capsule_paths(root):
+            try:
+                cap = yaml.safe_load(cy.read_text(encoding="utf-8")) or {}
+            except yaml.YAMLError:
+                continue
+            name = str(cap.get("name") or cy.parent.name)
+            if name in skip or str(cap.get("label")) not in labelset:
+                continue
+            family = str((cap.get("semantic") or {}).get("semantic_family") or "")
+            if family not in want:
+                continue
+            profile = profile_capsule(cy.parent, target, capability_contract=capability_contract)
+            if profile.kind == HOST_ONLY:
+                covered_by.setdefault(family, []).append(name)
+    return {
+        "status": "ok",
+        "families": sorted(want),
+        "n_required": len(want),
+        "n_covered": len(covered_by),
+        "uncovered": sorted(want - set(covered_by)),
+        "covered_by": {key: sorted(value) for key, value in sorted(covered_by.items())},
+        "note": (
+            "a family the hardware does not admit, shown landing on the host lane by a capsule "
+            "whose OWN family is that one -- not merely by a capsule that contains a host stretch"
+        ),
+    }
+
+
+def host_lane_coverage(
+    spec_doc: dict, corpus_roots, *, labels=None, exclude=None, capability_contract: dict | None = None
+) -> dict:
     """Does the corpus EVIDENCE the negative lane the spec derives — ``host_lane.required``?
 
     The cell vocabulary is ``admitted INTERSECT observed``, so by construction it can never contain a
@@ -577,8 +645,10 @@ def host_lane_coverage(spec_doc: dict, corpus_roots, *, labels=None, exclude=Non
     incidental: dict[str, list[str]] = {}
     entry_tensor: dict[str, list[str]] = {}
     unread: dict[str, str] = {}
+    from merlin.targetgen.conformance import _capsule_paths
+
     for root in roots:
-        for cy in sorted(Path(root).glob("*/capsule.yaml")):
+        for cy in _capsule_paths(root):
             try:
                 cap = yaml.safe_load(cy.read_text(encoding="utf-8")) or {}
             except yaml.YAMLError:
@@ -601,14 +671,23 @@ def host_lane_coverage(spec_doc: dict, corpus_roots, *, labels=None, exclude=Non
             # because its operands are not its entry tensor; a single-region capsule does not, and for
             # one the entry tensor IS the operand.
             declared = str(((cap.get("operation") or {}).get("attributes") or {}).get("dtype") or "")
-            prof = profile_capsule(cy.parent, target)
+            matching = []
+            for pair in sorted(pairs):
+                if declared and declared != pair[1]:
+                    entry_tensor.setdefault(f"{pair[0]}/{pair[1]}", []).append(name)
+                else:
+                    matching.append(pair)
+            # An entry tensor of a different dtype is not compute work in this pair. Avoid
+            # profiling its unrelated mixed-model boundary, whose unresolved result would
+            # otherwise turn a complete host-lane axis into an unreadable one.
+            if not matching:
+                continue
+            prof = profile_capsule(cy.parent, target, capability_contract=capability_contract)
             if prof.kind == UNKNOWN:
                 unread[name] = prof.detail
-            for pair in sorted(pairs):
+            for pair in matching:
                 key = f"{pair[0]}/{pair[1]}"
-                if declared and declared != pair[1]:
-                    entry_tensor.setdefault(key, []).append(name)
-                elif prof.kind == HOST_ONLY:
+                if prof.kind == HOST_ONLY:
                     covered.setdefault(key, []).append(name)
                 elif HOST_ONLY in (prof.contains or ()):
                     incidental.setdefault(key, []).append(name)

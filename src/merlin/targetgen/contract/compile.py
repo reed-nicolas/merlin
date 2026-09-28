@@ -19,6 +19,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
+from .harness_blobs import stage_harness_blobs
+
 
 def llvm_mlir_to_object(lowered_mlir_text: str, workdir: Path, *, target: str | None = None,
                         _build_service=None) -> Path:
@@ -274,6 +276,11 @@ def link_elf(cb: dict[str, Any], obj: Path, workdir: Path, *, target: str,
         from merlin.runtime.backends import base as _backends
         recipe = _backends.harness_build_recipe(target)
         _render = _backends.harness_renderer(target)
+    # An opt-in renderer may return large constant operands as exact bytes.
+    # The target still decides the tensor layout; the runner owns sidecar
+    # filenames, assembly and linking for every target in the same way.
+    blob_payloads: dict = {}
+    blob_kwargs = {"blobs": blob_payloads} if _accepts_keyword(_render, "blobs") else {}
     # ``inputs`` INJECTS the caller's real operands into the device harness. A renderer written before
     # this parameter existed still works and still materializes from names -- but silently doing that
     # while the reference and simulator use injected data produces a guaranteed three-way mismatch that
@@ -292,7 +299,7 @@ def link_elf(cb: dict[str, Any], obj: Path, workdir: Path, *, target: str,
                 raise NotImplementedError(
                     "backend compact harness cannot consume a strict warm profile")
             kwargs["warm_profile"] = warm_profile
-        harness = _render(cb, **kwargs)
+        harness = _render(cb, **kwargs, **blob_kwargs)
     else:
         _explicit_prepack_inputs(inputs, prepack_authorizations)
     if _compact_caller is None and prepack_authorizations is None and _build_service is None:
@@ -316,15 +323,16 @@ def link_elf(cb: dict[str, Any], obj: Path, workdir: Path, *, target: str,
             if not _accepts_keyword(_render, "warm_profile"):
                 raise NotImplementedError("backend harness cannot consume a strict warm profile")
             kwargs["warm_profile"] = warm_profile
-        harness = _render(cb, **kwargs)
+        harness = _render(cb, **kwargs, **blob_kwargs)
     else:
         kwargs = {"target": target}
         if warm_profile is not None:
             if not _accepts_keyword(_render, "warm_profile"):
                 raise NotImplementedError("backend harness cannot consume a strict warm profile")
             kwargs["warm_profile"] = warm_profile
-        harness = _render(cb, **kwargs)
+        harness = _render(cb, **kwargs, **blob_kwargs)
     (workdir / "harness.c").write_text(harness, encoding="utf-8")
+    blob_sources = stage_harness_blobs(workdir, blob_payloads)
     # Linker load address DERIVED from the RTL memory map (platform DRAM base), reusing the curated
     # script's proven section layout but replacing its BAKED origin — so the base is a HW fact, not a
     # hardcoded literal in a vendored file.
@@ -342,7 +350,7 @@ def link_elf(cb: dict[str, Any], obj: Path, workdir: Path, *, target: str,
     # so reordering could move code and change cycles. This build changes how each object is NAMED,
     # nothing about which objects are linked or in what order.
     objects: list[Path] = []
-    for source in [workdir / "harness.c", obj, *recipe.support_sources]:
+    for source in [workdir / "harness.c", obj, *blob_sources, *recipe.support_sources]:
         source = Path(source)
         # Assembly counts: the driver assembles a .S through the same temp-named intermediate that
         # a .c goes through, so leaving crt.S to the link step reintroduced the very STT_FILE symbol
@@ -351,8 +359,16 @@ def link_elf(cb: dict[str, Any], obj: Path, workdir: Path, *, target: str,
             objects.append(source)
             continue
         unit = workdir / f"{source.stem}.o"
-        step = subprocess.run(recipe.compile_command(source=source, output=unit),
-                              capture_output=True, text=True)
+        # `.incbin` names the staged payload by basename; assemble only these
+        # generated stubs from their own directory, leaving existing build
+        # command lines and support-source compilation unchanged.
+        if source in blob_sources:
+            command = recipe.compile_command(source=source.resolve(), output=unit.resolve())
+            compile_cwd = workdir.resolve()
+        else:
+            command = recipe.compile_command(source=source, output=unit)
+            compile_cwd = None
+        step = subprocess.run(command, cwd=compile_cwd, capture_output=True, text=True)
         if step.returncode != 0:
             raise recipe.error_cls(f"compile of {source.name} failed:\n{step.stderr[-2000:]}")
         objects.append(unit)

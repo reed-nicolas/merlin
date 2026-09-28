@@ -11,6 +11,21 @@ import yaml
 from merlin.targetgen import capsule_source as source
 
 
+def test_weight_reference_portability_is_one_exact_declared_edit(tmp_path):
+    weight = str(tmp_path / "weights.safetensors")
+    mlir = f'builtin.module attributes {{prov.weights_file = "{weight}", prov.level = "linalg"}} {{}}'
+    relocated, relocation = source._portable_weights_reference(mlir, weight, sidecar=True)
+    assert relocated == mlir.replace(weight, "capsule.weights.safetensors")
+    assert relocation["kind"] == "weights_reference_relocation" and relocation["edit_count"] == 1
+    omitted, omission = source._portable_weights_reference(mlir, weight, sidecar=False)
+    assert omitted == 'builtin.module attributes {prov.level = "linalg"} {}'
+    assert omission["kind"] == "weights_reference_omission" and omission["edit_count"] == 1
+    with pytest.raises(source.M2MUnavailable, match="selected weights"):
+        source._portable_weights_reference(mlir, str(tmp_path / "other.safetensors"), sidecar=True)
+    with pytest.raises(source.M2MUnavailable, match="multiple weights-file references"):
+        source._portable_weights_reference(mlir + mlir, weight, sidecar=True)
+
+
 @pytest.fixture
 def capture(tmp_path, monkeypatch):
     loader = tmp_path / "loader.py"

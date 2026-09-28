@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from .spec import SpecError
@@ -38,10 +39,51 @@ def lineage(run_dir: Path) -> dict:
     plan = _read_json(Path(record["run_dir"]) / "resolved-plan.json")
     pins = plan.get("inputs", {})
 
+    def phase0_descriptor_snapshot(path: str, pin: dict) -> dict | None:
+        """Recognize the evidence copy of a pinned descriptor by its actual bytes."""
+        digest = pin.get("sha256")
+        if not isinstance(digest, str):
+            return None
+        phase0 = Path(record["run_dir"]) / "phase0"
+        software = phase0 / "software"
+        snapshots = software / "source-snapshots"
+        selected_path = Path(path)
+        manifest_path = phase0 / "evidence-manifest.json"
+        if selected_path.parent != snapshots:
+            return None
+        try:
+            if any(member.is_symlink() for member in (phase0, software, snapshots, selected_path, manifest_path)):
+                return None
+            if not selected_path.is_file() or not manifest_path.is_file():
+                return None
+            manifest = _read_json(manifest_path)
+            sources = manifest.get("sources") if isinstance(manifest, dict) else None
+            if not isinstance(sources, list):
+                return None
+            relative = f"software/source-snapshots/{selected_path.name}"
+            if not any(
+                isinstance(source, dict)
+                and source.get("role") == "descriptor"
+                and source.get("path") == relative
+                and source.get("sha256") == digest
+                for source in sources
+            ):
+                return None
+            with selected_path.open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+                    return None
+        except (OSError, SpecError, TypeError, ValueError):
+            return None
+        return {"path": path, "sha256": digest, "identity": "frozen_equivalent_snapshot"}
+
     def selected(name: str, path: str) -> dict:
         pin = pins.get(name)
         if isinstance(pin, dict) and pin.get("path") == path and isinstance(pin.get("sha256"), str):
             return {"path": path, "sha256": pin["sha256"], "identity": "frozen_input"}
+        if name == "phase0:descriptor" and isinstance(pin, dict):
+            snapshot = phase0_descriptor_snapshot(path, pin)
+            if snapshot is not None:
+                return snapshot
         return {"path": path, "sha256": None, "identity": "historical_unverified"}
 
     phases = {}
@@ -93,6 +135,17 @@ def lineage(run_dir: Path) -> dict:
             },
         }
     definition = plan.get("definition")
+    definition_pin = pins.get("definition")
+    if isinstance(definition_pin, dict) and isinstance(definition_pin.get("path"), str):
+        # Fresh Phase 0 freezes the authored definition under its own input
+        # snapshot. The plan's `definition` field remains the original source
+        # location for navigation; comparing that mutable path to the frozen
+        # pin incorrectly labels a new run as historical/unverified.
+        definition_record = selected("definition", definition_pin["path"])
+        if definition != definition_pin["path"]:
+            definition_record["source_path"] = definition
+    else:
+        definition_record = selected("definition", definition) if definition is not None else None
     return {
         "scope": "frozen_orchestration_lineage",
         "run_dir": record["run_dir"],
@@ -100,7 +153,7 @@ def lineage(run_dir: Path) -> dict:
         "target": record["target"],
         "state": record["state"],
         "frozen_at": plan.get("frozen_at"),
-        "definition": selected("definition", definition) if definition is not None else None,
+        "definition": definition_record,
         "phases": phases,
         "evidence_authority": record["evidence_authority"],
         "qualification": "not_assessed_by_lineage",

@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -233,6 +234,27 @@ class EvidenceSelection:
     def raw_facts_sha256(self) -> str | None:
         return _digest(self.raw_facts) if self.raw_facts is not None else None
 
+    @property
+    def derivation_identity(self) -> dict[str, str | None]:
+        """Capability inputs that corpus derivation and capsule writing must share.
+
+        Support paths are relative to their selected package so an installed copy
+        with identical bytes has the same identity. Readout facets bind the
+        effective provider semantics, not just the target contract or raw RTL.
+        """
+        support = [source for source in self.source_snapshots if source.role == "support-source"]
+        root = Path(os.path.commonpath([str(source.path.absolute().parent) for source in support])) if support else None
+        support_rows = [
+            {"path": str(source.path.absolute().relative_to(root)), "sha256": source.sha256}
+            for source in support
+        ]
+        return {
+            "contract_sha256": _digest(_json(self.contract)),
+            "raw_facts_sha256": self.raw_facts_sha256,
+            "readout_facets_sha256": _canonical_digest(self.readout_facets),
+            "support_sources_sha256": _canonical_digest(sorted(support_rows, key=lambda row: row["path"])),
+        }
+
     def __getattr__(self, name: str) -> Any:
         # Every consumer receives a fresh value. The authoritative views are
         # immutable serialized bytes, not mutable objects shared with callers.
@@ -264,7 +286,7 @@ def select_evidence(
     from merlin.targetgen.rtl import facts as rtl_facts
 
     sources: dict[Path, EvidenceSource] = {}
-    diagnostics: list[dict[str, str]] = []
+    diagnostics: list[dict[str, Any]] = []
     excluded = {".git", "__pycache__", "build", ".venv"}
     extensions = {".py", ".json", ".yaml", ".yml", ".h", ".hpp", ".cpp", ".c", ".inc", ".S"}
 
@@ -591,6 +613,24 @@ def select_evidence(
         readout_inputs = readout_facet.capture_inputs(target, facts=refreshed_facts, include_taxonomy=False)
     readout_inputs["taxonomy"] = taxonomy
     facets = readout_facet.for_target(target, contract=contract, facts=refreshed_facts, readout_inputs=readout_inputs)
+    # The selected contract's scale claim must agree with the selected RTL
+    # readout. Keep a mismatch diagnostic: narrowing a declaration or certifying
+    # the software semantics requires its own reviewed input and fresh run.
+    units = [unit for unit in contract.get("compute_units") or () if isinstance(unit, Mapping)]
+    selected_facets = facets if units else []
+    for unit, facet in zip(units, selected_facets, strict=True):
+        for finding in readout_facet.reconcile(unit, facet):
+            diagnostics.append(
+                {
+                    "component": "readout-scaling",
+                    "status": "contradiction" if finding["kind"] == "scaling_exceeds_readout" else "unknown",
+                    "reason": finding["why"],
+                    "finding": finding,
+                    "contract_sha256": _canonical_digest(contract),
+                    "raw_facts_sha256": _digest(raw_facts) if raw_facts is not None else None,
+                    "readout_facet_sha256": _canonical_digest(facet.to_dict()),
+                }
+            )
     from merlin.targetgen.quant_recipe import derive_candidates
 
     quantization_candidates = [candidate.to_dict() for candidate in derive_candidates(contract, facets)]
@@ -823,7 +863,8 @@ def _coverage_readme(accounting: dict, quantization: dict) -> bytes:
         "",
         "## Independent host and accelerator support",
         "",
-        "These reviewed declaration screens are independent; neither implies actual dispatch or execution.",
+        "These declaration screens are independent; unreviewed inputs remain unknown.",
+        "Neither screen implies actual dispatch or execution.",
         "A host placement request without a matching pinned host capability remains unknown.",
         "",
         "| Support partition | Operations |",

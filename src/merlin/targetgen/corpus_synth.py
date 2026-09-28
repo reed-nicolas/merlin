@@ -473,6 +473,12 @@ def _tile_int(token, tile: int):
         return None
     if text == "tile":
         return int(tile)
+    if text.startswith("tile/"):
+        try:
+            divisor = int(text.partition("/")[2])
+            return tile // divisor if divisor > 0 and tile % divisor == 0 else None
+        except ValueError:
+            return None
     mult, sep, rest = text.partition("*tile")
     if sep and not rest:
         try:
@@ -527,12 +533,15 @@ def cap_to_affordable(entry: dict, spec_doc: dict, *, extends: str = "") -> str 
     elements = dims["M"] * dims["N"]
     if elements <= int(ceiling):
         return None
-    # THE LOOP TIER IS WHATEVER THIS TARGET HAS, not the name "L2". A target declaring `[L3]` alone has
-    # no cheaper tier to fall back to, and capping onto one it does not declare is refused downstream --
-    # correctly, because "a cap onto a tier that does not exist would silently leave the capsule
-    # demanding everything". Where there is no cheaper tier the honest outcome is to leave the tier
-    # alone and say the capsule is unaffordable, not to invent a tier for it.
-    tiers = [str(t) for t in (spec_doc.get("oracle_tiers") or ())]
+    # Constructed tiers are authoritative. During deterministic Phase 0
+    # derivation no oracle is constructed yet, but the selected recipe still
+    # declares which tiers MAY be used. That declaration can size a candidate;
+    # Phase 1 must establish actual availability before treating a pass as
+    # verified. Never invent a cheaper tier on a target declaring only one.
+    observed = list(spec_doc.get("oracle_tiers") or ())
+    declared = list(spec_doc.get("oracle_tiers_declared") or ())
+    source = "constructed" if observed else "declared"
+    tiers = [str(t) for t in (observed or declared) if str(t) not in ("L0", "L1")]
     loop_tier = tiers[0] if len(tiers) > 1 else None
     if loop_tier is None:
         return (
@@ -551,13 +560,14 @@ def cap_to_affordable(entry: dict, spec_doc: dict, *, extends: str = "") -> str 
     # years apart cannot tell a corpus that got more expensive from a corpus priced on a faster
     # machine -- which is exactly what the mixed fit this ceiling used to come from was hiding.
     on = f" on {aff['engine']}" if aff.get("engine") else ""
+    tier_note = " (declared in the selected recipe; execution must verify availability)" if source == "declared" else ""
     return (
         f"{elements} written output elements exceeds the {int(ceiling)} a {aff.get('budget_s')}s "
-        f"certification budget affords{on} on this target, so it is graded at {loop_tier} and "
+        f"certification budget affords{on} on this target, so it is graded at {loop_tier}{tier_note} and "
         f"rests on {extends!r}"
         if extends
         else f"{elements} written output elements exceeds the {int(ceiling)} a {aff.get('budget_s')}s "
-        f"certification budget affords{on} on this target, so it is graded at {loop_tier}"
+        f"certification budget affords{on} on this target, so it is graded at {loop_tier}{tier_note}"
     )
 
 
@@ -693,11 +703,12 @@ def filtered_precision(preference: list[str], admitted: set[str]) -> tuple[list[
 def _exceeds_tile(token: str, tile: int) -> bool:
     """Does this extent token resolve to more than one tile edge?
 
-    ``2*tile`` and friends exceed the edge by construction; a resolved integer is compared directly.
-    A token that names no multiple and is not a plain integer (``tile``, ``tile-1``, ``tile/4``) is at
-    or below the edge, so it answers False without guessing an extent.
+    Resolve any supported multiplier, not just the first few common spellings:
+    a capacity-derived boundary may need ``65*tile``. Unknown tokens remain
+    non-evidence rather than being guessed larger than the edge.
     """
-    return token.startswith(("2*", "4*", "8*")) or (token.isdigit() and bool(tile) and int(token) > tile)
+    resolved = _tile_int(token, tile) if tile else None
+    return resolved is not None and resolved > tile
 
 
 def pass_requirements_for(entry: dict, spec_doc: dict) -> list[str]:
@@ -789,7 +800,9 @@ def _mark_source(entry: dict) -> None:
         entry["source"] = "pytorch"
 
 
-def _exact_int_mm_group_candidates(group: dict, entries: list[dict], inventory_digest: str | None) -> list[str]:
+def _exact_int_mm_group_candidates(
+    group: dict, entries: list[dict], inventory_digest: str | None, application_order: tuple[str, ...]
+) -> list[str]:
     """Name candidates only when every source occurrence has one digest-bound exact signature.
 
     Compact operation groups lose the individual tensor ABI. The entries retain each full sidecar
@@ -807,20 +820,24 @@ def _exact_int_mm_group_candidates(group: dict, entries: list[dict], inventory_d
         source_rows = raw_sources
     else:
         return []
-    expected: dict[tuple[str, str], int] = {}
+    source_index = {name: index for index, name in enumerate(application_order)}
+    expected: dict[tuple[int, str], int] = {}
     for source in source_rows:
         if not isinstance(source, dict):
             return []
-        key = (str(source.get("application") or ""), str(source.get("capture_sha256") or ""))
+        index = source_index.get(str(source.get("application") or ""))
+        if index is None:
+            return []
+        key = (index, str(source.get("capture_sha256") or ""))
         count = source.get("count")
-        if not all(key) or type(count) is not int or count < 1 or key in expected:
+        if not key[1] or type(count) is not int or count < 1 or key in expected:
             return []
         expected[key] = count
     if not expected or sum(expected.values()) != group.get("count"):
         return []
 
-    actual: dict[tuple[str, str], int] = {}
-    ordinals: dict[tuple[str, str], set[int]] = {}
+    actual: dict[tuple[int, str], int] = {}
+    ordinals: dict[tuple[int, str], set[int]] = {}
     names: list[str] = []
     for entry in entries:
         match = entry.get("application_signature_match") or {}
@@ -836,7 +853,10 @@ def _exact_int_mm_group_candidates(group: dict, entries: list[dict], inventory_d
             return []
         names.append(str(entry["name"]))
         for source in match["sources"]:
-            key = (str(source.get("application") or ""), str(source.get("capture_sha256") or ""))
+            index = source.get("source_index")
+            if type(index) is not int:
+                return []
+            key = (index, str(source.get("capture_sha256") or ""))
             count = source.get("count")
             indexes = source.get("ordinals")
             signature = source.get("signature_sha256")
@@ -944,7 +964,12 @@ def _application_operation_plan(demands: dict | None, *, exact_entries: list[dic
         if disposition == "hardware_admitted":
             row["lane"] = "accelerator"
             exact_candidates = (
-                _exact_int_mm_group_candidates(group, exact_entries, demands.get("full_inventory_sha256"))
+                _exact_int_mm_group_candidates(
+                    group,
+                    exact_entries,
+                    demands.get("full_inventory_sha256"),
+                    tuple(sorted((demands.get("applications") or {}).keys())),
+                )
                 if (
                     operation == "aten._int_mm.default"
                     and mlir_operation == "linalg.generic"
@@ -1098,7 +1123,7 @@ def exact_int_mm_entries(demands: dict | None, inventory: dict | None) -> tuple[
     # full-model quantization workflows that happen to have the same integer tensor ABI.
     by_geometry: dict[tuple[str, int, int, int], list[dict]] = {}
     refused: list[dict] = []
-    for label, app in sorted(inventory["applications"].items()):
+    for source_index, (label, app) in enumerate(sorted(inventory["applications"].items())):
         declared = compact_apps[label]
         if any(
             app.get(key) != declared.get(key)
@@ -1119,7 +1144,9 @@ def exact_int_mm_entries(demands: dict | None, inventory: dict | None) -> tuple[
             if row.get("operation") != "aten._int_mm.default" or row.get("mlir_operation") != "linalg.generic":
                 continue
             source = {
-                "application": label,
+                # The exact private inventory keeps the source name. Public capsules use its
+                # deterministic roster ordinal and capture hash, never a claim-model name.
+                "source_index": source_index,
                 "capture_sha256": app["capture_sha256"],
                 "signature_sha256": hashlib.sha256(
                     json.dumps(
@@ -1204,7 +1231,7 @@ def exact_int_mm_entries(demands: dict | None, inventory: dict | None) -> tuple[
             "source_reference": (
                 f"exact normalized application aten._int_mm.default i8×i8→i32, {m}×{k}×{n}; "
                 f"{sum(s['count'] for s in sources)} occurrence(s) in "
-                + ", ".join(sorted({s["application"] for s in sources}))
+                f"{len({s['source_index'] for s in sources})} selected capture(s)"
             ),
             "label": "public",
             "generalization": {"generalization_axis": "application_operation"},
@@ -1238,6 +1265,15 @@ def synthesize(
     cells = list(spec_doc.get("cells") or ())
     probes = list((spec_doc.get("boundaries") or {}).get("extent_probes") or ())
     ws = dict(workload_spec or {})
+    # A literal-name check misses ordinary aliases such as Tiny-Llama/tiny_llama.
+    # This is an admission guard, not an anonymizer: held-out claim workloads
+    # cannot become the source of the public derivation corpus in a verified run.
+    if isinstance(application_inventory, dict) and isinstance(application_inventory.get("applications"), dict):
+        roster_key = lambda name: "".join(ch for ch in str(name).casefold() if ch.isalnum())  # noqa: E731
+        claims = {roster_key(name) for name in (ws.get("models") or ())}
+        captures = {roster_key(name) for name in application_inventory["applications"]}
+        if (claims - {""}) & (captures - {""}):
+            raise SynthesisError("held-out claim model appears in the selected public derivation inventory")
     pool = available_ops()
     exact_entries, exact_refused = exact_int_mm_entries(spec_doc.get("application_demands"), application_inventory)
 
@@ -1408,6 +1444,54 @@ def synthesize(
             entry["source_reference"] += f". {_why}"
         entry["pass_requirements"] = pass_requirements_for(entry, spec_doc)
         entries.append(entry)
+
+    # ---- the ACCUMULATOR-OUTPUT boundary ----------------------------------------------------------
+    # Input residency and K depth do not bound the number of output tiles a
+    # backend keeps live. Derive the first output shape beyond one addressable
+    # accumulator buffer from RTL facts, without importing a held-out model's
+    # shape or baking a target's row count into shared code.
+    output_bound = spec_doc.get("accumulator_output_boundary") or {}
+    output_bound_refusal = ""
+    if output_bound.get("status") == "resolved":
+        output_dtype = regime_dtype
+        output_op = (
+            op_for_family("contraction", admitted_ops=ops_gradeable_at(output_dtype, pool), dtype=output_dtype)
+            if output_dtype
+            else None
+        )
+        sibling = f"{SYNTH_PREFIX}_contraction_{output_dtype}_aligned"
+        if not output_op or sibling not in {str(e.get("name")) for e in entries}:
+            output_bound_refusal = f"no gradeable contraction and certified sibling at {output_dtype!r}"
+        else:
+            n_tiles = int(output_bound["N_tiles"])
+            entry = {
+                "cat": "isa",
+                "kind": "isa",
+                "name": f"{SYNTH_PREFIX}_accumulator_output_boundary",
+                "op": output_op,
+                "operand_dtype": output_dtype,
+                "lhs": "A0",
+                "weight": "W",
+                "out": "Y0",
+                "M": f"tile/{int(output_bound['tile_edge'])}",
+                "K": "tile",
+                "N": f"{n_tiles}*tile",
+                "source_role": SOURCE_ROLE,
+                "source_reference": (
+                    "synthesized for the accumulator-output boundary: the RTL-derived addressable "
+                    f"store has {output_bound['capacity_rows']} rows, while one output row by {n_tiles} "
+                    f"N tiles requires {output_bound['output_rows_if_resident']} simultaneously "
+                    "resident output rows. A streaming schedule may pass; a full-output-resident "
+                    "schedule must not address beyond the store"
+                ),
+                "label": "public",
+                "generalization": {"generalization_axis": "accumulator_output_capacity"},
+            }
+            why = cap_to_affordable(entry, spec_doc, extends=sibling)
+            if why:
+                entry["source_reference"] += f". {why}"
+            entry["pass_requirements"] = pass_requirements_for(entry, spec_doc)
+            entries.append(entry)
 
     # ---- the NEGATIVE lane ------------------------------------------------------------------------
     # Families a real capture CONTAINS and this target's manifest does NOT admit. The compiler must leave
@@ -1698,7 +1782,7 @@ def synthesize(
             "source_role": SOURCE_ROLE,
             "source_reference": (
                 f"synthesized for the epilogue axis: this target can fuse a {stage!r} stage onto a "
-                f"contraction (evidenced by {_st.get('evidenced_by')}), and a (family, dtype, "
+                "contraction (evidenced by the derived requirement), and a (family, dtype, "
                 f"alignment) cell cannot demand a particular stage -- so without this the capability is "
                 f"reported covered by whichever single stage the cell axis happened to pick"
             ),
@@ -1753,8 +1837,8 @@ def synthesize(
             **({"acc_scale": SYNTH_ACC_SCALE} if "acc_scale" in stages else {}),
             "source_role": SOURCE_ROLE,
             "source_reference": (
-                f"synthesized for the group axis: the captured models {_group.get('observed_in')} "
-                f"form {_group.get('groups')} compute group(s) with this stage combination on this "
+                f"synthesized for the group axis: selected captures form {_group.get('groups')} "
+                "compute group(s) with this stage combination on this "
                 f"target, and no per-stage member demands a combination"
             ),
             "label": "public",
@@ -1795,7 +1879,7 @@ def synthesize(
             "source_role": SOURCE_ROLE,
             "source_reference": (
                 f"synthesized for the carried-state axis: {stage!r} is configuration a unit stays in "
-                f"(evidenced by {_carried.get('evidenced_by')}), so the command after it, which does "
+                "(evidenced by the derived requirement), so the command after it, which does "
                 f"not ask for it, is where a backend that does not restore its configuration shows"
             ),
             "label": "public",
@@ -1880,7 +1964,7 @@ def synthesize(
             "source_role": SOURCE_ROLE,
             "source_reference": (
                 f"synthesized for the convolution-window axis: window {sig}, recovered structurally "
-                f"from {_cw.get('n_regions')} region(s) of {_cw.get('sources')}. torch-mlir emits "
+                f"from {_cw.get('n_regions')} region(s) in selected captures. torch-mlir emits "
                 f"im2col, so a captured convolution carries no padding/stride/dilation attribute at "
                 f"all and the geometry comes from the gather's affine map and its padding producer"
                 + (
@@ -2373,6 +2457,8 @@ def synthesize(
                 "this'"
             ),
             "memory_regimes_status": "resolved" if regimes_resolved else "not_resolved",
+            "accumulator_output_boundary": output_bound,
+            "accumulator_output_boundary_refusal": output_bound_refusal,
             "memory_regimes_unreachable": unreachable_regimes,
             "memory_regime_note": (
                 "the spec carries no `regime_extents`; it predates the axis and must be regenerated "

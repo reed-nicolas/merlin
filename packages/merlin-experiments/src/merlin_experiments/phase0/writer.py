@@ -53,17 +53,33 @@ def _integer_reference_bound(entry: dict, cap: dict) -> dict:
         return {"status": "unknown", "reason": "no selected full-operation internal-width bound policy"}
     operation = cap["operation"]
     op, attrs = operation["op"], operation.get("attributes") or {}
-    if op not in {"matmul", "linear", "matmul_bias", "residual_seam", "conv2d"}:
+    if op not in {"matmul", "linear", "matmul_bias", "residual_seam", "conv2d", "scope_chain", "attention_qk"}:
         return {"status": "not_applicable", "reason": "this writer path is not a single integer contraction"}
+    if op == "scope_chain":
+        families = attrs.get("scope_families")
+        if (
+            not isinstance(families, list)
+            or len(families) < 3
+            or families[:2] != ["movement", "contraction"]
+            or any(family != "elementwise_map" for family in families[2:])
+        ):
+            raise ValueError("integer scope chain needs one selected contraction and only post-contraction maps")
     leaves = CG.materialize_capsule_leaves(cap)
 
     def name(role, declared):
         return attrs.get(declared) or next((row["name"] for row in cap["inputs"] if row.get("role") == role), None)
 
-    lhs_name, rhs_name = name("input", "ifm" if op == "conv2d" else "lhs"), name("weight", "weight")
+    if op == "attention_qk":
+        lhs_name, rhs_name = attrs.get("q"), attrs.get("k")
+    else:
+        lhs_name, rhs_name = name("input", "ifm" if op == "conv2d" else "lhs"), name("weight", "weight")
     if lhs_name not in leaves or rhs_name not in leaves:
         raise ValueError("integer contraction bound requires concrete lhs and weight operands")
     lhs, rhs = leaves[lhs_name], leaves[rhs_name]
+    if op == "attention_qk" and rhs.shape[-1] != lhs.shape[-1]:
+        raise ValueError("attention score reduction extents differ between query and key")
+    if op == "scope_chain" and rhs.shape[-1] != lhs.shape[-1]:
+        raise ValueError("integer scope chain reduction extents differ between lhs and transposed weight")
     reduction_extent = rhs.shape[0] if op == "conv2d" else lhs.shape[-1]
     initial = [int(value) for key, tensor in leaves.items() if key not in {lhs_name, rhs_name} for value in tensor.data]
     result = integer_partial_sum_bound(
@@ -428,23 +444,26 @@ def _roster_captures() -> dict:
     return out
 
 
-def _emit_micro_model_loader(entry: dict, target: str, out_root) -> bool:
+def _emit_micro_model_loader(entry: dict, target: str, out_root, *, capture_dtype: str | None = None) -> bool:
     """Write the derived micro model's loader into its capsule directory, or say why not.
 
-    `micro_model.spec` states what a target's minimal whole-model capsule must contain -- one layer per
-    admitted family, one per family real captures contain that the manifest does not admit, sized to the
-    target's own tile edge, host layers interleaved into the INTERIOR. `emit_pytorch` turns that into the
-    loader. Doing it here rather than in `corpus_synth` is deliberate: the spec needs the captures, which
-    is I/O, and the synthesizer is pure.
+    `micro_model.spec` selects operations whose standalone placement is supported by the selected
+    hardware and software contracts, and puts the others on the host. The run passes its frozen capture
+    and software-spec snapshots, so the loader cannot drift with an ambient target file.
     """
     from merlin.targetgen import micro_model as MM
 
-    captures = _roster_captures()
+    # Derived-only execution passes exact run-owned snapshots. Pop the internal
+    # selector before the entry becomes a public capsule or provenance record.
+    captures = entry.pop("_frozen_application_captures", None)
+    software_spec = entry.pop("_frozen_software_spec", None)
+    if captures is None:
+        captures = _roster_captures()
     if not captures:
         print(f"  [skip] {entry['name']}: no captured model is available to derive the inventory from")
         return False
     try:
-        spec = MM.spec(target, captures)
+        spec = MM.spec(target, captures, software_spec=software_spec, capture_dtype=capture_dtype)
         src = MM.emit_pytorch(spec)
     except MM.UnwritableLayer as exc:
         print(f"  [skip] {entry['name']}: {exc}")
@@ -479,7 +498,9 @@ def _write_capsule_inner(entry, binding, out_root, facts_sha: str = ""):
             return None
         # A DERIVED micro model writes its own loader first. Without this the entry names a loader that
         # does not exist, and the capsule that the composition axis exists to produce cannot be built.
-        if entry.get("micro_model") and not _emit_micro_model_loader(entry, eb.target, out_root):
+        if entry.get("micro_model") and not _emit_micro_model_loader(
+            entry, eb.target, out_root, capture_dtype=entry.get("capture_dtype") or eb.operand_dtype
+        ):
             return None
         return CSRC.write_model_capsule(entry, eb, out_root, source=src)
     # PREFERRED source: a capsule defined in PyTorch (frontend-faithful), lowered to linalg via model2MLIR

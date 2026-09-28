@@ -17,6 +17,7 @@ numerical_semantics:
   readout:
     acc_scale_rounding: half_even
     narrowing: saturate_to_declared_dtype
+    # Portable host-side integer shift; not a Gemmini fused readout stage.
     requant_rounding: half_up
     hardware_integer_shift_rounding: rne
     shift: operation_parameter
@@ -34,7 +35,7 @@ operations:
     placement: fused_accelerator
     dtypes: [int8, i32]
     composed_with: [contraction]
-    epilogues: [bias, relu, acc_scale, requant]
+    epilogues: [bias, relu, acc_scale]
     scale_granularity: [tensor]
   movement:
     placement: accelerator

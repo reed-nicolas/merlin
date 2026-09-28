@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import shutil
 from pathlib import Path
@@ -9,6 +10,8 @@ from pathlib import Path
 import pytest
 import yaml
 from merlin_experiments import model_qualification as Q
+
+from merlin.targetgen.sandbox import preflight as PF
 
 
 def _bundle(root: Path):
@@ -61,6 +64,8 @@ def test_offline_process_boundary_preserves_interpreter_and_refuses_scope_upgrad
     if not all(shutil.which(tool) for tool in ("bwrap", "prlimit", "taskset")):
         pytest.skip("bounded local compiler tools are unavailable")
     monkeypatch.setenv("PYTHONPATH", ":".join(str(Path(path).absolute()) for path in __import__("sys").path if path))
+    monkeypatch.setenv("MERLIN_CHIPYARD", str(tmp_path / "selected-chipyard"))
+    monkeypatch.setenv("MERLIN_MESH_SIM", "spike")
     bundle, package = _bundle(tmp_path / "capture"), _package(tmp_path / "compiler")
     output = tmp_path / "qualification"
     result = Q.qualify(
@@ -75,6 +80,18 @@ def test_offline_process_boundary_preserves_interpreter_and_refuses_scope_upgrad
     )
     assert result["status"] == "completed"
     statuses = {row["entrypoint"]: row["status"] for row in result["observations"]["compiler_observations"]}
+    if not PF.probe_sandbox(network_isolation=True).usable:
+        assert statuses == {name: "unavailable" for name in (
+            "parse", "lower_interface_to_target", "emit_command_buffer", "lower_target_to_llvm"
+        )}
+        assert all(
+            "sandbox inoperable" in row["reason"]
+            for row in result["observations"]["compiler_observations"]
+        )
+        assert result["observations"]["model_routes"][0]["status"] == "unresolved"
+        assert result["observations"]["runtime"]["target_executed"] is False
+        assert result["whole_workload_validation_verified"] is False
+        return
     assert statuses == {
         "parse": "accepted",
         "lower_interface_to_target": "unchanged",
@@ -94,12 +111,60 @@ def test_offline_process_boundary_preserves_interpreter_and_refuses_scope_upgrad
     assert result["observations"]["native_lowerings"][0]["status"] == "failed"
     assert result["observations"]["workflow"]["application_validation_blockers"]
     assert result["observations"]["runtime"]["target_executed"] is False
+    assert result["request"]["tool_environment"]["MERLIN_CHIPYARD"] == str(tmp_path / "selected-chipyard")
+    assert result["request"]["tool_environment"]["MERLIN_MESH_SIM"] == "spike"
+    assert result["request"]["certification_output_root"] is None
+    assert (output / "worker-tmp").is_dir()
     assert json.loads((output / "qualification.json").read_bytes()) == result
     assert (output / "README.md").is_file()
     assert (output / "qualification.json").stat().st_mode & 0o222 == 0
     assert output.stat().st_mode & 0o222 == 0
     with pytest.raises(ValueError, match="fresh"):
         Q.qualify(bundle=bundle, package=package, target="fixture", output=output)
+
+
+def test_compiler_preflight_requires_the_same_network_isolation_as_its_launch(tmp_path, monkeypatch):
+    bundle, package = _bundle(tmp_path / "capture"), _package(tmp_path / "compiler")
+    from merlin.targetgen.package_runtime import load_package
+
+    seen = []
+
+    def refuse(_binary=None, **kwargs):
+        seen.append(kwargs)
+        raise PF.SandboxUnavailable(
+            PF.SandboxProbe(status=PF.SANDBOX_INOPERABLE, reason="netns_denied"),
+            kwargs.get("context", ""),
+        )
+
+    monkeypatch.setattr(PF, "require_working_sandbox", refuse)
+    with pytest.raises(PF.SandboxUnavailable, match="netns_denied"):
+        Q._compiler_check(load_package(package), bundle / "model.mlir", "parse", tmp_path, timeout=5)
+    assert seen and seen[0]["network_isolation"] is True
+
+
+def test_selected_certification_guards_source_but_allows_its_execution_copy(tmp_path):
+    selected = _package(tmp_path / "selected")
+    other = _package(tmp_path / "other")
+    active = contextvars.ContextVar("test_selected_certification", default=False)
+    called = []
+
+    def certify(source, *args, **kwargs):
+        copied = tmp_path / "compiler-execution-1" / "package"
+        copied.parent.mkdir()
+        shutil.copytree(source, copied)
+        assert active.get() is True
+        assert copied != selected
+        assert (copied / "manifest.yaml").read_bytes() == (selected / "manifest.yaml").read_bytes()
+        called.append((source, args, kwargs))
+        return {"status": "pass"}
+
+    checked = Q._selected_source_certifier(selected, certify, active)
+    with pytest.raises(ValueError, match="different compiler package"):
+        checked(other)
+    assert not called
+    assert checked(selected, "interface.mlir", target="fixture") == {"status": "pass"}
+    assert called == [(selected, ("interface.mlir",), {"target": "fixture"})]
+    assert active.get() is False
 
 
 def test_multi_program_roster_cannot_escape_or_become_one_forward(tmp_path):
@@ -186,6 +251,46 @@ def test_conditional_ssa_edge_becomes_transfer_only_after_reviewed_placements(mo
     summary, blockers = model_routes._ledger_observation(application, "exact")
     assert summary["conditional_ssa_edges"]["required_crossing"] == 1
     assert any("typed transfer lowering" in reason for reason in blockers)
+
+
+def test_support_lowering_does_not_become_a_host_lane_or_transfer_endpoint(monkeypatch):
+    from merlin_experiments.phase1 import model_routes
+
+    monkeypatch.setattr(model_routes, "_graph_totality", lambda *_: ({}, []))
+    monkeypatch.setattr(model_routes, "_source_complete", lambda *_: True)
+    application = {
+        "capture_sha256": "exact",
+        "capture_receipt": {"status": "verified_materialized", "source_closure_verified": True},
+        "n_mlir_operations": 2,
+        "completeness": {
+            "source_trace": {},
+            "operation_obligations": [
+                {
+                    "operation_ids": ["op:compute"],
+                    "role": "compute_placement",
+                    "status": "resolved",
+                    "precision": {"status": "resolved", "numerical_contracts": {"accelerator": {"status": "resolved"}}},
+                    "accelerator_admission": {"status": "admitted", "reviewed": True},
+                    "host_admission": {"status": "unsupported", "reviewed": True},
+                },
+                {
+                    "operation_ids": ["op:support"],
+                    "role": "support_lowering",
+                    "status": "resolved",
+                    "precision": {"status": "resolved"},
+                    "support_lowering_evidence": {"status": "not_available"},
+                },
+            ],
+            "graph_accounting": {"edges": [{"accounting": "support_dependency"}]},
+            "transfer_obligations": [],
+        },
+    }
+    summary, blockers = model_routes._ledger_observation(application, "exact")
+    assert summary["candidate_lanes"] == {"accelerator": 1}
+    assert summary["support_lowering"] == {"pending": 1, "support_dependencies": 1}
+    assert summary["conditional_ssa_edges"]["count"] == 0
+    assert any("support-lowering/shape" in reason for reason in blockers)
+    assert any("support-mediated" in reason for reason in blockers)
 
 
 def test_unobserved_oot_route_is_unresolved_not_a_compiler_decline():

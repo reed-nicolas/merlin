@@ -28,8 +28,12 @@ def sha(path: Path) -> str:
 def run_command(argv: list[str], *, timeout_s: int, cwd: Path | None = None) -> dict:
     result = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=timeout_s, check=False)
     if result.returncode:
-        tail = result.stderr[-1000:].decode("utf-8", errors="replace")
-        raise RuntimeError(f"tool exit {result.returncode}: {tail}")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        diagnostics = [
+            line.strip()[:500] for line in stderr.splitlines() if re.search(r"\b(?:error|fatal):", line, re.I)
+        ]
+        excerpt = "\n".join(diagnostics[:8]) if diagnostics else stderr[:1200]
+        raise RuntimeError(f"tool exit {result.returncode}: {excerpt} [stderr_bytes={len(result.stderr)}]")
     return {
         "argv": argv,
         "returncode": result.returncode,
@@ -75,6 +79,41 @@ def recorded_verilator_args(manifest: Path, *, original_binary: Path, original_m
     ):
         raise ValueError("recorded Verilator filelist is not the selected build filelist")
     return argv
+
+
+def relocate_hierarchy_annotations(original: Path, selected_dir: Path, artifact_dir: Path) -> tuple[Path, list[dict]]:
+    """Project only FIRTOOL's two output-only hierarchy paths into this artifact."""
+    rows = json.loads(original.read_text(encoding="utf-8"))
+    if not isinstance(rows, list):
+        raise ValueError("selected annotations are not a list")
+    destinations = {
+        "sifive.enterprise.firrtl.TestHarnessHierarchyAnnotation": "model_module_hierarchy.json",
+        "sifive.enterprise.firrtl.ModuleHierarchyAnnotation": "top_module_hierarchy.json",
+    }
+    moves = []
+    projected_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("selected annotation is not a mapping")
+        item = dict(row)
+        annotation_class = item.get("class")
+        if annotation_class in destinations:
+            filename = destinations[annotation_class]
+            before = str(selected_dir / filename)
+            if item.get("filename") != before:
+                raise ValueError(f"unexpected hierarchy output for {annotation_class}")
+            after = str(artifact_dir / filename)
+            item["filename"] = after
+            moves.append({"class": annotation_class, "from": before, "to": after})
+        elif "filename" in item:
+            raise ValueError(f"unreviewed annotation filename: {annotation_class}")
+        projected_rows.append(item)
+    if len(moves) != 2 or {move["class"] for move in moves} != set(destinations):
+        raise ValueError("selected annotations lack the exact two hierarchy output declarations")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    projected = artifact_dir / "annotations.json"
+    projected.write_text(json.dumps(projected_rows, indent=2) + "\n", encoding="utf-8")
+    return projected, moves
 
 
 def attest(
@@ -149,8 +188,20 @@ def attest(
     }
     output_root = ignored_output(output_root)
     lowering = (build / ".mfc_lowering_options").read_text(encoding="utf-8").strip()
+    # FIRTOOL's hierarchy export writes sidecars beside its input FIRRTL. The
+    # selected Chipyard source may be read-only; preserve it and export from
+    # an exact, hashed copy inside this new attestation artifact instead.
+    firtool_input = output_root / "firtool" / raw_firrtl.name
+    firtool_input.parent.mkdir(parents=True)
+    shutil.copyfile(raw_firrtl, firtool_input)
+    if sha(firtool_input) != raw_sha:
+        raise ValueError("FIRTOOL input copy differs from selected FIRRTL")
+    firtool_annotations, annotation_moves = relocate_hierarchy_annotations(
+        annotations, build, firtool_input.parent
+    )
+    projected_annotations_sha = sha(firtool_annotations)
     fresh_rtl = output_root / "firtool/gen-collateral"
-    fresh_rtl.parent.mkdir(parents=True)
+    fresh_rtl.parent.mkdir(parents=True, exist_ok=True)
     firtool_step = run_command(
         [
             str(firtool),
@@ -163,11 +214,11 @@ def attest(
             f"--lowering-options={lowering}",
             "--repl-seq-mem",
             f"--repl-seq-mem-file={output_root / 'firtool/mems.conf'}",
-            f"--annotation-file={annotations}",
+            f"--annotation-file={firtool_annotations}",
             "--split-verilog",
             "-o",
             str(fresh_rtl),
-            str(raw_firrtl),
+            str(firtool_input),
         ],
         timeout_s=FIRTOOL_TIMEOUT_S,
     )
@@ -209,7 +260,11 @@ def attest(
     )
     if sha(fresh_binary) != original_sha:
         raise ValueError("rebuilt Verilator executable differs from kernel-tested executable")
-    if any(sha(path) != digest for path, digest in stable_inputs.items()):
+    if (
+        sha(firtool_input) != raw_sha
+        or sha(firtool_annotations) != projected_annotations_sha
+        or any(sha(path) != digest for path, digest in stable_inputs.items())
+    ):
         raise ValueError("a selected build input changed during attestation")
     selected_tools = {
         "firtool": {"path": str(firtool), "sha256": sha(firtool)},
@@ -232,7 +287,14 @@ def attest(
         "attester_source_sha256": script_sha,
         "source_selection_sha256": sha(selection_path),
         "selected_firrtl_sha256": raw_sha,
+        "firtool_input_copy_sha256": sha(firtool_input),
         "annotations_sha256": sha(annotations),
+        "annotation_output_projection": {
+            "original_sha256": sha(annotations),
+            "projected_sha256": projected_annotations_sha,
+            "moves": annotation_moves,
+            "scope": "output-only hierarchy filenames; regenerated RTL, C++ model and binary must match exact bytes",
+        },
         "lowering_options_sha256": sha(build / ".mfc_lowering_options"),
         "verilator_input_manifest_sha256": sha(manifest),
         "verilator_filelist_sha256": sha(build / "sim_files.common.f"),

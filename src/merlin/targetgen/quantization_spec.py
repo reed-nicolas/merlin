@@ -178,8 +178,18 @@ def _parameters(
             # An authored unknown cannot make block geometry required after the
             # selected per-tensor/per-channel recipe proved it has no block axis.
             continue
-        if prior is not None and prior["status"] == "known" and not _unknown(value) and value != prior["value"]:
-            conflicts.append(f"{key}: authored value {value!r} differs from derived value {prior['value']!r}")
+        if prior is not None and prior["status"] == "known" and not _unknown(value):
+            authored, derived = value, prior["value"]
+            if key == "scale_encoding":
+                # A readout carrier and an authored SW declaration can spell the
+                # same registered numeric format differently (fp32 versus f32).
+                # Unknown/custom scale encodings retain exact comparison.
+                try:
+                    authored, derived = _dtype(authored), _dtype(derived)
+                except (KeyError, ValueError, TypeError):
+                    pass
+            if authored != derived:
+                conflicts.append(f"{key}: authored value {value!r} differs from derived value {prior['value']!r}")
         parameters[key] = _record(value, "authored quantization parameter")
     # The legacy shared granularity constrains both tensors. It is not a way to
     # silently request a finer weight scale than the selected readout can carry.
@@ -314,6 +324,10 @@ def capture_recipe_candidates(spec: Mapping, quantization_contract: Mapping) -> 
                 "status": spec["status"],
                 "operations": copy.deepcopy(rows),
             }
+            # This authored numerical choice determines which independent
+            # framework reference may judge the integer rewrite. Hardware
+            # facts derive the format, not the reference semantics.
+            recipe["software_numerical_engine"] = spec["numerical_semantics"]["model"]["engine"]
             framework = selected.get("framework") or {}
             unsupported = set(framework) - {"activation_observer", "weight_observer", "observer_epsilon"}
             if unsupported:

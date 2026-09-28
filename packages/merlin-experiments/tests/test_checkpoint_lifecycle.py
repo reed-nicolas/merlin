@@ -35,7 +35,9 @@ def lifecycle(tmp_path, monkeypatch):
     return build_lifecycle(tmp_path, monkeypatch)
 
 
-def build_lifecycle(tmp_path, monkeypatch, *, functional_run=None, target_name="fixture"):
+def build_lifecycle(
+    tmp_path, monkeypatch, *, functional_run=None, target_name="fixture", published_compiler_root=None
+):
     """Run the real checkpoint owner, optionally consuming a Phase-1 formal handoff."""
 
     def forbidden(*args, **kwargs):
@@ -231,6 +233,7 @@ def build_lifecycle(tmp_path, monkeypatch, *, functional_run=None, target_name="
         holdout_count=1,
         measurement_timeout=60,
         waive_functional_gsim_certificate=True,
+        published_compiler_root=published_compiler_root,
     )
     treatment = {"identity": "synthetic-external-agent"}
     contracts = {trial: {"trial": trial, "treatment_identity": treatment} for trial in AD.TRIALS}
@@ -244,6 +247,12 @@ def build_lifecycle(tmp_path, monkeypatch, *, functional_run=None, target_name="
             "chia_trace_sha256": "t" * 64,
         },
     }
+    if published_compiler_root is not None:
+        from merlin_experiments.phase2 import published_payload
+
+        declaration["published_compiler"] = published_payload.inspect(
+            functional, published_compiler_root, target=target_name
+        ).identity()
     launch = {"wrapper": {"sha256": "w" * 64}, "chia_trace": {"sha256": "t" * 64}}
     monkeypatch.setattr(CTRL.CHIA, "verify_launch_receipt", lambda **kw: launch)
     monkeypatch.setattr(AD, "preflight", lambda *a, **kw: declaration)

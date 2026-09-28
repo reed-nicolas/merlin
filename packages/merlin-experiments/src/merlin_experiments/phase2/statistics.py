@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 SCHEMA = "merlin.phase-p-performance-statistics.v4"
+TARGET_SELECTED_SCHEMA = "merlin.phase-p-performance-statistics.v5"
 FAILURE_POLICY = "refuse_claim_on_any_missing_duplicate_or_failed_declared_cell"
 SUBJECTS = ("baseline", "candidate")
 PERFORMANCE_ORACLES = {"gsim": "rtl_gsim"}
@@ -76,20 +77,59 @@ def _is_digest(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
+def _rtl_simulator(value: object) -> bool:
+    """A concrete simulator identity, suitable for a derived RTL oracle kind."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value[0].isalpha()
+        and value.isascii()
+        and all(char.isalnum() or char == "_" for char in value)
+        and value not in {"spike", "unknown", "elaborated_rtl"}
+    )
+
+
+_ORACLE_BINDING_FIELDS = frozenset(
+    {"simulator", "simulator_binary_sha256", "elaborated_firrtl_sha256", "certificate_sha256"}
+)
+
+
+def _valid_oracle_binding(binding: object, simulator: object) -> bool:
+    return (
+        isinstance(binding, Mapping)
+        and set(binding) == _ORACLE_BINDING_FIELDS
+        and binding.get("simulator") == simulator
+        and all(_is_digest(binding.get(field)) for field in _ORACLE_BINDING_FIELDS - {"simulator"})
+    )
+
+
 def predeclare(
     *,
     trials: Sequence[Mapping[str, Any]],
     capsules: Sequence[Mapping[str, str]],
     replicates: Sequence[str],
     primary_simulator: str = DEFAULT_PERFORMANCE_SIMULATOR,
+    schema: str | None = None,
+    oracle_binding: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the exact deterministic elaborated-RTL matrix before measurements exist.
 
-    GSIM is the sole primary timing authority.  A separate equivalence gate owns the predeclared
-    same-ELF Verilator correctness-corroboration sample; its cycle count is never admitted here.
+    The historical v4 declaration retains GSIM as its sole timing authority.  V5
+    binds an explicitly selected RTL simulator before measurements exist.
     """
-    if primary_simulator != DEFAULT_PERFORMANCE_SIMULATOR:
-        raise EvidenceError("primary performance simulator must be GSIM")
+    selected_schema = schema or (
+        SCHEMA if primary_simulator == DEFAULT_PERFORMANCE_SIMULATOR else TARGET_SELECTED_SCHEMA
+    )
+    if selected_schema not in (SCHEMA, TARGET_SELECTED_SCHEMA):
+        raise EvidenceError("unsupported performance statistics declaration schema")
+    if selected_schema == SCHEMA and primary_simulator != DEFAULT_PERFORMANCE_SIMULATOR:
+        raise EvidenceError("historical v4 primary performance simulator must be GSIM")
+    if selected_schema == TARGET_SELECTED_SCHEMA and not _rtl_simulator(primary_simulator):
+        raise EvidenceError("target-selected primary performance simulator must name a concrete RTL engine")
+    if selected_schema == TARGET_SELECTED_SCHEMA and not _valid_oracle_binding(oracle_binding, primary_simulator):
+        raise EvidenceError("target-selected timing requires a pinned certificate/binary/FIRRTL binding")
+    if selected_schema == SCHEMA and oracle_binding is not None:
+        raise EvidenceError("historical v4 declaration cannot add a target-selected oracle binding")
     if any(not isinstance(row, Mapping) for row in trials):
         raise EvidenceError("trial records must be mappings")
     trial_rows = sorted((dict(row) for row in trials), key=lambda row: str(row.get("trial", "")))
@@ -137,12 +177,14 @@ def predeclare(
         for replicate in replicate_ids
     ]
     declaration = {
-        "schema": SCHEMA,
+        "schema": selected_schema,
         "failure_policy": FAILURE_POLICY,
         "primary_simulator": primary_simulator,
         "trials": trial_rows,
         "matrix": matrix,
     }
+    if selected_schema == TARGET_SELECTED_SCHEMA:
+        declaration["oracle_binding"] = dict(oracle_binding)
     declaration["matrix_sha256"] = _sha256(matrix)
     declaration["declaration_sha256"] = _sha256(declaration)
     return declaration
@@ -152,7 +194,8 @@ def _declaration(declaration: Any) -> tuple[list[MatrixIdentity], list[dict[str,
     issues: list[str] = []
     if not isinstance(declaration, Mapping):
         return [], [], ["declaration is not a mapping"]
-    if declaration.get("schema") != SCHEMA:
+    schema = declaration.get("schema")
+    if schema not in (SCHEMA, TARGET_SELECTED_SCHEMA):
         issues.append("declaration schema is absent or unsupported")
     if declaration.get("failure_policy") != FAILURE_POLICY:
         issues.append("declared failure policy does not refuse incomplete cells")
@@ -173,8 +216,14 @@ def _declaration(declaration: Any) -> tuple[list[MatrixIdentity], list[dict[str,
     if any(identity.subject not in SUBJECTS for identity in identities):
         issues.append("matrix subject must be exactly baseline or candidate")
     primary_simulator = declaration.get("primary_simulator")
-    if primary_simulator != DEFAULT_PERFORMANCE_SIMULATOR:
-        issues.append("performance declaration must use GSIM as its primary timing authority")
+    if schema == SCHEMA and primary_simulator != DEFAULT_PERFORMANCE_SIMULATOR:
+        issues.append("historical v4 declaration must use GSIM as its primary timing authority")
+    if schema == TARGET_SELECTED_SCHEMA and not _rtl_simulator(primary_simulator):
+        issues.append("target-selected declaration lacks a concrete RTL timing simulator")
+    if schema == TARGET_SELECTED_SCHEMA and not _valid_oracle_binding(
+        declaration.get("oracle_binding"), primary_simulator
+    ):
+        issues.append("target-selected declaration lacks pinned certificate/binary/FIRRTL identities")
     if any(identity.simulator != primary_simulator for identity in identities):
         issues.append("performance matrix may contain only its predeclared primary simulator")
     trial_shapes: dict[str, set[tuple[str, str, str, str, str]]] = {}
@@ -228,7 +277,9 @@ def _row_identity(row: Any) -> MatrixIdentity | None:
         return None
 
 
-def _row_problem(row: Mapping[str, Any], identity: MatrixIdentity) -> str | None:
+def _row_problem(
+    row: Mapping[str, Any], identity: MatrixIdentity, *, schema: object, oracle_binding: object
+) -> str | None:
     if row.get("correct") is not True:
         return "correct is not true"
     if row.get("tier") != "L3":
@@ -236,13 +287,32 @@ def _row_problem(row: Mapping[str, Any], identity: MatrixIdentity) -> str | None
     if row.get("cycle_accurate") is not True:
         return "row lacks explicit cycle-accurate standing"
     oracle = row.get("oracle")
-    expected_oracle = PERFORMANCE_ORACLES.get(identity.simulator)
+    expected_oracle = (
+        f"rtl_{identity.simulator}"
+        if schema == TARGET_SELECTED_SCHEMA and _rtl_simulator(identity.simulator)
+        else PERFORMANCE_ORACLES.get(identity.simulator)
+    )
     if (
         not isinstance(oracle, Mapping)
         or oracle.get("derived_from_rtl") is not True
         or oracle.get("kind") != expected_oracle
     ):
         return f"row is not from the predeclared RTL-derived cycle-accurate {identity.simulator} oracle"
+    if schema == TARGET_SELECTED_SCHEMA:
+        if not _valid_oracle_binding(oracle_binding, identity.simulator):
+            return "target-selected declaration has no pinned oracle binding"
+        if any(
+            oracle.get(field) != oracle_binding[field]
+            for field in ("simulator_binary_sha256", "elaborated_firrtl_sha256")
+        ) or not _is_digest(oracle.get("program_elf_sha256")):
+            return "row lacks selected binary/FIRRTL/ELF identity"
+        qualification = row.get("qualification")
+        if (
+            not isinstance(qualification, Mapping)
+            or qualification.get("admitted") is not True
+            or qualification.get("certificate_sha256") != oracle_binding["certificate_sha256"]
+        ):
+            return "row lacks qualification against the pinned timing certificate"
     cycles = row.get("cycles")
     if isinstance(cycles, bool) or not isinstance(cycles, int) or cycles <= 0:
         return "cycles is not a positive integer"
@@ -260,6 +330,7 @@ def evaluate(
 ) -> dict[str, Any]:
     """Admit the exact matrix and calculate paired all-trial statistics, or refuse."""
     identities, trials, issues = _declaration(declaration)
+    schema = declaration.get("schema") if isinstance(declaration, Mapping) else None
     attached = list(trial_evidence or ())
     if len(attached) != len(trials) or any(not isinstance(row, Mapping) for row in attached):
         issues.append("every predeclared trial must attach one post-run evidence record")
@@ -283,7 +354,7 @@ def evaluate(
         rows = ()
     for row in rows:
         identity = _row_identity(row)
-        if identity is not None and identity.simulator == "spike":
+        if schema == SCHEMA and identity is not None and identity.simulator == "spike":
             excluded_spike += 1
             continue
         if identity is None or not isinstance(row, Mapping):
@@ -310,7 +381,12 @@ def evaluate(
             status, reason = "duplicate", f"{len(matches)} results for one declared identity"
             duplicate += 1
         else:
-            problem = _row_problem(matches[0], identity)
+            problem = _row_problem(
+                matches[0],
+                identity,
+                schema=schema,
+                oracle_binding=declaration.get("oracle_binding") if isinstance(declaration, Mapping) else None,
+            )
             if problem:
                 status, reason = "failed", problem
                 failed += 1
@@ -346,7 +422,7 @@ def evaluate(
     }
     if issues:
         result = {
-            "schema": SCHEMA,
+            "schema": schema if schema in (SCHEMA, TARGET_SELECTED_SCHEMA) else SCHEMA,
             "status": "refused",
             "failure_policy": FAILURE_POLICY,
             "matrix_sha256": declaration.get("matrix_sha256") if isinstance(declaration, Mapping) else None,
@@ -441,7 +517,7 @@ def evaluate(
         ),
     }
     result = {
-        "schema": SCHEMA,
+        "schema": schema,
         "status": "admitted",
         "failure_policy": FAILURE_POLICY,
         "matrix_sha256": declaration["matrix_sha256"],

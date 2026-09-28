@@ -392,6 +392,7 @@ ADAPTERS = {
             "gsim_slots": _POSITIVE,
             "functional_run_id": _REQUIRED_TEXT,
             "functional_submission_sha256": _REQUIRED_TEXT,
+            "published_compiler_root": Option("path"),
             "descriptor": _REQUIRED_INPUT,
             "rtl_facts": _REQUIRED_INPUT,
             "perf_profile": _REQUIRED_INPUT,

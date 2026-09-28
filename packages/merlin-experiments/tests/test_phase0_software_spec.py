@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from fractions import Fraction
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,27 @@ def _spec():
         "operations": [{"id": "matrix", "placement": "accelerator", "signature": {"ranks": [2]}}],
         "evidence": {"unknowns": ["unqualified example"]},
     }
+
+
+def test_gemmini_software_spec_does_not_admit_integer_shift_as_fused_readout():
+    from merlin_experiments.phase0.software_screen import screen_entry
+
+    path = Path(__file__).resolve().parents[3] / "examples/gemmini/target/software-spec.yaml"
+    spec = SS.load_software_spec(path, target="gemmini")
+    decision = screen_entry(
+        spec,
+        {
+            "op": "matmul",
+            "kind": "isa",
+            "epilogue": ["requant"],
+            "operand_dtype": "int8",
+            "accum_dtype": "i32",
+            "placement": "accelerator",
+            "layout": "row_major_contiguous",
+        },
+    )
+    assert decision["status"] == "unsupported"
+    assert any(row["role"] == "epilogue" and row["status"] == "unsupported" for row in decision["decisions"])
 
 
 def test_versioned_selection_preserves_bytes_and_rejects_incoherent_semantics(tmp_path):

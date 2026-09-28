@@ -656,6 +656,11 @@ def _oracle_unreachable(decline: str) -> bool:
     d = (decline or "").lower()
     if not d:
         return False
+    # The worker never reached the compiler or mesh when the host denied
+    # bubblewrap's loopback setup. This is an execution-environment failure,
+    # not evidence that a target layer cannot run.
+    if "bwrap: loopback:" in d and "netlink_route socket" in d:
+        return True
     return any(
         tok in d
         for tok in (

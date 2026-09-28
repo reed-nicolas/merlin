@@ -3,13 +3,15 @@ title: Generating capsules for a target
 kind: guide
 status: current
 owner: targetgen
-last_verified: 2026-09-26
+last_verified: 2026-09-28
 related: [adding_a_target, gemmini_experiment, capsule_bench, integrations, phase0_specification]
 code_refs:
   - experiments/catalog.yaml
   - packages/merlin-experiments/src/merlin_experiments/phase0/__main__.py
   - packages/merlin-experiments/src/merlin_experiments/phase0/generation.py
+  - packages/merlin-experiments/src/merlin_experiments/phase0/writer.py
   - packages/merlin-experiments/src/merlin_experiments/corpus/preparation.py
+  - src/merlin/targetgen/corpus_spec.py
 ---
 
 # Generating capsules for a target
@@ -27,6 +29,14 @@ The [examples index](../../examples/README.md) maps targets to definitions and p
 The matching [Atlas example](../../examples/atlas/phase0/README.md) follows the
 same input/artifact structure. Read [the SW-spec guide](phase0_specification.md)
 to separate authored behavior from extracted RTL and workload policy.
+
+An `attention_qk` entry can state independent query length `M`, key length `N`,
+and reduction depth `K` (or the corresponding `_tiles` extents). The generated
+operands are `Q[M,K]` and `K[N,K]`, with scores `[M,N]`; omitting `N` retains the
+square `[M,M]` default. For integer arithmetic, the capsule writer checks its
+actual stimulus and reduction depth against the selected internal-width policy.
+That mathematical bound is not target execution evidence. A generated tier cap
+also needs an explicit cheaper sibling; it does not certify an unrun simulator.
 
 | Input or output | Owner |
 | --- | --- |

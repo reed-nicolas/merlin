@@ -17,6 +17,7 @@ from . import campaign as PC
 from . import candidate_verification as VERIFY
 from . import corpus as P2_CORPUS
 from . import gsim_gate as GATE
+from . import measurement_evidence as ME
 from . import paired_measurement as PM
 from . import revealed_corpus as RC
 
@@ -211,6 +212,7 @@ def load_paired_inputs(
                 capsules_sha256=corpus_capsules_sha256,
                 expected_target=getattr(target_experiment, "target"),
             )
+        ME.require_supported_oracle_selection(corpus.capsules)
         certificate = GATE.load_certificate(gsim_certificate, expected_sha256=gsim_certificate_sha256)
     except Exception as exc:
         raise PC.CampaignGateError(f"paired inputs are not consumable: {exc}") from exc

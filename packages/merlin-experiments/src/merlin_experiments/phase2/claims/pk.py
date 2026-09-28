@@ -17,6 +17,8 @@ from collections.abc import Mapping, Sequence
 from fractions import Fraction
 from typing import Any
 
+from .oracle_acceptance import selected_acceptance
+
 _SIMPLE_NAME_CHARS = frozenset(string.ascii_letters + string.digits + "._-")
 _FAMILY = "PK"
 _CLAIM = "PREDICTS"
@@ -85,13 +87,38 @@ _ACCEPTANCE_BASE: dict[str, Any] = {
     },
 }
 
+# Historical v3 declarations are interpreted above exactly as frozen.  New
+# target-selected declarations use v4; their selected engine identities are
+# reconstructed from the frozen evidence by ``selected_acceptance``.
+_CURRENT_ACCEPTANCE_BASE = copy.deepcopy(_ACCEPTANCE_BASE)
+_CURRENT_ACCEPTANCE_BASE["analyzer"] = "perf_pk_claim.analyze_pk_claim/v4"
+_CURRENT_ACCEPTANCE_BASE["fit"]["dependent_metric"] = "$target_oracle_metric:L3"
+_CURRENT_ACCEPTANCE_BASE["evidence"]["correctness_simulator"] = "$target_oracle:L2"
+_CURRENT_ACCEPTANCE_BASE["evidence"]["timing_simulator"] = "$target_oracle:L3"
+_CURRENT_ACCEPTANCE_BASE["evidence"]["timing_oracle_kind"] = "$target_oracle_kind:L3"
+_CURRENT_ACCEPTANCE_BASE["evidence"]["correctness_cycles_citable"] = _CURRENT_ACCEPTANCE_BASE["evidence"].pop(
+    "spike_cycles_citable"
+)
+
 
 class _Refusal(ValueError):
     pass
 
 
-def supported_acceptance(timing_simulator: str = _DEFAULT_TIMING_SIMULATOR) -> dict[str, Any]:
-    """Return a copy of the only claim contract this analyzer can decide."""
+def supported_acceptance(declaration: Mapping[str, Any] | str | None = None) -> dict[str, Any]:
+    """Return the exact supported contract for a frozen declaration.
+
+    No argument, or an engine string, retains the historical v3 fixture API.
+    The v4 path requires the full frozen declaration to check both tier names,
+    their dependent metric and their RTL oracle-kind identity.
+    """
+    if isinstance(declaration, Mapping):
+        if declaration.get("analyzer") == _CURRENT_ACCEPTANCE_BASE["analyzer"]:
+            return selected_acceptance(_CURRENT_ACCEPTANCE_BASE, declaration)
+        evidence = declaration.get("evidence")
+        timing_simulator = evidence.get("timing_simulator") if isinstance(evidence, Mapping) else None
+    else:
+        timing_simulator = declaration if declaration is not None else _DEFAULT_TIMING_SIMULATOR
     if timing_simulator not in _TIMING_ENGINES:
         raise ValueError(f"timing simulator must be one of {sorted(_TIMING_ENGINES)}, got {timing_simulator!r}")
     acceptance = copy.deepcopy(_ACCEPTANCE_BASE)
@@ -107,9 +134,10 @@ def _validated_acceptance(value: object) -> tuple[dict[str, Any], str]:
         raise _Refusal("PK acceptance must be a mapping")
     evidence = value.get("evidence")
     simulator = evidence.get("timing_simulator") if isinstance(evidence, Mapping) else None
-    if simulator not in _TIMING_ENGINES:
-        raise _Refusal(f"PK acceptance timing simulator must be one of {sorted(_TIMING_ENGINES)}")
-    expected = supported_acceptance(str(simulator))
+    try:
+        expected = supported_acceptance(value)
+    except ValueError as exc:
+        raise _Refusal(str(exc)) from exc
     if not _exact_declaration_equal(value, expected):
         raise _Refusal(f"PK descriptor has a malformed or unsupported acceptance contract for {simulator}")
     return copy.deepcopy(expected), str(simulator)
@@ -331,11 +359,12 @@ def preflight_pk_claim(descriptors: object) -> dict[str, Any]:
             "expected_identities": [],
             "refusal_reasons": [str(exc)],
         }
+    correctness_simulator = str(acceptance["evidence"]["correctness_simulator"])
     timing_simulator = str(acceptance["evidence"]["timing_simulator"])
     expected = []
     for point in points:
         for replicate in acceptance["replicates"]["identities"]:
-            for simulator, tier in (("spike", "L2"), (timing_simulator, "L3")):
+            for simulator, tier in ((correctness_simulator, "L2"), (timing_simulator, "L3")):
                 expected.append(
                     {
                         "family": _FAMILY,
@@ -362,6 +391,7 @@ def _validate_results(
 ) -> list[dict[str, Any]]:
     rows = _sequence(results, "PK result rows")
     evidence_contract = _mapping(acceptance.get("evidence"), "PK acceptance evidence")
+    correctness_simulator = str(evidence_contract.get("correctness_simulator"))
     timing_simulator = str(evidence_contract.get("timing_simulator"))
     timing_oracle_kind = str(evidence_contract.get("timing_oracle_kind"))
     expected_capsules = {str(point["capsule"]) for point in points}
@@ -383,7 +413,7 @@ def _validate_results(
         replicate = identity.get("replicate")
         if (
             capsule not in expected_capsules
-            or simulator not in ("spike", timing_simulator)
+            or simulator not in (correctness_simulator, timing_simulator)
             or replicate not in tuple(_ACCEPTANCE_BASE["replicates"]["identities"])
         ):
             raise _Refusal(f"PK result has an undeclared identity: {dict(identity)!r}")
@@ -397,7 +427,7 @@ def _validate_results(
         capsule, k = str(point["capsule"]), int(point["K"])
         for replicate in tuple(_ACCEPTANCE_BASE["replicates"]["identities"]):
             for simulator, tier, purpose, citable in (
-                ("spike", "L2", "correctness_screen", False),
+                (correctness_simulator, "L2", "correctness_screen", False),
                 (timing_simulator, "L3", "performance_certification", True),
             ):
                 key = (capsule, simulator, replicate)
@@ -424,9 +454,9 @@ def _validate_results(
                 ):
                     raise _Refusal(f"PK result {key!r} is not a correct successful measurement")
                 cycles = row.get("cycles")
-                if simulator == "spike":
+                if simulator == correctness_simulator:
                     if cycles is not None:
-                        raise _Refusal(f"PK Spike L2 result {key!r} exposes citable cycles")
+                        raise _Refusal(f"PK correctness L2 result {key!r} exposes citable cycles")
                 else:
                     if isinstance(cycles, bool) or not isinstance(cycles, int) or cycles <= 0:
                         raise _Refusal(f"PK {timing_simulator} L3 result {key!r} lacks positive integer cycles")

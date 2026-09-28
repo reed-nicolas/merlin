@@ -76,6 +76,7 @@ def test_every_required_cell_becomes_an_entry(target):
     #: synthesizer writes into `source_reference`; an entry matching none of them is unattributable.
     axes = (
         "memory regime",
+        "accumulator-output boundary",
         "host-only family",
         "composition axis",
         "roster axis",
@@ -163,6 +164,23 @@ def test_alignment_decides_the_shape():
     partial = next(e for n, e in by.items() if n.endswith("_partial"))
     assert "tile" in str(aligned["N"]) and "-" not in str(aligned["N"])
     assert str(partial["N"]).endswith("-1"), "a partial cell must rag an axis off the boundary"
+
+
+def test_accumulator_output_capacity_is_a_derived_not_model_shaped_capsule():
+    doc = _spec("gemmini")
+    doc["accumulator_output_boundary"] = {
+        "status": "resolved", "capacity_rows": 1024, "tile_edge": 16, "M": 1, "K": 16,
+        "N": 1040, "N_tiles": 65, "output_rows_if_resident": 1040,
+    }
+    doc["oracle_tiers"] = []  # derivation has not constructed an oracle yet
+    doc["oracle_tiers_declared"] = ["L0", "L1", "L2", "L3"]
+    result = CS.synthesize(doc)
+    entry = next(e for e in result["capsules"] if e["name"] == "SY_accumulator_output_boundary")
+    assert (entry["M"], entry["K"], entry["N"]) == ("tile/16", "tile", "65*tile")
+    assert entry["extends"] == "SY_contraction_i8_aligned"
+    assert entry["max_oracle_tier"] == "L2"
+    assert "execution must verify availability" in entry["source_reference"]
+    assert "tile-schedule" in entry["pass_requirements"]
 
 
 def test_extents_are_tile_relative_not_baked_integers():
@@ -565,6 +583,19 @@ def test_a_target_with_no_host_only_families_synthesizes_none():
     assert not any("host_only" in e["name"] for e in out["capsules"])
 
 
+def test_float_movement_host_lane_has_a_pytorch_representative():
+    spec = {
+        **_HOST_SPEC,
+        "host_only": {"families": [], "dtypes": {}},
+        "host_lane": {"required": [{"family": "movement", "dtype": "f32", "n_regions": 19}]},
+    }
+    result = CS.synthesize(spec, capability_contract={"name": "t", "compute_units": []})
+    entry = next(item for item in result["capsules"] if item["name"] == "SY_host_lane_movement_f32")
+    assert entry["op"] == "transpose"
+    assert entry["source"] == "pytorch"
+    assert result["provenance"]["host_only_unsynthesizable"] == []
+
+
 def test_op_choice_prefers_an_op_that_can_actually_be_written_at_the_dtype():
     """Ranking by cost alone picked the cheapest op in the ABSTRACT and then discovered no writer could
     express it: an elementwise cell chose `gelu` -- one operand, no direct-MLIR builder -- over
@@ -668,6 +699,16 @@ def test_claim_evaluation_obligation_records_admitted_format_without_model_names
     assert obligation["status"] == "awaiting_phase1_freeze"
     assert obligation["capsule_dtype"] == want
     assert not any(name in yaml.safe_dump(res["capsules"]) for name in _ws(target)["models"])
+
+
+def test_held_out_claim_cannot_be_a_public_derivation_capture_even_under_an_alias():
+    with pytest.raises(CS.SynthesisError, match="held-out claim model"):
+        CS.synthesize(
+            {"target": "fixture", "cells": []},
+            workload_spec={"models": ["Tiny-Llama"]},
+            application_inventory={"applications": {"tiny_llama": {}}},
+            capability_contract={"name": "fixture", "compute_units": []},
+        )
 
 
 def test_a_claim_whose_preference_names_nothing_admitted_records_unavailable_format():

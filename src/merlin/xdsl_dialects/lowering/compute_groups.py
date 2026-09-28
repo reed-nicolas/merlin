@@ -59,6 +59,9 @@ READOUT_DOES_NOT_APPLY = "readout_does_not_apply"
 #: never "applies everything": assuming would put a stage on a store path nobody established applies
 #: it, which is the silent-discard defect :mod:`merlin.verify.epilogue_applicability` exists for.
 READOUT_UNDECLARED = "readout_epilogue_undeclared"
+# Round, clamp and cast are not independent command-buffer stages. They can ride a scaled store
+# only when the group actually contains an output scale; an unscaled i32 -> f32 cast is host work.
+READOUT_REQUIRES_SCALE = "readout_requires_scale"
 #: Growth stopped by a fact about the GRAPH rather than about the target: a value read outside the
 #: group, or a pad no pool consumes. Not a capability question and not a capability gap.
 STRUCTURAL = "graph_structure"
@@ -1138,6 +1141,16 @@ def _grow(root, oracle: TargetOracle, stage_of: Mapping[int, Stage | None], take
         if stage.kind == PAD and pending_pad is None:
             pending_pad, value = user, user.results[0]  # kept only if a pool follows
             continue
+        if stage.kind in CONVERSION_OF_SCALED_STORE and not any(
+            stage_of[id(member)].kind == SCALE for member in members
+        ):
+            group.stopped_by, group.stopped_at = stage.kind, pending_pad or user
+            group.refusal = READOUT_REQUIRES_SCALE
+            group.reason = (
+                f"{stage.kind!r} is a conversion of a scaled store, but this group has no output "
+                "scale; the conversion must remain on the host"
+            )
+            break
         absorbable = oracle.absorbs(stage.kind)
         if not absorbable.admitted:
             group.stopped_by, group.stopped_at = stage.kind, pending_pad or user
@@ -1206,6 +1219,10 @@ def gap_class(refusal: str | None) -> str | None:
     if refusal == STRUCTURAL:
         # The graph, not the target. Nothing about the hardware is established, so no gap is owed.
         return None
+    if refusal == READOUT_REQUIRES_SCALE:
+        # The readout can carry a conversion only when a scale stage precedes it. This instance
+        # lacks that required attachment; the owner is the same route/attachment class as fused_only.
+        return "OG4"
     if refusal in (READOUT_DOES_NOT_APPLY, READOUT_UNDECLARED):
         # No readout DECLARES this stage as something a contraction's group can take (a residual
         # accumulated into the result, for one) -- either none lists it, or the target described no
@@ -1469,31 +1486,7 @@ def _operand_sum_entry(group: Group, *, name: str | None) -> dict[str, Any]:
 
 
 def demand(groups: Sequence[Group], *, weight_args: Collection[int] | None = None) -> dict[str, Any]:
-    """Every distinct accelerator group of a model as capsule entries, with what could not be stated.
+    """Keep the group-formation API stable while capsule reporting lives separately."""
+    from . import compute_group_demand
 
-    Stated in DEVICE form (:mod:`.group_command`): the stored tensor on the right, a gathered
-    convolution as the unit's own convolution, the stages in the readout's order. A demand in the
-    capture's form asks a backend for the framework's lowering, not for the layer.
-    """
-    from . import group_command
-
-    entries: dict[str, dict[str, Any]] = {}
-    unstated: Counter = Counter()
-    for group in groups:
-        if group.placement == HOST:
-            continue
-        if group.root is None:
-            # A unit took a region with no contraction in it. The capsule vocabulary states
-            # contraction groups only, so nothing can demand this one; say so rather than skip it.
-            unstated["a region placed on a unit has no contraction root to state"] += 1
-            continue
-        try:
-            entry = group_command.program(group, weight_args=weight_args).entry
-        except NoCapsuleForm as error:
-            unstated[str(error)] += 1
-            continue
-        # A multiplier is a number the same program is run with, not a different program.
-        numbers = ("name", "acc_scale", "lhs_scale", "rhs_scale")
-        key = repr(sorted((k, repr(v)) for k, v in entry.items() if k not in numbers))
-        entries.setdefault(key, {**entry, "count": 0})["count"] += 1
-    return {"entries": sorted(entries.values(), key=lambda e: -e["count"]), "unstated": dict(unstated)}
+    return compute_group_demand.demand(groups, weight_args=weight_args)

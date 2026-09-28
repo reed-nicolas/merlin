@@ -9,6 +9,7 @@ code_refs:
   - src/merlin/verify/receipts.py
   - src/merlin/verify/refine.py
   - src/merlin/verify/linalg_semantics.py
+  - src/merlin/verify/merlin_iface_semantics.py
   - src/merlin/verify/smt_semantics.py
   - src/merlin/verify/cb_semantics.py
   - src/merlin/verify/model_coverage.py
@@ -37,7 +38,25 @@ merlin-verify compile-receipt --interface /generated/interface.mlir \
 ```
 
 Exit 0 means verified, 1 refuted, and 2 unsupported, unavailable or unknown.
-The command does not accept a capsule's custom `merlin_iface` assembly file.
+The installed command currently accepts only an in-tree `interface` module. The
+Python API can also check a capsule compiler's actual `merlin_iface` text as the
+target of `linalg_to_interface`, using the same saved text passed to the OOT
+compiler:
+
+```python
+receipt = verify_transformation(
+    "linalg_to_interface", source_module, emitted_merlin_iface_text,
+    translator=translator, expected_translator_sha256=expected_sha,
+)
+assert qualify_receipt(
+    receipt, source_module, emitted_merlin_iface_text, translator=translator
+)
+```
+
+Here `source_module` must be the actual before-pass xDSL module, not a recreated
+lookalike, and the target must be the emitted UTF-8 text. Replay binds both byte
+identities. This path currently covers only the narrow integer grammar below; it
+does not prove a complete capsule compiler or an accelerator executable.
 `merlin-verify capture-coverage /generated/model.mlir` separately prints a
 conservative textual inventory of the current SMT source subset; eligibility
 there is not a proof.
@@ -113,6 +132,15 @@ not physical packing, memory behavior, actual RTL execution, performance, or ind
 of the semantics encoder. The encoder and command-buffer meaning require separate review and
 conformance checks against an independent implementation.
 
+The OOT-text bridge additionally recognizes static signed `i8` rank-2
+`linalg.generic` matmul with `i32` accumulation when its indexing maps, region,
+and zero initialization match the encoded contraction. Its `merlin_iface` side
+accepts only explicit `argN` tensor bindings, value-preserving resident pack,
+matmul, an empty-epilogue `i32` commit, and eviction. Unknown operations or
+attributes abstain. A checked 16×16 instance proves equality for all input
+bit patterns **at that shape**, under this value model. It does not prove the
+physical packed layout, DMA, target RTL, or a mixed host/device program.
+
 [mlir-matmul]: https://mlir.llvm.org/docs/Dialects/Linalg/#linalgmatmul-linalgmatmulop
 
 Floating-point reassociation, dynamic shapes, arbitrary PyTorch operators, symbolic zero points,
@@ -157,3 +185,13 @@ target, receipt, and independent numerical differential test. Phase 2 consumes t
 oracle definitions and holdouts, then adds actual target execution and simulator/RTL checks. This
 separates a proved local transformation from the distinct questions of workload coverage, oracle
 validity, and target conformance.
+
+A minimal Phase 0 capsule set is a finite *witness basis*: it can cover the
+recorded source-operation and typed-edge rows, but it cannot by itself
+guarantee a functional compiler for arbitrary PyTorch models. A release claim
+must name a bounded supported domain (operations, shapes, dtypes, layouts,
+aliasing, control flow and numerical tolerances), show every captured operation
+is either supported or deliberately routed to a verified host path, and close
+the transformation, boundary-transfer, target-conformance and end-to-end
+execution obligations for the exact compiler/package bytes. Any unknown,
+unavailable verifier, uncovered row or unexecuted path keeps that claim open.

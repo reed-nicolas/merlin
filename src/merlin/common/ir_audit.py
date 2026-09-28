@@ -154,6 +154,41 @@ class IrAudit:
         self._tensor_descriptors.add(json.dumps(record, sort_keys=True))
         return record
 
+    def accounting(self, name: str, payload: Mapping) -> dict:
+        """Bind a non-executable JSON receipt to this invocation's index.
+
+        Receipts describe observed transformations, not correctness or a runnable
+        replacement for any exact IR stage. The caller owns their schema.
+        """
+        if self.directory is None:
+            raise ValueError("accounting receipt requires an enabled audit")
+        if not name or any(not (c.isascii() and (c.isalnum() or c in "-_")) for c in name):
+            raise ValueError("audit receipt names must be plain filename tokens")
+        if not isinstance(payload, Mapping) or not isinstance(payload.get("schema"), str):
+            raise ValueError("accounting receipt requires a schema")
+        serialized = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        path = self.directory / f"{name}.json"
+        if (
+            any(item["name"] == name for item in self.record.get("accounting_receipts", []))
+            or path.exists()
+            or path.is_symlink()
+        ):
+            raise ValueError(f"accounting receipt name already exists: {name}")
+        with path.open("xb") as stream:
+            stream.write(serialized)
+        descriptor = {
+            "name": name,
+            "file": path.name,
+            "schema": payload["schema"],
+            "sha256": hashlib.sha256(serialized).hexdigest(),
+            "bytes": len(serialized),
+            "representation": "accounting-only",
+            "executable": False,
+        }
+        self.record.setdefault("accounting_receipts", []).append(descriptor)
+        self._flush()
+        return descriptor
+
     def stage(
         self,
         name: str,
@@ -268,6 +303,7 @@ class IrAudit:
         changed = False
         tensors_changed = False
         stages_changed = False
+        accounting_changed = False
         if exc_type is None:
             try:
                 changed = [_identity(path) for path in self.sidecars] != self.record["sidecars"]
@@ -294,8 +330,20 @@ class IrAudit:
                             stages_changed = True
             except OSError:
                 stages_changed = True
+            try:
+                for receipt in self.record.get("accounting_receipts", []):
+                    path = self.directory / receipt["file"]
+                    if path.is_symlink() or not path.is_file():
+                        accounting_changed = True
+                        continue
+                    observed = _identity(path)
+                    if any(observed[key] != receipt[key] for key in ("sha256", "bytes")):
+                        accounting_changed = True
+            except (OSError, KeyError):
+                accounting_changed = True
         self.record["outcome"] = (
-            "failed" if exc_type is not None or changed or tensors_changed or stages_changed else "completed"
+            "failed" if exc_type is not None or changed or tensors_changed or stages_changed or accounting_changed
+            else "completed"
         )
         if exc_type is not None:
             self.record["failure_type"] = exc_type.__name__
@@ -305,6 +353,8 @@ class IrAudit:
             self.record["failure_type"] = "TensorPayloadChanged"
         elif stages_changed:
             self.record["failure_type"] = "StagePayloadChanged"
+        elif accounting_changed:
+            self.record["failure_type"] = "AccountingReceiptChanged"
         try:
             self._flush()
         except OSError as audit_error:
@@ -317,6 +367,8 @@ class IrAudit:
             raise ValueError("IR inspection tensor payload changed during lowering")
         if stages_changed:
             raise ValueError("IR audit stage payload changed during lowering")
+        if accounting_changed:
+            raise ValueError("IR audit accounting receipt changed during lowering")
         # Warning filters can raise. Persist the lowering's terminal outcome first,
         # and never replace an already-active lowering exception with a warning.
         if (

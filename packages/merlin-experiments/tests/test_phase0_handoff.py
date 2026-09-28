@@ -85,6 +85,16 @@ def test_real_installed_shaped_derivation_receipt_and_prepare(phase0_handoff, in
     assert emitted.read_bytes() == staged.read_bytes()
 
 
+def test_completed_phase0_resume_refuses_changed_generated_capsules(phase0_handoff):
+    fixture = phase0_handoff
+    _derive(fixture)
+    output = fixture["run"] / "phase0/capsules/isa/generated_member/golden.yaml"
+    output.write_bytes(output.read_bytes() + b"\n# changed generated output\n")
+    resumed = fixture["cli"]("resume", fixture["run"])
+    assert resumed.returncode == 2
+    assert "phase-0 output identity changed" in resumed.stderr
+
+
 @pytest.mark.parametrize(
     "tamper",
     [

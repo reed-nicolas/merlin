@@ -13,14 +13,47 @@ literal, and the last three pin the three bugs that were actually found while bu
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from merlin.targetgen import conformance as CF
 
 pytestmark = pytest.mark.target("radiance", "atlas", "gemmini", "saturn")
 
 TARGET = "radiance"
+
+
+def test_accumulator_boundary_uses_derived_rows_not_a_target_constant(monkeypatch):
+    from merlin.targetgen import address_space as AS
+
+    monkeypatch.setattr(AS, "derive_address_space", lambda target: object())
+    monkeypatch.setattr(
+        AS, "accumulator_kind",
+        lambda space: AS.AccumulatorKind(AS.ADDRESSABLE, store=SimpleNamespace(name="result_store"), rows=96),
+    )
+    bound = CF._accumulator_output_boundary("any_target", 16)
+    assert (bound["capacity_rows"], bound["N_tiles"], bound["output_rows_if_resident"]) == (96, 7, 112)
+    assert (bound["tile_edge"], bound["M"]) == (16, 1)
+    assert bound["store"] == "result_store"
+
+
+def test_accumulator_boundary_coverage_reads_capsule_shapes(tmp_path):
+    bound = {"status": "resolved", "capacity_rows": 96, "tile_edge": 16}
+    capsule = tmp_path / "member"
+    capsule.mkdir()
+    doc = {
+        "name": "boundary", "label": "public",
+        "operation": {"op": "matmul", "attributes": {"lhs": "A", "weight": "W"}},
+        "inputs": [
+            {"name": "A", "shape": [16, 16], "dtype": "i8"},
+            {"name": "W", "shape": [16, 112], "dtype": "i8"},
+        ],
+    }
+    assert CF._accumulator_output_gap(bound, tmp_path)["uncovered"] == ["accumulator_output_capacity"]
+    (capsule / "capsule.yaml").write_text(yaml.safe_dump(doc), encoding="utf-8")
+    assert CF._accumulator_output_gap(bound, tmp_path)["covered_by"] == ["boundary"]
 
 
 def test_admitted_comes_from_the_manifest_not_a_literal():

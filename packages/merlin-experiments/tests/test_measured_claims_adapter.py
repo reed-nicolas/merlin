@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from merlin_experiments.phase2 import chia_envelope_cli as EDGE
 from merlin_experiments.phase2 import chia_launch as LAUNCH
 
 from merlin.common.paths import module_source_path
+from merlin.targetgen import package_records
 
 
 @pytest.fixture(autouse=True)
@@ -263,6 +265,39 @@ def test_interrupted_driver_resumes_same_frozen_root_and_exact_command(case, mon
     assert R.resume(case.destination) == 0
     assert observed[0] == observed[1]
     assert observed[0][observed[0].index("--root") + 1] == str(case.destination / "phase2")
+
+
+def test_published_compiler_selection_is_frozen_across_managed_resume(case, monkeypatch):
+    source = case.root / "graded-payload"
+    source.mkdir()
+    (source / "manifest.yaml").write_text("target: fixture\n")
+    (source / "compiler.py").write_text("# graded fixture bytes\n")
+    published = case.root / "relocated-publication"
+    shutil.copytree(source, published)
+    (published / ".merlin").mkdir()
+    (published / ".merlin/provenance.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "target": "fixture",
+                "provider_role": "candidate_compiler",
+                "source_payload": package_records.payload_inventory(source),
+            }
+        )
+    )
+    case.document["phases"]["2"]["config"]["published_compiler_root"] = str(published)
+    case.definition.write_text(yaml.safe_dump(case.document))
+    resolved = plan(case)
+    command = resolved["phases"]["2"]
+    assert command["argv"][command["argv"].index("--published-compiler-root") + 1] == str(published)
+    assert "phase2:published:provenance" in resolved["input_paths"]
+    observed = fake_driver(monkeypatch, command, [130, 0])
+    assert R.run(resolved) == 130
+    assert R.resume(case.destination) == 0
+    assert observed[0] == observed[1]
+    (published / "compiler.py").write_text("# changed after resume\n")
+    with pytest.raises(SpecError, match="published compiler|frozen input changed"):
+        R.resume(case.destination)
+    assert len(observed) == 2
 
 
 def test_changed_immutable_input_refuses_resume_before_transport(case, monkeypatch):

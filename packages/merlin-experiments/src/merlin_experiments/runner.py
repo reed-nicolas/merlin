@@ -849,6 +849,14 @@ def _execute(root: Path, plan: dict, record: dict, *, checkpoint: Path | None = 
         for number, command in plan["phases"].items():
             previous = [entry for entry in record["attempts"] if entry["phase"] == number]
             if previous and previous[-1]["state"] == "execution_succeeded":
+                if command["adapter"] == "capsule_derivation":
+                    expected = previous[-1].get("output_sha256")
+                    try:
+                        observed = fingerprint(command["engine_output"])
+                    except (OSError, SpecError) as exc:
+                        raise SpecError("phase-0 output identity changed; create a new experiment run") from exc
+                    if not expected or observed != expected:
+                        raise SpecError("phase-0 output identity changed; create a new experiment run")
                 continue
             argv = list(command["argv"])
             checkpoint_pin = None

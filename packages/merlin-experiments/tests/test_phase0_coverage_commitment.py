@@ -76,6 +76,7 @@ def _fixture():
         "operation_ids": ["mlir:0"],
         "observed_signature": signature,
         "status": "resolved",
+        "role": "compute_placement",
         "placement": "unselected",
         "accelerator_admission": {"status": "admitted", "reviewed": True},
         "host_admission": {"status": "unsupported", "reviewed": True},
@@ -180,6 +181,16 @@ def test_precompiler_completeness_is_independent_and_uses_only_admitted_capsules
     operation = complete["applications"]["application"]["operations"][0]
     assert operation["placement"] == "accelerator"
     assert operation["witnesses"] == ["functional"]
+    basis = complete["phase1_witness_basis"]
+    assert basis["universe"]["n_total"] == 1
+    assert basis["uncovered_obligations"] == []
+    assert basis["selection"]["claim"] == "exact_minimum"
+    assert [row["name"] for row in basis["selection"]["selected_capsules"]] == ["functional"]
+    assert "does not establish" in basis["qualification"]
+    old_report = copy.deepcopy(complete)
+    old_report["schema"] = "merlin.phase0.coverage_commitment.v1"
+    with pytest.raises(ValueError, match="verified whole-workload"):
+        CC.require_complete(old_report)
     # A witness left in the source pool, but not admitted, cannot cover a demand.
     absent = _report(inputs, [])
     with pytest.raises(ValueError, match="admitted-capsule coverage"):
@@ -308,6 +319,90 @@ def test_noncompute_nodes_and_uses_are_counted_without_inventing_a_placement():
     report = _report(inputs, [capsule])
     CC.require_complete(report)
     assert report["applications"]["application"]["graph_accounting"]["n_edges"] == 1
+
+
+def test_support_lowering_is_graph_total_but_not_a_compute_or_transfer_endpoint():
+    inputs, capsule = _fixture()
+    application = inputs["accounting"]["applications"]["application"]
+    completeness = application["completeness"]
+    signature = {
+        "mlir_operation": "tensor.empty",
+        "semantic_family": "movement",
+        "ordered_operand_types": [],
+        "ordered_result_types": [{"shape": [2, 2], "dtype": "i32"}],
+        "disposition": "support_required",
+    }
+    support = copy.deepcopy(completeness["operation_obligations"][0])
+    support.update(
+        id="mlir:1",
+        operation_ids=["mlir:1"],
+        mlir_ordinals=[1],
+        observed_signature=signature,
+        role="support_lowering",
+        required_placement_choices=[],
+        precision={
+            "status": "resolved",
+            "ordered_operand_types": [],
+            "ordered_result_types": [{"shape": [2, 2], "dtype": "i32"}],
+            "ordered_storage_types": [],
+            "result_types": ["tensor<2x2xi32>"],
+        },
+        support_lowering_evidence={
+            "status": "not_available",
+            "source_capture_sha256": "a" * 64,
+            "source_operation_id": "mlir:1",
+            "operand_types": [],
+            "result_types": ["tensor<2x2xi32>"],
+            "operand_shapes": [],
+            "result_shapes": [[2, 2]],
+            "source_shape_status": "static",
+        },
+    )
+    completeness["operation_obligations"].append(support)
+    application["n_mlir_operations"] = 2
+    application["signatures"].append({"ordinals": [1], "observed_signature": signature})
+    graph = completeness["graph_accounting"]
+    graph["n_operations"] = 2
+    graph["nodes"].append(
+        {
+            "operation_id": "mlir:1",
+            "ordinal": 1,
+            "mlir_operation": "tensor.empty",
+            "disposition": "support_required",
+            "accounting": "support_lowering_obligation",
+            "obligation_id": "mlir:1",
+            "parent_operation_id": None,
+        }
+    )
+    graph["n_edges"] = 1
+    graph["edges"] = [
+        {
+            "id": "edge:support",
+            "producer_operation_id": "mlir:1",
+            "consumer_operation_id": "mlir:0",
+            "value_id": "value:support",
+            "type": "tensor<2x2xi32>",
+            "accounting": "support_dependency",
+            "transfer_id": None,
+        }
+    ]
+    capsule["signatures"].append(signature)
+    _bind_graph(inputs)
+    report = _report(inputs, [capsule])
+    assert report["status"] == "incomplete"
+    assert [item["component"] for item in report["blockers"]] == ["support_lowering", "support_dependency"]
+    assert report["applications"]["application"]["transfers"] == []
+    support_report = report["applications"]["application"]["operations"][1]
+    assert support_report["role"] == "support_lowering"
+    assert support_report["placement"] is None
+    assert support_report["witnesses"] == ["functional"]
+    # A self-asserted flag in the source ledger is not a compiler artifact or
+    # proof that its typed shape/value semantics survived lowering.
+    support["support_lowering_evidence"]["status"] = "verified"
+    assert _report(inputs, [capsule])["status"] == "incomplete"
+    graph["edges"][0]["accounting"] = "block_argument_or_non_independent_endpoint"
+    _bind_graph(inputs)
+    assert any(item["component"] == "graph_totality" for item in _report(inputs, [capsule])["blockers"])
 
 
 def test_framework_catalog_and_every_source_stage_must_match():
@@ -518,5 +613,13 @@ def test_conformance_cannot_borrow_ambient_provider_evidence(monkeypatch):
     requirement = {"target": "fixture", "cells": [], "composition": {"required": {"routing": 1}}}
     coverage = selected_cohort_coverage(requirement, [])
     assert coverage["composition"]["status"] == "not_measured"
+    assert coverage["composition"]["phase"] == "phase0"
     assert coverage["composition"]["required"] == {"routing": 1}
+    assert set(coverage["composition"]["phase1_receipt_required"]) == {
+        "selected_capture",
+        "selected_capsule",
+        "compiler_execution",
+        "lowering_correspondence",
+        "execution",
+    }
     assert CC._conformance_blockers(coverage)

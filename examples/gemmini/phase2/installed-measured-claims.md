@@ -58,6 +58,18 @@ hashes from the original evidence; do not hash edited files to relabel them as
 qualified. The tuning certificate and functional certificate serve different
 purposes and are not interchangeable. No waiver is included in this example.
 
+To start Phase 2 from a compiler publication cloned outside Merlin, optionally
+set `published_compiler_root` in a copied measured-claims definition to the
+absolute clone directory (or pass `--published-compiler-root` to the coordinator
+diagnostic). The original fully graded Phase 1 run and its exact submission hash
+are still required. Merlin compares the publication's `source_payload` inventory
+with that run and copies only those compiler members into a read-only Phase 2
+baseline; `.merlin`, Git history, and publication notes are not compiler input.
+The clone path and selected bytes are frozen for resume. An independent clone
+alone, or publication metadata claiming certification, cannot substitute for a
+functional grade. The published export's added metadata remains separately
+uncertified until an export-specific qualification is performed.
+
 ```bash
 evidence=(
   --functional-run-id "${FUNCTIONAL_RUN_ID:?}"

@@ -171,6 +171,49 @@ def test_release_derives_admission_from_staged_members(release_fixture, capsys, 
     assert report["counts"]["hidden_source"] == 1
 
 
+def test_generated_only_admission_reports_model_policy_and_private_cohort_gaps(release_fixture, capsys, monkeypatch):
+    from merlin.targetgen import eligibility
+
+    fixture = release_fixture
+    generated_member = fixture["baseline"] / "isa/generated_member/capsule.yaml"
+    model = yaml.safe_load(generated_member.read_text())
+    model["kind"] = "model"
+    generated_member.write_text(yaml.safe_dump(model))
+    descriptor = fixture["root"] / "source-experiment/target_experiment.yaml"
+    authored = yaml.safe_load(descriptor.read_text())
+    authored["grading"] = {
+        "release_admission": "derive_from_corpus_v1",
+        "resource_bound": {
+            "policy": "fixture_review",
+            "exclude_capsules": [],
+            "required_admitted_models": ["stale_model"],
+        },
+    }
+    descriptor.write_text(yaml.safe_dump(authored))
+    monkeypatch.setattr(eligibility, "capability_map_for_target", lambda _target: {"fixture": object()})
+
+    assert main(["run", str(fixture["definition"]), "--phase", "0", "--run-dir", str(fixture["run"])]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "corpus",
+                "prepare",
+                str(fixture["run"]),
+                "--output",
+                str(fixture["release"]),
+                "--generated-only",
+            ]
+        )
+        == 2
+    )
+    failure = json.loads((fixture["release"] / "private/failure.json").read_text())
+    assert "unclassified public models: generated_member" in failure["error"]
+    assert "policy names absent from staged public models: stale_model" in failure["error"]
+    assert "hidden grading cohort is empty" in failure["error"]
+    assert not (fixture["release"] / "private/seal.json").exists()
+
+
 def _prepare(fixture, capsys):
     assert main(["run", str(fixture["definition"]), "--phase", "0", "--run-dir", str(fixture["run"])]) == 0
     capsys.readouterr()
@@ -533,7 +576,7 @@ def _phase1_definition(fixture, sealed):
     return definition
 
 
-def test_public_coverage_reads_the_completed_phase0_run(release_fixture, capsys):
+def test_public_coverage_reads_the_completed_phase0_run(release_fixture, capsys, monkeypatch):
     fixture = release_fixture
     generated = fixture["baseline"] / "isa/generated_member/capsule.yaml"
     capsule = yaml.safe_load(generated.read_text())
@@ -552,6 +595,12 @@ def test_public_coverage_reads_the_completed_phase0_run(release_fixture, capsys)
             }
         )
     )
+    from merlin.targetgen import conformance
+
+    def ambient_coverage(*_args, **_kwargs):
+        pytest.fail("public coverage reopened ambient target facts instead of frozen inputs")
+
+    monkeypatch.setattr(conformance, "uncovered", ambient_coverage)
     assert main(["corpus", "coverage", str(fixture["run"]), "--spec", str(spec)]) == 0
     report = capsys.readouterr()
     result = json.loads(report.out)
@@ -559,6 +608,7 @@ def test_public_coverage_reads_the_completed_phase0_run(release_fixture, capsys)
     assert result["coverage"]["n_required"] == 1
     assert result["coverage"]["n_covered"] == 1
     assert result["coverage"]["uncovered"] == []
+    assert result["coverage"]["composition"]["phase"] == "phase0"
     assert "private_member_identity" not in report.out + report.err
 
 

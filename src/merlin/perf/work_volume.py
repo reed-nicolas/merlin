@@ -152,7 +152,9 @@ def work_from_command_buffer(command_buffer: Mapping[str, Any]) -> ProgramWork:
     handles: dict[str, str] = {}
     rows: list[CommandWork] = []
     refusals: list[str] = []
-    non_compute = {"RES_PACK", "COMMIT", "EVICT", "MOVEMENT"}
+    # VECTOR_MAP may multiply elements, but it performs no multiply-accumulate.
+    # Its cycles still count; it simply contributes zero to the MAC numerator.
+    non_compute = {"RES_PACK", "COMMIT", "EVICT", "MOVEMENT", "VECTOR_MAP"}
     for index, raw in enumerate(instructions):
         if not isinstance(raw, Mapping):
             reason = f"command {index} is not a mapping"

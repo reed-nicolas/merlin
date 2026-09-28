@@ -15,8 +15,9 @@ needs the external ``specir`` refmodel, available only at generation time) — t
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from merlin.targetgen.capsule_dram import dtype_bits
 
@@ -989,7 +990,7 @@ def build_resident_reuse(entry: dict, binding: CorpusBinding) -> tuple[dict, str
     idt, adt = binding.cap_dtype(binding.operand_dtype), binding.cap_dtype(binding.accum_dtype)
     midt, madt = binding.mlir_dtype(binding.operand_dtype), binding.mlir_dtype(binding.accum_dtype)
     inputs = [{"name": weight, "role": "weight", "shape": [K, N], "dtype": idt}]
-    matmuls, mlir_mm = [], []
+    matmuls = []
     L = _iface_prelude(binding.target, entry.get("comment", ""))
     L.append(f'  %{weight} = merlin_iface.tensor {{name = "{weight}", role = "weight"}} : tensor<{K}x{N}x{midt}>')
     for idx, mm in enumerate(entry["matmuls"]):
@@ -1094,6 +1095,9 @@ def build_attention_qk(entry: dict, binding: CorpusBinding) -> tuple[dict, str]:
     # axis name, and reading only `_tiles` turns a declared extent into the tile edge without a word.
     M = entry.get("M", entry.get("M_tiles", 1) * D)
     Kd = entry.get("K", entry.get("K_tiles", 1) * D)
+    # Queries and keys need not have the same sequence length (prefill against
+    # a carried KV cache is rectangular). Preserve the old square default.
+    N = entry.get("N", entry["N_tiles"] * D if "N_tiles" in entry else M)
     q, k, out = entry.get("q", "Q"), entry.get("k", "K"), entry.get("out", "Y0")
     idt, odt = binding.cap_dtype(binding.operand_dtype), binding.cap_dtype(binding.accum_dtype)
     midt, modt = binding.mlir_dtype(binding.operand_dtype), binding.mlir_dtype(binding.accum_dtype)
@@ -1107,7 +1111,7 @@ def build_attention_qk(entry: dict, binding: CorpusBinding) -> tuple[dict, str]:
         "interface_mlir": "capsule.interface.mlir",
         "inputs": [
             {"name": q, "role": "input", "shape": [M, Kd], "dtype": idt},
-            {"name": k, "role": "input", "shape": [M, Kd], "dtype": idt},
+            {"name": k, "role": "input", "shape": [N, Kd], "dtype": idt},
         ],
         "operation": {"op": "attention_qk", "attributes": attrs},
         "numeric_policy": _numeric_policy(binding, binding.accum_dtype, None),
@@ -1122,9 +1126,9 @@ def build_attention_qk(entry: dict, binding: CorpusBinding) -> tuple[dict, str]:
     L = _iface_prelude(binding.target, entry.get("comment", ""))
     L += [
         f'  %{q} = merlin_iface.tensor {{name = "{q}", role = "input"}} : tensor<{M}x{Kd}x{midt}>',
-        f'  %{k} = merlin_iface.tensor {{name = "{k}", role = "input"}} : tensor<{M}x{Kd}x{midt}>',
+        f'  %{k} = merlin_iface.tensor {{name = "{k}", role = "input"}} : tensor<{N}x{Kd}x{midt}>',
         f'  %{out} = merlin_iface.attention_qk %{q}, %{k} {{name = "{out}", output_dtype = "{odt}"}} '
-        f": (tensor<{M}x{Kd}x{midt}>, tensor<{M}x{Kd}x{midt}>) -> tensor<{M}x{M}x{modt}>",
+        f": (tensor<{M}x{Kd}x{midt}>, tensor<{N}x{Kd}x{midt}>) -> tensor<{M}x{N}x{modt}>",
         "}",
     ]
     return cap, "\n".join(L) + "\n"
@@ -2063,6 +2067,116 @@ def build_host_island_seam(entry: dict, binding: CorpusBinding) -> tuple[dict, s
     return cap, "\n".join(lines) + "\n"
 
 
+def scope_chain_region_ops(families: list[str]) -> list[str]:
+    """Exact operations emitted by the current standalone scope-chain writer.
+
+    This is an emitter inventory, not a semantic equivalence rule for captured
+    source operations. Phase 0 must compare against it before selecting a
+    source-derived performance cohort.
+    """
+    if not (
+        isinstance(families, list) and len(families) >= 3
+        and families[:2] == ["movement", "contraction"]
+        and all(family == "elementwise_map" for family in families[2:])
+    ):
+        raise ValueError("scope_chain needs a movement/contraction/elementwise-map+ family list")
+    return ["transpose", "matmul", *(["add"] * (len(families) - 2))]
+
+
+def build_scope_chain(entry: dict, binding: CorpusBinding) -> tuple[dict, str]:
+    """A priced contraction in a requirement-selected movement/contraction/map chain.
+
+    The transpose and scalar maps are real tensor regions, not command-buffer
+    annotations. Only the contraction contributes MACs. This member makes no claim
+    about epilogue fusion or carried configuration; those have separate functional
+    witnesses derived from the selected requirements.
+    """
+    idt = binding.cap_dtype(binding.operand_dtype)
+    midt = binding.mlir_dtype(binding.operand_dtype)
+    adt = binding.cap_dtype(binding.accum_dtype)
+    madt = binding.mlir_dtype(binding.accum_dtype)
+    if not (
+        midt.startswith("i") and midt[1:].isdigit()
+        and madt.startswith("i") and madt[1:].isdigit()
+        and int(madt[1:]) > int(midt[1:])
+    ):
+        raise ValueError(
+            f"scope_chain supports signed integer operands with a wider accumulator; "
+            f"binding declares {binding.operand_dtype!r}->{binding.accum_dtype!r}"
+        )
+    families = entry.get("scope_families")
+    region_ops = scope_chain_region_ops(families)
+    map_count = len(families) - 2
+    M, K, N = (int(entry.get(axis, binding.tile_dim)) for axis in ("M", "K", "N"))
+    if min(M, K, N) < 1:
+        raise ValueError("scope_chain extents must be positive")
+    a, w, out = entry.get("lhs", "A0"), entry.get("weight", "W"), entry.get("out", "Y0")
+    attrs = {"lhs": a, "weight": w, "out": out, "M": M, "K": K, "N": N,
+             "scope_families": list(families),
+             "scope_region_ops": region_ops,
+             "scope_signature": " -> ".join(families),
+             "map_count": map_count, "output_dtype": adt}
+    cap = {
+        "name": entry["name"], "kind": entry["kind"], "source_role": entry["source_role"],
+        "source_reference": entry["source_reference"], "label": entry.get("label", "dev"),
+        "interface_mlir": "capsule.interface.mlir", "linalg_mlir": "capsule.interface.mlir",
+        "inputs": [
+            {"name": a, "role": "input", "shape": [M, K], "dtype": idt},
+            {"name": w, "role": "weight", "shape": [N, K], "dtype": idt},
+        ],
+        "operation": {"op": "scope_chain", "attributes": attrs},
+        "numeric_policy": _numeric_policy(binding, binding.accum_dtype, None),
+        "expected": {
+            "instruction_classes": binding.classes_for(op="matmul", output_dtype=adt, epilogue=[], movement=True),
+            "modes": {"matmul": True},
+        },
+        "required_oracle_tiers": list(binding.tiers), "vcs": "optional", "firesim": "optional",
+    }
+    lines = [
+        'builtin.module attributes {prov.level = "linalg-on-tensors"} {',
+        f"  func.func @forward(%{a}: tensor<{M}x{K}x{midt}>, "
+        f"%{w}: tensor<{N}x{K}x{midt}>) -> tensor<{M}x{N}x{madt}> {{",
+        f"    %wt_empty = tensor.empty() : tensor<{K}x{N}x{midt}>",
+        f"    %wt = linalg.transpose ins(%{w} : tensor<{N}x{K}x{midt}>) "
+        f"outs(%wt_empty : tensor<{K}x{N}x{midt}>) permutation = [1, 0]",
+        f"    %zero = arith.constant 0 : {madt}",
+        f"    %acc_init = arith.constant dense<0> : tensor<{M}x{N}x{madt}>",
+        "    %acc = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>, "
+        "affine_map<(d0, d1, d2) -> (d2, d1)>, affine_map<(d0, d1, d2) -> (d0, d1)>], "
+        'iterator_types = ["parallel", "parallel", "reduction"]} '
+        f"ins(%{a}, %wt : tensor<{M}x{K}x{midt}>, tensor<{K}x{N}x{midt}>) "
+        f"outs(%acc_init : tensor<{M}x{N}x{madt}>) "
+        'attrs = {prov.region_id = "contraction_0", prov.op = "matmul", prov.family = "contraction"} {',
+        f"    ^bb0(%lhs: {midt}, %rhs: {midt}, %old: {madt}):",
+        f"      %lhs_wide = arith.extsi %lhs : {midt} to {madt}",
+        f"      %rhs_wide = arith.extsi %rhs : {midt} to {madt}",
+        f"      %product = arith.muli %lhs_wide, %rhs_wide : {madt}",
+        f"      %sum = arith.addi %old, %product : {madt}",
+        f"      linalg.yield %sum : {madt}",
+        f"    }} -> tensor<{M}x{N}x{madt}>",
+    ]
+    previous = "%acc"
+    for index in range(map_count):
+        result = f"%map{index}"
+        lines += [
+            f"    %map{index}_empty = tensor.empty() : tensor<{M}x{N}x{madt}>",
+            f"    %step{index} = arith.constant 1 : {madt}",
+            "    " + result + " = linalg.generic {indexing_maps = ["
+            "affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], "
+            'iterator_types = ["parallel", "parallel"]} '
+            f"ins({previous} : tensor<{M}x{N}x{madt}>) "
+            f"outs(%map{index}_empty : tensor<{M}x{N}x{madt}>) "
+            f'attrs = {{prov.region_id = "map_{index}", prov.op = "add", prov.family = "elementwise"}} {{',
+            f"    ^bb{index + 1}(%x: {madt}, %unused: {madt}):",
+            f"      %mapped = arith.addi %x, %step{index} : {madt}",
+            f"      linalg.yield %mapped : {madt}",
+            f"    }} -> tensor<{M}x{N}x{madt}>",
+        ]
+        previous = result
+    lines += [f"    func.return {previous} : tensor<{M}x{N}x{madt}>", "  }", "}"]
+    return cap, "\n".join(lines) + "\n"
+
+
 # op -> builder, for the driver to dispatch on the entry's declared op.
 BUILDERS: dict[str, Callable[[dict, CorpusBinding], tuple[dict, str]]] = {
     "matmul": build_matmul,
@@ -2094,6 +2208,7 @@ BUILDERS: dict[str, Callable[[dict, CorpusBinding], tuple[dict, str]]] = {
     "rope_qkv": build_rope_qkv,
     "gemv_batched": build_gemv_batched,
     "host_island_seam": build_host_island_seam,
+    "scope_chain": build_scope_chain,
 }
 
 

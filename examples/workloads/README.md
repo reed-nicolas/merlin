@@ -63,6 +63,10 @@ TinyLlama, random-input ResNet50 and a single SmolVLA denoising step are explici
 scoped diagnostics, not complete headline validation. SmolVLA's session workflow
 and TinyLlama's prefill/decode workflow need their own interfaces and checks.
 
+[Headline capture and lowering](headline_validation/README.md) gives reproducible
+commands for all three models, names each scope, and shows where to inspect the
+separate MLIR, tensor payload, session contract and lowering-stage artifacts.
+
 Phase 0 audits declarations and capsule obligations. Phase 1 must prove complete
 lowering, execution and numerical agreement; Phase 2 measures performance on a
 separate cohort. Report accelerator, host and unsupported work independently and

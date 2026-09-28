@@ -13,11 +13,13 @@ Two properties this file exists to hold, both learned the hard way in this tree:
 
 from __future__ import annotations
 
+import copy
 from fractions import Fraction
 
 import pytest
 import yaml
 from merlin_experiments.phase2.claims import pr as PR
+from merlin_experiments.phase2.claims.oracle_acceptance import selected_acceptance
 
 from merlin.common.paths import repo_root
 from merlin.perf import residency_claim as RC
@@ -164,6 +166,11 @@ def _rows(descriptors: list[dict], *, cycles_of, overlap_of) -> list[dict]:
     """Result rows in the exact shape the run seals: L2 correctness plus citable L3 timing."""
     rows = []
     for descriptor in descriptors:
+        declaration = descriptor["performance"].get("acceptance") or PR.supported_acceptance()
+        evidence = declaration["evidence"]
+        correctness_simulator = evidence["correctness_simulator"]
+        timing_simulator = evidence["timing_simulator"]
+        current_contract = declaration["analyzer"] == PR._CURRENT_ACCEPTANCE_BASE["analyzer"]
         axis = descriptor["performance"]["emitter"]["derived_axes"]["K"]
         band, k = str(axis["label"]), int(axis["value"])
         step = BANDS[band].index(k) + 1
@@ -183,7 +190,7 @@ def _rows(descriptors: list[dict], *, cycles_of, overlap_of) -> list[dict]:
                     "identity": {
                         "family": "PR",
                         "capsule": descriptor["name"],
-                        "simulator": "spike",
+                        "simulator": correctness_simulator,
                         "replicate": replicate,
                     },
                     "tier": "L2",
@@ -192,22 +199,29 @@ def _rows(descriptors: list[dict], *, cycles_of, overlap_of) -> list[dict]:
                     "cycles": None,
                 }
             )
-            rows.append(
-                {
-                    **common,
-                    "identity": {
-                        "family": "PR",
-                        "capsule": descriptor["name"],
-                        "simulator": "verilator",
-                        "replicate": replicate,
-                    },
-                    "tier": "L3",
-                    "purpose": "performance_certification",
-                    "citable": True,
-                    "cycles": cycles_of(band, k, replicate),
-                    "counter_values": overlap_of(band, step),
+            timing_row = {
+                **common,
+                "identity": {
+                    "family": "PR",
+                    "capsule": descriptor["name"],
+                    "simulator": timing_simulator,
+                    "replicate": replicate,
+                },
+                "tier": "L3",
+                "purpose": "performance_certification",
+                "citable": True,
+                "cycles": cycles_of(band, k, replicate),
+                "counter_values": overlap_of(band, step),
+            }
+            if current_contract:
+                kind = evidence["timing_oracle_kind"]
+                timing_row["oracle"] = {"kind": kind, "derived_from_rtl": True, "fidelity": "elaborated_rtl"}
+                timing_row["timing_identity"] = {
+                    "simulator": timing_simulator, "oracle_kind": kind, "fidelity": "elaborated_rtl",
+                    "simulator_binary_sha256": "a" * 64, "elaborated_firrtl_sha256": "b" * 64,
+                    "program_elf_sha256": "c" * 64,
                 }
-            )
+            rows.append(timing_row)
     return rows
 
 
@@ -265,7 +279,7 @@ def test_a_declared_acceptance_block_must_be_the_one_this_analyzer_implements(de
     sweep = next(row for row in profile["sweeps"] if row["id"] == "PR")
     declared = sweep["base"]["performance"].get("acceptance")
     if declared is not None:
-        assert declared == PR.supported_acceptance()
+        assert declared == PR._CURRENT_ACCEPTANCE_BASE
 
     for descriptor in descriptors:
         descriptor["performance"]["acceptance"] = PR.supported_acceptance()
@@ -274,6 +288,57 @@ def test_a_declared_acceptance_block_must_be_the_one_this_analyzer_implements(de
     refused = PR.preflight_pr_claim(descriptors, replicates=REPLICATES)
     assert refused["status"] == "REFUSED"
     assert "acceptance contract this analyzer does not implement" in refused["refusal_reasons"][0]
+
+
+def _current_acceptance(*, correctness: str = "reference_sim", timing: str = "selected_rtl") -> dict:
+    template = PR._CURRENT_ACCEPTANCE_BASE
+    declaration = copy.deepcopy(template)
+    declaration["evidence"]["correctness_simulator"] = correctness
+    declaration["evidence"]["timing_simulator"] = timing
+    declaration["evidence"]["timing_oracle_kind"] = f"rtl_{timing}"
+    declaration["fit"]["dependent_metric"] = f"{timing}_L3_cycles"
+    return selected_acceptance(template, declaration)
+
+
+def test_current_pr_contract_accepts_selected_oracles_and_checks_exact_rtl_identity(descriptors):
+    selected = copy.deepcopy(descriptors)
+    acceptance = _current_acceptance()
+    for descriptor in selected:
+        descriptor["performance"]["acceptance"] = copy.deepcopy(acceptance)
+    preflight = PR.preflight_pr_claim(selected, replicates=REPLICATES)
+    assert preflight["status"] == "READY"
+    assert preflight["contract_frozen"] is True
+    assert {row["simulator"] for row in preflight["expected_identities"]} == {
+        "reference_sim", "selected_rtl"
+    }
+    rows = _rows(selected, cycles_of=_affine(RATES), overlap_of=_settled_everywhere)
+    decision = PR.analyze_pr_claim(selected, rows, replicates=REPLICATES, counters=COUNTERS, partition=PARTITION)
+    assert decision["status"] == RC.ESTABLISHED
+    assert decision["evidence"]["timing_source"] == "selected_rtl_L3_only"
+    timing = next(row for row in rows if row["tier"] == "L3")
+    timing["oracle"]["kind"] = "rtl_other"
+    refused = PR.analyze_pr_claim(selected, rows, replicates=REPLICATES, counters=COUNTERS, partition=PARTITION)
+    assert refused["status"] == RC.REFUSED
+    assert "selected elaborated-RTL oracle" in refused["refusal_reasons"][0]
+
+
+@pytest.mark.parametrize("field", ["metric", "kind", "origin", "abstract_engine", "threshold"])
+def test_current_pr_refuses_oracle_or_claim_contract_drift(descriptors, field):
+    selected = copy.deepcopy(descriptors)
+    acceptance = _current_acceptance()
+    if field == "metric":
+        acceptance["fit"]["dependent_metric"] = "other_L3_cycles"
+    elif field == "kind":
+        acceptance["evidence"]["timing_oracle_kind"] = "rtl_other"
+    elif field == "origin":
+        acceptance["evidence"]["resolved_from"].pop("timing_oracle_kind")
+    elif field == "abstract_engine":
+        acceptance["evidence"]["timing_simulator"] = "elaborated_rtl"
+    else:
+        acceptance["noise_band"]["declared_constant"] = 8
+    for descriptor in selected:
+        descriptor["performance"]["acceptance"] = copy.deepcopy(acceptance)
+    assert PR.preflight_pr_claim(selected, replicates=REPLICATES)["status"] == "REFUSED"
 
 
 def test_one_replicate_is_refused_because_the_noise_band_is_the_measured_dispersion(descriptors):

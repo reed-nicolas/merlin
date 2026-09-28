@@ -16,8 +16,10 @@ import yaml
 
 from merlin.common.digest import is_sha256, sha256_bytes
 
+from .witness_basis import build_witness_basis
+
 INPUT_SCHEMA = "merlin.phase0.coverage_inputs.v1"
-SCHEMA = "merlin.phase0.coverage_commitment.v1"
+SCHEMA = "merlin.phase0.coverage_commitment.v2"
 INPUT_PATH = Path("_phase0/coverage-inputs.json")
 _SIGNATURE_FIELDS = (
     "mlir_operation",
@@ -53,6 +55,9 @@ def selected_inputs(selection, *, accounting: dict) -> dict:
         "software_spec": selection.software_spec,
         "capability_contract": selection.contract,
         "conformance": requirement,
+        # Preserve the exact selected bytes so memory coverage can be recomputed
+        # without asking a live target registry for a possibly different artifact.
+        "raw_facts_utf8": selection.raw_facts.decode("utf-8") if selection.raw_facts is not None else None,
         "evidence": {"status": selection.status, "raw_facts_sha256": selection.raw_facts_sha256},
         "qualification": "selected inputs only; hardware, compilation and numerical execution remain independent",
     }
@@ -232,9 +237,9 @@ def _graph_totality(application: dict, completeness: dict) -> tuple[dict, list[s
     for obligation in obligations:
         ids, positions = obligation.get("operation_ids") or [], obligation.get("mlir_ordinals") or []
         if len(ids) != 1 or len(positions) != 1 or ids[0] in obligation_index:
-            reasons.append("placement obligation is not one-to-one with a normalized operation")
+            reasons.append("operation obligation is not one-to-one with a normalized operation")
         elif isinstance(ids[0], str):
-            obligation_index[ids[0]] = (obligation.get("id"), positions[0])
+            obligation_index[ids[0]] = (obligation.get("id"), positions[0], obligation.get("role"))
     for node in nodes:
         if not isinstance(node, dict):
             reasons.append("normalized graph contains a malformed operation row")
@@ -246,17 +251,22 @@ def _graph_totality(application: dict, completeness: dict) -> tuple[dict, list[s
         if noncompute:
             if node.get("accounting") != "non_independent_compute" or node.get("obligation_id") is not None:
                 reasons.append("structural or nested operation is not explicitly accounted")
-        elif node.get("accounting") != "placement_obligation" or obligation_index.get(identity) != (
-            node.get("obligation_id"),
-            ordinal,
-        ):
-            reasons.append("normalized compute operation lacks its exact placement obligation")
+        else:
+            support = node.get("disposition") == "support_required"
+            expected_accounting = "support_lowering_obligation" if support else "placement_obligation"
+            expected_role = "support_lowering" if support else "compute_placement"
+            if node.get("accounting") != expected_accounting or obligation_index.get(identity) != (
+                node.get("obligation_id"),
+                ordinal,
+                expected_role,
+            ):
+                reasons.append("normalized operation lacks its exact role-specific obligation")
     if set(obligation_index) != {
         node.get("operation_id")
         for node in nodes
         if isinstance(node, dict) and node.get("disposition") not in {"structural", "component"}
     }:
-        reasons.append("placement obligation roster has missing or foreign operation identities")
+        reasons.append("operation obligation roster has missing or foreign operation identities")
     edge_ids = [edge.get("id") for edge in edges if isinstance(edge, dict)]
     if len(edge_ids) != len(edges) or len(set(edge_ids)) != len(edges):
         reasons.append("normalized SSA-use identities are incomplete or duplicated")
@@ -282,13 +292,21 @@ def _graph_totality(application: dict, completeness: dict) -> tuple[dict, list[s
                 for key in ("id", "value_id", "type", "producer_operation_id", "consumer_operation_id")
             ):
                 reasons.append("typed SSA use differs from its transfer obligation")
-        elif (
-            edge.get("accounting") != "block_argument_or_non_independent_endpoint"
-            or edge.get("transfer_id") is not None
-        ):
+        elif edge.get("accounting") == "support_dependency":
+            source = obligation_index.get(producer)
+            destination = obligation_index.get(consumer)
+            if (
+                edge.get("transfer_id") is not None
+                or source is None
+                or destination is None
+                or "support_lowering" not in {source[2], destination[2]}
+            ):
+                reasons.append("support dependency has no exact support-lowering endpoint")
+        elif edge.get("accounting") == "block_argument_or_non_independent_endpoint" and edge.get("transfer_id") is None:
+            if producer in obligation_index and consumer in obligation_index:
+                reasons.append("independent operation SSA use has no conditional transfer or support dependency")
+        else:
             reasons.append("SSA use has no recognized accounting disposition")
-        elif producer in obligation_index and consumer in obligation_index:
-            reasons.append("compute-to-compute SSA use has no conditional transfer obligation")
     if expected_transfers != set(transfer_index):
         reasons.append("conditional transfer roster has missing or foreign SSA uses")
     shape = graph.get("shape_domain") or {}
@@ -415,6 +433,62 @@ def build_commitment(
         selected_placements, selected_signatures, operation_reports = {}, {}, []
         for obligation in obligations:
             identifier = obligation.get("id")
+            if obligation.get("role") == "support_lowering":
+                precision = obligation.get("precision") or {}
+                evidence = obligation.get("support_lowering_evidence") or {}
+                operand_shapes = [row.get("shape") for row in precision.get("ordered_operand_types") or []]
+                result_shapes = [row.get("shape") for row in precision.get("ordered_result_types") or []]
+                static_source_shapes = all(
+                    isinstance(shape, list)
+                    and all(type(dimension) is int and dimension >= 0 for dimension in shape)
+                    for shape in [*operand_shapes, *result_shapes]
+                )
+                reasons = []
+                if obligation.get("status") != "resolved" or precision.get("status") != "resolved":
+                    reasons.append("exact source operand/result types or shapes are unresolved")
+                if (
+                    evidence.get("source_capture_sha256") != application.get("capture_sha256")
+                    or evidence.get("source_operation_id") != identifier
+                    or evidence.get("operand_types") != precision.get("ordered_storage_types")
+                    or evidence.get("result_types") != precision.get("result_types")
+                    or evidence.get("operand_shapes") != operand_shapes
+                    or evidence.get("result_shapes") != result_shapes
+                    or evidence.get("source_shape_status") != (
+                        "static" if static_source_shapes else "dynamic_or_unknown"
+                    )
+                ):
+                    reasons.append("support-lowering observation differs from the selected typed source operation")
+                # No selected compiler artifact/verifier is bound by these Phase 0
+                # inputs. A self-asserted status cannot certify a lowering or its
+                # shape/value mapping; keep this obligation open for Phase 1.
+                reasons.append("artifact-backed typed lowering and shape/value preservation are not verified")
+                key = signature_identity(obligation.get("observed_signature"))
+                witnesses = sorted(set(signature_witnesses.get(key, []))) if key is not None else []
+                if not witnesses:
+                    reasons.append("no admitted capsule has the exact observed typed operation signature")
+                operation_reports.append(
+                    {
+                        "id": identifier,
+                        "role": "support_lowering",
+                        "source_operation_ids": obligation.get("source_operation_ids"),
+                        "mlir_ordinals": obligation.get("mlir_ordinals"),
+                        "placement": None,
+                        "support_lowering_evidence": copy.deepcopy(evidence),
+                        "signature_sha256": key,
+                        "witnesses": witnesses,
+                        "status": "missing",
+                        "reasons": reasons,
+                    }
+                )
+                blockers.append(
+                    {
+                        "component": "support_lowering",
+                        "application": label,
+                        "obligation": identifier,
+                        "reason": "; ".join(reasons),
+                    }
+                )
+                continue
             placement = _placement(obligation)
             observed = obligation.get("observed_signature")
             if observed is None:
@@ -446,6 +520,7 @@ def build_commitment(
             operation_reports.append(
                 {
                     "id": identifier,
+                    "role": "compute_placement",
                     "source_operation_ids": obligation.get("source_operation_ids"),
                     "mlir_ordinals": obligation.get("mlir_ordinals"),
                     "placement": placement,
@@ -555,6 +630,20 @@ def build_commitment(
                     "reason": "conditional SSA uses await reviewed endpoint placement before transfer screening",
                 }
             )
+        pending_support_dependencies = sum(
+            edge.get("accounting") == "support_dependency"
+            for edge in graph_accounting.get("edges") or []
+            if isinstance(edge, dict)
+        )
+        if pending_support_dependencies:
+            blockers.append(
+                {
+                    "component": "support_dependency",
+                    "application": label,
+                    "count": pending_support_dependencies,
+                    "reason": "compute islands connected through support lowering await a compiler-owned typed route",
+                }
+            )
         application_reports[label] = {
             "capture_sha256": application.get("capture_sha256"),
             "capture_receipt": copy.deepcopy(receipt),
@@ -596,6 +685,9 @@ def build_commitment(
             ],
         },
         "applications": application_reports,
+        "phase1_witness_basis": build_witness_basis(
+            application_reports, rows, coverage_status="complete" if not blockers else "incomplete"
+        ),
         "conformance": conformance_coverage,
         "blockers": blockers,
         "independent_evidence": document.get("evidence"),
@@ -745,7 +837,12 @@ def observe_cohort(
     requirement = (inputs or {}).get("conformance")
     if isinstance(requirement, dict):
         try:
-            coverage = selected_cohort_coverage(requirement, sorted({Path(capsule["__dir__"]) for capsule in capsules}))
+            coverage = selected_cohort_coverage(
+                requirement,
+                sorted({Path(capsule["__dir__"]) for capsule in capsules}),
+                inputs=inputs,
+                phase=phase,
+            )
         except (OSError, ValueError, RuntimeError) as exc:
             coverage = {"status": "not_measured", "reason": f"{type(exc).__name__}: {str(exc)[:500]}"}
     return build_commitment(inputs, observations, phase=phase, conformance_coverage=coverage)

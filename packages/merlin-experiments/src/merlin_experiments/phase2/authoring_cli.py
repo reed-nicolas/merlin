@@ -31,6 +31,7 @@ def main(
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--functional-run-id", required=True)
     parser.add_argument("--functional-submission-sha256", required=True)
+    parser.add_argument("--published-compiler-root", type=Path)
     if resolve_layout is not None:
         parser.add_argument("--run-id", required=True)
     else:
@@ -95,6 +96,7 @@ def main(
             suite=suite if suite is not None else args.suite,
             functional_run_id=args.functional_run_id,
             functional_submission_sha256=args.functional_submission_sha256,
+            published_compiler_root=args.published_compiler_root,
             target_experiment=target_experiment,
             sandbox_inputs=PC.select_package_sandbox_inputs(target_experiment),
             model=args.model,

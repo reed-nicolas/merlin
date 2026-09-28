@@ -149,6 +149,25 @@ def test_static_pt2e_cache_binds_upstream_integerizer_bytes(tmp_path, monkeypatc
     assert capture._cache_slot(*request, recipe_sha256="recipe", static_pt2e=True) is None
 
 
+def test_cache_binds_transitive_model2mlir_package_source(tmp_path, monkeypatch):
+    from merlin.targetgen import capsule_source as source
+
+    monkeypatch.setenv("MERLIN_OUT_ROOT", str(tmp_path / "out"))
+    upstream = _upstream_source_fixture(tmp_path / "upstream")
+    helper = upstream / "m2m/capture/provenance.py"
+    helper.write_text("original helper\n")
+    capture = source.PytorchRefSource(m2m_dir=upstream, python=tmp_path / "python")
+    request = ("model", "f32", "loader", None)
+    before = capture._cache_slot(*request)
+    assert before is not None
+    helper.write_text("changed helper\n")
+    assert capture._cache_slot(*request) != before
+    helper.unlink()
+    assert capture._cache_slot(*request) != before
+    helper.symlink_to(upstream / "m2m/api.py")
+    assert capture._cache_slot(*request) is None
+
+
 def test_implementation_drift_refuses_publication(tmp_path, monkeypatch):
     from merlin.targetgen import capsule_source as source
 

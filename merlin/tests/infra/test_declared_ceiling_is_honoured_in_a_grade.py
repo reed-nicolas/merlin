@@ -21,11 +21,11 @@ import pathlib
 import pytest
 import yaml
 
-from merlin.common.paths import merlin_dir, repo_root
+from merlin.common.paths import module_source_path, repo_root
 from merlin.targetgen import tier_policy as TP
 
 CORPUS = repo_root() / "merlin/contract/capsules"
-RUNNER = merlin_dir() / "python/merlin/targetgen/capsule_runner.py"
+RUNNER = module_source_path("merlin.targetgen.capsule_runner")
 
 
 def _capped_capsules():

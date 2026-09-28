@@ -176,6 +176,14 @@ def source_inputs(command: dict) -> dict[str, str]:
         if path.is_symlink() or not path.is_file():
             raise SpecError(f"measured launch resource is absent or linked: {path}")
         paths[PREFIX + "resource:" + resource] = str(path)
+    if values.get("published_compiler_root"):
+        from .phase2.contracts import StageGateError
+        from .phase2.published_payload import selection_paths
+
+        try:
+            paths.update(selection_paths(Path(values["published_compiler_root"])))
+        except (ValueError, StageGateError) as exc:
+            raise SpecError(f"published compiler selection is invalid: {exc}") from exc
     return paths
 
 
@@ -205,6 +213,8 @@ def _verify_locations(command: dict) -> None:
     except (OSError, RuntimeError) as exc:
         raise SpecError(f"measured launch canonical location cannot be resolved: {exc}") from exc
     immutable = [Path(value) for value in (*command["inputs"].values(), *command["input_owner_roots"])]
+    if values.get("published_compiler_root"):
+        immutable.append(Path(values["published_compiler_root"]))
     mutable = [
         Path(value)
         for value in (
@@ -248,7 +258,10 @@ def verify_plan(plan: dict) -> None:
         actual = {
             name: path
             for name, path in plan["input_paths"].items()
-            if name.startswith(PREFIX) or name in {"phase2:" + key for key in command["inputs"]}
+            if (
+                name.startswith((PREFIX, "phase2:published:"))
+                or name in {"phase2:" + key for key in command["inputs"]}
+            )
         }
         if expected_inputs != actual:
             raise SpecError("installed measured source membership changed or is absent")

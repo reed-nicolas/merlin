@@ -141,6 +141,23 @@ def test_selected_recipe_and_observed_admission_do_not_license_host_or_framework
     )
 
 
+def test_scale_encoding_alias_matches_selected_carrier_without_accepting_different_format():
+    spec = _spec()
+    spec["quantization"]["formats"][0]["scale_encoding"] = "fp32"
+    hardware = _hardware()
+    hardware["readout_facets"][0]["scale"]["dtype"] = "f32"
+
+    match = build_quantization_contract(spec, hardware, _accounting())["formats"][0]["hardware_matches"][0]
+    assert match["status"] == "candidate"
+    assert match["conflicts"] == []
+    assert match["parameters"]["scale_encoding"]["value"] == "fp32"
+
+    spec["quantization"]["formats"][0]["scale_encoding"] = "bf16"
+    mismatch = build_quantization_contract(spec, hardware, _accounting())["formats"][0]["hardware_matches"][0]
+    assert mismatch["status"] == "incompatible"
+    assert "scale_encoding" in mismatch["conflicts"][0]
+
+
 def test_multi_format_candidates_never_borrow_the_selected_format_readout():
     spec = _spec()
     spec["quantization"]["formats"].append(
@@ -244,6 +261,7 @@ def test_capture_recipe_is_scoped_without_manually_authored_framework_bookkeepin
     assert recipe["software_admission"]["operations"][0]["ops"] == ["matmul"]
     assert recipe["activation"]["observer"] == "histogram"
     assert recipe["weight"]["observer"] == "minmax"
+    assert recipe["software_numerical_engine"] == "integer_reference"
     assert recipe["framework_capture_policy"]["observer_epsilon"] > 0
     assert recipe["recipe_sha256"] == quant_recipe.digest(recipe)
     spec["quantization"]["formats"][0]["activation_zero_point"] = 1

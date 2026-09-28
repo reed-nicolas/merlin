@@ -12,7 +12,46 @@ import pytest
 import yaml
 
 from merlin.targetgen import capsule_inputs
-from merlin.targetgen.application_inventory import exact_int_mm_geometry, verify_capture_receipt
+from merlin.targetgen.application_inventory import (
+    exact_int_mm_geometry, verified_static_integerization, verify_capture_receipt,
+)
+
+
+def test_integer_reference_projection_requires_exact_accounted_artifact():
+    agreement = {
+        "status": "passed", "finite": True, "samples": 1, "reference": "pt2e_integer",
+        "max_abs": 0.0, "max_rel": 0.0, "atol": 0.0, "rtol": 0.0,
+        "source": {"sha256": "a" * 64},
+        "output": {"path": "integer-reference.json", "sha256": "b" * 64},
+        "executed_contractions": {"linear": 1, "conv2d": 0, "matmul": 0,
+                                  "total": 1, "selected": 1, "observed": 1},
+        "outputs": [{"finite": True, "within_tolerance": True,
+                     "max_abs": 0.0, "max_rel": 0.0, "atol": 0.0, "rtol": 0.0}],
+    }
+    projection = {
+        "schema": "merlin.capture_integerization.v1", "status": "byte_bound_metadata",
+        "source_quantization": "int8_static_act_int8_weight",
+        "software_numerical_engine": "integer_reference",
+        "capture_receipt_sha256": "c" * 64,
+        "metadata": {"sha256": "d" * 64, "bytes": 1},
+        "capture": {"sha256": "e" * 64, "bytes": 1},
+        "reference_artifact": {"sha256": "b" * 64, "bytes": 1},
+        "integerization_receipt": {
+            "schema": "m2m.pt2e-integerize.v1", "accumulator_bound_checked": True,
+            "quantized_contractions_seen": 1, "quantized_contractions_integerized": 1,
+            "quantized_contractions_remaining": 0, "exported_integer_mm_count": 1,
+            "integer_mm_emitted": 1, "refusals": [], "golden_agreement": agreement,
+            "quantized_by_kind": {"linear": {"seen": 1}, "conv2d": {"seen": 0},
+                                  "matmul": {"seen": 0}},
+        },
+    }
+    assert verified_static_integerization(projection)
+    broken = deepcopy(projection)
+    broken["reference_artifact"]["sha256"] = "f" * 64
+    assert not verified_static_integerization(broken)
+    broken = deepcopy(projection)
+    broken["integerization_receipt"]["golden_agreement"]["outputs"][0]["max_abs"] = 0.001
+    assert not verified_static_integerization(broken)
 from merlin.targetgen.capsule_common import load_capsule
 from merlin.targetgen.capsule_source import (
     M2MUnavailable,
@@ -98,6 +137,8 @@ def test_exact_integer_matmul_bridge_refuses_weaker_signatures():
     assert (entry["M"], entry["K"], entry["N"]) == (2, 32, 64)
     assert entry["capture_op"] == "int_matmul" and entry["output_dtype"] == "i32"
     assert entry["application_signature_match"]["status"] == "candidate_unverified"
+    assert entry["application_signature_match"]["sources"][0]["source_index"] == 0
+    assert "application" not in entry["application_signature_match"]["sources"][0]
 
     row = full["applications"]["app"]["signatures"][0]
     assert exact_int_mm_geometry(row) == (2, 32, 64)
@@ -117,6 +158,30 @@ def test_exact_integer_matmul_bridge_refuses_weaker_signatures():
     partial = _application_operation_plan(demands, exact_entries=entries)
     assert partial["status"] == "blocked" and partial["blocked_operations"] == 1
     assert partial["obligations"][0]["status"] == "refused"
+
+
+def test_exact_integer_slice_uses_private_roster_ordinals_without_losing_group_identity():
+    demands, full = _demand_and_inventory()
+    private_name = "heldout_secret_model"
+    full["applications"][private_name] = deepcopy(full["applications"]["app"])
+    demands["applications"][private_name] = deepcopy(demands["applications"]["app"])
+    demands["operation_groups"][0]["count"] = 2
+    demands["operation_groups"][0]["sources"][private_name] = {
+        "capture_sha256": full["applications"][private_name]["capture_sha256"],
+        "count": 1,
+    }
+    demands["n_operations"] = 2
+    demands["full_inventory_sha256"] = hashlib.sha256(
+        json.dumps(full, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    entries, refused = exact_int_mm_entries(demands, full)
+    assert len(entries) == 1 and not refused
+    assert [source["source_index"] for source in entries[0]["application_signature_match"]["sources"]] == [0, 1]
+    assert private_name not in yaml.safe_dump(entries)
+    plan = _application_operation_plan(demands, exact_entries=entries)
+    assert plan["blocked_operations"] == 0
+    assert plan["obligations"][0]["capsule_candidates"] == [entries[0]["name"]]
 
 
 def test_integer_matmul_capsule_has_matching_linalg_and_independent_golden(tmp_path, monkeypatch):
@@ -297,6 +362,15 @@ def test_static_integer_slices_require_saved_byte_bound_complete_finite_conversi
     observed = verify_capture_receipt(tmp_path / "model.mlir")
     projection = observed.pop("capture_integerization")
     assert observed["status"] == "verified_materialized" and observed["source_closure_verified"] is False
+    # A producer can edit its own receipt. Materialization verification must not
+    # upgrade that claim to independently verified source closure.
+    receipt["source_closure_verified"] = True
+    (tmp_path / "capture_receipt.json").write_text(json.dumps(receipt))
+    claimed = verify_capture_receipt(tmp_path / "model.mlir")
+    assert claimed["status"] == "verified_materialized"
+    assert claimed["source_closure_verified"] is False
+    receipt["source_closure_verified"] = False
+    (tmp_path / "capture_receipt.json").write_text(json.dumps(receipt))
     app = full["applications"]["app"]
     app.update(
         capture_sha256=artifacts["model.mlir"]["sha256"],

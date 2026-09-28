@@ -11,6 +11,7 @@ from merlin_experiments.phase0 import profiles as PROFILES
 from merlin_experiments.phase0 import sweeps as SWEEPS
 from merlin_experiments.phase0 import writer as WRITER
 from merlin_experiments.phase2.claims import pk as PK
+from merlin_experiments.phase2.claims.oracle_acceptance import selected_acceptance
 from merlin_experiments.phase2.reporting import ReportingGateError
 
 from merlin.common.paths import repo_root
@@ -67,8 +68,10 @@ def descriptors() -> list[dict]:
 
 
 def _rows(descriptors: list[dict]) -> list[dict]:
-    timing_simulator = descriptors[0]["performance"]["acceptance"]["evidence"]["timing_simulator"]
-    oracle_kind = descriptors[0]["performance"]["acceptance"]["evidence"]["timing_oracle_kind"]
+    evidence = descriptors[0]["performance"]["acceptance"]["evidence"]
+    correctness_simulator = evidence["correctness_simulator"]
+    timing_simulator = evidence["timing_simulator"]
+    oracle_kind = evidence["timing_oracle_kind"]
     rows = []
     for descriptor in descriptors:
         k = descriptor["inputs"][1]["shape"][1]
@@ -86,7 +89,7 @@ def _rows(descriptors: list[dict]) -> list[dict]:
                     "identity": {
                         "family": "PK",
                         "capsule": descriptor["name"],
-                        "simulator": "spike",
+                        "simulator": correctness_simulator,
                         "replicate": replicate,
                     },
                     "tier": "L2",
@@ -205,11 +208,11 @@ def test_reporting_recomputes_real_frozen_corpus_and_pk_decision(descriptors, tm
 def test_profile_predeclares_the_exact_supported_contract():
     profile = yaml.safe_load((repo_root() / "experiments/templates/phase0/performance.yaml").read_text())
     sweep = next(row for row in profile["sweeps"] if row["id"] == "PK")
-    assert sweep["base"]["performance"]["acceptance"] == PK.supported_acceptance()
+    assert sweep["base"]["performance"]["acceptance"] == PK._CURRENT_ACCEPTANCE_BASE
     assert sweep["axes"] == {"M": ["tile"], "N": ["tile"], "K": ["tile", "2*tile", "4*tile", "8*tile"]}
 
 
-def test_real_gemmini_generator_emits_preflight_ready_pk_descriptors(tmp_path):
+def test_generator_emits_preflight_ready_pk_descriptors_with_explicit_inputs(tmp_path):
     from merlin_experiments.phase0.declarations import for_target
 
     from merlin.targetgen import corpus_spec
@@ -218,12 +221,31 @@ def test_real_gemmini_generator_emits_preflight_ready_pk_descriptors(tmp_path):
     declaration = for_target("gemmini")
     profile = PROFILES.load_profile(declaration.profile, **declaration.profile_inputs())
     target = load_target_experiment(declaration.descriptor)
-    binding = corpus_spec.derive_binding(target, profile.get("datapath", {}))
-    entries = SWEEPS.expand_sweeps(profile, binding, trait_facts=SWEEPS._performance_facts("gemmini"))
+    # This checks materialization and the frozen PK contract, not RTL extraction
+    # or trait proof. Both are selected explicitly so a local RTL checkout is
+    # not a hidden precondition of the test.
+    binding = corpus_spec.derive_binding(
+        target,
+        profile.get("datapath", {}),
+        facts={"facts": {"arrays": [{"name": "mesh", "rows": 16}]}},
+    )
+    trait_facts = {
+        "traits": {
+            "structural_pipeline_depth": {
+                "satisfied": True,
+                "tier": "test_fixture",
+                "evidence": "explicit pipeline fixture for declaration materialization",
+                "missing": [],
+            }
+        }
+    }
+    entries = SWEEPS.expand_sweeps(profile, binding, trait_facts=trait_facts)
     pk_entries = [entry for entry in entries if (entry.get("performance") or {}).get("family") == "PK"]
+    assert len(pk_entries) == 4, sorted((entry.get("performance") or {}).get("family", "") for entry in entries)
     written = [WRITER._write_capsule(entry, binding, tmp_path) for entry in pk_entries]
     generated = [yaml.safe_load((Path(path) / "capsule.yaml").read_text()) for path in written]
-    assert PK.preflight_pk_claim(generated)["status"] == "READY"
+    preflight = PK.preflight_pk_claim(generated)
+    assert preflight["status"] == "READY", preflight["refusal_reasons"]
 
 
 def test_preflight_records_fixed_cohort_and_the_declared_replicates(descriptors):
@@ -257,6 +279,51 @@ def test_verilator_is_supported_only_when_frozen_contract_selects_it(descriptors
     assert result["status"] == "ESTABLISHED"
     assert result["evidence"]["timing_source"] == "verilator_L3_only"
     assert result["evidence"]["timing_oracle_kind"] == "rtl_verilator"
+
+
+def _current_acceptance(*, correctness: str = "reference_sim", timing: str = "selected_rtl") -> dict:
+    template = PK._CURRENT_ACCEPTANCE_BASE
+    declaration = copy.deepcopy(template)
+    declaration["evidence"]["correctness_simulator"] = correctness
+    declaration["evidence"]["timing_simulator"] = timing
+    declaration["evidence"]["timing_oracle_kind"] = f"rtl_{timing}"
+    declaration["fit"]["dependent_metric"] = f"{timing}_L3_cycles"
+    return selected_acceptance(template, declaration)
+
+
+def test_current_pk_contract_uses_frozen_oracles_without_an_engine_whitelist(descriptors):
+    current = copy.deepcopy(descriptors)
+    acceptance = _current_acceptance()
+    for descriptor in current:
+        descriptor["performance"]["acceptance"] = copy.deepcopy(acceptance)
+    preflight = PK.preflight_pk_claim(current)
+    assert preflight["status"] == "READY"
+    assert {row["simulator"] for row in preflight["expected_identities"]} == {
+        "reference_sim", "selected_rtl"
+    }
+    result = PK.analyze_pk_claim(current, _rows(current))
+    assert result["status"] == "ESTABLISHED"
+    assert result["evidence"]["timing_source"] == "selected_rtl_L3_only"
+    assert result["evidence"]["timing_oracle_kind"] == "rtl_selected_rtl"
+
+
+@pytest.mark.parametrize("field", ["metric", "kind", "origin", "threshold", "abstract_engine"])
+def test_current_pk_refuses_oracle_or_claim_contract_drift(descriptors, field):
+    current = copy.deepcopy(descriptors)
+    acceptance = _current_acceptance()
+    if field == "metric":
+        acceptance["fit"]["dependent_metric"] = "other_L3_cycles"
+    elif field == "kind":
+        acceptance["evidence"]["timing_oracle_kind"] = "rtl_other"
+    elif field == "origin":
+        acceptance["evidence"]["resolved_from"].pop("timing_oracle_kind")
+    elif field == "threshold":
+        acceptance["thresholds"]["r_squared_min_inclusive"] = 0.1
+    else:
+        acceptance["evidence"]["timing_simulator"] = "elaborated_rtl"
+    for descriptor in current:
+        descriptor["performance"]["acceptance"] = copy.deepcopy(acceptance)
+    assert PK.preflight_pk_claim(current)["status"] == "REFUSED"
 
 
 @pytest.mark.parametrize(

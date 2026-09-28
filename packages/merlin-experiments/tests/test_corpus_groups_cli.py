@@ -70,6 +70,15 @@ def test_canonical_groups_uses_the_shared_parser(monkeypatch, capsys):
     assert "--max-tier" in capsys.readouterr().out
 
 
+def test_plan_only_rejects_partial_or_materializing_requests(tmp_path):
+    for option in ("only", "promote", "package"):
+        args = argparse.Namespace(plan_only=True, only=[], promote=False, package=None)
+        setattr(args, option, ["subset"] if option == "only" else True)
+        with pytest.raises(ValueError, match="--plan-only records all groups"):
+            group_capsules.run_from_args(args)
+    assert not list(tmp_path.iterdir())
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_group_help_and_unknown_options_never_execute(monkeypatch, tmp_path, capsys, legacy):
     def forbidden(_args):

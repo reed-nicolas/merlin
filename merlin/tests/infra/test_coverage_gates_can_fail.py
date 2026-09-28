@@ -94,10 +94,14 @@ def test_every_axis_the_requirement_measures_is_named_in_the_gate_table():
     """
     from merlin.targetgen import conformance
 
+    # This is an inventory receipt, not a pass/fail capsule-coverage axis. It
+    # carries ``status`` so its measurement state is visible, but deliberately
+    # has no ``uncovered`` vocabulary for the ratchet to waive.
+    diagnostic_only = {"application_demands"}
     produced = {
         key
         for key, value in conformance.uncovered({}, []).items()
-        if isinstance(value, dict) and ("uncovered" in value or "status" in value)
+        if key not in diagnostic_only and isinstance(value, dict) and ("uncovered" in value or "status" in value)
     }
     named = {key for key, _tag in CC.AXES}
     missing = produced - named

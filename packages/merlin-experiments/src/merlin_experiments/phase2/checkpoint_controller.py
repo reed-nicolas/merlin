@@ -45,6 +45,7 @@ from merlin_experiments.phase2 import holdout_corpus as HOLDOUT
 from merlin_experiments.phase2 import measurement_evidence as ME
 from merlin_experiments.phase2 import paired_inputs as PI
 from merlin_experiments.phase2 import paired_measurement as PME
+from merlin_experiments.phase2 import published_payload as PUBLISHED
 from merlin_experiments.phase2 import revealed_corpus as RC
 from merlin_experiments.phase2 import statistics as STATS
 from merlin_experiments.phase2.contracts import PerformanceExperimentError as ExperimentError
@@ -396,6 +397,8 @@ def _author_candidates(
             # already accepted.
             for predicate in config.waive_functional_gate or ():
                 command += ["--waive-functional-gate", predicate]
+            if config.published_compiler_root is not None:
+                command += ["--published-compiler-root", str(config.published_compiler_root)]
             launch = partial(_run_checked, command_runner, command, environment=environment, context=config.context)
 
         def commit(trial: str = trial, record: Path = record) -> dict[str, Any]:
@@ -714,6 +717,16 @@ def run(
         config.functional_submission_sha256,
         waive=frozenset(config.waive_functional_gate or ()),
     )
+    functional_base = functional.submission_dir
+    if config.published_compiler_root is not None:
+        published = PUBLISHED.inspect(functional, config.published_compiler_root, target=target.target)
+        if published.identity() != declaration.get("published_compiler"):
+            raise ExperimentError("published compiler selection changed after predeclaration")
+        functional_base = root / "published-functional-base"
+        if functional_base.exists() or functional_base.is_symlink():
+            PUBLISHED.verify_snapshot(functional, published, functional_base)
+        else:
+            PUBLISHED.materialize(functional, published, functional_base)
     functional_cohort = FC.functional_grade_cohort_from_run(target, functional, source_root=config.context.source_root)
     functional_cohort = replace(functional_cohort, declined=FC.declined_names(functional))
     tuning_certificate = GATE.load_certificate(config.gsim_certificate, expected_sha256=config.gsim_certificate_sha256)
@@ -881,7 +894,7 @@ def run(
                 Path(revealed["manifest"]),
                 qualification_root,
                 tuning_certificate,
-                functional_base=functional.submission_dir,
+                functional_base=functional_base,
                 functional_base_sha256=functional.digest,
                 reveal_manifest_sha256=revealed["manifest_sha256"],
                 reveal_corpus_sha256=revealed["capsules_sha256"],

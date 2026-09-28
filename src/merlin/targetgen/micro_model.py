@@ -15,13 +15,16 @@ the scorecard said the evidence was one architecture wide.
 So the inventory is DERIVED, from the same three sources the coverage requirement uses:
 
 ``accelerator layers``
-    one layer per ``(family, dtype)`` cell the target's capability manifest ADMITS. The accelerator is
-    exercised on everything it claims, or the claim is untested.
+    one layer per ``(family, dtype)`` cell whose emitted standalone operation is admitted at that
+    dtype by both the capability manifest and the authored software spec. A fused-only capability is
+    recorded as unexercised when this model has no matching fused statement; it never licenses a
+    standalone operation merely because the two share a family.
 
 ``host layers``
-    one layer per family a real capture CONTAINS that the target does NOT admit. These are not filler —
-    they are what makes a host seam exist at all, and they are interleaved BETWEEN accelerator layers so
-    the composition is ``A->H->A`` rather than a host prefix and a host suffix. On a matmul-only mesh the
+    one layer per family a real capture CONTAINS whose emitted operation the target cannot run on the
+    accelerator. These are not filler — they are what makes a host seam exist at all, and they are
+    interleaved BETWEEN accelerator layers so the composition is ``A->H->A`` rather than a host prefix
+    and a host suffix. On a matmul-only mesh the
     normalizations and activations of any real network have nowhere else to go, so this is the ordinary
     shape of real work rather than an artificial stress.
 
@@ -67,6 +70,7 @@ class LayerRequirement:
     op_frequency: int = 0  # how many regions across all captures carried that spelling
     admitted_by: tuple[str, ...] = ()  # compute units declaring it (accelerator side)
     observed_in: tuple[str, ...] = ()  # captures containing the family (host side)
+    emitted_op: str | None = None  # the concrete statement whose placement was checked
     why: str = ""
 
     def key(self) -> str:
@@ -83,6 +87,8 @@ class LayerRequirement:
             out["admitted_by"] = list(self.admitted_by)
         if self.observed_in:
             out["observed_in"] = list(self.observed_in)
+        if self.emitted_op:
+            out["emitted_op"] = self.emitted_op
         return out
 
 
@@ -95,19 +101,20 @@ class MicroModelSpec:
     extent: int | None = None  # the working extent, in elements
     tile_edge: int | None = None
     unmapped_families: dict = field(default_factory=dict)
+    unexercised_capabilities: list = field(default_factory=list)  # declared cells no standalone statement proves
     notes: list = field(default_factory=list)
 
     def accelerator_layers(self) -> list:
-        return [l for l in self.layers if l.side == ACCELERATOR]
+        return [layer for layer in self.layers if layer.side == ACCELERATOR]
 
     def host_layers(self) -> list:
-        return [l for l in self.layers if l.side == HOST]
+        return [layer for layer in self.layers if layer.side == HOST]
 
     def composition(self) -> str:
         """The composition shape this inventory produces, in the boundary axis's own vocabulary."""
         from merlin.targetgen import boundary as BD
 
-        seq = [BD.ACCEL if l.side == ACCELERATOR else BD.HOST for l in self.layers]
+        seq = [BD.ACCEL if layer.side == ACCELERATOR else BD.HOST for layer in self.layers]
         return BD.classify_sequence(seq)
 
     def to_dict(self) -> dict:
@@ -118,8 +125,9 @@ class MicroModelSpec:
             "composition": self.composition(),
             "n_accelerator_layers": len(self.accelerator_layers()),
             "n_host_layers": len(self.host_layers()),
-            "layers": [l.to_dict() for l in self.layers],
+            "layers": [layer.to_dict() for layer in self.layers],
             "unmapped_families": self.unmapped_families,
+            "unexercised_capabilities": self.unexercised_capabilities,
             "notes": self.notes,
         }
 
@@ -183,8 +191,74 @@ def interleave(accelerator: list, host: list) -> list:
     return out
 
 
-def spec(target: str, captures: dict, *, extent_tiles: int = _DEFAULT_EXTENT_TILES) -> MicroModelSpec:
-    """The derived inventory for ``target``'s minimal whole-model capsule."""
+def _standalone_admission(
+    family: str,
+    dtype: str,
+    op: str,
+    capture_dtype: str | None,
+    cap_map: dict,
+    software_spec: dict | None,
+) -> str | None:
+    """Return why the emitted statement cannot serve as an accelerator layer, or ``None``.
+
+    The capture worker casts the whole model for fp16/bf16 captures. Quantized formats start from an
+    f32 graph and integerize contractions; the standalone body statements remain float operations.
+    In particular, an int8 DMA capability cannot prove a floating-point transpose. The selected
+    capture dtype is required: a different admitted dtype is a separate, unexercised cell.
+    """
+    from merlin.common import quant_formats as qf
+    from merlin.targetgen.eligibility import RegionDescriptor, is_eligible
+    from merlin.targetgen.software_spec import admit_operation
+
+    if capture_dtype is None:
+        return "selected model capture dtype is unknown"
+    selected = "fp8_e4m3" if capture_dtype == "fp8" else capture_dtype
+    if not qf.has(selected):
+        return f"selected model capture dtype {capture_dtype!r} is unknown"
+    selected = qf.get(selected).name
+    if selected != qf.get(dtype).name:
+        return f"this model captures {selected}, not the declared {dtype} capability cell"
+    emitted_dtype = selected if op in {"matmul", "linear"} or selected in {"fp32", "fp16", "bf16"} else "fp32"
+    region = RegionDescriptor(op=op, family=family, in_dtype=emitted_dtype, rank=2, layout="row_major_contiguous")
+    hardware = is_eligible(region, cap_map)
+    if not hardware.eligible:
+        return hardware.reason
+    if software_spec is None:
+        return None
+    numerics = software_spec["numerical_semantics"]
+    signature = {
+        "family": family,
+        "operand_dtype": emitted_dtype,
+        "accum_dtype": numerics["accumulator_dtype"],
+        "readout_dtype": numerics["readout_dtype"],
+        "rank": 2,
+        "layout": "row_major_contiguous",
+        "tails": "zero_pad_valid_window",
+        "broadcasting": "none",
+        "aliasing": "disjoint_inputs_outputs",
+        "epilogues": [op] if family == "elementwise_map" else [],
+        "composed_with": [],
+        "scale_granularity": "tensor",
+    }
+    software = admit_operation(software_spec, op, signature, "accelerator")
+    if software.get("constraints_status") != "matched":
+        return f"authored software spec: {software['reason']}"
+    return None
+
+
+def spec(
+    target: str,
+    captures: dict,
+    *,
+    extent_tiles: int = _DEFAULT_EXTENT_TILES,
+    software_spec: dict | None = None,
+    capture_dtype: str | None = None,
+) -> MicroModelSpec:
+    """The derived inventory for ``target``'s minimal whole-model capsule.
+
+    ``software_spec`` is the caller's selected snapshot, not a live target-path lookup. A frozen
+    generation run passes both it and ``capture_dtype`` so placement uses the same capture inputs.
+    """
     from merlin.targetgen import conformance as CF
 
     out = MicroModelSpec(target=target)
@@ -203,7 +277,13 @@ def spec(target: str, captures: dict, *, extent_tiles: int = _DEFAULT_EXTENT_TIL
             f"for this target rather than a hardware boundary"
         )
 
+    from merlin.targetgen.eligibility import capability_map_for_target
+
     admitted = CF.admitted(target)
+    try:
+        cap_map = capability_map_for_target(target)
+    except Exception:  # noqa: BLE001 -- CF.admitted already reports an unresolvable contract as empty
+        cap_map = {}
     units = CF.admitting_units(target)
     spellings = observed_spellings(captures)
 
@@ -228,34 +308,61 @@ def spec(target: str, captures: dict, *, extent_tiles: int = _DEFAULT_EXTENT_TIL
         return (None, 0) if op == "?" else (op, int(n))
 
     accelerator: list = []
+    host: list = []
+    represented_on_host: set[str] = set()
     for fam in sorted(admitted):
         dtypes = tuple(admitted.get(fam) or ())
         if not dtypes:
             continue
         op, freq = _spelling(fam)
+        emitted_op, _ = statement_for(fam)
         if op is None:
             out.unmapped_families[fam] = (
                 "admitted by the hardware but no readable capture names an op for it, so the model "
                 "cannot be composed from evidence here; state the layer explicitly or accept that this "
                 "capability goes unexercised end to end"
             )
+        blocked_reasons = []
+        admitted_here = False
         for dt in dtypes:
-            accelerator.append(
+            reason = _standalone_admission(fam, dt, emitted_op, capture_dtype, cap_map, software_spec)
+            layer = LayerRequirement(
+                family=fam,
+                dtype=CF.capsule_dtype(dt),
+                side=ACCELERATOR,
+                op=op,
+                op_frequency=freq,
+                admitted_by=units.get((fam, CF.capsule_dtype(dt)), ()),
+                emitted_op=emitted_op,
+                why="the emitted operation is independently admitted at this dtype by hardware and software",
+            )
+            if reason is None:
+                accelerator.append(layer)
+                admitted_here = True
+                continue
+            out.unexercised_capabilities.append(
+                {"family": fam, "dtype": dt, "emitted_op": emitted_op, "reason": reason}
+            )
+            blocked_reasons.append(reason)
+        if not admitted_here and fam in observed_counts and fam not in represented_on_host:
+            host.append(
                 LayerRequirement(
                     family=fam,
-                    dtype=CF.capsule_dtype(dt),
-                    side=ACCELERATOR,
+                    dtype=None,
+                    side=HOST,
                     op=op,
                     op_frequency=freq,
-                    admitted_by=units.get((fam, CF.capsule_dtype(dt)), ()),
-                    why="the capability manifest declares the hardware computes this family at this dtype; "
-                    "a whole-model capsule that never reaches it leaves the claim untested",
+                    observed_in=tuple(sorted(observed_in.get(fam, ()))),
+                    emitted_op=emitted_op,
+                    why="the emitted standalone operation cannot use this target's accelerator: "
+                    + "; ".join(blocked_reasons),
                 )
             )
+            represented_on_host.add(fam)
 
-    host: list = []
     for fam in sorted(f for f in observed_counts if f not in admitted):
         op, freq = _spelling(fam)
+        emitted_op, _ = statement_for(fam)
         host.append(
             LayerRequirement(
                 family=fam,
@@ -264,17 +371,24 @@ def spec(target: str, captures: dict, *, extent_tiles: int = _DEFAULT_EXTENT_TIL
                 op=op,
                 op_frequency=freq,
                 observed_in=tuple(sorted(observed_in.get(fam, ()))),
+                emitted_op=emitted_op,
                 why=f"real captures contain {observed_counts[fam]} region(s) of this family and the target "
                 f"declares no capability for it, so it MUST run on the host lane; placing it between "
                 f"accelerator layers is what makes the seam exist",
             )
         )
 
+    if len(accelerator) == 1 and host:
+        # The same admitted contraction can close the round trip when no second standalone family can.
+        # This does not pretend that a fused-only family supplied the second accelerator segment.
+        from dataclasses import replace
+
+        accelerator.append(replace(accelerator[0], why="repeated admitted operation closes the host seam"))
     out.layers = interleave(accelerator, host)
     if not host:
         out.notes.append(
-            "this target admits every family the captures contain, so the model has no host island and "
-            "no seam to prove; that is a fact about the target, not a gap in the model"
+            "every emitted operation in the captures has an accelerator placement, so the model has "
+            "no host island and no seam to prove"
         )
     return out
 
@@ -377,6 +491,11 @@ def emit_pytorch(spec) -> str:
     inits, fwd, notes = [], [], []
     for i, layer in enumerate(layers):
         op, (init_line, forward_line) = statement_for(layer.family)
+        if layer.emitted_op is not None and op != layer.emitted_op:
+            raise UnwritableLayer(
+                f"{layer.family}: classified statement {layer.emitted_op!r} changed to {op!r}; "
+                "derive the placement again before emitting"
+            )
         if init_line:
             inits.append("        " + init_line.format(i=i))
         fwd.append(f"        # {layer.side}: {layer.family} (observed spelling {layer.op!r})")
@@ -384,16 +503,21 @@ def emit_pytorch(spec) -> str:
         notes.append(f"#   {i}. {layer.side:11} {layer.family:16} -> {op}")
 
     body_init = "\n".join(inits) or "        pass"
+    blocked = list(getattr(spec, "unexercised_capabilities", ()) or ())
+    blocked_inventory = (
+        "\nUnexercised accelerator capabilities (the emitted standalone statement cannot prove these):\n"
+        + "\n".join(f"#   {row['family']}/{row['dtype']} via {row['emitted_op']}: {row['reason']}" for row in blocked)
+        + "\n"
+        if blocked
+        else ""
+    )
     return (
         '"""DERIVED micro model -- regenerate with merlin.targetgen.micro_model.emit_pytorch.\n'
         "\n"
         f"Composition: {spec.composition()}\n"
-        "Layer inventory, in composition order:\n" + "\n".join(notes) + "\n"
-        "\n"
-        "Every layer is here because the target's capability manifest admits its family (accelerator) or\n"
-        "because a real capture contains a family the manifest does not admit (host). The order is the\n"
-        "interleave that puts host layers in the INTERIOR, so the model exercises a round trip rather\n"
-        "than a prefix.\n"
+        "Layer inventory, in composition order:\n" + "\n".join(notes) + "\n" + blocked_inventory + "\n"
+        "Accelerator labels require an admitted standalone statement at the emitted dtype; host labels\n"
+        "mark statements the target cannot accelerate. Host layers sit between accelerator layers.\n"
         '"""\n'
         "import torch\n"
         "import torch.nn as nn\n"

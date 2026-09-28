@@ -186,6 +186,10 @@ def build_measurement_plan(inputs: PairedInputs) -> MeasurementPlan:
     members = sorted(inputs.corpus.capsules, key=lambda member: (str(member.family), str(member.capsule)))
     if not members:
         raise PC.CampaignGateError("measurement corpus contains zero capsules")
+    try:
+        ME.require_supported_oracle_selection(members)
+    except ME.MeasurementEvidenceError as exc:
+        raise PC.CampaignGateError(str(exc)) from exc
     member_by_key = {(str(member.family), str(member.capsule)): member for member in members}
     if len(member_by_key) != len(members):
         raise PC.CampaignGateError("measurement corpus has duplicate capsule identities")
@@ -783,7 +787,12 @@ def run_execution(
         with MS.counter_environment(enabled=True, unit=physical_unit):
             physical = run_one("physical_bytes")
         linked = MS.link_counter_passes(
-            occupancy, physical, physical_unit=physical_unit, counter_binding=counter_binding, rtl_facts_sha256=rtl_sha
+            occupancy,
+            physical,
+            physical_unit=physical_unit,
+            counter_binding=counter_binding,
+            rtl_facts_sha256=rtl_sha,
+            timing_simulator=PRIMARY_SIMULATOR,
         )
         measurement = dict(occupancy)
         measurement["counter_passes"] = {"occupancy": occupancy, "physical_bytes": physical}

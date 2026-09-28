@@ -46,6 +46,10 @@ quantization:
     - operand_dtype: fp8_e4m3
       accumulator_dtype: bf16
       eligible_operations: [contraction]
+      # These are model-operand quantization choices, not the E8M0 byte used
+      # by MXU_POP_FP8 / VFP8PACK when packing a BF16 result for storage.
+      # The selected RTL proves neither an operand block scope nor the
+      # software scale/compensation rule for a quantized model.
       scale_encoding: unknown
       block_size: unknown
 transfer_contracts:

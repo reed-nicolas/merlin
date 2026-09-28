@@ -360,6 +360,16 @@ def _fixed_field(descriptor: Mapping[str, Any], field: str) -> Any:
         return attributes.get("output_dtype")
     if field == "epilogue":
         return list(attributes.get("epilogue") or [])
+    if field in {"M", "N"}:
+        extent = attributes.get(field)
+        if type(extent) is not int or extent <= 0:
+            raise _Refusal(f"member {descriptor.get('name')!r} lacks a positive declared {field} extent")
+        return extent
+    if field == "scope_signature":
+        signature = attributes.get(field)
+        if not isinstance(signature, str) or not signature:
+            raise _Refusal(f"member {descriptor.get('name')!r} lacks its selected scope signature")
+        return signature
     raise _Refusal(
         f"the cohort control names a fixed field {field!r} this procedure cannot read from a "
         "descriptor; it would be declared and never checked"

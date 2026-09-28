@@ -87,6 +87,26 @@ def test_env_precedes_generated_and_legacy_contracts_still_work(tmp_path, monkey
     assert registry.resolve("synthetic").provider.declared is False
 
 
+def test_oot_capability_override_does_not_replace_provider_plugin(tmp_path, monkeypatch):
+    provider = support(tmp_path / "sdk")
+    write_yaml(
+        provider / "contracts/target_contract.yaml",
+        {"name": "synthetic", "compute_units": [{"name": "old"}], "plugin": {"backend": "provider.py"}},
+    )
+    selected = tmp_path / "selected.yaml"
+    write_yaml(
+        selected,
+        {"name": "synthetic", "compute_units": [{"name": "new"}], "plugin": {"backend": "untrusted.py"}},
+    )
+    monkeypatch.setenv("MERLIN_TARGET_PATH", str(provider))
+    monkeypatch.setenv("MERLIN_TARGET_CONTRACT", str(selected))
+    resolved = registry.resolve("synthetic")
+    assert resolved.contract_path == provider / "contracts/target_contract.yaml"
+    assert registry.load_contract("synthetic")["compute_units"] == [{"name": "new"}]
+    assert resolved.plugin()["backend"] == "provider.py"
+    assert resolved.plugin()["path"] == str(provider)
+
+
 def test_resolution_is_read_only_even_with_legacy_autofetch(tmp_path, monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("resolution attempted to materialize or fetch")

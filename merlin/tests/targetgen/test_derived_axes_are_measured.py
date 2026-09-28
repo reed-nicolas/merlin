@@ -11,6 +11,7 @@ from __future__ import annotations
 import yaml
 
 from merlin.targetgen import conformance as CF
+from merlin.targetgen import boundary
 
 
 def _capsule(tmp_path, name, **doc):
@@ -135,3 +136,50 @@ def test_uncovered_reports_the_host_lane_axis_at_all(tmp_path):
 def test_a_spec_with_no_host_lane_block_is_not_measured(tmp_path):
     rep = CF.uncovered({"target": "t", "cells": []}, [tmp_path])
     assert rep["host_lane"]["status"] == "not_measured"
+
+
+def test_host_lane_skips_unrelated_entry_dtype_before_profiling(tmp_path, monkeypatch):
+    _capsule(
+        tmp_path,
+        "M0_i8_compute_f32_entry",
+        kind="model",
+        semantic={"semantic_family": "contraction"},
+        operation={"op": "model", "attributes": {"dtype": "i8"}},
+        inputs=[{"role": "input", "dtype": "f32", "shape": [1, 16]}],
+    )
+    examined = []
+
+    def unresolved(path, target, *, capability_contract=None):
+        examined.append(path.name)
+        return boundary.BoundaryProfile(kind=boundary.UNKNOWN, detail="unresolved boundary")
+
+    monkeypatch.setattr(boundary, "profile_capsule", unresolved)
+    spec = {"target": "t", "host_lane": {"required": [{"family": "contraction", "dtype": "f32"}]}}
+    gap = boundary.host_lane_coverage(spec, [tmp_path])
+    assert examined == []
+    assert gap["entry_tensor_witnesses"] == {"contraction/f32": ["M0_i8_compute_f32_entry"]}
+    assert gap["uncovered"] == ["contraction/f32"]
+    assert gap["unreadable_capsules"] == {}
+
+
+def test_host_lane_keeps_unknown_for_matching_compute_dtype(tmp_path, monkeypatch):
+    _capsule(
+        tmp_path,
+        "M0_f32_compute_f32_entry",
+        kind="model",
+        semantic={"semantic_family": "contraction"},
+        operation={"op": "model", "attributes": {"dtype": "f32"}},
+        inputs=[{"role": "input", "dtype": "f32", "shape": [1, 16]}],
+    )
+    examined = []
+
+    def unresolved(path, target, *, capability_contract=None):
+        examined.append(path.name)
+        return boundary.BoundaryProfile(kind=boundary.UNKNOWN, detail="unresolved boundary")
+
+    monkeypatch.setattr(boundary, "profile_capsule", unresolved)
+    spec = {"target": "t", "host_lane": {"required": [{"family": "contraction", "dtype": "f32"}]}}
+    gap = boundary.host_lane_coverage(spec, [tmp_path])
+    assert examined == ["M0_f32_compute_f32_entry"]
+    assert gap["uncovered"] == ["contraction/f32"]
+    assert gap["unreadable_capsules"] == {"M0_f32_compute_f32_entry": "unresolved boundary"}

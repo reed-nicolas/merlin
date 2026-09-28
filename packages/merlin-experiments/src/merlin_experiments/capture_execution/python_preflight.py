@@ -11,6 +11,7 @@ import ast
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import tomllib
 from pathlib import Path, PurePosixPath
@@ -57,6 +58,14 @@ def _sha(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _has_symlink_component(path: Path) -> bool:
+    """Reject lexical parent traversal and links before reading selected source bytes."""
+    if ".." in path.parts:
+        return True
+    absolute = path.absolute()
+    return any(component.is_symlink() for component in (absolute, *absolute.parents))
 
 
 def _path(value: str | Path, *, hash_file: bool = False) -> dict[str, Any]:
@@ -183,6 +192,7 @@ def _receipt_audit(receipt: Path, loader: Path, m2m_root: Path) -> dict[str, Any
         "source_closure_verified": False,
         "loader": None,
         "tool_sources": [],
+        "observed_imports": None,
         "errors": [],
     }
     if not receipt.is_file():
@@ -213,6 +223,9 @@ def _receipt_audit(receipt: Path, loader: Path, m2m_root: Path) -> dict[str, Any
     if not isinstance(expected, str) or len(expected) != 64:
         result["errors"].append("Receipt loader digest is invalid")
         return result
+    if _has_symlink_component(loader):
+        result["errors"].append("Selected loader path traverses a symlink or parent traversal")
+        return result
     observed = _sha(loader) if loader.is_file() else None
     result["loader"] = {
         "expected_sha256": expected,
@@ -228,7 +241,7 @@ def _receipt_audit(receipt: Path, loader: Path, m2m_root: Path) -> dict[str, Any
             result["errors"].append("Receipt direct source path is unsafe")
             continue
         path = m2m_root.joinpath(*relative.parts)
-        if not relative.parts or any(part.is_symlink() for part in (path, *path.parents) if part != Path("/")):
+        if not relative.parts or _has_symlink_component(path):
             result["errors"].append("Receipt direct source path is empty or traverses a symlink")
             continue
         observed = _sha(path) if path.is_file() else None
@@ -242,10 +255,133 @@ def _receipt_audit(receipt: Path, loader: Path, m2m_root: Path) -> dict[str, Any
         )
     if result["errors"]:
         return result
+    result["observed_imports"] = _observed_imports(receipt, payload, m2m_root, owner_hashes)
     all_match = result["loader"]["status"] == "match" and all(
         row["status"] == "match" for row in result["tool_sources"]
     )
     result["status"] = "current_direct_sources_match" if all_match else "current_direct_sources_drift"
+    return result
+
+
+def _observed_imports(
+    receipt: Path, payload: dict[str, Any], m2m_root: Path, owner_hashes: dict[str, str]
+) -> dict[str, Any]:
+    """Cross-check receipt-bound capture metadata, not an authenticated execution log."""
+    result: dict[str, Any] = {
+        "scope": "receipt_bound_meta_observed_imports_only",
+        "status": "unavailable",
+        "meta": _path(receipt.parent / "meta.json", hash_file=True),
+        "observed_dependency_count": None,
+        "selected_m2m_sources": [],
+        "selected_checkout_sources": [],
+        "foreign_m2m_modules": [],
+        "errors": [],
+    }
+    artifacts = payload.get("artifacts")
+    recorded = artifacts.get("meta.json") if isinstance(artifacts, dict) else None
+    if not isinstance(recorded, dict) or not isinstance(recorded.get("sha256"), str):
+        result["errors"].append("Receipt has no digest for capture metadata")
+        return result
+    if result["meta"].get("sha256") != recorded["sha256"]:
+        result["status"] = "meta_drift_or_missing"
+        result["errors"].append("Capture metadata bytes differ from the receipt")
+        return result
+    try:
+        meta = json.loads((receipt.parent / "meta.json").read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        result["errors"].append("Capture metadata is not readable JSON")
+        return result
+    dependencies = meta.get("loader_dependency_sources") if isinstance(meta, dict) else None
+    if not isinstance(dependencies, list):
+        result["errors"].append("Capture metadata has no observed import list")
+        return result
+    result["observed_dependency_count"] = len(dependencies)
+    root = m2m_root.absolute()
+    for item in dependencies:
+        if not isinstance(item, dict):
+            result["errors"].append("Malformed observed import entry")
+            continue
+        module, source, expected = item.get("module"), item.get("path"), item.get("sha256")
+        if not isinstance(module, str) or not isinstance(source, str) or not isinstance(expected, str):
+            result["errors"].append("Malformed observed import fields")
+            continue
+        path = Path(source)
+        is_m2m_module = module == "m2m" or module.startswith("m2m.")
+        if not path.is_absolute() or ".." in path.parts or not path.absolute().is_relative_to(root):
+            if is_m2m_module:
+                result["foreign_m2m_modules"].append(module)
+            continue
+        name = path.absolute().relative_to(root).as_posix()
+        bucket = result["selected_m2m_sources" if is_m2m_module else "selected_checkout_sources"]
+        if _has_symlink_component(path):
+            result["errors"].append(f"Observed checkout source path traverses a symlink: {name}")
+            bucket.append(
+                {
+                    "module": module,
+                    "name": name,
+                    "observed_sha256": expected,
+                    "current_sha256": None,
+                    "named_direct_owner": name in owner_hashes,
+                    "status": "unsafe_path",
+                }
+            )
+            continue
+        current = _sha(path) if path.is_file() else None
+        bucket.append(
+            {
+                "module": module,
+                "name": name,
+                "observed_sha256": expected,
+                "current_sha256": current,
+                "named_direct_owner": name in owner_hashes,
+                "status": "match" if current == expected else "drift_or_missing",
+            }
+        )
+    result["selected_m2m_sources"].sort(key=lambda row: (row["name"], row["module"]))
+    result["selected_checkout_sources"].sort(key=lambda row: (row["name"], row["module"]))
+    result["foreign_m2m_modules"].sort()
+    result["status"] = "invalid_observed_imports" if result["errors"] else "observed_imports_inventoried"
+    return result
+
+
+def _package_inventory(m2m_root: Path, receipt_audit: dict[str, Any] | None) -> dict[str, Any]:
+    """Bind today's complete M2M package tree, not a historical import closure."""
+    package = m2m_root / "m2m"
+    result: dict[str, Any] = {
+        "scope": "current_m2m_package_tree_only",
+        "status": "unusable_source_tree",
+        "tree_sha256": None,
+        "members": [],
+        "unlisted_python_sources_by_receipt": None,
+        "errors": [],
+    }
+    if _has_symlink_component(package) or not package.is_dir():
+        result["errors"].append("Selected M2M package is absent or traverses a symlink")
+        return result
+    for path in sorted(package.rglob("*")):
+        name = path.relative_to(m2m_root).as_posix()
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            result["members"].append({"name": name, "kind": "directory"})
+        elif stat.S_ISREG(mode):
+            result["members"].append({"name": name, "kind": "file", "bytes": path.stat().st_size, "sha256": _sha(path)})
+        else:
+            result["errors"].append(f"Selected M2M package has a link or special entry: {name}")
+    if result["errors"]:
+        return result
+    canonical = json.dumps(result["members"], sort_keys=True, separators=(",", ":")).encode()
+    result["tree_sha256"] = hashlib.sha256(canonical).hexdigest()
+    result["status"] = "current_tree_inventoried"
+    if receipt_audit and receipt_audit["status"] in {
+        "current_direct_sources_match",
+        "current_direct_sources_drift",
+    }:
+        named = {row["name"] for row in receipt_audit["tool_sources"]}
+        result["unlisted_python_sources_by_receipt"] = [
+            row["name"]
+            for row in result["members"]
+            if row["kind"] == "file" and row["name"].endswith(".py") and row["name"] not in named
+        ]
     return result
 
 
@@ -319,7 +455,7 @@ def inspect(
         else {"needed_sonames": [], "interpreter": None, "error": "Torch extension is absent"}
     )
     required_paths = [
-        *inputs.values(),
+        *(value for name, value in inputs.items() if name != "loader_manifest" or value["kind"] != "missing"),
         *editable,
         *(row["path"] for row in env_inputs),
         python_elf["interpreter"],
@@ -354,6 +490,9 @@ def inspect(
             f"{[x for x in (python_elf['error'], torch_elf['error']) if x]}"
         )
     receipt_audit = _receipt_audit(capture_receipt, loader, m2m_root) if capture_receipt else None
+    package_inventory = _package_inventory(m2m_root, receipt_audit)
+    if package_inventory["status"] != "current_tree_inventoried":
+        blockers.append("Selected M2M package source tree cannot be safely inventoried")
     if receipt_audit:
         blockers.append(
             "A prior capture receipt can only compare its declared direct source hashes with current files; "
@@ -361,6 +500,16 @@ def inspect(
         )
         if receipt_audit["status"] != "current_direct_sources_match":
             blockers.append("Selected capture receipt's direct source bytes are absent, changed, or invalid")
+        observed = receipt_audit["observed_imports"]
+        if observed and any(not row["named_direct_owner"] for row in observed["selected_m2m_sources"]):
+            blockers.append("Receipt's direct-owner list omits M2M sources observed by its capture metadata")
+        if observed and observed["selected_checkout_sources"]:
+            blockers.append(
+                "Capture metadata observed other selected-checkout sources; compare their bytes and include them "
+                "in any future sealed source snapshot"
+            )
+        if package_inventory["unlisted_python_sources_by_receipt"]:
+            blockers.append("Prior receipt omits Python files from the selected M2M package tree")
     return {
         "schema": SCHEMA,
         "inspector_source_sha256": _sha(Path(__file__)),
@@ -378,6 +527,7 @@ def inspect(
         "explicit_data_paths": [_path(path, hash_file=True) for path in data_paths],
         "dynamic_libraries": {"python": python_elf, "torch_extension": torch_elf},
         "capture_receipt_audit": receipt_audit,
+        "m2m_package_source_inventory": package_inventory,
         "missing_paths": missing,
         "blockers": blockers,
         "next_step": (

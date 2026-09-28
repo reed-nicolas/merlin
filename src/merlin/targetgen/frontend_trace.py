@@ -19,7 +19,14 @@ def _digest(document: dict) -> str:
 
 
 def _graph(snapshot: dict | None, stage: str, errors: list[str]) -> dict:
-    unknown = {"status": "unknown", "call_count": None, "nodes": {}, "calls": set(), "by_target": {}}
+    unknown = {
+        "status": "unknown",
+        "call_count": None,
+        "nodes": {},
+        "calls": set(),
+        "input_dtypes": {},
+        "by_target": {},
+    }
     if not isinstance(snapshot, dict) or snapshot.get("status") != "complete":
         errors.append(f"{stage} graph is unavailable")
         return unknown
@@ -51,6 +58,7 @@ def _graph(snapshot: dict | None, stage: str, errors: list[str]) -> dict:
         for result in node.get("results") or []
         if isinstance(result, dict) and isinstance(result.get("id"), str)
     }
+    input_dtypes: dict[str, list[str]] = {}
     for edge in snapshot.get("edges") or []:
         if (
             not isinstance(edge, dict)
@@ -65,15 +73,38 @@ def _graph(snapshot: dict | None, stage: str, errors: list[str]) -> dict:
             if result is None or result.get("dtype") != edge.get("dtype") or result.get("shape") != edge.get("shape"):
                 errors.append(f"{stage} graph typed edge disagrees with its producer value")
                 return unknown
+        if isinstance(edge.get("dtype"), str):
+            input_dtypes.setdefault(edge["consumer_node_id"], []).append(edge["dtype"])
     return {
         "status": "verified",
         "call_count": len(calls),
         "nodes": indexed,
         "calls": calls,
+        "input_dtypes": {identity: sorted(dtypes) for identity, dtypes in input_dtypes.items()},
         "sha256": snapshot["sha256"],
         "runtime_versions": snapshot.get("runtime_versions"),
         "by_target": dict(sorted(Counter(indexed[identity].get("target") for identity in calls).items())),
     }
+
+
+def _unresolved_call(graph: dict, identity: str) -> dict:
+    node = graph["nodes"][identity]
+    return {
+        "node_id": identity,
+        "op": node.get("op"),
+        "target": node.get("target"),
+        "input_dtypes": graph["input_dtypes"].get(identity, []),
+        "result_dtypes": [result.get("dtype") for result in node.get("results") or []],
+    }
+
+
+def _recorded_unresolved_status(transition: dict, field: str, computed: set[str]) -> str:
+    recorded = transition.get(field)
+    if recorded is None:
+        return "not_reported"
+    if not isinstance(recorded, list) or any(not isinstance(identity, str) for identity in recorded):
+        return "mismatch"
+    return "matched" if len(recorded) == len(set(recorded)) and set(recorded) == computed else "mismatch"
 
 
 def join_frontend_trace(trace: dict | None, application_graph: dict | None, *, capture_sha256: str) -> dict:
@@ -89,8 +120,10 @@ def join_frontend_trace(trace: dict | None, application_graph: dict | None, *, c
         "quantized_invocation_count": None,
         "prepared_invocation_count": None,
         "graphs": {},
+        "transition_obligations": [],
         "normalized_operations": {},
         "raw_mlir_correspondence": {"status": "unknown"},
+        "prepared_lowering_obligations": {"status": "unknown", "unresolved_calls": []},
         "normalization_correspondence": {"status": "unknown"},
     }
     if trace is None:
@@ -103,7 +136,9 @@ def join_frontend_trace(trace: dict | None, application_graph: dict | None, *, c
     stages_valid = all(graph["status"] == "verified" for graph in graphs.values())
     for stage, graph in graphs.items():
         base[f"{stage}_invocation_count"] = graph["call_count"]
-        base["graphs"][stage] = {key: value for key, value in graph.items() if key not in {"nodes", "calls"}}
+        base["graphs"][stage] = {
+            key: value for key, value in graph.items() if key not in {"nodes", "calls", "input_dtypes"}
+        }
     relations = trace.get("transformations")
     seen_transitions = set()
     if not isinstance(relations, list):
@@ -124,6 +159,50 @@ def join_frontend_trace(trace: dict | None, application_graph: dict | None, *, c
                 errors.append(f"{source} -> {destination} references unknown source identities")
             consumed.update(sources)
             produced.update(destinations)
+        source_calls = graphs[source]["calls"] - consumed
+        destination_calls = graphs[destination]["calls"] - produced
+        graph_verified = graphs[source]["status"] == graphs[destination]["status"] == "verified"
+        reported = [
+            _recorded_unresolved_status(transition, field, computed)
+            for field, computed in (
+                ("unresolved_source_ids", source_calls),
+                ("unresolved_destination_ids", destination_calls),
+            )
+        ]
+        producer_status = (
+            "not_checked"
+            if not graph_verified
+            else "mismatch"
+            if "mismatch" in reported
+            else "not_reported"
+            if "not_reported" in reported
+            else "matched"
+        )
+        if producer_status == "mismatch":
+            errors.append(f"{source} -> {destination} producer unresolved call IDs disagree with relation roster")
+        base["transition_obligations"].append(
+            {
+                "from_stage": source,
+                "to_stage": destination,
+                "status": "unknown_graph"
+                if not graph_verified
+                else "complete"
+                if transition.get("status") == "complete" and not source_calls and not destination_calls
+                else "unresolved",
+                "producer_unresolved_ids_status": producer_status,
+                "unresolved_source_calls": [
+                    _unresolved_call(graphs[source], identity) for identity in sorted(source_calls)
+                ]
+                if graph_verified
+                else [],
+                "unresolved_destination_calls": [
+                    _unresolved_call(graphs[destination], identity) for identity in sorted(destination_calls)
+                ]
+                if graph_verified
+                else [],
+                "scope": "uncovered selected call sites; neither elimination nor semantic equivalence is inferred",
+            }
+        )
         if (
             transition.get("status") != "complete"
             or not graphs[source]["calls"] <= consumed
@@ -146,8 +225,8 @@ def join_frontend_trace(trace: dict | None, application_graph: dict | None, *, c
         raw_operations, recorded = raw.get("operations") or [], mlir.get("operations")
         prepared_nodes = graphs["prepared"]["nodes"]
         origin_nodes = {**graphs["original"]["nodes"], **graphs["quantized"]["nodes"]}
-        valid = isinstance(recorded, list) and len(recorded) == len(raw_operations)
-        if valid:
+        roster_valid = isinstance(recorded, list) and len(recorded) == len(raw_operations)
+        if roster_valid:
             for ordinal, (observed, record) in enumerate(zip(raw_operations, recorded, strict=True)):
                 expected_role = observed.get("trace_role") or (
                     "structural" if observed["mlir_operation"] in _STRUCTURAL else "unresolved"
@@ -164,27 +243,38 @@ def join_frontend_trace(trace: dict | None, application_graph: dict | None, *, c
                     or not set(record.get("source_node_ids") or []) <= set(prepared_nodes)
                     or not set(record.get("origin_node_ids") or []) <= set(origin_nodes)
                 ):
-                    valid = False
+                    roster_valid = False
                     break
-        if valid:
+        if roster_valid:
+            base["raw_mlir_correspondence"] = {
+                "status": "verified",
+                "sha256": capture_sha256,
+                "bytes": mlir["bytes"],
+                "n_operations": len(recorded),
+            }
             mapped = {
                 identity: [record["ordinal"] for record in recorded if identity in record["source_node_ids"]]
                 for identity in graphs["prepared"]["calls"]
             }
             correspondence = mlir.get("source_correspondence")
+            correspondence_valid = True
+            unresolved = set()
             if not isinstance(correspondence, list) or len(correspondence) != len(mapped):
-                valid = False
+                correspondence_valid = False
             else:
                 seen = set()
                 for receipt in correspondence:
+                    if not isinstance(receipt, dict):
+                        correspondence_valid = False
+                        break
                     identity = receipt.get("node_id")
                     if identity not in mapped or identity in seen or receipt.get("mlir_ordinals") != mapped[identity]:
-                        valid = False
+                        correspondence_valid = False
                         break
                     seen.add(identity)
                     if mapped[identity]:
                         if receipt.get("status") != "lowered":
-                            valid = False
+                            correspondence_valid = False
                             break
                     elif receipt.get("status") == "alias":
                         if (
@@ -192,22 +282,27 @@ def join_frontend_trace(trace: dict | None, application_graph: dict | None, *, c
                             or type(receipt.get("result_index")) is not int
                             or receipt["result_index"] < 0
                         ):
-                            valid = False
+                            correspondence_valid = False
                             break
                     elif receipt.get("status") == "eliminated":
                         if not receipt.get("reason"):
-                            valid = False
+                            correspondence_valid = False
                             break
+                    elif receipt.get("status") == "unresolved":
+                        unresolved.add(identity)
                     else:
-                        valid = False
+                        correspondence_valid = False
                         break
-        if valid:
-            base["raw_mlir_correspondence"] = {
-                "status": "verified",
-                "sha256": capture_sha256,
-                "bytes": mlir["bytes"],
-                "n_operations": len(recorded),
+            base["prepared_lowering_obligations"] = {
+                "status": "unknown" if not correspondence_valid else "unresolved" if unresolved else "verified",
+                "unresolved_calls": [
+                    _unresolved_call(graphs["prepared"], identity) for identity in sorted(unresolved)
+                ] if correspondence_valid else [],
             }
+            if not correspondence_valid:
+                errors.append("prepared call-site lowering receipt disagrees with exact MLIR source identities")
+            elif unresolved:
+                errors.append("prepared call-site lowering correspondence is incomplete")
             normalized = application_graph.get("normalization_correspondence") or {}
             normalization_valid = normalized.get("status") in {"identity", "serialization_equivalent"}
             base["normalization_correspondence"] = {

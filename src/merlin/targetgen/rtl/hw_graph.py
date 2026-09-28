@@ -39,9 +39,12 @@ def load_hw_graph(path: str | Path, *, circt_opt):
     if selected is None:
         generic = to_generic(path, circt_opt=circt_opt)
     else:
-        generic = Path(path).with_suffix(".generic.mlir")
+        generic = Path(selected["_generic_hw_output"])
+        if generic.is_symlink():
+            raise ValueError("selected CIRCT genericization output may not be a symlink")
         receipt = selected.get("_genericization")
         if receipt is None:
+            generic.parent.mkdir(parents=True, exist_ok=True)
             command = [str(circt_opt), "--mlir-print-op-generic", str(path), "-o", str(generic)]
             subprocess.run(command, check=True, capture_output=True)
             selected["_genericization"] = {

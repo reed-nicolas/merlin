@@ -490,6 +490,18 @@ def _recompute_golden(capsule: dict) -> dict[str, list]:
             f"tensor: no `attributes.bias`, no input with role 'bias', and no `arg_order`"
         )
 
+    if op == "scope_chain":
+        lhs = env[attrs["lhs"]]
+        weight = env[attrs["weight"]]
+        transposed = _transpose2d(weight)
+        contracted = lhs.matmul(transposed)
+        # One increment per requirement-selected tensor map. Their adjacency
+        # is verified on the MLIR rather than inferred from this scalar oracle.
+        map_count = attrs["map_count"]
+        return {out_name: [
+            [value + map_count for value in row] for row in contracted.to_list()
+        ]}
+
     if op in ("matmul", "linear"):
         lhs = env[attrs.get("lhs", _pick("input"))]
         w = env[attrs.get("weight", _pick("weight"))]

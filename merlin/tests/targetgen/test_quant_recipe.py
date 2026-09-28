@@ -227,8 +227,8 @@ def get_model_and_inputs():
 
 
 @pytest.mark.slow
-def test_static_fp8_recipe_reaches_model2mlir_capture(tmp_path: Path) -> None:
-    """A derived floating-point format must not be fed to an integer-only observer."""
+def test_static_fp8_recipe_records_projected_storage_as_diagnostic(tmp_path: Path) -> None:
+    """A valid FP8 recipe reaches capture but cannot claim native FP8 from projected f32 storage."""
     from merlin.common.paths import env
 
     python = env("MERLIN_M2M_PYTHON") or (
@@ -264,6 +264,7 @@ def test_static_fp8_recipe_reaches_model2mlir_capture(tmp_path: Path) -> None:
             "mode": "static",
         },
     }
+    recipe["recipe_sha256"] = QR.digest(recipe)
     (tmp_path / "recipe.json").write_text(json.dumps(recipe), encoding="utf-8")
     result = subprocess.run(
         [
@@ -285,9 +286,11 @@ def test_static_fp8_recipe_reaches_model2mlir_capture(tmp_path: Path) -> None:
         timeout=120,
         env={**os.environ, "TMPDIR": str(tmp_path)},
     )
-    assert result.returncode == 0, result.stderr[-3000:]
+    assert result.returncode == 3, result.stderr[-3000:]
     assert (tmp_path / "capture" / "linalg.mlir").is_file()
     meta = json.loads((tmp_path / "capture" / "meta.json").read_text())
+    assert meta["ok"] is False
+    assert meta["precision_realization"]["status"] == "projected"
     assert meta["scheme"] == "fp8_e4m3_static_act_weight"
     assert meta["quantization_stats"]["framework_capture_policy"]["activation_observer"] == "minmax"
 
@@ -425,6 +428,7 @@ def test_the_generic_quantizer_realises_tensor_and_channel_integer_capture(tmp_p
     for granularity in ("tensor", "channel"):
         body = QR.derive(_facet()).to_dict()
         body["weight"]["granularity"] = granularity
+        body["software_numerical_engine"] = "integer_reference"
         body["recipe_sha256"] = QR.digest(body)
         recipe = tmp_path / f"{granularity}.json"
         recipe.write_text(json.dumps(body), encoding="utf-8")
@@ -453,9 +457,12 @@ def test_the_generic_quantizer_realises_tensor_and_channel_integer_capture(tmp_p
         assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
         assert meta["integerization_receipt"]["quantized_contractions_remaining"] == 0
         assert meta["integerization_receipt"]["golden_agreement"]["status"] == "passed"
+        assert meta["integerization_receipt"]["golden_agreement"]["reference"] == "pt2e_integer"
+        assert meta["integerization_receipt"]["portable_agreement"]["status"] == "passed"
         assert meta["integerization_receipt"]["exported_integer_mm_count"] == 2
         assert meta["determinism"]["deterministic_algorithms"] == "required"
-        assert meta["recipe_sha256"] == body["recipe_sha256"] and meta["scheme"] is None
+        assert meta["recipe_sha256"] == body["recipe_sha256"]
+        assert meta["scheme"] == "int8_static_act_int8_weight"
         assert meta["quantization_stats"]["annotated_contractions"] == 2
         assert meta["recipe_agreement"]["samples"] >= 1
         seen[granularity] = (out / "linalg.mlir").read_text()

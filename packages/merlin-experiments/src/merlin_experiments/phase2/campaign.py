@@ -806,12 +806,23 @@ def inspect_functional_run(
     )
 
 
-def materialize_perf_workspace(record: FunctionalRun, perf_root: Path) -> Path:
+def materialize_perf_workspace(
+    record: FunctionalRun, perf_root: Path, *, published_root: Path | None = None, target: str | None = None
+) -> Path:
     """Copy the exact functional package into a new performance-only workspace."""
     perf_root = Path(perf_root).resolve()
     workspace = perf_root / "workspace"
     snapshot = workspace / "submission"
-    observed = materialize_readonly_tree(record.submission_dir, snapshot)
+    if published_root is None:
+        observed = materialize_readonly_tree(record.submission_dir, snapshot)
+    else:
+        if target is None:
+            raise CampaignGateError("published compiler selection requires the admitted target")
+        from .published_payload import inspect, materialize
+
+        selected = inspect(record, published_root, target=target)
+        materialize(record, selected, snapshot)
+        observed = hash_tree(snapshot)["sha256"]
     if observed != record.digest:
         raise CampaignGateError(f"copied performance submission digest {observed} does not match {record.digest}")
     return snapshot

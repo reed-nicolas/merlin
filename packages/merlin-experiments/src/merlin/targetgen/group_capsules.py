@@ -107,11 +107,17 @@ def write(target: str, stated: Mapping[str, Any], out_root: Path, *, declaration
     experiment, selected = _experiment(target, declaration)
     profile = profiles.load_profile(selected.profile, include_holdouts=False, **selected.profile_inputs())
     binding = corpus_spec.derive_binding(experiment, profile.get("datapath", {}))
+    semantics = (profile.get("datapath") or {}).get("numerical_semantics")
     built: dict[str, str] = {}
     refused: dict[str, str] = {}
     for row in stated["entries"]:
         try:
-            built[row["name"]] = str(writer._write_capsule(dict(row["entry"]), binding, Path(out_root)))
+            entry = dict(row["entry"])
+            if semantics is not None:
+                if entry.get("numerical_semantics") not in (None, semantics):
+                    raise ValueError("group entry numerical semantics differ from the selected software spec")
+                entry["numerical_semantics"] = semantics
+            built[row["name"]] = str(writer._write_capsule(entry, binding, Path(out_root)))
         except Exception as error:  # noqa: BLE001 -- reported per capsule, never swallowed
             refused[row["name"]] = f"{type(error).__name__}: {str(error)[:300]}"
     return {"built": built, "refused_by_generator": refused}
@@ -216,6 +222,11 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--only", action="append", default=[], help="build and run only these capsule names")
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="write the complete derived group demand without building goldens or capsules",
+    )
+    parser.add_argument(
         "--promote",
         action="store_true",
         help="write a covering subset (one program per stage combination, the cheapest) into the "
@@ -231,8 +242,14 @@ def run_from_args(args: argparse.Namespace) -> int:
     from merlin_experiments.phase0.declarations import for_target, from_definition
 
     from merlin.common import mlir_query as mq
+    from merlin.common.digest import sha256_file
+    from merlin.targetgen.rtl.facts import find_facts, target_contract_path
+    from merlin.targetgen.software_spec import software_spec_path_for_recipe
+    from merlin.targetgen.target_registry import resolve
     from merlin.xdsl_dialects.lowering import stream_plan
 
+    if args.plan_only and (args.only or args.promote or args.package):
+        raise ValueError("--plan-only records all groups and cannot combine with --only, --promote, or --package")
     definition = getattr(args, "definition", None)
     selected = from_definition(definition) if definition is not None else for_target(args.target)
     _experiment(args.target, selected)  # refuse an incompatible declaration before writing output
@@ -241,15 +258,42 @@ def run_from_args(args: argparse.Namespace) -> int:
     if args.manifest:
         weights = stream_plan.weight_args_of(json.loads(Path(args.manifest).read_text(encoding="utf-8")))
     stated = entries(args.target, mq.parse(args.capture), weight_args=weights, model=args.model)
+    # A derived group list is evidence about these exact bytes, not merely about paths a later
+    # reader might repoint. Record the oracle's selected contract/facts alongside source inputs.
+    selected_inputs = {
+        "capture": Path(args.capture),
+        "definition": selected.definition,
+        "software_spec": software_spec_path_for_recipe(selected.recipe),
+        "capability_contract": target_contract_path(args.target),
+        "provider_contract": resolve(args.target).contract_path,
+        "rtl_facts": find_facts(args.target),
+    }
+    if args.manifest:
+        selected_inputs["manifest"] = Path(args.manifest)
+    inputs = {
+        name: {"path": str(path.resolve()), "sha256": sha256_file(path)}
+        for name, path in selected_inputs.items()
+        if path is not None and path.is_file()
+    }
+    missing_inputs = sorted(name for name, path in selected_inputs.items() if path is None or not path.is_file())
     if args.only:
         stated["entries"] = [row for row in stated["entries"] if row["name"] in set(args.only)]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    if args.promote:
+    if args.plan_only:
+        report: dict[str, Any] = {
+            **stated,
+            "built": {},
+            "refused_by_generator": {},
+            "materialization": "not_requested",
+        }
+    elif args.promote:
         report: dict[str, Any] = {**stated, **promote(args.target, stated, declaration=selected)}
         report["entries"] = [row for row in stated["entries"] if row["name"] in report["built"]]
     else:
         report = {**stated, **write(args.target, stated, out / "capsules", declaration=selected)}
+    report["inputs"] = inputs
+    report["missing_input_receipts"] = missing_inputs
     if args.package:
         report["graded"] = run(
             args.target,

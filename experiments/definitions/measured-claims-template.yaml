@@ -21,6 +21,8 @@ phases:
       suite: OPERATOR_SUITE
       functional_run_id: OPERATOR_FROZEN_FUNCTIONAL_RUN_ID
       functional_submission_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      # Optional: an independently cloned Merlin publication of that same graded submission.
+      # published_compiler_root: ../operator-inputs/published-compiler-clone
       descriptor: ../operator-inputs/target_experiment.yaml
       rtl_facts: ../operator-inputs/rtl-facts.json
       perf_profile: ../operator-inputs/perf-profile.yaml

@@ -652,6 +652,18 @@ def test_counter_passes_link_only_as_raw_named_readings() -> None:
     assert "total" not in physical and "read_bytes" not in physical and "write_bytes" not in physical
 
 
+def test_counter_passes_use_only_the_explicitly_selected_timing_simulator() -> None:
+    occupancy = _counter_pass_fixture("occupancy")
+    physical = _counter_pass_fixture("physical_bytes")
+    selected = MS.link_counter_passes(
+        occupancy, physical, physical_unit="BYTES", timing_simulator="verilator"
+    )
+    assert selected["status"] == "linked"
+    wrong = MS.link_counter_passes(occupancy, physical, physical_unit="BYTES", timing_simulator="gsim")
+    assert wrong["status"] == "refused"
+    assert any("no RTL simulator result" in reason for reason in wrong["refusals"])
+
+
 def test_counter_pass_linkage_refuses_identity_drift_and_missing_readings() -> None:
     occupancy = _counter_pass_fixture("occupancy")
     physical = _counter_pass_fixture("physical_bytes")
