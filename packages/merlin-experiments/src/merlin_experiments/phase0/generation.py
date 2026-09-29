@@ -195,11 +195,13 @@ def _prepare_model_capture_entry(
                 f"selected model2MLIR checkout {capture.m2m_dir} lacks {integerizer}; "
                 "static int8 model capture requires m2m.capture.pt2e_integerize"
             )
-        if capture.available():
+        if capture.available() and not entry.get("micro_model"):
             # The PT2E quantizer imports these from the selected checkout only
-            # after source capsules start writing. Probe that exact interpreter
-            # and package now, so an absent lineage API cannot leave a partial
-            # cohort that looks like a completed Phase 0 materialization.
+            # after source capsules start writing. The derived micro-model is
+            # the sole exception: its graph is checked at capture time for
+            # complete ATen provenance and absence of BatchNorm before Merlin
+            # permits a missing fold API. Every other static model must have
+            # the API before any writer runs.
             probe = subprocess.run(
                 [
                     str(capture.python),

@@ -562,6 +562,54 @@ def _as_tuple(sample: Any) -> tuple:
     return tuple(sample) if isinstance(sample, (tuple, list)) else (sample,)
 
 
+def _no_batch_norm_fold_needed(original_snapshot: Any, exported: Any) -> bool:
+    """Prove the selected original and PT2E-input graphs contain no BN to fold.
+
+    A missing upstream fold-lineage API is harmless only for complete, plain
+    ATen graphs with no BatchNorm call. Unknown/custom calls cannot establish
+    absence, even when their names do not mention BatchNorm.
+    """
+    if not isinstance(original_snapshot, Mapping):
+        return False
+    if original_snapshot.get("schema") != "m2m.frontend_graph.v1" or original_snapshot.get("status") != "complete":
+        return False
+    nodes = original_snapshot.get("nodes")
+    if not isinstance(nodes, list):
+        return False
+    for node in nodes:
+        if not isinstance(node, Mapping):
+            return False
+        if node.get("op") not in {"call_function", "call_method", "call_module"}:
+            continue
+        target = node.get("target")
+        if node.get("classification") != "aten" or not isinstance(target, str):
+            return False
+        if "batch_norm" in target.lower() or "batchnorm" in target.lower():
+            return False
+    graph = getattr(exported, "graph", None)
+    if graph is None:
+        return False
+    for node in graph.nodes:
+        if node.op not in {"call_function", "call_method", "call_module"}:
+            continue
+        if node.op == "call_module" and node.target == "_guards_fn":
+            # torch.export.module() injects a shape-guard submodule after the
+            # original ATen snapshot. The selected framework's GuardsFn does
+            # not perform model computation and cannot hide a BN call.
+            get_submodule = getattr(exported, "get_submodule", None)
+            guard = get_submodule("_guards_fn") if callable(get_submodule) else None
+            guard_type = type(guard)
+            if guard_type.__module__ == "torch.export._unlift" and guard_type.__qualname__ == "GuardsFn":
+                continue
+            return False
+        target = str(node.target)
+        if node.op != "call_function" or not target.startswith("aten."):
+            return False
+        if "batch_norm" in target.lower() or "batchnorm" in target.lower():
+            return False
+    return True
+
+
 def apply_recipe(
     model: Any,
     recipe: Mapping[str, Any],
@@ -655,10 +703,23 @@ def apply_recipe(
     if type(epsilon) not in (int, float) or not math.isfinite(epsilon) or epsilon <= 0:
         raise RecipeError("observer epsilon must be finite and positive")
     fold_candidates = []
+    fold_provenance_api = "not_applicable"
     if original_frontend_snapshot is not None:
-        from m2m.capture.trace import pt2e_conv_bn_fold_candidates
+        from m2m.capture import trace as capture_trace
 
-        fold_candidates = pt2e_conv_bn_fold_candidates(exported, original_frontend_snapshot)
+        fold_api = getattr(capture_trace, "pt2e_conv_bn_fold_candidates", None)
+        if callable(fold_api):
+            fold_candidates = fold_api(exported, original_frontend_snapshot)
+            fold_provenance_api = "selected_model2mlir"
+        elif _no_batch_norm_fold_needed(original_frontend_snapshot, exported):
+            # There is no BatchNorm source identity for a PT2E fold to carry.
+            # This is an exact graph absence proof, not a family-level alias.
+            fold_provenance_api = "not_needed_no_batch_norm"
+        else:
+            raise RecipeError(
+                "selected model2MLIR lacks pt2e_conv_bn_fold_candidates; "
+                "cannot prove PT2E Conv+BatchNorm source identity for this graph"
+            )
     quantizer = build_quantizer(recipe, layer_plan=layer_plan, eps=epsilon,
                                 fold_candidates=fold_candidates)
     prepared = prepare_pt2e(exported, quantizer)
@@ -708,6 +769,7 @@ def apply_recipe(
         "weight_granularity": recipe["weight"]["granularity"],
         "activation_granularity": recipe["activation"]["granularity"],
         "software_admission": quantizer.software_decisions,
+        "fold_provenance_api": fold_provenance_api,
         "framework_capture_policy": {
             "activation_observer": _observer_name(recipe["activation"], is_weight=False),
             "weight_observer": _observer_name(recipe["weight"], is_weight=True),

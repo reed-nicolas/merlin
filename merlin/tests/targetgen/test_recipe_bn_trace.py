@@ -10,6 +10,30 @@ from pathlib import Path
 import pytest
 
 from merlin.common.paths import merlin_dir
+from merlin.targetgen._recipe_quantizer import _no_batch_norm_fold_needed
+
+
+def test_missing_fold_api_requires_complete_plain_aten_graph_without_batch_norm() -> None:
+    from types import SimpleNamespace
+
+    original = {
+        "schema": "m2m.frontend_graph.v1",
+        "status": "complete",
+        "nodes": [{"op": "call_function", "classification": "aten", "target": "aten.matmul.default"}],
+    }
+    exported = SimpleNamespace(
+        graph=SimpleNamespace(nodes=[SimpleNamespace(op="call_function", target="aten.matmul.default")])
+    )
+    assert _no_batch_norm_fold_needed(original, exported)
+    assert not _no_batch_norm_fold_needed({**original, "status": "incomplete"}, exported)
+    assert not _no_batch_norm_fold_needed(
+        {**original, "nodes": [{"op": "call_function", "classification": "aten", "target": "aten.batch_norm.default"}]},
+        exported,
+    )
+    assert not _no_batch_norm_fold_needed(
+        {**original, "nodes": [{"op": "call_function", "classification": "custom", "target": "opaque"}]},
+        exported,
+    )
 
 
 def test_static_recipe_conv_bn_fold_preserves_frontend_trace() -> None:

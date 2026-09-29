@@ -101,6 +101,22 @@ def test_static_int8_model_missing_selected_fold_trace_api_fails_before_all_writ
     assert calls == []
 
 
+def test_derived_micro_model_defers_fold_api_to_exact_graph_check(monkeypatch, tmp_path):
+    entry = {
+        "name": "micro_model",
+        "kind": "model",
+        "micro_model": True,
+        "quant_scheme": "int8_static_act_int8_weight",
+    }
+    run, calls, upstream = _generation_with_entries(monkeypatch, tmp_path, [entry])
+    capture = upstream / "m2m/capture"
+    capture.mkdir(parents=True)
+    (capture / "pt2e_integerize.py").write_text("def integerize_pt2e(*args): pass\n")
+
+    assert run() == []
+    assert calls == ["micro_model"]
+
+
 def test_missing_capture_interpreter_keeps_optional_model_skip(monkeypatch, tmp_path):
     entry = {"name": "static_model", "kind": "model", "quant_scheme": "int8_static_act_int8_weight"}
     run, calls, _ = _generation_with_entries(monkeypatch, tmp_path, [entry])

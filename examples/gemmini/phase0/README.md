@@ -98,12 +98,18 @@ simulator, and set
 `MERLIN_M2M_PYTHON` to its pinned interpreter for generated
 PyTorch-sourced capsules. The L3 performance members cannot execute if the
 simulator cannot be resolved; a missing exporter also leaves source capsules unwritten.
-Static-int8 source capsules additionally require
-`m2m/capture/pt2e_integerize.py` and the
+Static-int8 source capsules require `m2m/capture/pt2e_integerize.py` in the
+selected tree. Captures that may fold Conv+BatchNorm also require the
 `m2m.capture.trace` PT2E fold-provenance API
-(`pt2e_conv_bn_fold_candidates`, `attach_pt2e_conv_bn_folds`) in that selected
-tree. Check the exact modules and interpreter together before freezing; a
-different checkout with the same project name is not interchangeable.
+(`pt2e_conv_bn_fold_candidates`, `attach_pt2e_conv_bn_folds`). The generated
+micro-model can omit that API only after its complete original and PT2E-input
+ATen graphs prove that no BatchNorm call exists; an unknown or opaque graph
+still fails closed. Check the selected modules and interpreter together before
+freezing; a different checkout with the same project name is not interchangeable.
+The selected independent integer reference must also report every integerized
+contraction kind used by a generated source capsule, including `matmul` when
+present. A portable TorchAO Q/DQ comparison is diagnostic and cannot replace
+that exact reference; missing accounting leaves the capsule unbuilt.
 Record these dependencies in the frozen run rather than relying on a later
 resume to supply them.
 
