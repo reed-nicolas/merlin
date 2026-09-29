@@ -158,6 +158,23 @@ def test_the_rocc_encoding_regime_is_unchanged():
     assert got == ["CONFIG_EX", "CONFIG_LD", "MVIN", "PRELOAD", "COMPUTE_PRELOADED", "MVOUT"]
 
 
+def test_self_hosted_isa_does_not_fall_back_to_command_encoding_when_taxonomy_is_unknown():
+    from merlin.targetgen import isa_taxonomy as IT
+
+    contract = {"features": ["self_hosted_isa"], "compute_units": [{"name": "u", "dtypes": ["bf16"]}]}
+    taxonomy = IT.Taxonomy(
+        {
+            "status": "unknown",
+            "by_class": {},
+            "by_mnemonic": {},
+            "asm_mnemonics": {},
+            "unknown": {"taxonomy": "selected model environment is absent"},
+        }
+    )
+    with pytest.raises(IT.TaxonomyUnknown, match="selected model environment is absent"):
+        CS._classes_source(SimpleNamespace(target="self_hosted"), contract, taxonomy=taxonomy)
+
+
 def test_command_issue_order_is_owned_by_each_contract_and_refuses_missing_classes():
     contract = {
         "encoding": {"semantic_class": {"0": "LAUNCH", "1": "BARRIER"}, "corpus_issue_order": ["BARRIER", "LAUNCH"]}
@@ -209,11 +226,10 @@ def test_rocc_movement_does_not_inherit_matrix_compute_classes():
 
 
 @pytest.mark.parametrize("name", ["FT00_movement_tail_15x15", "FT01_movement_tail_17x15"])
-def test_shipped_tail_movement_coverage_matches_its_generated_mirror(name):
-    """The public manifest and its answer-surface mirror must describe one DMA-only obligation."""
+def test_shipped_tail_movement_coverage_is_dma_only(name):
+    """The public seed describes DMA-only work; generated mirrors stay in run artifacts."""
     root = merlin_dir() / "contract/capsules/isa" / name
     capsule = yaml.safe_load((root / "capsule.yaml").read_text(encoding="utf-8"))
-    mirror = yaml.safe_load((root / "expected_instruction_coverage.yaml").read_text(encoding="utf-8"))
-
-    assert capsule["expected"] == mirror
-    assert all(_coarse_of_hand_class(label) != "compute" for label in mirror["instruction_classes"])
+    assert all(
+        _coarse_of_hand_class(label) != "compute" for label in capsule["expected"]["instruction_classes"]
+    )

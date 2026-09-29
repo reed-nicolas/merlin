@@ -609,6 +609,13 @@ def select_evidence(
                 isa_taxonomy.derive_isa_taxonomy(SimpleNamespace(target=target, isa_headers=headers), model_ext=model)
             )
         except Exception as exc:  # noqa: BLE001 -- absent ISA tooling is unknown evidence
+            taxonomy = {
+                "status": "unknown",
+                "by_class": {},
+                "by_mnemonic": {},
+                "asm_mnemonics": {},
+                "unknown": {"taxonomy": f"{type(exc).__name__}: {exc}"},
+            }
             diagnostics.append(
                 {"component": "isa-taxonomy", "status": "unknown", "reason": f"{type(exc).__name__}: {exc}"}
             )
