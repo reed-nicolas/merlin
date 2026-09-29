@@ -3,7 +3,7 @@ title: Target publishing — preserved payloads and scoped evidence
 kind: design
 status: current
 owner: core
-last_verified: 2026-09-21
+last_verified: 2026-09-29
 related: [repo_structure, integrations, architecture]
 code_refs: [src/merlin/targetgen/publish.py, src/merlin/targetgen/oot_fetch.py, src/merlin/targetgen/package_records.py, src/merlin/targetgen/publication_verification.py, src/merlin/targetgen/providers.py, merlin/contract/schemas/result.schema.json]
 ---
@@ -137,8 +137,13 @@ Remotes resolve from override, target environment configuration, then
 fingerprint confirmation. Local tests use synthetic bare repositories only.
 
 Staging destinations must be fresh, disjoint and free of symlink components.
-Idempotency binds package ID, Merlin revision, run ID and exact source inventory
-SHA-256. Only a matching remote branch-tip fingerprint is a no-op. Existing tags
+Idempotency binds package ID, Merlin revision, run ID, exact source inventory
+SHA-256 and, when present, the separate publication record's canonical digest.
+Changing the record cannot silently reuse a branch tip for an older verdict.
+The selected payload and record are rechecked after build verification, before
+remote use. The generated timestamp is not part of this stable identity, so the
+confirmation token is not a byte-for-byte hash of every exported metadata file.
+Only a matching remote branch-tip fingerprint is a no-op. Existing tags
 remain immutable; their presence does not suppress a new branch commit.
 Index admission uses the same role/gate checks and advertises only existing branches.
 

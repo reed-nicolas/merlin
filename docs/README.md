@@ -115,7 +115,7 @@ predates the newest change to the code it documents (see `check_docs_freshness.p
 - [Design: wiring phase 2 — what the performance search can measure, ask, and refuse](design/perf_phase2_wiring.md) — `current`, verified 2026-09-08 · owner: gemmini-perf-bench — see also: [compiler_plane](design/compiler_plane.md), [expert_gap_attribution](design/expert_gap_attribution.md), [command_stream_reorder_emitter](design/command_stream_reorder_emitter.md)
 - [Macro scheduling: a stream-level plan over compute groups](design/macro_scheduling.md) — `draft`, verified 2026-09-17 · owner: core — see also: [static_arena_wiring](design/static_arena_wiring.md), [command_stream_reorder_emitter](design/command_stream_reorder_emitter.md), [compiler_plane](design/compiler_plane.md)
 - [Radiance search, GSIM certification, and kernel-library comparison](design/radiance_staged_evaluation.md) — `current`, verified 2026-09-08 · owner: targetgen
-- [Target publishing — preserved payloads and scoped evidence](design/target_publishing.md) — `current`, verified 2026-09-21 · owner: core — see also: [repo_structure](reference/repo_structure.md), [integrations](guides/integrations.md), [architecture](reference/architecture.md)
+- [Target publishing — preserved payloads and scoped evidence](design/target_publishing.md) — `current`, verified 2026-09-29 · owner: core — see also: [repo_structure](reference/repo_structure.md), [integrations](guides/integrations.md), [architecture](reference/architecture.md)
 - [The cross-target dialect test bar](design/dialect_test_bar.md) — `current`, verified 2026-07-25 · owner: core — see also: [compiler_plane](design/compiler_plane.md), [target_publishing](design/target_publishing.md)
 
 ## By area
