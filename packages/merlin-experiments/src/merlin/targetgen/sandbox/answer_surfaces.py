@@ -159,9 +159,9 @@ def golden_files(te: TargetExperiment) -> list[Path]:
             # goldens. Exposing them tells the agent the exact command mix it must synthesize, so they
             # are an answer surface even though their filename does not begin with ``golden``.
             files += sorted(corpus.rglob("expected_instruction_coverage.yaml"))
-    # Every example expected-output (``expected_command_buffer_g0/g1/g2…`` and any ``expected_*`` artifact),
-    # not just the single ``_g0`` literal that used to be masked.
-    for ex_dir in contract_resource_roots(root, "examples"):
+    # Every example expected-output and canonical test answer fixture. The checkout compatibility
+    # link is masked too, but a broad bind could reach the fixture at its own path.
+    for ex_dir in (*contract_resource_roots(root, "examples"), root / "merlin/tests"):
         if ex_dir.is_dir():
             files += sorted(ex_dir.rglob("expected_*"))
     # de-dup while preserving order

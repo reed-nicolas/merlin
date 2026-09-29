@@ -169,4 +169,5 @@ module attributes {merlin_iface.version = "0.1", merlin_iface.target = "gemmini"
 }
 ```
 
-The golden command buffer this lowers to is `examples/expected_command_buffer_g0.json`.
+The Gemmini test fixture for this example is
+`merlin/tests/gemmini/fixtures/expected_command_buffer_g0.json`.

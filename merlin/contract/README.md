@@ -46,9 +46,12 @@ require: oracle_output == reference_outputs(cb) == simulate(cb)   (integer, bit-
 | `telemetry_schema.yaml` | required recorded-run metadata |
 | `scoring.yaml` | the K0–K10 conformance ladder |
 | `integrity_policy.md` | the no-harness-import / no-cheat rules |
-| `examples/*.interface.mlir` | golden public inputs (g0/g1/g2) |
-| `examples/expected_command_buffer_g0.json` | golden cb for g0 |
 | `schemas/*.schema.json` | JSON Schemas (fail-closed validators) |
+
+The Gemmini g0–g2 interface samples are owned by
+`examples/gemmini/phase0/reference/`; their expected command buffer is a
+Gemmini test fixture. Checkout links under `contract/examples/` preserve old
+paths, but neither the samples nor the expected output ship in the core wheel.
 
 ## Languages
 

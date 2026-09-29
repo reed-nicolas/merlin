@@ -9,25 +9,23 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import yaml
 
-from merlin.common.paths import merlin_dir, repo_root
-
-# HW certification (builds + runs native/cpp verilator) — heavy; deselect with `-m "not slow"` for the
-# fast gate. Runs in the full suite (no filter) / nightly.
-pytestmark = pytest.mark.slow
-
+from merlin.common.paths import repo_root
 from merlin.runtime.backends import base as _bk
-
-gem = _bk.get_backend("gemmini")
 from merlin.targetgen.contract import schemas
 from merlin.targetgen.contract import toolchain as mlir_tc
 from merlin.targetgen.oot_runner import certify
 
+# HW certification (builds + runs native/cpp verilator) — heavy; deselect with `-m "not slow"` for the
+# fast gate. Runs in the full suite (no filter) / nightly.
+pytestmark = pytest.mark.slow
+gem = _bk.get_backend("gemmini")
+
 REPO = repo_root()
 NATIVE = REPO / "out/artifacts/targets" / "gemmini" / "merlin_native_v0"
 CPP = REPO / "out/artifacts/targets" / "gemmini" / "hand_smoke_oot"
-EX = REPO / "merlin/contract" / "examples"
+EX = REPO / "examples/gemmini/phase0/reference"
+GOLDEN = REPO / "merlin/tests/gemmini/fixtures/expected_command_buffer_g0.json"
 
 _HAVE_SPIKE = gem.available("spike")
 _HAVE_VERILATOR = gem.available("verilator")
@@ -73,7 +71,7 @@ def test_cpp_package_builds_and_certifies(tmp_path):
     cb = json.loads(
         (Path(tmp_path) / "runs" / "gemmini-contract" / "cpp_g0" / "generated" / "command_buffer.json").read_text()
     )
-    golden = json.loads((EX / "expected_command_buffer_g0.json").read_text())
+    golden = json.loads(GOLDEN.read_text())
     assert cb == golden
 
 

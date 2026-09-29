@@ -551,12 +551,13 @@ def test_real_release_wheel_files_are_covered_when_installed(tmp_path, isolated_
     oracle = site / "merlin/runtime/reference.py"
     expected_output = site / "merlin/_data/contract/examples/expected_command_buffer_g0.json"
     public = site / "merlin/xdsl_dialects/interface.py"
-    assert all(path.is_file() for path in (grader, oracle, expected_output, public))
+    assert all(path.is_file() for path in (grader, oracle, public))
+    assert not expected_output.exists(), "Gemmini's answer fixture must not ship in the core wheel"
     surfaces = AS.answer_surfaces(isolated_policy)
-    assert {grader, oracle, expected_output} <= {surface.path for surface in surfaces}
+    assert {grader, oracle} <= {surface.path for surface in surfaces}
     assert all(surface.path != public and surface.path not in public.parents for surface in surfaces)
     unmasked = ["--ro-bind", str(tmp_path / ".venv"), str(tmp_path / ".venv")]
-    assert {grader, oracle, expected_output} <= {surface.path for surface in BW.coverage_gap(unmasked, surfaces)}
+    assert {grader, oracle} <= {surface.path for surface in BW.coverage_gap(unmasked, surfaces)}
     assert BW.coverage_gap(BW.apply_answer_masks(unmasked, surfaces), surfaces) == []
 
 
@@ -567,6 +568,7 @@ def test_private_resource_masks_follow_each_declared_layout(tmp_path, isolated_p
     hidden = _write(tmp_path, f"{resource_root}/capsules/hidden/sample/capsule.yaml").parents[1]
     holdout = _write(tmp_path, f"{resource_root}/capsules/profiles/test.hidden.yaml")
     expected = _write(tmp_path, f"{resource_root}/examples/expected_command_buffer.json")
+    fixture = _write(tmp_path, "merlin/tests/gemmini/fixtures/expected_command_buffer_g0.json")
     surfaces = AS.answer_surfaces(isolated_policy)
     by_path = {surface.path: surface.origin for surface in surfaces}
     assert by_path[golden] == "golden"
@@ -574,8 +576,9 @@ def test_private_resource_masks_follow_each_declared_layout(tmp_path, isolated_p
     assert by_path[hidden] == "hidden"
     assert by_path[holdout] == "hidden"
     assert by_path[expected] == "example"
+    assert by_path[fixture] == "golden"
     argv = ["--ro-bind", str(tmp_path), str(tmp_path)]
-    assert len(BW.coverage_gap(argv, surfaces)) == 5
+    assert len(BW.coverage_gap(argv, surfaces)) == 6
     assert BW.coverage_gap(BW.apply_answer_masks(argv, surfaces), surfaces) == []
     tokens = AS.audit_tokens(isolated_policy)["answer"]
     assert "capsules/hidden" in tokens and ".hidden.yaml" in tokens

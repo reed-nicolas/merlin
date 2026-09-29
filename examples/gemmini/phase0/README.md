@@ -24,6 +24,8 @@ compute precision.
 
 [regression-seeds.yaml](regression-seeds.yaml) preserves historical authored tests
 for explicit compatibility studies. It is **not** a default derivation input.
+The small hand-authored g0–g2 interface samples in [reference/](reference/)
+exercise the historical OOT contract; they are not a generated Phase 0 release.
 Generated capsules, weights and goldens are artifacts, never committed examples.
 Read [the shared specification guide](../../../docs/guides/phase0_specification.md)
 for what belongs in a SW spec versus extracted evidence.
