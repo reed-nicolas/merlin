@@ -80,14 +80,22 @@ An opt-in whole-model handoff now exists for *qualified* outlines. Its identity
 is the normalized MLIR file produced by `prepare_for_lowering`, not an earlier
 raw capture that preparation may rewrite. `ExactOffloadSelection.from_outline`
 re-derives the candidate IDs and interfaces from that file and the selected SW
-spec/contract bytes; it refuses the current `unknown` SW admission. Its
-`certify` step runs the selected interface through the OOT numerical oracle
+spec/contract bytes; it refuses the current `unknown` SW admission. Before
+certification, the experiments owner must call `bind_exact_offload` with the
+reviewed Phase 0 release seal, selected descriptor, and application label. The
+binding checks that the exact model and both contract byte strings are selected
+sources of that release, and is reopened at certification, rewrite, and build.
+If preparation changes the raw capture, the normalized model needs its own
+selected capture receipt; a matching outline alone cannot confer admission.
+The `certify` step runs the selected interface through the OOT numerical oracle
 with an accelerator trace, and only then may `DeviceRouting(exact_selection=...)`
 replace those exact operations. The rewrite and object build recheck model,
-package, transport, pointer ABI and interface identities; unselected operations
-stay on the host path. This is not a full-model numerical certificate. The
-present example has neither reviewed admission nor a demonstrated OOT
-whole-model execution, so its outline remains diagnostic.
+package, transport, pointer ABI, release lineage, and interface identities;
+unselected operations stay on the host path. This is a trusted-host evidence
+gate, not a sandbox against arbitrary Python in the host process, and is not a
+full-model numerical certificate. The present example has neither reviewed
+admission nor a demonstrated OOT whole-model execution, so its outline remains
+diagnostic.
 
 For a new numerical accelerator certificate, the compiler must emit
 `compiler_pointer_abi: {version: 1, arguments: [...]}` in its command buffer.
