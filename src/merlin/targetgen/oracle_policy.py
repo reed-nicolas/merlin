@@ -209,6 +209,9 @@ class _SimOracle:
     is_compile_based: bool = False  # lowers the kernel via an oracle-side compile toolchain (smoke-testable)
     l3_selection: Callable[[str], dict] | None = None
     tier_plan: Callable[[str], OracleTierPlan] | None = None
+    # Target -> exact executable/config receipt for the selected L2 engine.
+    # Absent means L2 search-pass sealing cannot be verified for this oracle.
+    l2_binding: Callable[[str], dict] | None = None
     #: target -> the rtl_engine_policy selection record for this sim's cert tier, when it has a CHOICE
     #: of elaborated-RTL engine to make. Optional: a sim with exactly one engine has nothing to report.
     #: It exists so :func:`describe_l3_engine` can ask the PLUGIN which engine it picked instead of
@@ -273,12 +276,14 @@ def register_sim_oracle(
     is_compile_based: bool = False,
     l3_selection: Callable[[str], dict] | None = None,
     tier_plan: Callable[[str], OracleTierPlan] | None = None,
+    l2_binding: Callable[[str], dict] | None = None,
 ) -> None:
     """Register a bespoke-sim oracle under its ``sim_via`` engine name (idempotent) — the public seam a
     NEW simulator uses to plug into oracle routing without editing :func:`oracle_adapters` /
     :func:`oracle_available`. ``exclusive=True`` replaces the arc/program default (a self-hosted SIMT
     core graded on its own kernel ELF); ``exclusive=False`` layers additive tiers on top of the arc
-    default (a chipyard-style sim). See :class:`_SimOracle`."""
+    default (a chipyard-style sim). ``l2_binding`` is optional but required when a
+    search-pass seal cites this simulator's L2 measurements. See :class:`_SimOracle`."""
     _SIM_ORACLES[sim_via] = _SimOracle(
         adapters=adapters,
         available=available,
@@ -287,6 +292,7 @@ def register_sim_oracle(
         is_compile_based=is_compile_based,
         l3_selection=l3_selection,
         tier_plan=tier_plan,
+        l2_binding=l2_binding,
     )
 
 
