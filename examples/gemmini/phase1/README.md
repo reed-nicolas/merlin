@@ -157,8 +157,12 @@ For direct invocation, set the variables below to actual operator-selected input
 that release. `RESOURCE_ROOT` resolves declared resource paths. `BUNDLE_ID` must
 match `BUNDLE_MANIFEST`; use reviewed RTL-checks inputs, not an invented bundle.
 `ORACLE_TIMING` must name an existing operator-owned timing record. The example
-path is not supplied here: provision a genuine record or select an existing one;
-do not fabricate an empty placeholder or change it after freezing a run.
+selects `.oracle_timing.gemmini.json` in the target resource directory. The native
+readiness check writes that file only after a real L3 pass and binds its target,
+declared simulator configuration and simulator SHA256. The installed preflight
+rechecks those bytes. Older records under the shared `scripts/` link are diagnostic
+only. Provision a genuine record or select an existing measured one; do not
+fabricate a placeholder or change it after freezing a run.
 
 ```sh
 MERLIN_CORPUS_SEAL="${CORPUS_SEAL:?}" python -m merlin_experiments.phase1 \

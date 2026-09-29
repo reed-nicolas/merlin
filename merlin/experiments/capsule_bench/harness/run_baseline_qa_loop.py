@@ -30,6 +30,7 @@ from pathlib import Path
 import _common as C
 import run_agent_experiment as RX  # reuse bundle/workspace/bwrap primitives
 from merlin_experiments.phase1 import treatments as T
+from merlin_experiments.phase1.timing import timing_path
 
 SCRIPTS = Path(__file__).resolve().parent  # retained native brokers and tools
 
@@ -79,7 +80,7 @@ def main(argv: list[str] | None = None, *, treatment: T.Treatment | None = None)
         options,
         bundle_manifest=C.BUNDLES / bundle_id / "input_bundle_manifest.yaml",
         bundle_id=bundle_id,
-        oracle_timing=SCRIPTS / ".oracle_timing.json",
+        oracle_timing=timing_path(C.EXP, C.TARGET) if _te().sim_via == "chipyard" else SCRIPTS / ".oracle_timing.json",
         launcher_argv=tuple(sys.argv[1:] if argv is None else argv),
         language=os.environ.get("PILOT_LANG", ""),
         treatment=treatment,

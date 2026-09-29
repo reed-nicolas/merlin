@@ -56,6 +56,16 @@ def run(
     refusal = session.validate_options(options)
     if refusal is not None:
         return refusal
+    # --no-oracle is an explicit diagnostic bypass, never a verified oracle claim.
+    if not options.no_oracle:
+        from .timing import read_verified_timing, requires_chipyard_timing
+
+        try:
+            if requires_chipyard_timing(context.descriptor):
+                read_verified_timing(oracle_timing, descriptor=context.descriptor, target=context.target)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 3
     from merlin.targetgen import tool_registry
 
     for name in (*options.with_tool, *options.without_tool):

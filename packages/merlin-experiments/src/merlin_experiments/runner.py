@@ -381,11 +381,22 @@ def _phase1_operator_inputs(command: dict) -> dict[str, str | None]:
             raise SpecError(f"bundle {kind} must contain explicit path records")
         for index, row in enumerate(rows):
             paths[f"{kind}:{index}"] = resolve_grant(row["path"], root)
+    chipyard_timing = False
+    if descriptor.is_file():
+        from merlin.targetgen.target_experiment import declared_vs_resolved_contract, load_target_experiment
+
+        selected = load_target_experiment(descriptor)
+        if selected.sim_via == "chipyard":
+            chipyard_timing = True
+            _, contract_path, agreement = declared_vs_resolved_contract(selected)
+            if agreement != "agree" or contract_path is None:
+                raise SpecError(f"selected Phase 1 target contract is not agreed and resolvable: {agreement}")
+            paths["target_contract"] = contract_path
     result = {"phase1:operator:" + name: str(path.resolve()) for name, path in paths.items()}
     target = document.get("target", "")
     for name, path in {
         "task": declared_task_root(document, root=root) or resources / "task",
-        "timing:target": resources / "scripts" / f".oracle_timing.{target}.json",
+        "timing:target": (resources if chipyard_timing else resources / "scripts") / f".oracle_timing.{target}.json",
         "timing:legacy": resources / "scripts/.oracle_timing.json",
         "environment": resources / "experiment.env",
     }.items():
@@ -620,6 +631,22 @@ def preflight(plan: dict) -> dict:
         _verify_corpus_closures(plan)
         _verify_phase0_sources(plan)
         _verify_phase1_sources(plan)
+        from .phase1.timing import read_verified_timing, requires_chipyard_timing
+
+        for command in plan["phases"].values():
+            if (
+                command.get("module") == PHASE1_MODULE
+                and "--no-oracle" not in command["argv"]
+                and requires_chipyard_timing(Path(command["inputs"]["descriptor"]))
+            ):
+                try:
+                    read_verified_timing(
+                        Path(command["inputs"]["oracle_timing"]),
+                        descriptor=Path(command["inputs"]["descriptor"]),
+                        target=plan["target"],
+                    )
+                except ValueError as exc:
+                    raise SpecError(str(exc)) from exc
         from .measured_launch import verify_plan
 
         verify_plan(plan)

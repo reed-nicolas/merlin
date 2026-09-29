@@ -192,8 +192,10 @@ def test_smoke_resolves_its_own_bundle_before_any_provider(loop, monkeypatch):
     monkeypatch.setattr(execution, "sandbox_command", lambda *a, **k: "unused")
 
     def stop(workspace, config):
+        from merlin_experiments.phase1.timing import timing_path
+
         assert config.tools == ("isa_tools",)
-        assert config.timing_file == loop.C.HARNESS / ".oracle_timing.json"
+        assert config.timing_file == timing_path(loop.C.EXP, loop.C.TARGET)
         assert selected.is_dir()
         raise RuntimeError("fixture stops before broker/provider")
 

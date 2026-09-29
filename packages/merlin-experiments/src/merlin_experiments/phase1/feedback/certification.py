@@ -370,46 +370,57 @@ def _l3_cost_fit(obs: list[tuple[int, float]]) -> tuple[float, float, str] | Non
     )
 
 
-def _verilator_per_capsule_timeout(context) -> int:
-    """The UNSCALED per-capsule L3 (verilator RTL cert) bound, from a T_obs that is POSITIVELY confirmed
-    to be THIS
-    target's sim (generous 2x, min 900s). The readiness gate writes scripts/.oracle_timing.json — but that
-    path is a symlink shared across targets, so a radiance run must NOT inherit a GemminiRocketConfig T_obs
-    measured for a different, far lighter RTL (which would floor to 900s and mass-timeout every L3 capsule,
-    the abc9 "L3 0/N = timeout not skill" trap). A measurement is trusted only when it is target-scoped:
-    the file ``.oracle_timing.<target>.json`` OR a legacy ``.oracle_timing.json`` whose ``target`` field
-    matches. An unconfirmed / foreign-config measurement is ignored in favor of a conservative bound and a
-    loud log — never a silent under-time.
+def _verilator_per_capsule_timeout(context, *, timing_file: Path | None = None) -> int:
+    """The UNSCALED per-capsule L3 bound (generous 2x, min 900s).
+
+    Chipyard T_obs must match the selected simulator bytes at
+    ``<resources>/.oracle_timing.<target>.json``; shared-script records remain
+    diagnostic for that simulator. Other simulator classes retain their historical
+    target-scoped/target-tagged timeout input, without a Chipyard verification claim.
+    Absent or foreign measurements use a conservative bound with a visible reason.
 
     This is the FLOOR, not the budget the grade runs with: :func:`_verilator_l3_budget` scales it by the
     promoted capsules' own emitted size, because a flat bound fails a large capsule for being large."""
     import math
 
+    from merlin_experiments.phase1.timing import read_verified_timing, requires_chipyard_timing, timing_path
+
     tgt = context.target
-    for p in (
-        context.experiment / "scripts" / f".oracle_timing.{tgt}.json",
-        context.experiment / "scripts" / ".oracle_timing.json",
-    ):
-        try:
-            d = json.loads(p.read_text())
-        except Exception:
-            continue
-        if p.name.endswith(f".{tgt}.json") or d.get("target") == tgt:
-            return max(900, int(math.ceil(2 * float(d["verilator_per_capsule_s"]))))
-        print(
-            f"[timeout] ignoring {p.name}: T_obs measured on config={d.get('config')!r} "
-            f"target={d.get('target')!r}, not {tgt!r} — needs a target-scoped measurement",
-            file=sys.stderr,
-        )
+    if not requires_chipyard_timing(getattr(context, "descriptor", None)):
+        # Preserve the historical target-scoped/target-tagged observation for other simulators.
+        for p in (
+            Path(context.experiment) / "scripts" / f".oracle_timing.{tgt}.json",
+            Path(context.experiment) / "scripts/.oracle_timing.json",
+        ):
+            try:
+                d = json.loads(p.read_text())
+            except Exception:
+                continue
+            if p.name.endswith(f".{tgt}.json") or d.get("target") == tgt:
+                return max(900, int(math.ceil(2 * float(d["verilator_per_capsule_s"]))))
+            print(f"[timeout] ignoring {p.name}: timing belongs to {d.get('target')!r}, not {tgt!r}", file=sys.stderr)
+        print(f"[timeout] no target-confirmed L3 timing for {tgt!r}; using conservative 2400s", file=sys.stderr)
+        return 2400
+    selected = Path(timing_file) if timing_file is not None else timing_path(context.experiment, tgt)
+    try:
+        d = read_verified_timing(selected, descriptor=getattr(context, "descriptor", None), target=tgt)
+        return max(900, int(math.ceil(2 * float(d["verilator_per_capsule_s"]))))
+    except ValueError as exc:
+        print(f"[timeout] ignoring oracle timing: {exc}", file=sys.stderr)
+    legacy = Path(context.experiment) / "scripts/.oracle_timing.json"
+    if legacy.is_file():
+        print(f"[timeout] legacy timing at {legacy} is diagnostic only; select a target-bound record", file=sys.stderr)
     print(
         f"[timeout] no target-confirmed L3 timing for {tgt!r}; using conservative 2400s. Run readiness "
-        f"or the L3 measurement to record scripts/.oracle_timing.{tgt}.json",
+        f"or the L3 measurement to record {timing_path(context.experiment, tgt)}",
         file=sys.stderr,
     )
     return 2400
 
 
-def _verilator_l3_budget(run_dir: Path | None, capsules: list | None, cert_tier: str = "L3", *, context) -> int:
+def _verilator_l3_budget(
+    run_dir: Path | None, capsules: list | None, cert_tier: str = "L3", *, context, timing_file: Path | None = None
+) -> int:
     """The per-capsule cert-tier budget, SCALED BY CAPSULE SIZE instead of one flat number.
 
     Why: a flat bound fails a capsule for being large. Measured on this corpus — ``GM0`` (2310 emitted
@@ -433,7 +444,7 @@ def _verilator_l3_budget(run_dir: Path | None, capsules: list | None, cert_tier:
     is excluded from the pricing rather than assumed small — the floor still covers it. The whole
     derivation is written to ``<run_dir>/l3_timeout_derivation.json`` so a budget can be audited.
     """
-    flat = _verilator_per_capsule_timeout(context)
+    flat = _verilator_per_capsule_timeout(context, timing_file=timing_file)
     rec: dict = {
         "cert_tier": cert_tier,
         "unscaled_bound_s": flat,

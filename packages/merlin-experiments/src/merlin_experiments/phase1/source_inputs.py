@@ -189,12 +189,19 @@ def paths(
         import yaml
 
         from merlin.targetgen.software_spec import software_spec_path_for_recipe
+        from merlin.targetgen.target_experiment import declared_vs_resolved_contract, load_target_experiment
         from merlin_experiments.corpus.numeric_policy import numeric_profile_path
 
         document = yaml.safe_load(Path(descriptor).read_bytes())
         if not isinstance(document, dict):
             raise SpecError("phase-1 descriptor must be a mapping")
         inputs.update(_selected_provider_inputs(document.get("target")))
+        selected_target = load_target_experiment(descriptor)
+        if selected_target.sim_via == "chipyard":
+            _, contract_path, agreement = declared_vs_resolved_contract(selected_target)
+            if agreement != "agree" or contract_path is None:
+                raise SpecError(f"phase-1 selected target contract is not agreed and resolvable: {agreement}")
+            inputs["phase1:startup:target_contract"] = str(contract_path.resolve())
         profile = numeric_profile_path(document.get("numeric_profile"), repo=root)
         if profile is not None:
             # Membership binds absence of this declaration too: introducing one
