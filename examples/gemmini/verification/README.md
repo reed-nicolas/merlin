@@ -180,6 +180,7 @@ bound by that corpus's `_evidence/evidence-manifest.json`. Select the OOT
 Gemmini support and Chipyard toolchain explicitly:
 
 ```sh
+export PYTHONPATH=src:packages/merlin-experiments/src
 export MERLIN_TARGET_PATH=/selected/gemmini-mlir/merlin-support
 export MERLIN_CHIPYARD=/selected/chipyard
 python examples/gemmini/verification/probe_native_kernel.py \
@@ -219,6 +220,40 @@ cycle limit; `receipt.json` records those rejections. This is finite numerical
 evidence, not a proof for every input, model, or operator. The generated
 capsules' software admission remains `unknown`, and the receipt does not prove
 that the selected Verilator binary was built from the exact selected RTL source.
+
+For a finite signed boundary probe, [probe_signed_i8.py](probe_signed_i8.py)
+reuses the generated `SY_contraction_i8_partial` interface and injects explicit
+`-128`/`127` operands through the selected OOT LLVM emitter and runner harness.
+It requires the separately verified MacUnit characterization receipt. The
+31-deep reduction has a conservative maximum partial sum of 507,904, below the
+signed i20 positive limit of 524,287. It compares all 240 full i32 outputs and
+both directions of scaled i8 saturation against independent scalar results.
+The emitted ELF must contain custom-3 RoCC instructions, and a bounded Spike
+instruction trace must show those exact PCs executing. The probe keeps only the
+matching trace lines, not the full trace. Run it with the same source, facts, corpus,
+support package and toolchain selections used for the Phase 0 diagnostic:
+
+```sh
+export PYTHONPATH=src:packages/merlin-experiments/src
+export MERLIN_TARGET_PATH=/selected/gemmini-mlir/merlin-support
+export MERLIN_CHIPYARD=/selected/chipyard
+export MERLIN_RTL_FACTS=/selected/facts/facts.json
+export MERLIN_M2M_VENV=/selected/model2MLIR/.venv
+export MERLIN_CLANG=/selected/clang
+python examples/gemmini/verification/probe_signed_i8.py \
+  --corpus /selected/phase0/capsules \
+  --source /selected/source-bundle \
+  --facts /selected/facts \
+  --cell-receipt /selected/cell/characterization.json \
+  --output out/artifacts/probes/gemmini-signed-i8-1
+```
+
+The default receipt is explicitly `spike_passed_rtl_not_run`; Spike is a
+functional model. Add `--rtl` to execute each exact ELF on the selected
+prebuilt Verilator, bounded by `--timeout` (180 seconds maximum). A Verilator
+timeout is not an RTL numerical verdict. This finite diagnostic does not
+review the software spec or establish model-level integerization, physical
+layout, tails or aliasing.
 
 To check that missing build link, run
 [attest_native_simulator.py](attest_native_simulator.py) against a fresh ignored
