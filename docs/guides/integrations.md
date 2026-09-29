@@ -3,7 +3,7 @@ title: Integrations
 kind: guide
 status: current
 owner: kernels
-last_verified: 2026-09-27
+last_verified: 2026-09-29
 related: [kernel_mining, architecture, repo_structure]
 code_refs: [src/merlin/kernels/ingest, packages/merlin-experiments/pyproject.toml, packages/merlin-analysis/pyproject.toml, packages/merlin-experiments/src/merlin/benchharness/chia_bridge.py, packages/merlin-experiments/src/merlin/benchharness/chia_tasks.py, packages/merlin-experiments/src/merlin/targetgen/aet_bridge.py, packages/merlin-experiments/src/merlin_experiments/phase2/telemetry.py]
 ---
@@ -306,10 +306,13 @@ The Chia extra pins official [ucb-bar/chia main at `dd976318`](https://github.co
 verified as that branch's tip on 2026-09-29. Relative to the previous `e85318e`
 pin, only Vertex configuration/token accounting and ChampSim raw-stat files changed;
 the dependency metadata and managed-worker lifecycle implementation are unchanged.
-Fresh core and experiments wheels with the previous `e85318e` pin installed outside the checkout;
-the joined Phase 0/1/2 admission test passed 7 cases, and the installed Chia
-envelope/launch/public-hook suite passed 47 cases with 2 opt-in live-Ray cases
-skipped. Those passes do not establish live worker-loss cleanup on the current pin:
+The previous `e85318e` pin passed a seven-case joined Phase 0/1/2 admission test.
+An exact-commit `dd976318` Chia 1.0.1 wheel also installed outside the checkout:
+its public API and frozen-resume smoke passed with Ray 2.54.0, the
+launch/envelope/hook/task checks passed 59 cases (3 skipped), and the managed-driver
+policy passed 2 cases. The 96-package installed environment passed dependency
+compatibility after resolving its NumPy and OpenTelemetry dependencies. These checks
+do not establish live worker-loss cleanup on the current pin:
 the opt-in Ray test requires a loopback-only network namespace, unavailable in
 this release host. AET remains pinned independently to official main `903d4def`,
 also confirmed as upstream `main` on 2026-09-27. Merlin uses the public profiler
