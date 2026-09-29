@@ -105,7 +105,6 @@ from .oot_runner import (
 )
 from .rocc import decode as RD
 
-SUITE = "gemmini-capsule-bench"
 CONTRACT_VERSION = "0.1"
 
 
@@ -2075,10 +2074,10 @@ def suite_for(target: str, *, dtype: str = "i8xi8_i32") -> str:
     """The suite path segment ``run_capsule`` writes results under for this target (``cfg.suite``).
 
     Any reader that re-globs the on-disk ``capsule_result.json`` MUST resolve the suite through this,
-    NOT the module-level ``SUITE`` literal ('gemmini-capsule-bench'): ``run_capsule`` lays results at
+    not a reference-target constant: ``run_capsule`` lays results at
     ``<runs_root>/runs/<cfg.suite>/<capsule>/`` where ``cfg.suite`` is the TARGET's own suite
-    (e.g. 'atlas-capsule-bench'). Using the gemmini literal made the atlas self-check glob an empty
-    gemmini dir and report ``n_capsules: 0`` on every call — the agent's feedback loop went blind while
+    (e.g. '<target>-capsule-bench'). Using a fixed reference suite made another target's self-check
+    glob an empty directory and report ``n_capsules: 0`` on every call — the feedback loop went blind while
     the in-memory grade was correct. Derived from the target's RunnerConfig, so it stays target-agnostic."""
     return _config_for_target(target, None, dtype).suite
 

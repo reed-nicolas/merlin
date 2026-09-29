@@ -157,10 +157,11 @@ def certify(
     rung = interface_mlir.stem.split(".")[0]
     if target is None:
         target = _runtime._package_target(package_dir)
+    suite = _runtime.certification_suite(target)
 
     spec = _runtime.RunSpec(
         project="merlin",
-        suite=_runtime.SUITE,
+        suite=suite,
         method=f"{run_id}",
         seed=seed,
         run_id=run_id,
@@ -561,11 +562,12 @@ def _record(
     target: str,
 ) -> None:
     """Write the run_manifest + artifact records + FailureRecord (the attributable ledger)."""
+    suite = _runtime.certification_suite(target)
     cycle_accurate = simulator in _runtime._CYCLE_ACCURATE_SIMULATORS and oracle.get("result") == "pass"
     manifest = {
         "schema_version": "1.0",
         "project": "merlin",
-        "suite": _runtime.SUITE,
+        "suite": suite,
         "method": run_id,
         "seed": seed,
         "run_id": run_id,
@@ -588,7 +590,7 @@ def _record(
 
     logger = _runtime.EvalRunLogger.start(
         project="merlin",
-        suite=_runtime.SUITE,
+        suite=suite,
         target=target,
         method=run_id,
         seed=seed,
