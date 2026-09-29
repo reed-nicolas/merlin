@@ -121,23 +121,21 @@ entries:
     owner: targetgen
     items:
       - packages/merlin-analysis/src/merlin/baselines/buddy_harness.py
-      - merlin/python/merlin/baselines/profile.py
       - merlin/python/merlin/compare/frozen_environment.py
       - merlin/python/merlin/mining/k1.py
     why: >-
       Invisible until 2026-09-14, when the no-target-name gate's name set was derived from the target
-      registries instead of listed. Three bake one board's clock into generated C: `K1_CPU_HZ` in the
-      buddy and profile timing harnesses and in mining/k1.py's sustained-mode source is the k1_cpu
-      target's clock. frozen_environment.py persists a `k1_cpu_probe_version` key in a frozen study
-      manifest.
+      registries instead of listed. The buddy generated C still embeds one board's clock;
+      mining/k1.py's sustained-mode source uses the k1_cpu target's clock.
+      frozen_environment.py persists a `k1_cpu_probe_version` key in a frozen study manifest.
     blocks: >-
-      A second CPU-host target reusing the buddy/profile timing harness: it would be timed against
-      another board's clock constant and report wrong wall times with no error.
+      A second CPU-host target reusing the buddy generated C harness would be timed against another
+      board's clock constant and report wrong estimated cycles with no error. The shared profile
+      parser now requires runner-supplied rates and no longer makes this assumption.
     removal_condition: >-
-      The timing harnesses read the clock from the target contract's measurement block, mining/k1.py
-      folds into a parameterized board bench, the frozen manifest key is renamed at its next schema
-      version. Delete each path
-      from this list as it lands.
+      The remaining generated timing harness reads its clock from a measurement provider,
+      mining/k1.py folds into a parameterized board bench, and the frozen manifest key is renamed
+      at its next schema version. Delete each path from this list as it lands.
 
   # ---------------------------------------------------------------- scheduling-decision dialect
   - id: schedule-dialect-ops-nothing-constructs

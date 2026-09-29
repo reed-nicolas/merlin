@@ -1177,7 +1177,7 @@ def _run_native_on_board(res: BaselineResult, elf: Path, arg0: Path, b: _bundle.
     metrics = parsed.get("metrics", {}) if isinstance(parsed.get("metrics"), dict) else {}
     if metrics.get("time_ticks") is not None:
         res.e2e_rdtime_ticks = int(metrics["time_ticks"])
-        res.e2e_cycles = profile.ticks_to_cycles(int(metrics["time_ticks"]))
+        res.e2e_cycles = profile.ticks_to_cycles(int(metrics["time_ticks"]), clock=k1_exec.MEASUREMENT_CLOCK)
     if metrics.get("wall_ns") is not None:
         res.e2e_wall_ns = int(metrics["wall_ns"])
     if res.e2e_rdtime_ticks is not None:
@@ -1282,14 +1282,14 @@ def _run_on_board(res: BaselineResult, elf: Path, b: _bundle.CaptureBundle, work
     ticks = metrics.get("time_ticks")
     if ticks is not None:
         res.e2e_rdtime_ticks = int(ticks)
-        res.e2e_cycles = profile.ticks_to_cycles(int(ticks))
+        res.e2e_cycles = profile.ticks_to_cycles(int(ticks), clock=k1_exec.MEASUREMENT_CLOCK)
     if metrics.get("wall_ns") is not None:
         res.e2e_wall_ns = int(metrics["wall_ns"])
     if metrics.get("cycles") is not None and res.e2e_cycles is None:
         res.e2e_cycles = int(metrics["cycles"])
     # compute-vs-overhead split from the harness MERLIN_REGION brackets (compute = whole monolithic
     # forward; overhead = the descriptor-pack loop — the only runtime cost outside buddy's compute).
-    _wm, _regions = profile.parse_profile(console)
+    _wm, _regions = profile.parse_profile(console, clock=k1_exec.MEASUREMENT_CLOCK)
     ov_ticks = next(
         (int(r.rdtime_ticks) for r in _regions if r.name == "overhead" and r.rdtime_ticks is not None), None
     )
@@ -1308,7 +1308,7 @@ def _run_on_board(res: BaselineResult, elf: Path, b: _bundle.CaptureBundle, work
                 RegionProfile(
                     name="overhead",
                     rdtime_ticks=ov_ticks,
-                    cycles=profile.ticks_to_cycles(ov_ticks),
+                    cycles=profile.ticks_to_cycles(ov_ticks, clock=k1_exec.MEASUREMENT_CLOCK),
                     rvv_coverage=0.0,
                     note="descriptor-pack (runtime dispatch overhead; near-zero)",
                 )
