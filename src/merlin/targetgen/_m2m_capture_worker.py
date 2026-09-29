@@ -513,7 +513,10 @@ def main(argv=None) -> int:
     import torch
     from m2m.coverage import opaque_report
 
-    out = Path(a.out)
+    # Model2MLIR embeds this path in prov.weights_file. A relative --out would
+    # otherwise leave a CWD-relative reference in the saved MLIR, which a
+    # relocated/frozen corpus cannot safely resolve against its selected bytes.
+    out = Path(a.out).absolute()
     out.mkdir(parents=True, exist_ok=True)
     determinism = _seed_capture(a.seed, torch)
     modules_before_loader = set(sys.modules)
@@ -713,7 +716,9 @@ def main(argv=None) -> int:
                 seen = integerization_receipt["quantized_contractions_seen"]
                 if executed != seen or selected != seen:
                     golden_agreement["status"] = "failed"
-                    golden_agreement["reason"] = "selected, observed and independently executed contraction counts differ"
+                    golden_agreement["reason"] = (
+                        "selected, observed and independently executed contraction counts differ"
+                    )
                 reference_leaves, reference_abi = _output_abi(independent.output)
                 reference_bytes = (
                     json.dumps(
