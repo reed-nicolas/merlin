@@ -396,3 +396,32 @@ selected RTL source and exact simulator executable, run the separate binary
 binder with the verified facts and original build attestation. A passing
 synthetic window is a representative kernel check, **not** numerical
 equivalence of any of these complete models or proof of model-wide coverage.
+
+### Execute one staged Phase 1 candidate
+
+After `merlin-target-tools stage-int-mm-admission --build-dir ... --out ...`
+has produced a `candidate-build-receipt.json`,
+[`probe_staged_candidate_spike.py`](probe_staged_candidate_spike.py) links the
+receipt's exact kernel and descriptor-shim objects with explicitly selected
+Gemmini support, then runs one bounded signed-int8 matmul on Spike. It checks
+all output elements against an independent scalar result, rejects a wrong
+shape through the descriptor, and records which disassembled package
+instructions executed. Select the matching stage report, compiler package,
+RTL facts, and OOT support directory explicitly:
+
+```sh
+python examples/gemmini/verification/probe_staged_candidate_spike.py \
+  --target gemmini --stage-report /generated/gemmini/stage-1/report.json \
+  --build-dir /generated/gemmini/stage-1/build \
+  --package /selected/gemmini/compiler-package \
+  --facts /generated/gemmini/source-1/facts.json \
+  --support "$MERLIN_TARGET_PATH" \
+  --output out/artifacts/probes/gemmini-staged-1
+```
+
+The output directory must be fresh under `out/`. Inspect its `receipt.json`,
+`inputs.json`, `expected.json`, `observed.json`, `harness.c`, ELF,
+`disassembly.txt`, and `spike_package_instructions.trace`. The receipt remains
+`incomplete_support_provenance` while support-source identity or the
+compiler-package-to-support binding is unproven. A finite Spike match does not
+review the software spec, prove RTL execution, or establish whole-model offload.
