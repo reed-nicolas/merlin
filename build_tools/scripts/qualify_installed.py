@@ -206,6 +206,7 @@ SUITES = {
             "test_phase1_formal_handoff.py",
             "test_checkpoint_lifecycle.py",
             "test_corpus_release.py",
+            "test_exact_offload_release_binding.py",
         ),
         "support_files": ("reviewed_corpus_fixtures.py", "phase1_feedback_fixtures.py"),
         "core_extras": ("xdsl",),

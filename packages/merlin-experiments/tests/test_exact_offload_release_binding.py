@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import tomllib
 from dataclasses import replace
 from importlib.metadata import EntryPoint
 from pathlib import Path
@@ -16,17 +15,17 @@ from merlin_experiments.runner import fingerprint
 from merlin_experiments.spec import SpecError
 
 from merlin.common.digest import sha256_bytes
-from merlin.common.paths import repo_root
 from merlin.llvmlower import exact_offload
 from merlin.llvmlower.exact_offload import ExactOffloadSelection, SelectedKernel
 
 
 def test_installed_verifier_entry_point_is_the_release_owner(monkeypatch) -> None:
-    project = tomllib.loads((repo_root() / "packages/merlin-experiments/pyproject.toml").read_text())
     group = "merlin.exact_offload_release"
-    entry = project["project"]["entry-points"][group]
-    assert set(entry) == {"reviewed_phase0"}
-    provider = EntryPoint(name="reviewed_phase0", value=entry["reviewed_phase0"], group=group)
+    provider = EntryPoint(
+        name="reviewed_phase0",
+        value="merlin_experiments.corpus.release:verify_exact_offload_binding",
+        group=group,
+    )
     monkeypatch.setattr(exact_offload, "entry_points", lambda **_kwargs: (provider,))
     assert exact_offload._release_verifier() is release.verify_exact_offload_binding
     monkeypatch.setattr(exact_offload, "entry_points", lambda **_kwargs: ())
@@ -57,9 +56,15 @@ def test_exact_offload_requires_selected_reviewed_capture_and_rechecks_it(tmp_pa
     plan = {
         "target": "test_device",
         "phase0_evidence_bundle": str(bundle),
-        "phases": {"0": {"inputs": {
-            "descriptor": str(descriptor), "software_spec": str(spec), "capability_contract": str(contract),
-        }}},
+        "phases": {
+            "0": {
+                "inputs": {
+                    "descriptor": str(descriptor),
+                    "software_spec": str(spec),
+                    "capability_contract": str(contract),
+                }
+            }
+        },
     }
     prepared = {
         "schema_version": 1,
@@ -73,9 +78,14 @@ def test_exact_offload_requires_selected_reviewed_capture_and_rechecks_it(tmp_pa
     preparation = private / "preparation.json"
     preparation.write_text(json.dumps(prepared))
     preparation.chmod(0o600)
-    monkeypatch.setattr(release, "verify", lambda _seal, _descriptor: {
-        "release": str(root), "review_digest": "a" * 64,
-    })
+    monkeypatch.setattr(
+        release,
+        "verify",
+        lambda _seal, _descriptor: {
+            "release": str(root),
+            "review_digest": "a" * 64,
+        },
+    )
     monkeypatch.setattr(release, "source_run", lambda _run: (plan, {"output_sha256": "output-digest"}, tmp_path))
     monkeypatch.setattr(release, "generation_lineage", lambda _plan, _generated: lineage)
     sources = [
@@ -85,16 +95,26 @@ def test_exact_offload_requires_selected_reviewed_capture_and_rechecks_it(tmp_pa
         SimpleNamespace(role="application-capture:app", path=capture, content=capture.read_bytes()),
     ]
     selected = SimpleNamespace(
-        target="test_device", status="verified", source_snapshots=sources,
+        target="test_device",
+        status="verified",
+        source_snapshots=sources,
         application_inventory_identity={"status": "digest_bound"},
-        application_inventory={"applications": {"app": {
-            "capture_source_path": capture.name, "capture_sha256": sha256_bytes(capture.read_bytes()),
-        }}},
+        application_inventory={
+            "applications": {
+                "app": {
+                    "capture_source_path": capture.name,
+                    "capture_sha256": sha256_bytes(capture.read_bytes()),
+                }
+            }
+        },
     )
     monkeypatch.setattr(phase0_evidence, "load_exported_evidence", lambda _bundle: selected)
     selection = ExactOffloadSelection(
-        target="test_device", model_sha256=sha256_bytes(capture.read_bytes()),
-        package_sha256="0" * 64, transport="test", abi_sha256="1" * 64,
+        target="test_device",
+        model_sha256=sha256_bytes(capture.read_bytes()),
+        package_sha256="0" * 64,
+        transport="test",
+        abi_sha256="1" * 64,
         kernels=(SelectedKernel("op", "interface", "2" * 64),),
         software_spec_sha256=sha256_bytes(spec.read_bytes()),
         capability_contract_sha256=sha256_bytes(contract.read_bytes()),
