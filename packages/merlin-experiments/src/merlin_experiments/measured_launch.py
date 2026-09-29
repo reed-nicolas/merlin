@@ -21,6 +21,7 @@ COORDINATOR = "merlin_experiments.phase2.checkpoint_cli"
 OWNER = "merlin_experiments.phase2.chia_envelope"
 PREFIX = "phase2:installed:"
 ENVELOPE_FIELDS = {"managed_native_endpoint", "codex_slots", "gsim_slots"}
+FROZEN_PHASE0_ENV_POLICY = "merlin.phase0.selected_environment.v1"
 
 
 def _source(name: str) -> Path:
@@ -189,6 +190,20 @@ def source_inputs(command: dict) -> dict[str, str]:
 
 def execution_environment(command: dict) -> dict[str, str]:
     """Use the frozen installed roots even if the invoking ambient selection changed."""
+    if command.get("adapter") == "capsule_derivation" and command.get("source_snapshot"):
+        if command.get("phase0_environment_policy") != FROZEN_PHASE0_ENV_POLICY:
+            raise SpecError("frozen Phase 0 launch predates selected-only environment; freeze a new run")
+        # A frozen derivation may execute source generators. Inheriting a live
+        # Model2MLIR interpreter, checkout, or simulator makes its output depend
+        # on inputs absent from the selected source receipt and changes resume.
+        # Optional generators remain unavailable until their owners are
+        # explicitly selected and frozen by Phase 0.
+        return {
+            "PATH": "/usr/bin:/bin",
+            "LC_ALL": "C.UTF-8",
+            "PYTHONHASHSEED": "0",
+            **command["env"],
+        }
     environment = dict(os.environ, **command["env"])
     if command.get("module") in {MODULE, "merlin_experiments.phase2.portfolio_cli"}:
         environment.pop("PYTHONHOME", None)

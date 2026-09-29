@@ -12,6 +12,7 @@ import yaml
 
 from merlin.common.paths import checkout_root, module_source_path, python_import_roots
 from merlin_experiments import frozen_python, source_snapshot
+from merlin_experiments.measured_launch import FROZEN_PHASE0_ENV_POLICY
 from merlin_experiments.phase1.source_inputs import fingerprint
 
 from .evidence import export_evidence, select_evidence
@@ -232,6 +233,7 @@ def stage(plan: dict) -> dict:
     command["entrypoint"] = path_map[command["entrypoint"]]
     command["cwd"] = str(snapshot)
     command["source_snapshot"] = str(snapshot)
+    command["phase0_environment_policy"] = FROZEN_PHASE0_ENV_POLICY
     command["env"].update(source_snapshot.provider_environment(snapshot, receipt))
     command["env"].update(
         MERLIN_REPO_ROOT=str(snapshot),
@@ -292,6 +294,8 @@ def verify(plan: dict) -> None:
     command = plan["phases"]["0"]
     if command.get("source_snapshot") != str(snapshot) or command.get("cwd") != str(snapshot):
         raise ValueError("frozen Phase 0 source selection changed")
+    if command.get("phase0_environment_policy") != FROZEN_PHASE0_ENV_POLICY:
+        raise ValueError("frozen Phase 0 launch predates selected-only environment; freeze a new run")
     if command["env"].get("MERLIN_REPO_ROOT") != str(snapshot):
         raise ValueError("frozen Phase 0 repository ownership changed")
     for key, value in source_snapshot.provider_environment(snapshot, receipt).items():

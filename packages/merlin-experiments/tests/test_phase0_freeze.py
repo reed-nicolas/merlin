@@ -14,9 +14,31 @@ from pathlib import Path
 
 import pytest
 import yaml
+from merlin_experiments.measured_launch import FROZEN_PHASE0_ENV_POLICY, execution_environment
 from merlin_experiments.phase0 import freeze
+from merlin_experiments.spec import SpecError
 
 from merlin.common.paths import data_path
+
+
+def test_frozen_phase0_launch_uses_only_selected_environment(monkeypatch):
+    monkeypatch.setenv("MERLIN_M2M_PYTHON", "/unselected/python")
+    monkeypatch.setenv("MERLIN_MODEL2MLIR", "/unselected/source")
+    monkeypatch.setenv("SPECIR_ROOT", "/unselected/model")
+    command = {
+        "adapter": "capsule_derivation",
+        "source_snapshot": "/frozen/source",
+        "phase0_environment_policy": FROZEN_PHASE0_ENV_POLICY,
+        "env": {"MERLIN_REPO_ROOT": "/frozen/source", "SPECIR_ROOT": "/frozen/model"},
+    }
+    selected = execution_environment(command)
+    assert selected["SPECIR_ROOT"] == "/frozen/model"
+    assert selected["MERLIN_REPO_ROOT"] == "/frozen/source"
+    assert "MERLIN_M2M_PYTHON" not in selected
+    assert "MERLIN_MODEL2MLIR" not in selected
+    with pytest.raises(SpecError, match="freeze a new run"):
+        execution_environment({**command, "phase0_environment_policy": None})
+    assert execution_environment({**command, "source_snapshot": None})["MERLIN_M2M_PYTHON"] == "/unselected/python"
 
 
 @pytest.fixture(autouse=True)
