@@ -849,6 +849,8 @@ def _installed_phase2_output(command: dict, attempt: dict) -> dict[str, dict[str
             or not (path.is_dir() if directory else path.is_file())
         ):
             raise SpecError(f"completed installed Phase 2 terminal member is absent or linked: {name}")
+        if directory and any(member.is_symlink() for member in path.rglob("*")):
+            raise SpecError(f"completed installed Phase 2 terminal tree contains a link: {name}")
         return {"path": str(path), "sha256": fingerprint(path)}
 
     if command["adapter"] == "measured_claims":
@@ -1055,8 +1057,19 @@ def _execute(root: Path, plan: dict, record: dict, *, checkpoint: Path | None = 
             raise SpecError("--checkpoint requires a prior portfolio segment")
         for attempt in record["attempts"]:
             pin = attempt.get("resume_checkpoint")
-            if pin is not None and fingerprint(pin["path"]) != pin["sha256"]:
-                raise SpecError("previous portfolio resume checkpoint bytes changed")
+            if pin is not None:
+                if (
+                    not isinstance(pin, dict)
+                    or not isinstance(pin.get("path"), str)
+                    or not isinstance(pin.get("sha256"), str)
+                ):
+                    raise SpecError("previous portfolio resume checkpoint identity is malformed")
+                try:
+                    observed = fingerprint(pin["path"])
+                except (OSError, SpecError) as exc:
+                    raise SpecError("previous portfolio resume checkpoint is unavailable or changed") from exc
+                if observed != pin["sha256"]:
+                    raise SpecError("previous portfolio resume checkpoint bytes changed")
             command = plan["phases"][attempt["phase"]]
             if (
                 attempt["state"] == "execution_succeeded"

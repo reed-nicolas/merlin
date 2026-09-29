@@ -174,8 +174,36 @@ def test_completed_portfolio_segment_can_resume_from_explicit_checkpoint(tmp_pat
     with pytest.raises(SpecError, match="completed portfolio candidate differs|terminal bytes changed"):
         resume(destination)
     candidate.write_bytes(original)
+    # The native scientific digest skips build/, but the orchestration pin
+    # must still detect any later bytes under the selected snapshot.
+    ignored = candidate.parent / "build"
+    ignored.mkdir()
+    (ignored / "codegen.py").write_text("changed executable state\n")
+    with pytest.raises(SpecError, match="terminal bytes changed"):
+        resume(destination)
+    (ignored / "codegen.py").unlink()
+    ignored.rmdir()
+    linked = candidate.parent / "linked.py"
+    linked.symlink_to(candidate)
+    with pytest.raises(SpecError, match="terminal tree contains a link"):
+        resume(destination)
+    linked.unlink()
     checkpoint.write_text("changed checkpoint bytes\n")
     with pytest.raises(SpecError, match="previous portfolio resume checkpoint bytes changed"):
+        resume(destination)
+    original_checkpoint = (first / "global_iterations/round_0000_authoring.json").read_bytes()
+    checkpoint.write_bytes(original_checkpoint)
+    from merlin_experiments import runner as runner_module
+
+    original_fingerprint = runner_module.fingerprint
+
+    def unavailable(path):
+        if Path(path) == checkpoint:
+            raise OSError("selected checkpoint cannot be read")
+        return original_fingerprint(path)
+
+    monkeypatch.setattr(runner_module, "fingerprint", unavailable)
+    with pytest.raises(SpecError, match="resume checkpoint is unavailable or changed"):
         resume(destination)
     assert len(status(destination)["attempts"]) == 2
 
