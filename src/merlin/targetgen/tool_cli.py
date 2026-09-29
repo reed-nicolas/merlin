@@ -196,6 +196,40 @@ def _outline_integer_matmuls(args: argparse.Namespace) -> int:
     return 0
 
 
+def _probe_integer_model_route(args: argparse.Namespace) -> int:
+    """Record selected OOT command emission for exact captured integer kernels."""
+    from .contract.model_kernel_route import probe_integer_model_kernels
+
+    selected = {}
+    for label, argument in (
+        ("mlir", args.mlir),
+        ("software-spec", args.software_spec),
+        ("capability-contract", args.capability_contract),
+    ):
+        path = Path(argument)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"--{label} must name a regular, non-symlink file")
+        selected[label] = path.read_bytes()
+    result = probe_integer_model_kernels(
+        selected["mlir"],
+        target=args.target,
+        software_spec=selected["software-spec"],
+        capability_contract=selected["capability-contract"],
+        package_dir=args.package,
+        timeout=args.timeout,
+    )
+    destination = Path(args.out).absolute()
+    if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents):
+        raise ValueError("route-probe output may not traverse a symlink")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("x", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+    print(json.dumps({"out": str(destination), "candidate_count": result["candidate_count"],
+                      "emission_counts": result["emission_counts"]}, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="merlin-target-tools", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -263,6 +297,18 @@ def build_parser() -> argparse.ArgumentParser:
     outline.add_argument("--capability-contract", required=True, help="selected Phase 0 capability contract")
     outline.add_argument("--out", required=True, help="fresh directory for kernel interfaces and source bindings")
     outline.set_defaults(func=_outline_integer_matmuls)
+
+    route = sub.add_parser(
+        "probe-int-mm-route", help="observe OOT command emission for exact model integer matmuls"
+    )
+    route.add_argument("--target", required=True)
+    route.add_argument("--mlir", required=True, help="exact captured model MLIR")
+    route.add_argument("--software-spec", required=True, help="selected software-spec YAML or JSON")
+    route.add_argument("--capability-contract", required=True, help="selected capability contract")
+    route.add_argument("--package", required=True, help="selected OOT compiler package")
+    route.add_argument("--timeout", type=int, default=30, help="seconds per distinct kernel interface")
+    route.add_argument("--out", required=True, help="fresh JSON diagnostic receipt destination")
+    route.set_defaults(func=_probe_integer_model_route)
     return parser
 
 

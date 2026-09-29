@@ -7,6 +7,8 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
+from subprocess import CompletedProcess
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +16,7 @@ from merlin.common.paths import repo_root
 from merlin.runtime.simulator import simulate
 from merlin.targetgen.contract.interface_emit import parse_interface_mlir
 from merlin.targetgen.contract.model_kernel_outline import outline_integer_matmuls
+from merlin.targetgen.contract.model_kernel_route import probe_integer_model_kernels
 from merlin.targetgen.contract.model_stitching import stitching_inventory
 from merlin.targetgen.source_kernel_probe import derive_kernel_window
 
@@ -59,6 +62,54 @@ def _integer_capture(tmp_path, *, body=_INTEGER_BODY):
     }
     (tmp_path / "frontend-trace.json").write_text(json.dumps(trace), encoding="utf-8")
     return tmp_path
+
+
+def test_exact_model_route_probe_keeps_ssa_bindings_and_separates_kernel_from_model(tmp_path, monkeypatch):
+    from merlin.targetgen.contract import model_kernel_route as route
+
+    source = repo_root() / "examples/gemmini/target"
+    package = tmp_path / "selected-package"
+    package.mkdir()
+    (package / "manifest.yaml").write_text("target: gemmini\n", encoding="utf-8")
+    monkeypatch.setattr(
+        route.package_runtime, "load_package",
+        lambda _path: SimpleNamespace(target="gemmini", package_id="test-package", directory=package),
+    )
+
+    def emit(_package, _name, input_mlir, output_json, **_kw):
+        text = input_mlir.read_text(encoding="utf-8")
+        if "merlin_iface." in text:
+            command = parse_interface_mlir(text)
+        else:
+            command = {"target": "gemmini", "commands": [], "declined": {"op": "model", "reason": "unrouted"}}
+        output_json.write_text(json.dumps(command), encoding="utf-8")
+        return CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(route.package_runtime, "run_entrypoint", emit)
+    report = probe_integer_model_kernels(
+        _INTEGER_BODY.encode(),
+        target="gemmini",
+        software_spec=(source / "software-spec.yaml").read_bytes(),
+        capability_contract=(source / "contracts/target_contract.yaml").read_bytes(),
+        package_dir=package,
+    )
+    assert report["model_sha256"] == hashlib.sha256(_INTEGER_BODY.encode()).hexdigest()
+    assert report["candidate_count"] == report["distinct_interfaces"] == 1
+    assert report["emission_counts"] == {"isolated_kernel_emitted": 1}
+    candidate = report["candidates"][0]
+    assert candidate["operand_bindings"] == [
+        {"source": "function_argument", "argument_index": 0},
+        {"source": "function_argument", "argument_index": 1},
+    ]
+    assert candidate["output_result_id"] == candidate["operation_id"] + ":result:0"
+    assert [command["opcode"] for command in candidate["emission"]["commands"]] == [
+        "RES_PACK", "MATMUL_RESIDENT", "COMMIT"
+    ]
+    assert report["complete_model_direct_emission"] == {
+        "status": "declined", "declined": {"op": "model", "reason": "unrouted"}
+    }
+    assert report["stitching"]["composition_status"] == "unlowered"
+    assert report["whole_model_offload_verified"] is False
 
 
 def test_integerized_source_matrix_body_can_supply_a_bounded_window(tmp_path):
@@ -254,7 +305,11 @@ def test_exact_model_selection_reaches_device_rewrite_without_shape_redecision(t
     def fake_certify(_package, interface, **kwargs):
         assert interface.read_text() == reviewed["candidates"][0]["interface_mlir"]
         assert kwargs["require_accelerator_trace"] is True
-        return {"status": "pass", "oracle": {"result": "ran"}, "test_only": True}
+        return {
+            "status": "pass", "oracle": {"result": "pass"},
+            "trace_check": {"status": "pass", "drives_accelerator": True},
+            "test_only": True,
+        }
 
     monkeypatch.setattr(oot_runner, "certify", fake_certify, raising=False)
     selection = selection.certify(package, runs_root=tmp_path / "cert_runs", simulator="test_oracle", timeout=3)
@@ -295,7 +350,8 @@ def test_exact_model_selection_reaches_device_rewrite_without_shape_redecision(t
     monkeypatch.setattr(
         oot_runner, "certify",
         lambda _package, interface, **_kwargs: {
-            "status": "pass", "oracle": {"result": "ran"},
+            "status": "pass", "oracle": {"result": "pass"},
+            "trace_check": {"status": "pass", "drives_accelerator": True},
             "interface_sha256": hashlib.sha256(interface.read_bytes()).hexdigest(), "test_only": True,
         },
     )
