@@ -1,27 +1,8 @@
-"""Board facts as DATA, so targeting a new board is a descriptor rather than a code change.
+"""Target-owned board facts consumed by generic runtime builders.
 
-The generated Zephyr app used to assume its board: an HTIF console, a ``&ram0`` label at
-``0x80000000``, and a 256-bit vector-state save area. Those are true of the chipyard boards it was
-written against and are not properties of "a RISC-V board" — which matters now that we build for a
-tapeout whose facts come from *its own* repo, and for boards nobody here can test on.
-
-Each field is a fact someone can check against the board's device tree / defconfig, and every one of
-them has a failure mode if it is wrong rather than a performance cost:
-
-* ``console`` — the wrong driver options mean **no output at all**, which is indistinguishable from a
-  hang. The HTIF options we set are also the fix for a real one: unbuffered HTIF emits one character
-  per host round-trip, which on a ~20 MHz core looks like the model never finishes.
-* ``dram_bytes`` — the region the image is linked for. Larger than the chip has = a boot that dies
-  before ``main``; smaller than the model needs = an allocation failure mid-inference.
-* ``vlen`` — sizes the per-thread vector save area AND (via ``march_with_vlen``) what the compiler
-  assumes. Over-declaring costs memory and a different LMUL (the documented K1 trap). UNDER-declaring
-  corrupts kernel memory: the save area is a fixed ``vreg[32][vlen/8]`` but Zephyr fills it with a
-  hardware-derived length, so a too-small ``vlen`` overruns the thread struct on every context switch.
-  See ``backends.zephyr_model._vector_max_len_bits``.
-* ``harts`` — how many the SoC actually has. Zephyr's SMP boot hangs waiting for harts that do not
-  exist, with no fault printed.
-* ``fpu_sharing`` — ``y`` mis-routes V-illegal-instruction traps into the FP path, which retries
-  forever: a silent hang. Kept ``False`` unless a board is known to need otherwise.
+Merlin ships the schema and loader, not a board registry. An OOT catalog must
+state hardware and port facts explicitly; guessing DRAM, harts, console, memory
+labels or upload protocol can create images that hang without a diagnostic.
 """
 
 from __future__ import annotations
@@ -44,15 +25,15 @@ FLOW_BAREMETAL = "baremetal"
 
 #: How the operator loads an image, which decides how many bytes cross the serial link.
 #:
-#: * `uart_tsi` (the C fesvr tool, used by gemmelos) walks PT_LOAD and writes **MemSiz**, zero-filling
+#: * `uart_tsi` walks PT_LOAD and writes **MemSiz**, zero-filling
 #:   the part past `filesz`. An image whose `.bss`/arena claims the rest of DRAM therefore pays for
 #:   hundreds of megabytes of zeros before it starts.
-#: * `pyuartsi` (the Python loader on the Kodiak branch) walks the SECTION table and writes only
+#: * `pyuartsi` walks the SECTION table and writes only
 #:   `SHT_PROGBITS` sections with `sh_addr > 0`. `SHT_NOBITS` is skipped entirely, so it sends far less
 #:   than MemSiz -- roughly `filesz`.
 #:
-#: Estimating both with one formula is how the shipped README came to quote "4 min" for an image that
-#: takes an hour on the baud its own loader line specifies.
+#: A loader choice must match the target's actual transport; the byte volume can
+#: differ substantially even for the same ELF.
 LOADER_UART_TSI = "uart_tsi"
 LOADER_PYUARTSI = "pyuartsi"
 
@@ -62,104 +43,59 @@ class Board:
     """Everything the generated app needs to know about a target."""
 
     name: str  # this descriptor's identity (appears in filenames, manifests)
-    dram_bytes: int  # usable DRAM at `dram_base` (the REAL chip's, not the DTS default)
+    dram_bytes: int  # usable physical DRAM at dram_base
     harts: int  # harts the SoC has
+    dram_base: int  # physical DRAM origin
+    console: str  # runtime console family
+    flow: str  # Zephyr or bare metal
+    loader: str  # operator's ELF upload protocol
+    loader_baud: int  # baud of the upload link, not necessarily runtime console
     #: How many of those harts can execute VECTOR code, when that differs from `harts`. A
-    #: heterogeneous SoC is normal -- a chip may bring up three cores and attach a vector unit to only
-    #: two of them -- and the difference is invisible in every place you would look for it: the device
-    #: tree lists identical `cpu@N` nodes, and `arch_num_cpus()` counts all of them. Fanning an RVV
-    #: model out over a hart with no vector unit does not fail cleanly: that worker takes an illegal
-    #: instruction, never reaches the barrier its peers are waiting on, and the image hangs until
-    #: whoever is running it gives up on a timeout. Measured on a 3-core tapeout where 2 cores have V:
-    #: the 1-hart images passed and every 3-hart image timed out.
+    #: heterogeneous SoC may attach a vector unit to only some harts. Fanning an
+    #: RVV model out over a scalar hart can trap before a worker barrier completes.
     #: None means "all of them"; with only a count, the vector-capable harts are taken to be
     #: 0..vector_harts-1 -- see `vector_hart_ids` when that is not true.
     vector_harts: int | None = None
     #: WHICH harts are vector-capable, when they are not the first `vector_harts` of them. A count
-    #: alone silently assumes 0..N-1, and on a chip whose vector units sit on (say) harts 0 and 2 that
-    #: assumption deadlocks exactly like building too many harts does -- a worker lands on a scalar
-    #: hart, traps, and never reaches the barrier. Nothing readable states the mapping (the device tree
-    #: lists identical cpu@N nodes), so it is a fact someone has to tell us. None = the count's default.
+    #: alone assumes 0..N-1. None = the count's default.
     vector_hart_ids: tuple[int, ...] | None = None
     vlen: int | None = None  # hardware vector length in bits; None = unknown, assume the V minimum
-    console: str = CONSOLE_HTIF
-    dram_base: int = 0x80000000  # derived-ok: per-board dataclass default; each board declares its own
-    ram_label: str = "ram0"  # DT label the `&<label> { reg = ... }` overlay targets
-    fpu_sharing: bool = False
-    #: Set CONFIG_RISCV_ISA_EXT_V in the Zephyr config? Not "does the board have vectors" — our
-    #: model.o always carries `v` from its own -march. This is only about whether ZEPHYR's kernel is
-    #: compiled with V, and on a tree WITHOUT RISCV_V_KERNEL_ONLY it cannot be: setting it puts `v` in
-    #: the GLOBAL march, and SDK 0.17.0 has no rv64imafdcv/lp64d libgcc multilib -- the link falls back
-    #: to a 32-bit one and dies with "ELFCLASS32 incompatible with ELFCLASS64". `_prj_conf` therefore
-    #: gates on the TREE's capability as well as this flag.
-    #:
-    #: Turning it off is NOT free, and the cost is not what the earlier note here claimed. reset.S does
-    #: enable `mstatus.VS`, but only for the BOOT context: a Zephyr thread's initial mstatus comes from
-    #: MSTATUS_DEF_RESTORE, which carries VS only under RISCV_ISA_EXT_V. So with this off, every thread
-    #: starts with VS = Off, and any context switch puts it back to Off -- on silicon that enforces VS
-    #: (Kodiak does; spike and Saturn do not) the next vector instruction traps. That is the Kodiak
-    #: multi-hart hang: the single-worker image survives because it never switches again after poking
-    #: VS by hand, and the multi-hart image dies because creating the OpenMP pool switches the master
-    #: out and back. Leave this ON wherever the tree allows it.
-    zephyr_vector_ext: bool = True
-    #: Kernel tick rate to force, or None to accept the board's own. This is about OUR image, not
-    #: about the board: it runs a single-shot inference on one pinned COOP worker per hart, with no
-    #: preemption and no timeouts to resolve, so it needs almost no ticks. Where a board pairs a slow
-    #: timer with a high tick rate the default is pathological -- Kodiak declares
-    #: SYS_CLOCK_HW_CYCLES_PER_SEC=40000 with SYS_CLOCK_TICKS_PER_SEC=10000, i.e. a tick every 4
-    #: cycles, and every tick saves/restores 32 vector registers under the FPU_SHARING=y that board
-    #: also requires. The result is an image that spends essentially all of its time in the timer ISR.
+    ram_label: str | None = None  # required for Zephyr; DT memory label to override
+    fpu_sharing: bool | None = None
+    #: Whether the selected Zephyr port can save vector state for threads. The
+    #: runtime also checks whether the selected Zephyr tree defines the symbols.
+    zephyr_vector_ext: bool | None = None
+    #: Kernel tick rate to force, or None to accept the selected port's own.
     tick_hz: int | None = None
-    #: The Zephyr board to build against, when it differs from `name`. Some chips have no Zephyr port
-    #: of their own: gemmelos-bringup is a Baremetal-IDE fork with zero Zephyr in it, but its SoCs are
-    #: Chipyard-based, so the generic `chipyard_riscv64` board describes them (DRAM at 0x80000000,
-    #: CLINT at 0x02000000, HTIF console over the TSI/FESVR link they already load through). Keeping
-    #: the names separate lets the package say WHICH CHIP it is for while the build says which port it
-    #: used -- so the README can be honest that it is a generic port, not a bespoke one.
+    #: The Zephyr port to build against, when it differs from this descriptor's name.
     zephyr_board: str | None = None
     #: Maximum CPU nodes declared by this Zephyr port's device tree. If the SoC
     #: has fewer harts, generate a disabling overlay; unknown means no overlay.
     dt_cpu_nodes: int | None = None
     #: For `console == CONSOLE_UART`: the key that selects this chip's platform directory inside its
-    #: SDK checkout, from whose headers the UART/PLL/clock-selector facts are DERIVED at build time
-    #: (`runtime.sdk_facts`). It is a lookup key into the target's own tree, not a fact about the
-    #: chip -- the facts themselves are never written down here, because a literal MMIO address in
-    #: shared code is silently wrong for the next tapeout. None for boards whose console needs no
-    #: bring-up (a host-assisted HTIF link is alive before the core starts).
+    #: SDK checkout, from whose headers the UART/PLL/clock facts are derived.
     sdk_chip: str | None = None
     #: DT label of the console UART node, for the `chosen`/`&label` overlay. A label is a property of
     #: the board's device tree, not of the chip -- unlike the address, which is derived.
-    uart_label: str = "uart0"
+    uart_label: str | None = None
     #: PLL target for a UART console, or None to stay on the chip's reset clock. Also the clock a
     #: returned `METRIC cycles` should be divided by, which is why the image prints it.
     chip_freq_hz: int | None = None
-    flow: str = FLOW_ZEPHYR
-    #: How this board's operator gets the image onto the chip. This decides HOW MANY BYTES cross the
-    #: wire, which is not a detail: the two loaders in use here disagree by a factor of ten on the same
-    #: ELF, and both were reported as "FAIL" when the real answer was "the upload had not finished".
-    #: See `upload_bytes` for what each one actually sends.
-    loader: str = LOADER_UART_TSI
-    #: Baud of the LOADER link (not of the runtime console, which can differ). Bytes/second is derived
-    #: from it rather than pinned, because a constant here silently survives a change of loader command.
-    loader_baud: int = 921_600
-    #: bytes to reserve for code+stack before the weights blob in a baremetal layout
-    code_reserve: int = 64 * 1024 * 1024
+    #: Bytes to reserve for code+stack before weights in a bare-metal layout.
+    code_reserve: int | None = None
     #: The merlin target whose RTL this board elaborates, when one is registered. Per-target environment
     #: names derive from it (``common.paths.target_env_name``) -- the Verilator binary override is
     #: MERLIN_<TARGET>_VERILATOR -- so the board, not shared code, says whose variable applies.
     target: str | None = None
-    #: The chipyard harness config that elaborates THIS board's SoC, i.e. its RTL simulator is
-    #: ``simulator-chipyard.harness-<rtl_sim_config>``. None = no elaborated simulator is declared.
+    #: The selected simulator harness config, if an RTL simulator is declared.
     rtl_sim_config: str | None = None
-    #: For a FireSim board: the hardware config (bitstream) its measurements were taken on, so a result
-    #: quoted from FireSim names its hardware from the registry rather than from a literal where it is quoted.
+    #: FPGA bitstream identity for measurements, when applicable.
     bitstream: str | None = None
     notes: str = ""
 
     @property
     def loader_bytes_per_s(self) -> float:
-        """Payload throughput of the loader link. 8N1 framing is 10 bits on the wire per byte, which
-        matches the 92 KB/s measured at 921600 baud, so derive it instead of carrying a constant."""
+        """Payload throughput of an 8N1 upload link (10 wire bits per byte)."""
         return self.loader_baud / 10.0
 
     @property
@@ -273,7 +209,7 @@ def load_boards(path: str | Path | None = None) -> dict[str, Board]:
     """Read the board registry into ``{name: Board}``.
 
     Fails closed: a missing file, an unknown field, a value of the wrong type or outside its vocabulary,
-    or a missing required fact (``dram_bytes``, ``harts``) raises :class:`BoardRegistryError` naming the
+    or a missing required hardware or port fact raises :class:`BoardRegistryError` naming the
     board and the field. The caller passes ``path`` or selects an OOT catalog with
     ``MERLIN_BOARD_CATALOG``. Merlin never guesses a board or loads example target
     facts implicitly.
@@ -319,6 +255,25 @@ def load_boards(path: str | Path | None = None) -> dict[str, Board]:
         missing = [key for key in required if key not in kwargs]
         if missing:
             raise BoardRegistryError(f"{where}: missing required fact(s) {missing}")
+        conditional = []
+        if kwargs["flow"] == FLOW_ZEPHYR:
+            conditional.extend(("ram_label", "fpu_sharing", "zephyr_vector_ext"))
+            if kwargs["console"] == CONSOLE_UART:
+                conditional.append("uart_label")
+        if kwargs["flow"] == FLOW_BAREMETAL:
+            conditional.append("code_reserve")
+        missing = [key for key in conditional if kwargs.get(key) is None or kwargs.get(key) == ""]
+        if missing:
+            raise BoardRegistryError(f"{where}: missing required fact(s) for {kwargs['flow']}: {missing}")
+        if kwargs["flow"] == FLOW_ZEPHYR and kwargs.get("vector_harts") is None and kwargs.get("vector_hart_ids") is None:
+            raise BoardRegistryError(f"{where}: declare vector_harts or vector_hart_ids for a Zephyr board")
+        for key in ("dram_bytes", "harts", "loader_baud"):
+            if kwargs[key] <= 0:
+                raise BoardRegistryError(f"{where}: {key} must be positive")
+        if kwargs["dram_base"] < 0:
+            raise BoardRegistryError(f"{where}: dram_base must be nonnegative")
+        if kwargs.get("code_reserve") is not None and kwargs["code_reserve"] <= 0:
+            raise BoardRegistryError(f"{where}: code_reserve must be positive")
         out[name] = Board(name=name, **kwargs)
     return out
 

@@ -17,6 +17,25 @@ from merlin.runtime.backends import zephyr_model as zm
 from merlin.runtime.sdk_facts import UartConsoleFacts
 
 
+def _fixture_board(name: str, **overrides):
+    facts = {
+        "name": name,
+        "dram_bytes": 1 << 28,
+        "dram_base": 0x80000000,
+        "harts": 2,
+        "vector_harts": 2,
+        "console": boards.CONSOLE_HTIF,
+        "flow": boards.FLOW_ZEPHYR,
+        "fpu_sharing": False,
+        "zephyr_vector_ext": True,
+        "loader": boards.LOADER_UART_TSI,
+        "loader_baud": 921600,
+        "ram_label": "ram0",
+    }
+    facts.update(overrides)
+    return boards.Board(**facts)
+
+
 @pytest.fixture()
 def uart_facts():
     """Console facts as `sdk_facts` derives them, without needing an SDK checkout on disk.
@@ -180,7 +199,7 @@ def test_the_vector_save_area_is_never_declared_smaller_than_the_tree_default():
     if not floor:
         pytest.skip("this Zephyr tree states no single numeric default for RISCV_VECTOR_MAX_LEN")
 
-    understated = boards.Board("some_new_tapeout", dram_bytes=1 << 28, harts=2, vlen=128)
+    understated = _fixture_board("some_new_tapeout", vlen=128)
     assert understated.vector_max_len == 128, "the descriptor still reports what it was told"
     assert zm._vector_max_len_bits(understated) == floor, "but the emitted config is floored"
     conf = zm._prj_conf(understated.harts, "rvv", understated)
@@ -188,7 +207,7 @@ def test_the_vector_save_area_is_never_declared_smaller_than_the_tree_default():
 
     # The floor must not CLAMP a board that legitimately has wider registers -- that would recreate the
     # overrun on the one class of board where it is guaranteed to happen.
-    wide = boards.Board("some_new_tapeout", dram_bytes=1 << 28, harts=2, vlen=1024)
+    wide = _fixture_board("some_new_tapeout", vlen=1024)
     assert zm._vector_max_len_bits(wide) == 1024
 
 
@@ -206,14 +225,14 @@ def test_a_uart_board_without_derived_facts_is_refused():
     failure, because the generic chipyard board's defconfig sets CONFIG_UART_HTIF=y. The image kept a
     host-assisted console and hung in its first print on silicon. There is no safe default here."""
     with pytest.raises(RuntimeError, match="no SDK facts"):
-        zm._prj_conf(2, "rvv", boards.Board("x", dram_bytes=1 << 28, harts=2, console=boards.CONSOLE_UART))
+        zm._prj_conf(2, "rvv", _fixture_board("x", console=boards.CONSOLE_UART))
 
 
 def test_a_uart_board_turns_htif_off_and_states_both_clock_terms(uart_facts):
     """The driver computes its divisor as (SYS_CLOCK_HW_CYCLES_PER_SEC * RTC_CLOCK_DIVIDER_VALUE)/baud
     - 1, so BOTH terms must describe the chip. The board's own defaults imply a 1 GHz peripheral clock
     and would emit garbage rather than nothing -- which reads as a corrupt program, not a bad UART."""
-    uart_board = boards.Board("x", dram_bytes=1 << 28, harts=2, console=boards.CONSOLE_UART)
+    uart_board = _fixture_board("x", console=boards.CONSOLE_UART)
     conf = zm._prj_conf(2, "rvv", uart_board, uart_facts)
     assert "CONFIG_UART_HTIF=n" in conf
     assert "CONFIG_UART_SIFIVE=y" in conf and "CONFIG_UART_SIFIVE_PORT_0=y" in conf
@@ -228,7 +247,7 @@ def test_a_core_clock_that_is_not_a_multiple_of_the_mtime_rate_is_refused(uart_f
     that model must fail loudly rather than be rounded into a wrong baud rate."""
     odd = type(uart_facts)(**{**uart_facts.__dict__, "mtime_hz": 30_000})
     with pytest.raises(RuntimeError, match="integer multiple"):
-        zm._prj_conf(2, "rvv", boards.Board("x", dram_bytes=1 << 28, harts=2, console=boards.CONSOLE_UART), odd)
+        zm._prj_conf(2, "rvv", _fixture_board("x", console=boards.CONSOLE_UART), odd)
 
 
 def test_the_scalar_backend_still_carries_no_vector_config():
@@ -468,7 +487,7 @@ def test_which_harts_have_vectors_is_stated_not_assumed():
     # A scalar image may use every hart; that is the point of having one.
     assert kodiak.hart_ids_for("scalar") == (0, 1, 2)
     # Non-contiguous sets are expressible.
-    odd = boards.Board("x", dram_bytes=1 << 28, harts=3, vector_hart_ids=(0, 2))
+    odd = _fixture_board("x", harts=3, vector_hart_ids=(0, 2))
     assert odd.hart_ids_for("rvv") == (0, 2) and odd.n_vector_harts == 2
     # A homogeneous board keeps the default so its image stays byte-identical.
     assert boards.board("spike_riscv64").hart_ids_for("rvv") == tuple(range(8))
@@ -584,11 +603,48 @@ def test_the_board_table_is_the_registry_file_not_code(tmp_path):
     assert boards.load_boards(path) == boards.BOARDS
     reg = tmp_path / "boards.yaml"
     reg.write_text("schema_version: 1\nboards:\n  a_new_tapeout:\n    dram_bytes: 1 GiB\n    harts: 3\n"
-                   "    vlen: 256\n    console: uart\n    vector_hart_ids: [0, 2]\n", encoding="utf-8")
+                   "    dram_base: 0x80000000\n    console: uart\n    flow: zephyr\n"
+                   "    loader: pyuartsi\n    loader_baud: 57600\n    ram_label: ram0\n"
+                   "    uart_label: uart0\n    fpu_sharing: false\n    zephyr_vector_ext: true\n"
+                   "    vlen: 256\n    vector_hart_ids: [0, 2]\n", encoding="utf-8")
     b = boards.load_boards(reg)["a_new_tapeout"]
     assert b.dram_bytes == 1 << 30 and b.harts == 3
     assert b.vector_hart_ids == (0, 2) and b.hart_ids_for("rvv") == (0, 2)
     assert b.console == boards.CONSOLE_UART
+
+
+@pytest.mark.parametrize("missing_fact", [
+    "dram_base", "console", "flow", "loader", "loader_baud",
+    "ram_label", "uart_label", "fpu_sharing", "zephyr_vector_ext",
+])
+def test_catalog_rejects_missing_critical_facts(tmp_path, missing_fact):
+    facts = {
+        "dram_bytes": "1 GiB", "dram_base": 0x80000000, "harts": 2,
+        "console": "uart", "flow": "zephyr", "loader": "pyuartsi",
+        "loader_baud": 57600, "ram_label": "ram0", "uart_label": "uart0",
+        "fpu_sharing": False, "zephyr_vector_ext": True, "vector_harts": 2,
+    }
+    facts.pop(missing_fact)
+    import yaml
+
+    reg = tmp_path / "boards.yaml"
+    reg.write_text(yaml.safe_dump({"schema_version": 1, "boards": {"board": facts}}), encoding="utf-8")
+    with pytest.raises(boards.BoardRegistryError, match="missing required fact"):
+        boards.load_boards(reg)
+
+
+def test_baremetal_catalog_requires_declared_code_reserve(tmp_path):
+    import yaml
+
+    facts = {
+        "dram_bytes": "1 GiB", "dram_base": 0x80000000, "harts": 1,
+        "console": "htif", "flow": "baremetal", "loader": "uart_tsi",
+        "loader_baud": 921600,
+    }
+    reg = tmp_path / "boards.yaml"
+    reg.write_text(yaml.safe_dump({"schema_version": 1, "boards": {"board": facts}}), encoding="utf-8")
+    with pytest.raises(boards.BoardRegistryError, match="code_reserve"):
+        boards.load_boards(reg)
 
 
 @pytest.mark.parametrize("entry, needle", [

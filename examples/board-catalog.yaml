@@ -11,6 +11,9 @@
 #
 # Value spellings:
 #   * byte sizes (`dram_bytes`, `code_reserve`) are an integer or "<n> KiB|MiB|GiB";
+#   * every entry explicitly states `dram_base`, `console`, `flow`, `loader`, and `loader_baud`;
+#   * Zephyr entries state `ram_label` (and UART entries also state `uart_label`);
+#   * bare-metal entries state `code_reserve`;
 #   * `console` is htif | uart, `flow` is zephyr | baremetal, `loader` is uart_tsi | pyuartsi;
 #   * `vector_hart_ids` is a list of hart ids;
 #   * `target` names the merlin target whose RTL the board elaborates. Per-target environment names
@@ -24,8 +27,17 @@ boards:
   # The substrates we already validate on, described here so the same code path serves them.
   spike_riscv64:
     dram_bytes: 2 GiB
+    dram_base: 0x80000000
     harts: 8
+    vector_harts: 8
+    vlen: 128
     console: htif
+    flow: zephyr
+    loader: uart_tsi
+    loader_baud: 921600
+    ram_label: ram0
+    fpu_sharing: false
+    zephyr_vector_ext: true
     notes: "functional simulator; DRAM is whatever `-m` says, VLEN comes from the ISA string"
 
   # The chipyard multicore vector SoC as Verilator elaborates it. Its config
@@ -36,9 +48,17 @@ boards:
   chipyard_riscv64:
     dt_cpu_nodes: 8
     dram_bytes: 256 MiB
+    dram_base: 0x80000000
     harts: 4
+    vector_harts: 4
     vlen: 256
     console: htif
+    flow: zephyr
+    loader: uart_tsi
+    loader_baud: 921600
+    ram_label: ram0
+    fpu_sharing: false
+    zephyr_vector_ext: true
     target: saturn
     rtl_sim_config: MultiSaturnV256D128ShuttleConfig
     notes: "Verilator/FireSim multi-Saturn SoC"
@@ -52,9 +72,17 @@ boards:
     zephyr_board: chipyard_riscv64
     dt_cpu_nodes: 8
     dram_bytes: 16 GiB
+    dram_base: 0x80000000
     harts: 2
+    vector_harts: 2
     vlen: 256
     console: htif
+    flow: zephyr
+    loader: uart_tsi
+    loader_baud: 921600
+    ram_label: ram0
+    fpu_sharing: false
+    zephyr_vector_ext: true
     target: saturn
     bitstream: alveo_u250_firesim_dual_saturn_v256d128
     notes: >-
@@ -75,10 +103,13 @@ boards:
   chipyard_kodiak:
     dt_cpu_nodes: 8
     dram_bytes: 512 MiB
+    dram_base: 0x80000000
     harts: 3
     vector_harts: 2
     vlen: 512
     console: htif
+    flow: zephyr
+    ram_label: ram0
     # These two flags used to read `fpu_sharing: true, zephyr_vector_ext: false`, on the reasoning that
     # this board's Zephyr lacks RISCV_V_KERNEL_ONLY and routes isr.S's
     # `z_riscv_vstate_save`/`_restore` through fpu.c/fpu.S, which only compile under FPU_SHARING -- so V
@@ -125,9 +156,13 @@ boards:
     zephyr_board: chipyard_kodiak
     dt_cpu_nodes: 8
     dram_bytes: 4 GiB
+    dram_base: 0x80000000
     harts: 2
+    vector_harts: 2
     vlen: 512
     console: htif
+    flow: zephyr
+    ram_label: ram0
     fpu_sharing: false
     zephyr_vector_ext: true
     tick_hz: 100
@@ -155,9 +190,17 @@ boards:
     zephyr_board: chipyard_riscv64
     dt_cpu_nodes: 8
     dram_bytes: 16 GiB
+    dram_base: 0x80000000
     harts: 1
+    vector_harts: 1
     vlen: 512
     console: htif
+    flow: zephyr
+    loader: uart_tsi
+    loader_baud: 921600
+    ram_label: ram0
+    fpu_sharing: false
+    zephyr_vector_ext: true
     bitstream: alveo_u250_firesim_kodiak_opu_1core
     notes: >-
       FireSim alveo_u250_firesim_kodiak_opu_1core: single Shuttle core with the outer-product unit,
@@ -180,9 +223,13 @@ boards:
   # which is what the uart_tsi/FESVR link carries.
   gemmelos_bearly25:
     dram_bytes: 1 GiB
+    dram_base: 0x80000000
     harts: 2
     vlen: 256
     console: uart
+    loader: uart_tsi
+    loader_baud: 921600
+    code_reserve: 64 MiB
     sdk_chip: bearly25
     chip_freq_hz: 500000000
     flow: baremetal
@@ -205,9 +252,17 @@ boards:
     zephyr_board: chipyard_riscv64
     dt_cpu_nodes: 8
     dram_bytes: 1 GiB
+    dram_base: 0x80000000
     harts: 2
+    vector_harts: 2
     vlen: 256
     console: uart
+    loader: uart_tsi
+    loader_baud: 921600
+    ram_label: ram0
+    uart_label: uart0
+    fpu_sharing: false
+    zephyr_vector_ext: true
     sdk_chip: bearly25
     flow: zephyr
     tick_hz: 100
@@ -237,9 +292,17 @@ boards:
     zephyr_board: chipyard_riscv64
     dt_cpu_nodes: 8
     dram_bytes: 1 GiB
+    dram_base: 0x80000000
     harts: 2
+    vector_harts: 2
     vlen: 256
     console: uart
+    loader: uart_tsi
+    loader_baud: 921600
+    ram_label: ram0
+    uart_label: uart0
+    fpu_sharing: false
+    zephyr_vector_ext: true
     sdk_chip: bearly25
     chip_freq_hz: 500000000
     flow: zephyr
@@ -251,9 +314,13 @@ boards:
 
   gemmelos_dsp25:
     dram_bytes: 1 GiB
+    dram_base: 0x80000000
     harts: 2
     vlen: 128
     console: uart
+    loader: uart_tsi
+    loader_baud: 921600
+    code_reserve: 64 MiB
     sdk_chip: dsp25
     chip_freq_hz: 500000000
     flow: baremetal

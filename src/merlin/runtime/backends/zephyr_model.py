@@ -1954,6 +1954,8 @@ def _prj_conf(cpus: int, backend: str, brd, console_facts=None, debug: bool = Fa
     from ..boards import CONSOLE_HTIF, CONSOLE_UART
     if brd is None:
         raise ZephyrModelError("a board descriptor is required for Zephyr app configuration")
+    if brd.fpu_sharing is None or brd.zephyr_vector_ext is None:
+        raise ZephyrModelError("Zephyr board must declare fpu_sharing and zephyr_vector_ext")
     # HTIF: the direct-putchar path races under SMP (a worker on hart != 0 printing) and silently
     # wedges, so use the buffered + syscall path. It is also the fix for an apparent hang: unbuffered
     # HTIF emits ONE CHARACTER per host round-trip, which on a ~20 MHz core looks like the model never
