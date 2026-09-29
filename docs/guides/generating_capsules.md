@@ -56,6 +56,13 @@ The installed generator lives in `merlin_experiments.phase0`; shared derivation 
 remain in core. There is no need to copy generation scripts into `out/`. Generated capsules
 are artifacts, not new library code or files to sync into a wheel.
 
+The tracked `merlin/contract/capsules/` tree is retained historical benchmark input,
+not the destination for a new Phase 0 run. Existing descriptors and frozen input
+bundles still name its exact paths; it is excluded from the installed core wheel.
+The generator rejects output or evidence destinations that overlap either this
+legacy tree or the descriptor-selected source corpus. Keep new derived capsules in
+the run artifact, then prepare and seal a reviewed release for Phase 1 and Phase 2.
+
 ## Inspect, preflight, then generate
 
 These commands use catalog ID `gemmini-functional` as an example. Choose your definition

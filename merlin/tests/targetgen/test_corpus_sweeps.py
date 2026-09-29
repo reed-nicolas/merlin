@@ -922,7 +922,7 @@ def test_generate_target_passes_gate_skips_to_provenance(tmp_path, monkeypatch):
         "blocked_unimplemented": [],
     }
     binding = _binding(16)
-    te = SimpleNamespace(capsule_corpus=str(tmp_path / "isa"))
+    te = SimpleNamespace(capsule_corpus=str(tmp_path / "retained" / "isa"))
     monkeypatch.setattr(GENERATION, "_descriptor_for", lambda _target: tmp_path / "target.yaml")
     monkeypatch.setattr(GENERATION, "_ensure_contract_on_path", lambda _descriptor: None)
     monkeypatch.setattr(GENERATION, "load_target_experiment", lambda _descriptor: te)
@@ -939,8 +939,9 @@ def test_generate_target_passes_gate_skips_to_provenance(tmp_path, monkeypatch):
         return tmp_path / "MANIFEST.yaml"
 
     monkeypatch.setattr(GENERATION, "update_provenance_manifest", record)
-    assert GENERATION.generate_target("fixture", output_root=tmp_path, profiles_root=tmp_path / "profiles") == []
-    assert captured["cap_root"] == tmp_path
+    output = tmp_path / "generated"
+    assert GENERATION.generate_target("fixture", output_root=output, profiles_root=tmp_path / "profiles") == []
+    assert captured["cap_root"] == output
     assert captured["target"] == "fixture"
     perf = captured["performance_record"]
     assert perf["skipped_inapplicable"][0]["status"] == "skipped_inapplicable"
@@ -965,7 +966,7 @@ def test_generate_target_persists_family_and_member_counts(tmp_path, monkeypatch
         "blocked_unimplemented": [],
     }
     binding = _binding(16)
-    te = SimpleNamespace(capsule_corpus=str(tmp_path / "isa"))
+    te = SimpleNamespace(capsule_corpus=str(tmp_path / "retained" / "isa"))
     monkeypatch.setattr(GENERATION, "_descriptor_for", lambda _target: tmp_path / "target.yaml")
     monkeypatch.setattr(GENERATION, "_ensure_contract_on_path", lambda _descriptor: None)
     monkeypatch.setattr(GENERATION, "load_target_experiment", lambda _descriptor: te)
@@ -990,7 +991,8 @@ def test_generate_target_persists_family_and_member_counts(tmp_path, monkeypatch
         return tmp_path / "MANIFEST.yaml"
 
     monkeypatch.setattr(GENERATION, "update_provenance_manifest", record)
-    assert len(GENERATION.generate_target("fixture", output_root=tmp_path, profiles_root=tmp_path / "profiles")) == 2
+    output = tmp_path / "generated"
+    assert len(GENERATION.generate_target("fixture", output_root=output, profiles_root=tmp_path / "profiles")) == 2
     counts = captured["performance_record"]["counts"]
     assert counts == {
         "declared_families": 1,

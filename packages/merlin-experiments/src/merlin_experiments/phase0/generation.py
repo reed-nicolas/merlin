@@ -76,6 +76,37 @@ def _descriptor_for(target: str) -> Path:
     return repo_root() / "merlin" / "experiments" / "capsule_bench" / "targets" / target / "target_experiment.yaml"
 
 
+def _require_distinct_corpus_destinations(te, *, output_root: str | Path, evidence_root: str | Path | None) -> None:
+    """Keep generated Phase 0 bytes out of retained and descriptor-selected input corpora.
+
+    The legacy corpus is still addressable by frozen benchmark grants. Rewriting it
+    under a new derivation would silently change those experiments, even when the
+    caller explicitly supplied ``--output-root``. Resolve paths before comparing
+    them so an alias cannot bypass this source-ownership check.
+    """
+    from merlin.targetgen.corpora import capsule_corpus_roots
+
+    sources = [*capsule_corpus_roots()]
+    selected = getattr(te, "capsule_corpus", None)
+    if selected:
+        sources.append(Path(selected))
+    for method_name in ("graded_roots", "perf_roots", "hidden_roots"):
+        method = getattr(te, method_name, None)
+        if callable(method):
+            sources.extend(method())
+    sources = sorted({Path(source).expanduser().resolve() for source in sources})
+    for field, raw in (("output_root", output_root), ("evidence_root", evidence_root)):
+        if raw is None:
+            continue
+        destination = Path(raw).expanduser().resolve()
+        for source in sources:
+            if destination == source or destination in source.parents or source in destination.parents:
+                raise ValueError(
+                    f"Phase 0 {field} {destination} overlaps source capsule corpus {source}; "
+                    "select a separate run artifact destination"
+                )
+
+
 def _ensure_contract_on_path(descriptor: Path) -> None:
     """If the descriptor names an out-of-tree ``target_contract`` (e.g. radiance's contract lives under
     the ``radiance`` target package), prepend its package root to ``MERLIN_TARGET_PATH`` so the registry
@@ -274,6 +305,7 @@ def generate_target(
     if evidence_input is None:
         _ensure_contract_on_path(descriptor)
     te = load_target_experiment(descriptor)
+    _require_distinct_corpus_destinations(te, output_root=output_root, evidence_root=evidence_root)
     hardware_target = te.target if explicit_descriptor else target
     profile = load_profile(
         target, descriptor=descriptor, **{key: value for key, value in profile_inputs.items() if value is not None}
