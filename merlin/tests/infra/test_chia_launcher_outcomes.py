@@ -108,6 +108,18 @@ def launchers(tmp_path, monkeypatch):
         ("ray.util.scheduling_strategies", strategies),
     ):
         monkeypatch.setitem(sys.modules, name, module)
+    # The installed envelope may have been imported by an earlier test with a
+    # real or absent Chia distribution. Bind this fixture's own Ref/decorator
+    # per case; a cached .chia_remote would return an earlier Ref class and fail
+    # the raw ObjectRef ownership check for reasons unrelated to the launcher.
+    from merlin_experiments.phase2 import chia_envelope
+
+    def synthetic_coordinator(*_args):
+        raise AssertionError("synthetic transport must not enter the coordinator body")
+
+    synthetic_coordinator.__name__ = "run_coordinator"
+    monkeypatch.setattr(chia_envelope, "run_coordinator", decorate()(synthetic_coordinator))
+    monkeypatch.setattr(chia_envelope, "_HAVE_CHIA", True)
     monkeypatch.setattr(chia_bridge, "_backend_cls", None)  # isolate the optional upstream base class
     context = SimpleNamespace(REPO=tmp_path, EXP=tmp_path / "target", RUNS=tmp_path / "runs", TARGET="fixture")
     batch = types.ModuleType("launch_ab_batch")
@@ -437,13 +449,13 @@ def test_perf_keeps_native_command_separate_from_frozen_transport(launchers, mon
         == 0
     )
     _, arguments = state["submitted"][0]
-    command, _, plan, _ = arguments
+    command, _, plan, _, _ = arguments
     assert plan["command"] == command
     assert plan["transport_command"] == ["guarded-python", "sealed-transport", *command]
-    assert plan["command_artifacts"] == module.chia_launch.command_artifacts(command)
-    assert plan["launch_policy"] == module.chia_launch.policy_identity()
+    assert plan["command_artifacts"] == module.ENVELOPE.chia_launch.command_artifacts(command)
+    assert plan["launch_policy"] == module.ENVELOPE.chia_launch.policy_identity()
     unhashed = {key: value for key, value in plan.items() if key != "sha256"}
-    assert module.hashlib.sha256(module._canonical(unhashed)).hexdigest() == plan["sha256"]
+    assert module.ENVELOPE.hashlib.sha256(module._canonical(unhashed)).hexdigest() == plan["sha256"]
 
 
 @pytest.mark.parametrize("failure", ["dispatch", "bypass"])
