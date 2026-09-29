@@ -61,9 +61,18 @@ def test_the_package_is_threaded_as_the_accelerator_backend_not_the_codegen_pack
 
 
 def test_run_capsule_passes_the_package_to_the_model_path():
-    src = _RUNNER.read_text(encoding="utf-8")
-    assert "_grade_model_capsule(capsule, target=eff_target, timeout=timeout,\n" in src
-    assert "package_dir=package_dir, budget_s=_budget)" in src
+    calls = [
+        node for node in ast.walk(ast.parse(_fn_src(_RUNNER, "run_capsule")))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "_grade_model_capsule"
+    ]
+    assert len(calls) == 1
+    assert [ast.unparse(arg) for arg in calls[0].args] == ["capsule"]
+    passed = {keyword.arg: ast.unparse(keyword.value) for keyword in calls[0].keywords}
+    assert passed["target"] == "eff_target"
+    assert passed["timeout"] == "timeout"
+    assert passed["package_dir"] == "package_dir"
+    assert passed["budget_s"] == "_budget"
 
 
 def test_a_padded_tile_records_the_layer_extent_it_did_not_certify():

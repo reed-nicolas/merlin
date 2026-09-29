@@ -37,6 +37,17 @@ not establish the arithmetic or accelerator placement. The
 [whole-model example](../whole-model/README.md) explains IR inspection, but its
 lowering smoke is not this functional certificate.
 
+Placement is a separate acceptance condition: every source compute region must
+appear in the whole-module census, and every region admitted by the independent
+Gemmini eligibility contract must execute on Gemmini (possibly as a declared
+fused stage). A correct host result does not satisfy that condition. A host
+region is acceptable only when the target contract explains why it is not
+Gemmini-eligible; an unknown precision, unclassified operation, missing census,
+or unobserved dispatch leaves the claim incomplete. Review both region recall
+and estimated-work recall, since a single missed contraction can dominate model
+time even when the region count looks good. The exact minimum Phase 0 source-op
+witness basis is not a substitute for this Phase 1 placement and execution check.
+
 The current example does **not** claim that finish line has been reached.
 The descriptor makes `M2_microvit_gemmini`, `M3_host_island_seam_gemmini`, and
 `SY_micro_model` mandatory admitted L3 representatives, while
