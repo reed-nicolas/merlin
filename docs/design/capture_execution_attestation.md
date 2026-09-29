@@ -3,11 +3,12 @@ title: Capture execution attestation boundary
 kind: design
 status: current
 owner: targetgen
-last_verified: 2026-09-27
+last_verified: 2026-09-29
 related: [phase0_specification, model2mlir, reproducibility]
 code_refs:
   - packages/merlin-experiments/src/merlin_experiments/phase0/capture_execution_attestation.py
   - packages/merlin-experiments/src/merlin_experiments/capture_execution/sealed_static.py
+  - packages/merlin-experiments/src/merlin_experiments/capture_execution/sealed_python.py
   - packages/merlin-experiments/src/merlin_experiments/capture_execution/python_preflight.py
   - src/merlin/targetgen/application_inventory.py
 ---
@@ -40,6 +41,15 @@ Its receipt says `local_sealed_static_execution`; replay returns
 because unsigned JSON and replay cannot prove the historical issuing process.
 The observed scope is `static_elf_process_only`. This is not a model2MLIR or
 PyTorch capture attestation and is not wired into Phase 0 admission.
+
+`sealed_python.py` now tests the analogous *process isolation* seam for a caller-supplied
+guest Python root and source tree. It copies and hashes both trees, runs an isolated
+Python script without host home, checkout or network access, and independently
+replays the saved inputs and output bytes. The guest root is still a caller
+selection: this diagnostic cannot prove that its Python packages, native `dlopen`
+dependencies, checkpoints and preprocessing data form the complete
+Model2MLIR/PyTorch closure. Its receipt explicitly says
+`phase0_admissible: false` and `source_closure_verified: false`; Phase 0 rejects it.
 
 A future verified issuer must perform a *fresh* capture in a new output directory.
 It must privately snapshot the complete loader/importer source, Python runtime and

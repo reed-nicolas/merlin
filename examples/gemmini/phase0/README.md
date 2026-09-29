@@ -61,6 +61,10 @@ Repeat with the other three loader names and distinct output directories.
 inputs/goldens and `capture_receipt.json` from the **same conversion and model
 instance**; it does not recapture an unrelated model. Inspect `frontend-trace.json`
 and `pytorch-opset.json` for source correspondence and build-specific operator scope.
+The worker anchors `--out` before Model2MLIR writes its weight reference, so a
+relative command-line output path still yields an absolute source reference.
+Phase 0 later copies the receipt-bound weights and rewrites that one reference
+to the capsule-local sidecar; do not edit the captured MLIR by hand.
 FP32 captures inventory frontend demand; they do not imply FP32 device support.
 
 TinyLlama, SmolVLA and ResNet50 remain held-out validation workloads. Their

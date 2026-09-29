@@ -85,7 +85,7 @@ predates the newest change to the code it documents (see `check_docs_freshness.p
 
 ## Design notes
 
-- [Capture execution attestation boundary](design/capture_execution_attestation.md) — `current`, verified 2026-09-27 · owner: targetgen — see also: [phase0_specification](guides/phase0_specification.md), [model2mlir](guides/model2mlir.md), [reproducibility](guides/reproducibility.md)
+- [Capture execution attestation boundary](design/capture_execution_attestation.md) — `current`, verified 2026-09-29 · owner: targetgen — see also: [phase0_specification](guides/phase0_specification.md), [model2mlir](guides/model2mlir.md), [reproducibility](guides/reproducibility.md)
 - [Design note: attributing the expert-kernel gap (instructions vs stalls)](design/expert_gap_attribution.md) — `current`, verified 2026-07-19 · owner: core — see also: [beam_search](guides/beam_search.md)
 - [Design note: auditing for runtime escapes in emitted compute regions](design/runtime_escape_audit.md) — `current`, verified 2026-07-19 · owner: core — see also: [expert_gap_attribution](design/expert_gap_attribution.md), [compiler_plane](design/compiler_plane.md)
 - [Design note: can the search beat ExecuTorch on its own? (int8, K1, from a frozen unoptimized seed)](design/autonomous_search_vs_executorch.md) — `current`, verified 2026-09-07 · owner: rvvgen — see also: [beam_cca_architecture](design/beam_cca_architecture.md), [codegen_vs_handc_wholemodel](design/codegen_vs_handc_wholemodel.md), [expert_gap_attribution](design/expert_gap_attribution.md)
