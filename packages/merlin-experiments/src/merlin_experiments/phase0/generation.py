@@ -623,7 +623,8 @@ def generate_target(
         name = str(error.get("member") or error.get("family") or "<performance sweep>")
         if name not in failed_names:
             kind = str(error.get("error_type") or "unknown error")
-            failures.append((name, f"performance materialization failed ({kind}); inspect MANIFEST.yaml"))
+            detail = str(error.get("detail") or "no further detail recorded").replace("\n", " ")[:240]
+            failures.append((name, f"performance materialization failed ({kind}): {detail}; inspect MANIFEST.yaml"))
             failed_names.add(name)
     if failures:
         print(f"  [FAIL] {len(failures)} capsule(s) could not be written:")
