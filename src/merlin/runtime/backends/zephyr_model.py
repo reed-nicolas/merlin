@@ -22,7 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -3271,21 +3271,37 @@ def _check_firesim_workload(firesim_root: str, workload: str) -> None:
         )
 
 
-def run_on_firesim(
-    elf: str | Path,
+class FireSimRunner(Protocol):
+    """Out-of-tree execution adapter; Merlin owns only console parsing and gating.
+
+    The adapter owns staging, queue submission, workload/project naming and any
+    simulator-specific imports. It returns the captured UART text, not a verdict.
+    """
+
+    def __call__(
+        self,
+        elf: str,
+        *,
+        firesim_root: str,
+        firesim_env: str,
+        timeout: int,
+        queue: bool,
+    ) -> str: ...
+
+
+def _legacy_modelblaster_firesim(
+    elf: str,
     *,
-    reference: np.ndarray | None = None,
-    references: dict | None = None,
-    timeout: int = 900,
-    queue: bool = True,
-    firesim_root: str | None = None,
-    firesim_env: str | None = None,
-) -> dict[str, Any]:
-    """Run a ``chipyard_riscv64`` ELF on FireSim by reusing ModelBlaster's queue-safe
-    ``validation.firesim_runner.run_firesim`` (single physical FPGA → always go through
-    the queue). Parses our OUT/METRIC/DONE markers from the captured uartlog and (when a
-    reference is given) gates ``cos``/``rel``. Requires the firesim env activated and the
-    queue daemon up (see module doc / the FireSim section of the plan)."""
+    firesim_root: str,
+    firesim_env: str,
+    timeout: int,
+    queue: bool,
+) -> str:
+    """Compatibility adapter for existing ModelBlaster-backed FireSim callers.
+
+    New target support supplies a runner explicitly instead of importing this
+    checkout-specific integration from Merlin's shared execution path.
+    """
     import sys
 
     # Resolve through paths.env (os.environ -> .env -> default), NOT os.environ alone: every
@@ -3298,11 +3314,6 @@ def run_on_firesim(
     for p in (f"{mb}/src", mb):
         if p not in sys.path:
             sys.path.insert(0, p)
-    # FIRESIM_ROOT/FIRESIM_ENV default to the configured chipyard checkout rather than a
-    # placeholder, so a repo with MERLIN_CHIPYARD set needs no extra FireSim-specific config.
-    _cy = _env("MERLIN_CHIPYARD", "/path/to/chipyard")
-    fr = firesim_root or _env("FIRESIM_ROOT", f"{_cy}/sims/firesim")
-    fe = firesim_env or _env("FIRESIM_ENV", f"{_cy}/env.sh")
     # Run under OUR FireSim workload name, not ModelBlaster's. firesim_runner reads
     # FIRESIM_WORKLOAD_NAME into a module constant AT IMPORT, so this must be set before
     # the (lazy) import below. The workload def lives at deploy/workloads/merlin-oscar.json.
@@ -3326,13 +3337,43 @@ def run_on_firesim(
     else:
         # Without the queue the shared config_runtime.yaml is what FireSim reads, so it has to agree
         # with where we stage. See _check_firesim_workload.
-        _check_firesim_workload(fr, os.environ["FIRESIM_WORKLOAD_NAME"])
+        _check_firesim_workload(firesim_root, os.environ["FIRESIM_WORKLOAD_NAME"])
     try:
         from modelblaster.validation.firesim_runner import run_firesim  # type: ignore
     except ModuleNotFoundError:
         from validation.firesim_runner import run_firesim  # type: ignore
 
-    uart = run_firesim(str(elf), models=None, firesim_root=fr, firesim_env=fe, timeout=float(timeout))
+    return run_firesim(
+        str(elf), models=None, firesim_root=firesim_root, firesim_env=firesim_env, timeout=float(timeout)
+    )
+
+
+def run_on_firesim(
+    elf: str | Path,
+    *,
+    reference: np.ndarray | None = None,
+    references: dict | None = None,
+    timeout: int = 900,
+    queue: bool = True,
+    firesim_root: str | None = None,
+    firesim_env: str | None = None,
+    runner: FireSimRunner | None = None,
+) -> dict[str, Any]:
+    """Execute an ELF with a selected FireSim adapter, then parse and gate its UART.
+
+    An out-of-tree adapter owns simulator staging, queue and environment policy.
+    Existing callers without one use the legacy ModelBlaster integration. That
+    default is compatibility only, not a target-independent execution claim.
+    """
+    from ...common.paths import env as _env
+
+    chipyard = _env("MERLIN_CHIPYARD", "/path/to/chipyard")
+    root = firesim_root or _env("FIRESIM_ROOT", f"{chipyard}/sims/firesim")
+    environment = firesim_env or _env("FIRESIM_ENV", f"{chipyard}/env.sh")
+    selected = runner if runner is not None else _legacy_modelblaster_firesim
+    uart = selected(str(elf), firesim_root=root, firesim_env=environment, timeout=timeout, queue=queue)
+    if not isinstance(uart, str):
+        raise ZephyrModelError("FireSim runner must return captured UART text")
     res = _parse_console(uart, 0)
     refs = references if references is not None else reference
     if refs is not None:

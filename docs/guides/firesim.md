@@ -168,6 +168,14 @@ queue, runs under the `merlin-oscar` workload definition (`deploy/workloads/merl
 session's agent is dead — the queue records the *submitter's* environment and the daemon later
 runs `firesim kill`, which SSHes to localhost.
 
+Those settings describe the legacy ModelBlaster adapter, which remains the default for existing
+callers. New target support can pass `runner=` to `run_on_firesim`. The callable receives the ELF
+path and keyword arguments `firesim_root`, `firesim_env`, `timeout`, and `queue`, and returns raw
+UART text. The out-of-tree runner owns staging, workload/project identity, queue submission, and
+simulator imports; Merlin alone parses `OUT`/`METRIC`/`DONE` and applies the reference gate. A
+runner must honor `queue=True` on shared hardware. Passing one does not by itself certify that it
+used the queue or that the expected bitstream executed.
+
 Mind the **timeout**. `run_on_firesim` defaults to 900 s, which is a small model. Whole models
 are hours: at 25 MHz, cycles/2.5×10⁷ = seconds. `firesim_sweep.py` defaults to 5400 s and takes
 `--timeout`.

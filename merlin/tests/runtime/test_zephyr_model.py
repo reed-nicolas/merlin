@@ -118,6 +118,68 @@ def test_firesim_workload_mismatch_is_refused(tmp_path):
     _check_firesim_workload(str(tmp_path / "nowhere"), "merlin-oscar")
 
 
+def test_firesim_runner_seam_parses_and_gates_without_legacy_setup(monkeypatch):
+    """An OOT runner owns execution; Merlin consumes only its UART text."""
+    import sys
+
+    zm = _zm()
+    before_path = list(sys.path)
+    before_env = dict(os.environ)
+    received = {}
+
+    def runner(elf, *, firesim_root, firesim_env, timeout, queue):
+        received.update(elf=elf, firesim_root=firesim_root, firesim_env=firesim_env, timeout=timeout, queue=queue)
+        return "OUT 2 1065353216 1073741824\nMETRIC cycles 1234\nDONE\n"
+
+    def no_legacy(*args, **kwargs):
+        raise AssertionError("the selected runner must not load the legacy adapter")
+
+    monkeypatch.setattr(zm, "_legacy_modelblaster_firesim", no_legacy)
+    result = zm.run_on_firesim(
+        "image.elf",
+        reference=np.array([1.0, 2.0], dtype=np.float32),
+        firesim_root="/selected/firesim",
+        firesim_env="/selected/env.sh",
+        timeout=23,
+        runner=runner,
+    )
+    assert received == {
+        "elf": "image.elf",
+        "firesim_root": "/selected/firesim",
+        "firesim_env": "/selected/env.sh",
+        "timeout": 23,
+        "queue": True,
+    }
+    assert result["ok"] is True
+    assert result["metrics"]["cycles"] == 1234
+    assert sys.path == before_path
+    assert dict(os.environ) == before_env
+
+
+def test_firesim_runner_requires_uart_text():
+    zm = _zm()
+
+    def wrong_result(elf, *, firesim_root, firesim_env, timeout, queue):
+        return {"ok": True}
+
+    with pytest.raises(zm.ZephyrModelError, match="captured UART text"):
+        zm.run_on_firesim("image.elf", runner=wrong_result)
+
+
+def test_firesim_legacy_default_keeps_existing_call_shape(monkeypatch):
+    zm = _zm()
+    calls = []
+
+    def legacy(elf, *, firesim_root, firesim_env, timeout, queue):
+        calls.append((elf, timeout, queue))
+        return "OUT 2 1065353216 1073741824\nMETRIC cycles 7\nDONE\n"
+
+    monkeypatch.setattr(zm, "_legacy_modelblaster_firesim", legacy)
+    result = zm.run_on_firesim("image.elf", timeout=900)
+    assert calls == [("image.elf", 900, True)]
+    assert result["metrics"]["cycles"] == 7
+
+
 def test_console_parse_surfaces_per_op_profile():
     """A console from an ``op_profile`` build carries ``PROF <id> <ticks> <hits>``; the parser must
     hand them back, since per-op cycles are what price a unit. Absent PROF lines, the key stays absent
