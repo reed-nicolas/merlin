@@ -12,6 +12,8 @@ from merlin_experiments.capture_execution import sealed_m2m
 from merlin_experiments.capture_execution.sealed_m2m import (
     SealedM2MError,
     _capture_api_missing,
+    _frontend_trace_api_missing,
+    _static_integer_reference_api_missing,
     _command,
     _command_v2,
     _ldd_library_path,
@@ -26,6 +28,7 @@ from merlin_experiments.phase0.capture_execution_attestation import AttestationN
 from merlin.common.paths import module_source_path, schemas_dir
 from merlin.targetgen import application_inventory
 from merlin.targetgen.quant_recipe import digest as recipe_digest
+from merlin.targetgen._m2m_capture_worker import _diagnostic_model_copy
 
 
 def test_selected_capture_api_refuses_second_conversion_before_runtime_snapshot(tmp_path, monkeypatch):
@@ -62,6 +65,44 @@ def test_selected_capture_api_refuses_second_conversion_before_runtime_snapshot(
     )
     (capture / "provenance.py").write_text("def write_capture_receipt(out, *, source_path): pass\n")
     assert _capture_api_missing(m2m) == ()
+
+
+def test_selected_optional_capture_features_are_reported_separately(tmp_path):
+    m2m = tmp_path / "selected-m2m"
+    package = m2m / "m2m"
+    package.mkdir(parents=True)
+    (package / "api.py").write_text("def convert(model, inputs, *, capture_trace=False): pass\n")
+    assert _frontend_trace_api_missing(m2m) == (
+        "m2m/api.py:convert(original_frontend_snapshot)",
+        "m2m/capture/trace.py",
+    )
+    assert _static_integer_reference_api_missing(m2m) == (
+        "m2m/capture/pt2e_integerize.py",
+        "m2m/capture/pt2e_integer_reference.py",
+    )
+
+
+def test_raw_model_copy_identifies_exact_missing_api_without_admitting_capture(tmp_path):
+    output = tmp_path / "raw"
+    output.mkdir()
+    loader = tmp_path / "loader.py"
+    loader.write_text("def get_model_and_inputs(): pass\n")
+    for name in (
+        "linalg.mlir", "weights.safetensors", "weights.safetensors.manifest.json",
+        "inputs.json", "golden.json", "frontend-trace.json", "pytorch-opset.json", "meta.json",
+    ):
+        (output / name).write_text("{}\n")
+    report = {
+        "same_conversion_missing": ["m2m/capture/bundle.py:write_bundle(conversion_result)"],
+        "frontend_trace_missing": ["m2m/capture/trace.py"],
+        "static_integerization_missing": ["m2m/capture/pt2e_integerize.py"],
+    }
+    _diagnostic_model_copy(output, loader, capture_api=report)
+    record = json.loads((output / "diagnostic-capture.json").read_text())
+    assert record["capture_api"] == report
+    assert record["phase0_admission"] == "not_granted"
+    assert record["source_closure_verified"] is False
+    assert not (output / "capture_receipt.json").exists()
 
 
 def test_normalized_venv_inventory_matches_copied_bytes(tmp_path):

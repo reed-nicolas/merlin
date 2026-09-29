@@ -138,7 +138,7 @@ def _capture_api_missing(m2m_root: Path) -> tuple[str, ...]:
     This is only a compatibility gate. The fresh sandbox execution and replay,
     not source signatures, establish whether a selected implementation works.
     """
-    required = {
+    return _source_api_missing(m2m_root, {
         "m2m/api.py": {
             "convert": {"backend", "quantization", "quantization_preapplied", "level", "func_name", "weights_path"}
         },
@@ -146,7 +146,30 @@ def _capture_api_missing(m2m_root: Path) -> tuple[str, ...]:
             "write_bundle": {"source_path", "capture_trace", "conversion_result"}
         },
         "m2m/capture/provenance.py": {"write_capture_receipt": {"source_path"}},
-    }
+    })
+
+
+def _frontend_trace_api_missing(m2m_root: Path) -> tuple[str, ...]:
+    """Report the exact optional APIs needed for frontend-op and precision evidence."""
+    return _source_api_missing(m2m_root, {
+        "m2m/api.py": {"convert": {"capture_trace", "original_frontend_snapshot"}},
+        "m2m/capture/trace.py": {
+            "capture_frontend_snapshot": {"stage"},
+            "materialize_frontend_precision": {"dtype", "original_frontend_snapshot"},
+        },
+    })
+
+
+def _static_integer_reference_api_missing(m2m_root: Path) -> tuple[str, ...]:
+    """Report APIs needed before a static W8A8 capture can claim integer arithmetic."""
+    return _source_api_missing(m2m_root, {
+        "m2m/capture/pt2e_integerize.py": {"integerize_pt2e": set()},
+        "m2m/capture/pt2e_integer_reference.py": {"run_pt2e_integer_reference": set()},
+    })
+
+
+def _source_api_missing(m2m_root: Path, required: dict[str, dict[str, set[str]]]) -> tuple[str, ...]:
+    """Inspect selected source signatures only; neither execution nor provenance proof."""
     missing: list[str] = []
     for member, functions in required.items():
         source = m2m_root / member

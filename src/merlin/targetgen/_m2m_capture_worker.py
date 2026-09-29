@@ -48,7 +48,38 @@ _SCHEME = {
 _CAPTURE_ABI_VERSION = 6
 
 
-def _diagnostic_model_copy(out: Path, loader: Path) -> None:
+def _capture_api_report(m2m) -> dict[str, list[str]]:
+    """Report selected runtime API gaps; a signature check is not capture qualification."""
+    from m2m.capture.bundle import write_bundle
+
+    bundle_args = set(inspect.signature(write_bundle).parameters)
+    convert_args = set(inspect.signature(m2m.convert).parameters)
+    same_conversion_missing = [
+        f"m2m/capture/bundle.py:write_bundle({name})"
+        for name in sorted({"source_path", "capture_trace", "conversion_result"} - bundle_args)
+    ]
+    if importlib.util.find_spec("m2m.capture.provenance") is None:
+        same_conversion_missing.append("m2m/capture/provenance.py")
+    frontend_trace_missing = [
+        f"m2m/api.py:convert({name})"
+        for name in sorted({"capture_trace", "original_frontend_snapshot"} - convert_args)
+    ]
+    if importlib.util.find_spec("m2m.capture.trace") is None:
+        frontend_trace_missing.append("m2m/capture/trace.py")
+    static_integerization_missing = [
+        member for module, member in (
+            ("m2m.capture.pt2e_integerize", "m2m/capture/pt2e_integerize.py"),
+            ("m2m.capture.pt2e_integer_reference", "m2m/capture/pt2e_integer_reference.py"),
+        ) if importlib.util.find_spec(module) is None
+    ]
+    return {
+        "same_conversion_missing": same_conversion_missing,
+        "frontend_trace_missing": frontend_trace_missing,
+        "static_integerization_missing": static_integerization_missing,
+    }
+
+
+def _diagnostic_model_copy(out: Path, loader: Path, *, capture_api: dict[str, list[str]]) -> None:
     """Expose the exact converted MLIR for inventory, never as an admitted bundle.
 
     This deliberately omits the capture receipt and runtime input/golden ABI. An
@@ -84,6 +115,7 @@ def _diagnostic_model_copy(out: Path, loader: Path) -> None:
         "source_closure_verified": False,
         "materialized_abi": False,
         "reason": "raw conversion has no same-conversion Model2MLIR bundle or producer capture receipt",
+        "capture_api": capture_api,
         "loader": {"path": str(loader.absolute()), "sha256": digest(loader)},
         "artifacts": artifacts,
     }
@@ -562,17 +594,14 @@ def main(argv=None) -> int:
     import m2m
     import torch
     from m2m.coverage import opaque_report
+    capture_api = _capture_api_report(m2m)
 
-    if a.materialize_bundle:
-        from m2m.capture.bundle import write_bundle
-
-        required = {"source_path", "capture_trace", "conversion_result"}
-        actual = set(inspect.signature(write_bundle).parameters)
-        if not required <= actual or importlib.util.find_spec("m2m.capture.provenance") is None:
-            raise RuntimeError(
-                "selected Model2MLIR lacks same-conversion bundle/receipt APIs; "
-                "use --diagnostic-model-copy only for unadmitted raw-model inventory"
-            )
+    if a.materialize_bundle and capture_api["same_conversion_missing"]:
+        raise RuntimeError(
+            "selected Model2MLIR lacks same-conversion bundle/receipt APIs: "
+            f"{capture_api['same_conversion_missing']}; "
+            "use --diagnostic-model-copy only for unadmitted raw-model inventory"
+        )
 
     # Model2MLIR embeds this path in prov.weights_file. A relative --out would
     # otherwise leave a CWD-relative reference in the saved MLIR, which a
@@ -949,7 +978,7 @@ def main(argv=None) -> int:
     }
     (out / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
     if a.diagnostic_model_copy:
-        _diagnostic_model_copy(out, Path(a.loader))
+        _diagnostic_model_copy(out, Path(a.loader), capture_api=capture_api)
     if a.materialize_bundle:
         from m2m.capture.bundle import write_bundle
 

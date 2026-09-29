@@ -73,6 +73,12 @@ This copies the exact converted MLIR to `model.mlir` and hashes the observed
 files in `diagnostic-capture.json`, but emits no `capture_receipt.json`, runtime
 input/golden ABI, or Phase 0 admission. It cannot substitute for a verified
 materialized derivation input.
+The diagnostic record lists missing same-conversion, frontend-trace and static
+integerization APIs separately. The frozen M2M selection records those API
+checks too; an API reported as available only permits a sealed preflight, not
+source-closure verification or corpus admission. In particular, the older
+`write_bundle` that calls `m2m.convert` again cannot establish that its runtime
+bundle has the argument map of the inspected conversion.
 
 TinyLlama, SmolVLA and ResNet50 remain held-out validation workloads. Their
 captures and layer frequencies do not select or tune the derivation corpus.

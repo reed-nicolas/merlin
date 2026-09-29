@@ -16,7 +16,13 @@ from pathlib import Path
 
 import yaml
 
-from merlin_experiments.capture_execution.sealed_m2m import _capture_api_missing, _source_tree, _venv_home
+from merlin_experiments.capture_execution.sealed_m2m import (
+    _capture_api_missing,
+    _frontend_trace_api_missing,
+    _source_tree,
+    _static_integer_reference_api_missing,
+    _venv_home,
+)
 from merlin_experiments.capture_execution.sealed_static import _canonical_path, _file_digest
 
 SCHEMA = "merlin.phase0.selected_m2m_runtime.v1"
@@ -95,6 +101,8 @@ def observe(
     workloads = {name: _source_tree(root / "workloads" / name) for name in names}
     package_inventory = _source_tree(package)
     missing_capture_api = _capture_api_missing(root)
+    missing_frontend_trace_api = _frontend_trace_api_missing(root)
+    missing_static_integer_api = _static_integer_reference_api_missing(root)
     copy_bytes = package_inventory["bytes"] + sum(row["bytes"] for row in workloads.values())
     if copy_bytes > _MAX_SOURCE_COPY_BYTES:
         raise ValueError("selected Model2MLIR package and workload bytes exceed the 15 GB source-copy limit")
@@ -107,6 +115,16 @@ def observe(
         "same_conversion_capture_api": {
             "status": "available_for_sealed_preflight" if not missing_capture_api else "incompatible",
             "missing": list(missing_capture_api),
+            "phase0_admission": "not_granted",
+        },
+        "frontend_trace_api": {
+            "status": "available_for_sealed_preflight" if not missing_frontend_trace_api else "incompatible",
+            "missing": list(missing_frontend_trace_api),
+            "phase0_admission": "not_granted",
+        },
+        "static_integer_reference_api": {
+            "status": "available_for_sealed_preflight" if not missing_static_integer_api else "incompatible",
+            "missing": list(missing_static_integer_api),
             "phase0_admission": "not_granted",
         },
         "workloads": workloads,
