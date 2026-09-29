@@ -75,7 +75,7 @@ def test_debug_e2e_refuses_output_and_maps_state():
     # a trivial kernel is enough — we assert plumbing + redaction, not numeric correctness
     with tempfile.TemporaryDirectory() as td:
         ks = Path(td) / "kernel.S"
-        ks.write_text(".text\n.word 0x00000000\n")
+        ks.write_text(".text\nnop\n")
         try:
             r = PO.run_program_debug(
                 target,
