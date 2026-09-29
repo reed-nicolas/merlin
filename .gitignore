@@ -74,6 +74,9 @@ selfcheck_out/
 # Diagnostic probes and isolated wheel installations are generated, including
 # their rendered README/AGENT files; skeleton exceptions must not expose them.
 /out/artifacts/probes/*/**
+# Fresh diagnostic derivations and failed runs generate per-capsule README files.
+# Keep their entire run trees local; only selected source docs belong in Git.
+/out/artifacts/diagnostics/*/**
 # Generated protocol/review bundles contain rendered README files too. They are
 # never curated source docs, even though out's skeleton rule un-ignores README.md.
 /out/artifacts/protocols/*/**
