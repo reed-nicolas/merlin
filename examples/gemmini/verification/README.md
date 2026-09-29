@@ -251,7 +251,9 @@ python examples/gemmini/verification/probe_signed_i8.py \
 The default receipt is explicitly `spike_passed_rtl_not_run`; Spike is a
 functional model. Add `--rtl` to execute each exact ELF on the selected
 prebuilt Verilator, bounded by `--timeout` (180 seconds maximum). A Verilator
-timeout is not an RTL numerical verdict. This finite diagnostic does not
+timeout writes an `rtl_timeout_incomplete` receipt with the exact ELF hash and
+bounded stdout/stderr tails, then exits nonzero; it is not an RTL numerical
+verdict. This finite diagnostic does not
 review the software spec or establish model-level integerization, physical
 layout, tails or aliasing.
 

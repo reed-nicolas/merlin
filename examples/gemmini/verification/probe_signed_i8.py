@@ -164,6 +164,12 @@ def run(args: argparse.Namespace) -> dict:
     backend = get_backend("gemmini")
     if not backend.available("spike") or (args.rtl and not backend.available("verilator")):
         raise RuntimeError("requested prebuilt Gemmini oracle is unavailable")
+    spike_flags, spike_libdir = backend.spike_extension()
+    if spike_flags != ("--extension=gemmini",):
+        raise ValueError("this diagnostic expects the selected Gemmini Spike extension")
+    spike_extension = spike_libdir / "libgemmini.so"
+    if not spike_extension.is_file():
+        raise ValueError("selected Gemmini Spike extension library is missing")
     emitter = importlib.import_module(f"{backend.__package__}.gemmini_codegen_mlir")
     output = {
         "schema": "merlin.gemmini.signed_i8_diagnostic.v1",
@@ -185,6 +191,7 @@ def run(args: argparse.Namespace) -> dict:
                                 "sha256": sha(Path(os.environ["MERLIN_M2M_VENV"]) / "bin/python")},
             "clang": {"path": os.environ["MERLIN_CLANG"], "sha256": sha(Path(os.environ["MERLIN_CLANG"]))},
             "spike": {"path": str(backend.spike_path()), "sha256": sha(backend.spike_path())},
+            "spike_extension": {"path": str(spike_extension), "sha256": sha(spike_extension)},
             "verilator": {"path": str(backend.verilator_path()), "sha256": sha(backend.verilator_path())},
         },
         "input_shape": {"A0": [m, k], "W": [k, n]},
@@ -220,9 +227,37 @@ def run(args: argparse.Namespace) -> dict:
         rocc_count = len(re.findall(r"\.insn\s+4,\s+0x[0-9a-f]*7b\b", disassembly))
         if not rocc_count:
             raise AssertionError(f"{label}: ELF contains no custom-3 RoCC instruction")
-        engines = {}
+        case_receipt = {
+            "status": "incomplete", "readout_dtype": "i32" if scale is None else "i8",
+            "acc_scale": scale, "same_elf_sha256": sha(elf), "rocc_instructions": rocc_count,
+            "command_buffer_sha256": sha(case_dir / "command_buffer.json"),
+            "expected_sha256": sha(case_dir / "expected.json"),
+            "lowered_mlir_sha256": sha(case_dir / "model.mlir"),
+            "harness_sha256": sha(case_dir / "harness.c"),
+            "disassembly_sha256": sha(case_dir / "disassembly.txt"), "engines": {},
+        }
+        output["cases"][label] = case_receipt
+        engines = case_receipt["engines"]
         for engine in (("spike", "verilator") if args.rtl else ("spike",)):
-            console = backend.run_elf(elf, simulator=engine, timeout=args.timeout)
+            try:
+                console = backend.run_elf(elf, simulator=engine, timeout=args.timeout)
+            except subprocess.TimeoutExpired as exc:
+                timeout_evidence = {"status": "timeout", "wall_limit_seconds": args.timeout}
+                for stream in ("stdout", "stderr"):
+                    captured = getattr(exc, stream) or b""
+                    data = captured.encode("utf-8") if isinstance(captured, str) else captured
+                    retained = data[-65536:]
+                    path = case_dir / f"{engine}.{stream}.tail"
+                    path.write_bytes(retained)
+                    timeout_evidence[stream] = {
+                        "captured_bytes": len(data), "retained_bytes": len(retained),
+                        "tail_sha256": sha(path), "truncated": len(data) > len(retained),
+                    }
+                engines[engine] = timeout_evidence
+                case_receipt["status"] = "rtl_timeout_incomplete"
+                output["status"] = "rtl_timeout_incomplete"
+                save(root / "receipt.json", output)
+                raise RuntimeError(f"{label}: {engine} timed out; incomplete receipt saved at {root}") from exc
             (case_dir / f"{engine}.log").write_text(console, encoding="utf-8")
             observed, metrics = backend.parse_output(console)
             if observed.get("Y0") != expected:
@@ -237,19 +272,11 @@ def run(args: argparse.Namespace) -> dict:
                 "status": "matched", "console_sha256": sha(case_dir / f"{engine}.log"),
                 "cycles": metrics.get("cycles"), "output_elements": m * n,
             }
-        engines["spike"].update(
-            traced_rocc_pcs(backend, elf, case_dir, disassembly, (case_dir / "spike.log").read_text(), args.timeout)
-        )
-        output["cases"][label] = {
-            "status": "spike_and_verilator_matched" if args.rtl else "spike_matched_rtl_not_run",
-            "readout_dtype": "i32" if scale is None else "i8",
-            "acc_scale": scale, "same_elf_sha256": sha(elf), "rocc_instructions": rocc_count,
-            "command_buffer_sha256": sha(case_dir / "command_buffer.json"),
-            "expected_sha256": sha(case_dir / "expected.json"),
-            "lowered_mlir_sha256": sha(case_dir / "model.mlir"),
-            "harness_sha256": sha(case_dir / "harness.c"),
-            "disassembly_sha256": sha(case_dir / "disassembly.txt"), "engines": engines,
-        }
+            if engine == "spike":
+                engines["spike"].update(
+                    traced_rocc_pcs(backend, elf, case_dir, disassembly, console, args.timeout)
+                )
+        case_receipt["status"] = "spike_and_verilator_matched" if args.rtl else "spike_matched_rtl_not_run"
     output["status"] = "spike_and_verilator_passed" if args.rtl else "spike_passed_rtl_not_run"
     save(root / "receipt.json", output)
     return output
