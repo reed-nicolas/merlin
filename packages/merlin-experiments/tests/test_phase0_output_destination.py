@@ -99,10 +99,12 @@ def test_evidence_output_rejects_alias_to_source_corpus(tmp_path):
     )
 
 
-def test_retained_corpus_is_never_an_output_even_for_another_descriptor(tmp_path):
-    from merlin.targetgen.corpora import capsule_corpus_roots
+def test_registered_corpus_is_never_an_output_even_for_another_descriptor(tmp_path, monkeypatch):
+    from merlin.targetgen import corpora
 
-    retained = capsule_corpus_roots()[0]
+    retained = tmp_path / "retained"
+    retained.mkdir()
+    monkeypatch.setattr(corpora, "capsule_corpus_roots", lambda: [retained])
     te = SimpleNamespace(capsule_corpus=tmp_path / "unrelated" / "isa")
     with pytest.raises(ValueError, match="output_root .* overlaps source capsule corpus"):
         generation._require_distinct_corpus_destinations(te, output_root=retained / "isa", evidence_root=None)
