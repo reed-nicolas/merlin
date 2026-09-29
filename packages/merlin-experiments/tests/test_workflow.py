@@ -632,6 +632,7 @@ def test_phase0_output_and_manifest_are_run_owned(tmp_path):
     import copy
     from types import SimpleNamespace
 
+    from merlin_experiments.phase0.generation import _require_distinct_corpus_destinations
     from merlin_experiments.phase0.profiles import validate_profile_inputs
     from merlin_experiments.spec import ExperimentSpec
 
@@ -653,6 +654,7 @@ def test_phase0_output_and_manifest_are_run_owned(tmp_path):
         "load_target_experiment": lambda _: SimpleNamespace(
             capsule_corpus=canonical / "isa", target="external-hardware"
         ),
+        "_require_distinct_corpus_destinations": _require_distinct_corpus_destinations,
         "load_profile": lambda _, **kwargs: {},
         "CS": SimpleNamespace(derive_binding=lambda *args: None),
         "_performance_facts": lambda target: hardware_targets.append(target) or {"sha256": "0" * 64},

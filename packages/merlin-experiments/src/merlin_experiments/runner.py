@@ -783,6 +783,50 @@ def _verify_inputs(plan: dict) -> None:
             raise SpecError(f"frozen input changed: {name} ({pin['path']}); create a new experiment definition/run")
 
 
+_PHASE1_COMPLETION_MEMBERS = (
+    "submission",
+    "run_manifest.yaml",
+    "qa_loop_summary.yaml",
+    "timing_detailed.json",
+)
+
+
+def _phase1_completion_inputs(command: dict) -> dict[str, dict[str, str]]:
+    """Bind the installed functional compiler and its final formal evidence.
+
+    The native run may also contain mutable workspaces and caches. Those are not
+    the compiler handed to Phase 2; pin the four final handoff members instead.
+    """
+    root = Path(command["engine_output"])
+    if root.resolve() != root or root.is_symlink():
+        raise SpecError("installed Phase 1 handoff output changed location")
+    result = {}
+    for name in _PHASE1_COMPLETION_MEMBERS:
+        path = root / name
+        if path.is_symlink() or not path.exists():
+            raise SpecError(f"installed Phase 1 completion member is missing or linked: {name}")
+        if name == "submission" and not path.is_dir():
+            raise SpecError("installed Phase 1 compiler submission is not a directory")
+        if name == "submission" and any(member.is_symlink() for member in path.rglob("*")):
+            raise SpecError("installed Phase 1 compiler submission contains linked members")
+        if name != "submission" and not path.is_file():
+            raise SpecError(f"installed Phase 1 completion member is not a file: {name}")
+        result[name] = {"path": str(path), "sha256": fingerprint(path)}
+    return result
+
+
+def _verify_completed_phase1(command: dict, attempt: dict) -> None:
+    expected = attempt.get("completion_inputs")
+    if not isinstance(expected, dict) or set(expected) != set(_PHASE1_COMPLETION_MEMBERS):
+        raise SpecError("completed installed Phase 1 lacks bound handoff outputs; create a new experiment run")
+    try:
+        observed = _phase1_completion_inputs(command)
+    except (OSError, SpecError) as exc:
+        raise SpecError(f"completed installed Phase 1 handoff changed: {exc}") from exc
+    if observed != expected:
+        raise SpecError("completed installed Phase 1 handoff bytes changed; create a new experiment run")
+
+
 def _process_active(pid: int | None) -> bool:
     if pid is None:
         return False
@@ -903,6 +947,8 @@ def _execute(root: Path, plan: dict, record: dict, *, checkpoint: Path | None = 
                         raise SpecError("phase-0 output identity changed; create a new experiment run") from exc
                     if not expected or observed != expected:
                         raise SpecError("phase-0 output identity changed; create a new experiment run")
+                if command["adapter"] == "capsule_bench" and command.get("module") == PHASE1_MODULE:
+                    _verify_completed_phase1(command, previous[-1])
                 continue
             argv = list(command["argv"])
             checkpoint_pin = None
@@ -986,12 +1032,14 @@ def _execute(root: Path, plan: dict, record: dict, *, checkpoint: Path | None = 
             elif returncode == 0 and command["adapter"] == "capsule_bench":
                 try:
                     _verify_inputs(plan)
+                    if command.get("module") == PHASE1_MODULE:
+                        entry["completion_inputs"] = _phase1_completion_inputs(command)
                 except (OSError, SpecError) as exc:
                     entry.update(
                         returncode=1,
                         engine_returncode=0,
                         state="execution_failed",
-                        error=f"phase1 input identity changed during execution; engine evidence unchanged: {exc}",
+                        error=f"phase1 handoff identity not established; engine evidence unchanged: {exc}",
                     )
                     returncode = 1
             record["state"] = entry["state"]
