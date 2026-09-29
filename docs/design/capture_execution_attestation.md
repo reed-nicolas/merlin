@@ -134,10 +134,11 @@ The bounded `sealed_m2m` CPU runner has a separate v2 policy for either FP32
 without a recipe or static int8 with an explicitly selected, content-validated
 `quant_recipe_v1` whose numerical engine is `integer_reference`. Its plan names
 the dtype and recipe bytes, selected Model2MLIR revision, workload, Merlin worker
-package and Python runtime. Issuance copies those inputs into a private
-empty-root process. Replay reconstructs the selected command and checks the
-recipe against the capture's quantization metadata and independent integer
-reference agreement. Historical FP32 v1 receipts retain their original replay
+package, its canonical schema tree, and Python runtime. Issuance copies those
+inputs into a private empty-root process. Replay reconstructs the selected
+command and checks bundled schema membership and bytes. It also checks the
+recipe against capture metadata and independent integer-reference agreement.
+Historical FP32 v1 receipts retain their original replay
 policy. Neither version is an authenticated historical-execution attestation or
 Phase 0 admission; the result explicitly says `phase0_admission: not_granted`.
 Loaders that read ambient environment values or require checkpoints outside the

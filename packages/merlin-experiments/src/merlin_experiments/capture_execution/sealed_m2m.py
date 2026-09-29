@@ -232,7 +232,7 @@ def _system_libs(interpreter: Path, torch_so: Path, numpy_so: Path) -> tuple[Pat
 
 
 def prepare_plan(*, m2m_root: Path, workload_root: Path, worker: Path,
-                 venv: Path, dtype: str = "fp32", recipe: Path | None = None,
+                 venv: Path, schemas_root: Path, dtype: str = "fp32", recipe: Path | None = None,
                  max_snapshot_bytes: int = _MAX_SNAPSHOT_BYTES) -> dict[str, Any]:
     """Read-only selection and space bound; no capture or admission claim."""
     if type(max_snapshot_bytes) is not int or not 0 < max_snapshot_bytes <= _MAX_SNAPSHOT_BYTES:
@@ -241,10 +241,18 @@ def prepare_plan(*, m2m_root: Path, workload_root: Path, worker: Path,
     workload_root = _canonical_path(workload_root, exists=True)
     worker = _canonical_path(worker, exists=True)
     venv = _canonical_path(venv, exists=True)
+    schemas_root = _canonical_path(schemas_root, exists=True)
     selected_recipe = _recipe_selection(recipe, dtype=dtype)
     merlin_root = worker.parents[1]
     if worker != merlin_root / "targetgen/_m2m_capture_worker.py" or not (merlin_root / "__init__.py").is_file():
         raise SealedM2MError("selected worker must belong to the selected Merlin source package")
+    if schemas_root not in {merlin_root / "_data/schemas", merlin_root.parent.parent / "merlin/schemas"}:
+        raise SealedM2MError("selected schemas must belong to the selected Merlin package or source checkout")
+    if not schemas_root.is_dir() or any(
+        not (schemas_root / name).is_file()
+        for name in ("quant_formats.registry.yaml", "quant_format.schema.yaml")
+    ):
+        raise SealedM2MError("selected Merlin schema tree lacks the quant-format registry and validator")
     if not (m2m_root / "m2m/api.py").is_file() or not (workload_root / "loader.py").is_file():
         raise SealedM2MError("M2M package or workload loader is absent")
     if _loader_env_reads((workload_root / "loader.py").read_text()):
@@ -276,6 +284,7 @@ def prepare_plan(*, m2m_root: Path, workload_root: Path, worker: Path,
         "m2m": _source_tree(m2m_root / "m2m"),
         "workload": _source_tree(workload_root),
         "merlin": _source_tree(merlin_root),
+        "schemas": _source_tree(schemas_root),
     }
     estimate = sum(row["bytes"] for row in selected_trees.values())
     estimate += sum(path.stat().st_size for path in libs)
@@ -286,7 +295,7 @@ def prepare_plan(*, m2m_root: Path, workload_root: Path, worker: Path,
     return {
         "schema": SCHEMA, "status": "plan_only", "m2m_root": str(m2m_root),
         "m2m_commit": selected, "workload_root": str(workload_root),
-        "worker": str(worker), "merlin_root": str(merlin_root),
+        "worker": str(worker), "merlin_root": str(merlin_root), "schemas_root": str(schemas_root),
         "venv": str(venv), "base": str(base), "dtype": dtype, "recipe": selected_recipe,
         "worker_sha256": _file_digest(worker),
         "loader_sha256": _file_digest(workload_root / "loader.py"),
@@ -311,6 +320,11 @@ def _validate_snapshots(source: Path, runtime: Path, output_mount: Path, *, sche
               source / "merlin-src/merlin/targetgen/_m2m_capture_worker.py")
     if not worker.is_file() or not (source / "workload/loader.py").is_file():
         raise SealedM2MError("selected source entrypoints are absent")
+    if schema == SCHEMA and any(
+        not (source / "merlin-src/merlin/_data/schemas" / name).is_file()
+        for name in ("quant_formats.registry.yaml", "quant_format.schema.yaml")
+    ):
+        raise SealedM2MError("selected Merlin package data is absent from the snapshot")
     mounted = runtime / output_mount.relative_to("/")
     if mounted.is_symlink() or not mounted.is_dir() or any(mounted.iterdir()):
         raise SealedM2MError("host-resolvable guest output mount point is not empty")
@@ -383,19 +397,38 @@ def _materialized_v2(output: Path, source: Path, output_mount: Path, plan: dict[
     return result
 
 
+def _stage_source(plan: dict[str, Any], source: Path) -> None:
+    """Copy exactly the source members named by the selected v2 plan."""
+    shutil.copytree(Path(plan["m2m_root"]) / "m2m", source / "m2m-src/m2m", symlinks=False)
+    shutil.copytree(Path(plan["workload_root"]), source / "workload", symlinks=False)
+    shutil.copytree(Path(plan["merlin_root"]), source / "merlin-src/merlin", symlinks=False)
+    if _snapshot_tree(source / "merlin-src/merlin") != plan["selected_trees"]["merlin"]:
+        raise SealedM2MError("Merlin package snapshot differs from selected bytes")
+    bundled_schemas = source / "merlin-src/merlin/_data/schemas"
+    if not bundled_schemas.exists():
+        shutil.copytree(Path(plan["schemas_root"]), bundled_schemas, symlinks=False)
+    if plan.get("recipe"):
+        selected_recipe = source / "inputs/quant_recipe.json"
+        selected_recipe.parent.mkdir()
+        shutil.copy2(plan["recipe"]["path"], selected_recipe)
+
+
 def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = None) -> Path:
     """Make one private snapshot and capture; receipt remains pending replay."""
     if plan.get("schema") != SCHEMA or plan.get("status") != "plan_only":
         raise SealedM2MError("unsupported M2M plan")
     selected = prepare_plan(m2m_root=Path(plan["m2m_root"]), workload_root=Path(plan["workload_root"]),
                             worker=Path(plan["worker"]), venv=Path(plan["venv"]),
+                            schemas_root=Path(plan["schemas_root"]),
                             dtype=plan["dtype"],
                             recipe=Path(plan["recipe"]["path"]) if plan.get("recipe") else None,
                             max_snapshot_bytes=plan["max_snapshot_bytes"])
     if selected != plan:
         raise SealedM2MError("selected M2M plan changed")
     run_dir = _canonical_path(run_dir, exists=False)
-    inputs = [Path(plan[key]) for key in ("m2m_root", "workload_root", "worker", "merlin_root", "venv", "base")]
+    inputs = [Path(plan[key]) for key in (
+        "m2m_root", "workload_root", "worker", "merlin_root", "schemas_root", "venv", "base"
+    )]
     if plan.get("recipe"):
         inputs.append(Path(plan["recipe"]["path"]))
     if any(run_dir == path or run_dir.is_relative_to(path) or path.is_relative_to(run_dir) for path in inputs):
@@ -406,13 +439,7 @@ def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = No
     runtime = run_dir / "snapshots/guest-root"
     source.mkdir(parents=True)
     runtime.mkdir()
-    shutil.copytree(Path(plan["m2m_root"]) / "m2m", source / "m2m-src/m2m", symlinks=False)
-    shutil.copytree(Path(plan["workload_root"]), source / "workload", symlinks=False)
-    shutil.copytree(Path(plan["merlin_root"]), source / "merlin-src/merlin", symlinks=False)
-    if plan.get("recipe"):
-        selected_recipe = source / "inputs/quant_recipe.json"
-        selected_recipe.parent.mkdir()
-        shutil.copy2(plan["recipe"]["path"], selected_recipe)
+    _stage_source(plan, source)
     venv_copy = runtime / "opt/capture-venv"
     venv_copy.parent.mkdir(parents=True)
     shutil.copytree(plan["venv"], venv_copy, symlinks=False,
@@ -441,8 +468,10 @@ def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = No
         raise SealedM2MError("M2M package snapshot differs from selected bytes")
     if _snapshot_tree(source / "workload") != _source_tree(Path(plan["workload_root"])):
         raise SealedM2MError("workload snapshot differs from selected bytes")
-    if _snapshot_tree(source / "merlin-src/merlin") != _source_tree(Path(plan["merlin_root"])):
-        raise SealedM2MError("Merlin package snapshot differs from selected bytes")
+    selected_schemas = _snapshot_tree(source / "merlin-src/merlin/_data/schemas")
+    if (selected_schemas != plan["selected_trees"]["schemas"]
+            or selected_schemas != _source_tree(Path(plan["schemas_root"]))):
+        raise SealedM2MError("Merlin schema snapshot differs from selected bytes")
     if _file_digest(source / "merlin-src/merlin/targetgen/_m2m_capture_worker.py") != plan["worker_sha256"]:
         raise SealedM2MError("worker snapshot differs from selected bytes")
     if plan.get("recipe") and _file_digest(source / "inputs/quant_recipe.json") != plan["recipe"]["sha256"]:
@@ -466,6 +495,7 @@ def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = No
         "nonce": secrets.token_hex(16), "plan": plan, "command": list(command),
         "policy_sha256": _policy(command, output), "source": source_digest,
         "guest_root": runtime_digest, "output": _snapshot_tree(output),
+        "schemas": selected_schemas,
         "process": process, "materialized": materialized,
         "bwrap_sha256": _file_digest(bwrap),
         "scope": _V2_SCOPE,
@@ -521,6 +551,10 @@ def replay_verify(run_dir: Path, *, bwrap_binary: Path | None = None) -> dict[st
         doc.get("source"), doc.get("guest_root"), doc.get("output")
     ):
         raise SealedM2MError("sealed M2M snapshot or capture bytes differ")
+    if schema == SCHEMA:
+        schemas = _snapshot_tree(source / "merlin-src/merlin/_data/schemas")
+        if schemas != (plan.get("selected_trees") or {}).get("schemas") or schemas != doc.get("schemas"):
+            raise SealedM2MError("selected Merlin schema bytes differ from the v2 plan or receipt")
     materialized = (_materialized(output, source, output) if schema == SCHEMA_V1
                     else _materialized_v2(output, source, output, plan))
     if materialized != doc.get("materialized"):

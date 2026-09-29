@@ -4,10 +4,12 @@ import json
 import shutil
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 import pytest
 from merlin.targetgen import application_inventory
+from merlin.common.paths import module_source_path, schemas_dir
 from merlin.targetgen.quant_recipe import digest as recipe_digest
 from merlin_experiments.capture_execution import sealed_m2m
 from merlin_experiments.capture_execution.sealed_m2m import (
@@ -124,6 +126,34 @@ def test_v2_materialized_receipt_binds_the_executed_package_worker(tmp_path, mon
         sealed_m2m._materialized(output, source, output, worker_member=worker_member)
 
 
+def test_v2_staged_source_loads_selected_quant_format_registry_without_host_checkout(tmp_path):
+    m2m, workload, source = tmp_path / "m2m", tmp_path / "workload", tmp_path / "source"
+    (m2m / "m2m").mkdir(parents=True)
+    (m2m / "m2m/__init__.py").write_text("")
+    workload.mkdir()
+    (workload / "loader.py").write_text("pass\n")
+    source.mkdir()
+    plan = {
+        "m2m_root": str(m2m), "workload_root": str(workload),
+        "merlin_root": str(module_source_path("merlin").parent),
+        "schemas_root": str(schemas_dir()),
+        "selected_trees": {"merlin": _source_tree(module_source_path("merlin").parent)},
+    }
+    sealed_m2m._stage_source(plan, source)
+    selected_package = source / "merlin-src"
+    site_packages = sysconfig.get_paths()["purelib"]
+    program = (
+        "import sys;sys.path[:0]=" + repr([str(selected_package), site_packages]) + ";"
+        "import merlin;from merlin.common.quant_formats import names;"
+        "print(merlin.__file__);print(len(names()))"
+    )
+    result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", program],
+                            env={}, cwd=tmp_path, capture_output=True, text=True, timeout=10, check=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0] == str(selected_package / "merlin/__init__.py")
+    assert int(result.stdout.splitlines()[1]) > 0
+
+
 def test_int8_recipe_selection_is_explicit_and_content_bound(tmp_path):
     recipe = {
         "schema": "quant_recipe_v1", "status": "derived", "software_numerical_engine": "integer_reference",
@@ -197,7 +227,8 @@ def test_cpu_receipts_replay_only_under_their_selected_policy(tmp_path, monkeypa
     plan = {"schema": schema, "status": "plan_only",
             "command_template_sha256": sealed_m2m._digest(template.encode())}
     if not old:
-        plan.update({"dtype": "int8", "recipe": {"sha256": "selected"}})
+        plan.update({"dtype": "int8", "recipe": {"sha256": "selected"},
+                     "selected_trees": {"schemas": input_identity}})
     receipt = {
         "schema": schema, "status": "pending_replay",
         "issuer_sha256": sealed_m2m._V1_ISSUER_SHA256 if old else "current-issuer", "nonce": "0" * 32,
@@ -205,13 +236,15 @@ def test_cpu_receipts_replay_only_under_their_selected_policy(tmp_path, monkeypa
         "command": list(command), "policy_sha256": _policy(command, output),
         "scope": sealed_m2m._V1_SCOPE if old else sealed_m2m._V2_SCOPE,
         "source": input_identity, "guest_root": input_identity,
+        **({"schemas": input_identity} if not old else {}),
         "output": output_identity, "process": process, "materialized": materialized,
         "bwrap_sha256": "bwrap",
     }
     (run / "sealed_m2m_pending.json").write_text(json.dumps(receipt))
     monkeypatch.setattr(sealed_m2m, "_validate_snapshots", lambda *_, **__: None)
     monkeypatch.setattr(sealed_m2m, "_snapshot_tree", lambda path: (
-        input_identity if Path(path) in (source, runtime) else output_identity
+        input_identity if Path(path) in (source, runtime, source / "merlin-src/merlin/_data/schemas")
+        else output_identity
     ))
     monkeypatch.setattr(sealed_m2m, "_materialized", lambda *_: materialized)
     monkeypatch.setattr(sealed_m2m, "_materialized_v2", lambda *_: materialized)
@@ -226,12 +259,17 @@ def test_cpu_receipts_replay_only_under_their_selected_policy(tmp_path, monkeypa
     assert result.get("capture_dtype") == (None if old else "int8")
     assert result["phase0_admission"] == "not_granted"
     assert result["status"] == "verified_sandbox_replay"
+    if not old:
+        receipt["schemas"] = {"sha256": "unselected"}
+        (run / "sealed_m2m_pending.json").write_text(json.dumps(receipt))
+        with pytest.raises(SealedM2MError, match="schema bytes differ"):
+            sealed_m2m.replay_verify(run)
 
 
 def test_plan_cannot_raise_snapshot_cap(tmp_path):
     with pytest.raises(SealedM2MError, match="no larger than 15 GB"):
         prepare_plan(m2m_root=tmp_path, workload_root=tmp_path, worker=tmp_path,
-                     venv=tmp_path, max_snapshot_bytes=15_000_000_001)
+                     venv=tmp_path, schemas_root=tmp_path, max_snapshot_bytes=15_000_000_001)
 
 
 def test_ldd_dependency_parser_accepts_only_structural_library_paths():
