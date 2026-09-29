@@ -44,15 +44,24 @@ For an already-integerized capture, you can materialize the exact signed
 ```sh
 merlin-target-tools outline-int-mm --target gemmini \
   --mlir /absolute/capture/model.mlir \
+  --software-spec /absolute/phase0-artifacts/software/software-spec.json \
+  --capability-contract /absolute/phase0-artifacts/software/contract.json \
   --out /configured/out/artifacts/model-kernels/int8-iteration-001
 ```
 
 The fresh directory contains `manifest.json` plus one interface MLIR file per
-accepted contraction. The manifest binds each kernel to the model's SHA-256,
-the exact MLIR operation and its operand-producing SSA values; refusals stay
-explicit. Submit those interface files to the selected OOT compiler to check
-kernel code generation. This does not lower the intervening quantization,
-transpose, dequantization or host operations, connect the kernels back to the
+outlined contraction. Both operator-selected Phase 0 files are required: the SW spec must
+declare accelerator contraction with a matching precision/rank, and the capability
+contract must explicitly declare the resident-packed, accumulator-commit and
+command-buffer class.
+Missing, foreign or malformed selections refuse; an unsupported declaration emits
+no interface. The manifest binds the exact model, SW spec and capability-contract
+byte hashes, MLIR operation and operand-producing SSA values. Each candidate's
+`software_admission` can still be `unknown` (the current unreviewed example is),
+and `compiler_support` remains `not_evaluated`; this is an inspectable diagnostic,
+not a Phase 0 provenance certificate or a claim that the target compiler supports the operation. Submit an interface
+to the selected OOT compiler to check kernel code generation separately. This does
+not lower the intervening quantization, transpose, dequantization or host operations, connect the kernels back to the
 model, or establish numerical execution. The published Gemmini compiler still
 declines the *whole* upstream Linalg module; an isolated kernel command buffer
 does not change that verdict.

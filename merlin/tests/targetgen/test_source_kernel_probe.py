@@ -9,9 +9,12 @@ import json
 
 import pytest
 
+from merlin.common.paths import repo_root
 from merlin.targetgen.contract.interface_emit import parse_interface_mlir
 from merlin.targetgen.contract.model_kernel_outline import outline_integer_matmuls
 from merlin.targetgen.source_kernel_probe import derive_kernel_window
+
+pytestmark = pytest.mark.target("gemmini", "atlas")
 
 _INTEGER_BODY = """builtin.module {
   func.func @forward(%a: tensor<4x19xi8>, %b: tensor<19x8xi8>) -> tensor<4x8xi32> {
@@ -71,14 +74,26 @@ def test_exact_integer_model_body_outlines_a_compilable_interface_kernel(tmp_pat
 
     model = _INTEGER_BODY.encode()
     (tmp_path / "model.mlir").write_bytes(model)
+    source_root = repo_root() / "examples/gemmini/target"
+    software_spec = source_root / "software-spec.yaml"
+    capability_contract = source_root / "contracts/target_contract.yaml"
     output = tmp_path / "kernels"
     assert main(
-        ["outline-int-mm", "--target", "example", "--mlir", str(tmp_path / "model.mlir"), "--out", str(output)]
+        [
+            "outline-int-mm", "--target", "gemmini", "--mlir", str(tmp_path / "model.mlir"),
+            "--software-spec", str(software_spec), "--capability-contract", str(capability_contract),
+            "--out", str(output),
+        ]
     ) == 0
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["model_sha256"] == hashlib.sha256(model).hexdigest()
+    assert manifest["software_spec_sha256"] == hashlib.sha256(software_spec.read_bytes()).hexdigest()
+    assert manifest["capability_contract_sha256"] == hashlib.sha256(capability_contract.read_bytes()).hexdigest()
+    assert manifest["interface_class"]["status"] == "declared"
     assert len(manifest["candidates"]) == 1 and manifest["refused"] == []
     candidate = manifest["candidates"][0]
+    assert candidate["software_admission"]["status"] == "unknown"
+    assert candidate["compiler_support"] == "not_evaluated"
     assert candidate["operation_id"].startswith(f"mlir:{manifest['model_sha256']}:")
     assert candidate["operand_bindings"] == [
         {"source": "function_argument", "argument_index": 0},
@@ -94,9 +109,54 @@ def test_exact_integer_model_body_outlines_a_compilable_interface_kernel(tmp_pat
 
     # Neither same-typed wrong wiring nor a nonzero seed is a standalone matmul.
     wrong_product = _INTEGER_BODY.replace('"arith.muli"(%lhs32, %rhs32)', '"arith.muli"(%lhs32, %lhs32)')
-    assert outline_integer_matmuls(wrong_product.encode(), target="example")["candidates"] == []
+    selection = {"target": "gemmini", "software_spec": software_spec.read_bytes(),
+                 "capability_contract": capability_contract.read_bytes()}
+    assert outline_integer_matmuls(wrong_product.encode(), **selection)["candidates"] == []
     nonzero_init = _INTEGER_BODY.replace('value = 0 : i32', 'value = 1 : i32')
-    assert outline_integer_matmuls(nonzero_init.encode(), target="example")["candidates"] == []
+    assert outline_integer_matmuls(nonzero_init.encode(), **selection)["candidates"] == []
+
+
+def test_outline_requires_selected_same_target_resident_class_and_sw_declaration():
+    root = repo_root() / "examples"
+    gemmini_spec = (root / "gemmini/target/software-spec.yaml").read_bytes()
+    gemmini_contract = (root / "gemmini/target/contracts/target_contract.yaml").read_bytes()
+    atlas_spec = (root / "atlas/target/software-spec.yaml").read_bytes()
+    atlas_contract = (root / "atlas/target/contracts/target_contract.yaml").read_bytes()
+    model = _INTEGER_BODY.encode()
+
+    with pytest.raises(ValueError, match="exact bytes"):
+        outline_integer_matmuls(model, target="gemmini", software_spec=gemmini_spec, capability_contract=None)
+    with pytest.raises(ValueError, match="target"):
+        outline_integer_matmuls(model, target="another_target", software_spec=gemmini_spec,
+                                capability_contract=gemmini_contract)
+    with pytest.raises(ValueError, match="features list"):
+        outline_integer_matmuls(model, target="gemmini", software_spec=gemmini_spec,
+                                capability_contract=b"name: gemmini\nfamily: tensor_resident\n")
+    unsupported = outline_integer_matmuls(model, target="atlas", software_spec=atlas_spec,
+                                          capability_contract=atlas_contract)
+    assert unsupported["candidates"] == []
+    assert unsupported["interface_class"]["status"] == "unsupported"
+    assert len(unsupported["refused"]) == 1
+    assert "selected contract lacks" in unsupported["refused"][0]["reason"]
+    no_command_buffer = gemmini_contract.replace(
+        b"accumulator_commit, command_buffer, metrics", b"accumulator_commit, metrics", 1
+    )
+    no_interface = outline_integer_matmuls(model, target="gemmini", software_spec=gemmini_spec,
+                                           capability_contract=no_command_buffer)
+    assert no_interface["candidates"] == []
+    assert "command_buffer" in no_interface["refused"][0]["reason"]
+    host_only = gemmini_spec.replace(b"placement: accelerator", b"placement: host", 1)
+    refused = outline_integer_matmuls(model, target="gemmini", software_spec=host_only,
+                                      capability_contract=gemmini_contract)
+    assert refused["candidates"] == []
+    assert "placement" in refused["refused"][0]["reason"]
+
+    renamed_spec = gemmini_spec.replace(b"target: gemmini", b"target: another_target", 1)
+    renamed_contract = gemmini_contract.replace(b"name: gemmini", b"name: another_target", 1)
+    renamed = outline_integer_matmuls(model, target="another_target", software_spec=renamed_spec,
+                                      capability_contract=renamed_contract)
+    assert len(renamed["candidates"]) == 1
+    assert renamed["candidates"][0]["software_admission"]["status"] == "unknown"
 
 
 @pytest.mark.parametrize("changed", [

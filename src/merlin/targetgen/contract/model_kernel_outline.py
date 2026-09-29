@@ -10,11 +10,15 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+import yaml
+
 from merlin.common import mlir_query as mq
 from merlin.targetgen.application_inventory import exact_int_mm_generic_operation
 from merlin.targetgen.contract.interface_emit import emit_interface_mlir
+from merlin.targetgen.software_spec import admit_operation, validate_software_spec
 
 SCHEMA = "merlin.model_kernel_outline.v1"
+_REQUIRED_CLASS_FEATURES = frozenset({"resident_packed_tensor", "accumulator_commit", "command_buffer"})
 
 
 def _zero_initializer(value: Any) -> bool:
@@ -30,14 +34,28 @@ def _zero_initializer(value: Any) -> bool:
     return type(scalar) is int and scalar == 0
 
 
-def outline_integer_matmuls(model: bytes, *, target: str) -> dict:
-    """Return exact-source kernel MLIR and typed SSA bindings for proven i8×i8→i32 ops.
+def outline_integer_matmuls(
+    model: bytes, *, target: str, software_spec: bytes, capability_contract: bytes
+) -> dict:
+    """Return diagnostic kernel MLIR and typed SSA bindings for exact i8×i8→i32 ops.
 
-    Only one known arithmetic form is accepted. All other operations remain in the
-    model; this function never infers a placement or discharges a Phase 1 obligation.
+    A selected same-target SW declaration and resident command-buffer class are required.
+    Unknown SW admission remains an inspectable candidate, never a support verdict.
     """
     if not target or not target.isidentifier():
         raise ValueError("target must be a nonempty identifier")
+    if not isinstance(software_spec, bytes) or not isinstance(capability_contract, bytes):
+        raise ValueError("selected software spec and capability contract must be exact bytes")
+    spec = validate_software_spec(yaml.safe_load(software_spec), target=target)
+    contract = yaml.safe_load(capability_contract)
+    if not isinstance(contract, dict) or contract.get("name") != target:
+        raise ValueError("selected capability contract must match the target")
+    features = contract.get("features")
+    if not isinstance(features, list) or any(not isinstance(feature, str) for feature in features):
+        raise ValueError("selected capability contract requires a features list")
+    class_missing = sorted(_REQUIRED_CLASS_FEATURES - set(features))
+    if contract.get("family") != "tensor_resident":
+        class_missing.insert(0, "tensor_resident family")
     digest = hashlib.sha256(model).hexdigest()
     module = mq.parse(model.decode("utf-8"))
     operations = list(mq.walk(module))
@@ -69,6 +87,29 @@ def outline_integer_matmuls(model: bytes, *, target: str) -> dict:
         output = mq.type_shape_dtype(op.results[0].type)[0]
         if output != [left[0], right[1]]:
             refused.append({"operation_id": operation_id, "reason": "result shape disagrees with contraction"})
+            continue
+        if class_missing:
+            refused.append(
+                {"operation_id": operation_id, "reason": "selected contract lacks " + ", ".join(class_missing)}
+            )
+            continue
+        admission = admit_operation(
+            spec,
+            "linalg.generic",
+            {
+                "family": "contraction",
+                "operand_dtype": "i8",
+                "accum_dtype": "i32",
+                "readout_dtype": "i32",
+                "rank": 2,
+                "broadcasting": "none",
+                "epilogues": [],
+                "dimensions": {"M": left[0], "K": left[1], "N": right[1]},
+            },
+            "accelerator",
+        )
+        if admission["status"] == "unsupported":
+            refused.append({"operation_id": operation_id, "reason": admission["reason"]})
             continue
         command_buffer = {
             "abi_version": "0.1",
@@ -116,6 +157,8 @@ def outline_integer_matmuls(model: bytes, *, target: str) -> dict:
                 "operand_bindings": bindings,
                 "output_result_index": 0,
                 "output_type": str(op.results[0].type),
+                "software_admission": admission,
+                "compiler_support": "not_evaluated",
                 "interface_sha256": hashlib.sha256(interface.encode()).hexdigest(),
                 "interface_mlir": interface,
             }
@@ -124,10 +167,18 @@ def outline_integer_matmuls(model: bytes, *, target: str) -> dict:
         "schema": SCHEMA,
         "target": target,
         "model_sha256": digest,
+        "software_spec_sha256": hashlib.sha256(software_spec).hexdigest(),
+        "capability_contract_sha256": hashlib.sha256(capability_contract).hexdigest(),
+        "interface_class": {
+            "family": "tensor_resident",
+            "required_features": sorted(_REQUIRED_CLASS_FEATURES),
+            "status": "declared" if not class_missing else "unsupported",
+            "missing": class_missing,
+        },
         "candidates": candidates,
         "refused": refused,
         "qualification": (
-            "isolated exact integer kernels only; "
+            "diagnostic isolated integer kernels; SW admission may be unknown; "
             "no target compilation, model stitching, or numerical proof"
         ),
     }

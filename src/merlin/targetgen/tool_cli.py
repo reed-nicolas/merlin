@@ -160,13 +160,24 @@ def _semantic_search(args: argparse.Namespace) -> int:
 
 
 def _outline_integer_matmuls(args: argparse.Namespace) -> int:
-    """Materialize exact model-to-kernel slices for OOT compiler experiments."""
+    """Materialize diagnostic model-to-kernel slices for OOT compiler experiments."""
     from .contract.model_kernel_outline import outline_integer_matmuls
 
     source = Path(args.mlir)
     if not source.is_file() or source.is_symlink():
         raise ValueError("--mlir must name a regular, non-symlink model file")
-    result = outline_integer_matmuls(source.read_bytes(), target=args.target)
+    selected = {}
+    for label, argument in (("software spec", args.software_spec), ("capability contract", args.capability_contract)):
+        path = Path(argument)
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"--{label.replace(' ', '-')} must name a regular, non-symlink selected file")
+        selected[label] = path.read_bytes()
+    result = outline_integer_matmuls(
+        source.read_bytes(),
+        target=args.target,
+        software_spec=selected["software spec"],
+        capability_contract=selected["capability contract"],
+    )
     destination = Path(args.out).absolute()
     if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents):
         raise ValueError("outline output may not traverse a symlink")
@@ -244,10 +255,12 @@ def build_parser() -> argparse.ArgumentParser:
     selection.set_defaults(func=_semantic_search)
 
     outline = sub.add_parser(
-        "outline-int-mm", help="materialize exact i8×i8→i32 contraction slices from model MLIR"
+        "outline-int-mm", help="materialize diagnostic i8×i8→i32 contraction slices from model MLIR"
     )
     outline.add_argument("--target", required=True)
     outline.add_argument("--mlir", required=True, help="captured linalg-on-tensors model MLIR")
+    outline.add_argument("--software-spec", required=True, help="selected Phase 0 software-spec YAML or JSON")
+    outline.add_argument("--capability-contract", required=True, help="selected Phase 0 capability contract")
     outline.add_argument("--out", required=True, help="fresh directory for kernel interfaces and source bindings")
     outline.set_defaults(func=_outline_integer_matmuls)
     return parser
