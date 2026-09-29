@@ -29,6 +29,11 @@ REPO = Path(__file__).resolve().parents[2]
 # Probe run inside the fresh venv (cwd outside repo, MERLIN_REPO_ROOT unset). Prints OK / raises.
 _PROBE = r"""
 import merlin, merlin.common.paths as p
+import sys
+from pathlib import Path
+assert p.checkout_root() is None, "installed core still resolves a source checkout"
+assert Path(merlin.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()), \
+    f"core imported outside the isolated venv: {merlin.__file__}"
 sd, pd = p.schemas_dir(), p.prompts_dir()
 assert sd.is_dir(), f"schemas_dir missing in wheel: {sd}"
 assert pd.is_dir(), f"prompts_dir missing in wheel: {pd}"
@@ -96,9 +101,16 @@ def main() -> int:
 
     staging = REPO / "out/build/python"
     staging.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="merlin-standalone-", dir=staging) as td:
-        tmp = Path(td)
-        wheeldir, venv = tmp / "wheel", tmp / "venv"
+    with (
+        tempfile.TemporaryDirectory(prefix="merlin-standalone-build-", dir=staging) as build_td,
+        tempfile.TemporaryDirectory(prefix="merlin-standalone-probe-") as probe_td,
+    ):
+        wheeldir = Path(build_td) / "wheel"
+        probe_root = Path(probe_td).resolve(strict=True)
+        if probe_root.is_relative_to(REPO.resolve()):
+            print("FAIL: standalone probe temp directory is inside the source checkout")
+            return 1
+        venv = probe_root / "venv"
 
         r = _run(["uv", "build", "--wheel", "--out-dir", str(wheeldir), str(REPO)])
         if r.returncode != 0:
@@ -110,8 +122,12 @@ def main() -> int:
             return 1
 
         pyver = f"{sys.version_info.major}.{sys.version_info.minor}"
-        if _run(["uv", "venv", str(venv), "--python", pyver]).returncode != 0:
-            _run(["uv", "venv", str(venv)])  # fall back to whatever python uv picks
+        created = _run(["uv", "venv", str(venv), "--python", pyver])
+        if created.returncode != 0:
+            created = _run(["uv", "venv", str(venv)])  # fall back to whatever python uv picks
+        if created.returncode != 0:
+            print("FAIL: external venv creation\n" + created.stderr[-2000:])
+            return 1
         r = _run(["uv", "pip", "install", "--python", str(venv / "bin" / "python"), str(wheels[0]), "pyyaml"])
         if r.returncode != 0:
             print("FAIL: wheel install\n" + r.stderr[-2000:])
@@ -121,7 +137,7 @@ def main() -> int:
         import os
 
         env = {k: v for k, v in os.environ.items() if not k.startswith("MERLIN_") and k != "PYTHONPATH"}
-        r = _run([str(venv / "bin" / "python"), "-c", _PROBE], cwd=str(tmp), env=env)
+        r = _run([str(venv / "bin" / "python"), "-I", "-c", _PROBE], cwd=str(probe_root), env=env)
         sys.stdout.write(r.stdout)
         if r.returncode != 0:
             print("FAIL: standalone probe\n" + r.stderr[-2000:])
