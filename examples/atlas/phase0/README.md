@@ -108,7 +108,10 @@ and derive again from those exact bytes before generating a realized corpus.
 Select the newly derived requirement/profile together for inspect, preflight and run:
 Pin the same OOT support and independent SpecIR oracle selected for derivation.
 The NPU model selection is required for an established ISA taxonomy; leaving it
-unset produces a diagnostic unknown, not a silently inferred command contract.
+unset produces a diagnostic unknown and stops capsule materialization. Atlas is a
+self-hosted ISA target: do not add a command-ISA `corpus_issue_order` to bypass a
+missing model environment. Select and pin the model's Python environment, then
+rerun from a new artifact root; the failed frozen run remains diagnostic evidence.
 
 ```sh
 MERLIN_TARGET_PATH="$ATLAS_SUPPORT_ROOT" SPECIR_ROOT="$SPECIR_ROOT" \
