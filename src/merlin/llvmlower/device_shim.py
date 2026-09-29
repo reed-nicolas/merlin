@@ -328,11 +328,17 @@ def tile_edge_for(device: str) -> int | None:
         body = _f.body_if_present(device)
     except Exception:            # noqa: BLE001
         return None
+    edges = set()
     for arr in (body.get("arrays") or ()):
+        if not isinstance(arr, dict):
+            return None
         rows, cols = arr.get("rows"), arr.get("cols")
-        if rows and cols:
-            return int(min(int(rows), int(cols)))
-    return None
+        if type(rows) is not int or type(cols) is not int or rows <= 0 or rows != cols:
+            # The current shim stages square tiles. A rectangular mesh cannot
+            # safely be represented by choosing its smaller dimension.
+            return None
+        edges.add(rows)
+    return edges.pop() if len(edges) == 1 else None
 
 
 def _elem_bytes(token: str) -> int | None:

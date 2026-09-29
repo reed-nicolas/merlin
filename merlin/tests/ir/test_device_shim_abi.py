@@ -282,6 +282,20 @@ def test_the_tile_edge_is_derived_from_the_device_not_assumed():
     assert edge > 0
 
 
+def test_rectangular_or_ambiguous_mesh_does_not_mint_a_square_shim_edge(monkeypatch):
+    from merlin.llvmlower.device_shim import tile_edge_for
+    from merlin.targetgen.rtl import facts
+
+    monkeypatch.setattr(facts, "body_if_present", lambda _target: {
+        "arrays": [{"rows": 16, "cols": 32}],
+    })
+    assert tile_edge_for("example") is None
+    monkeypatch.setattr(facts, "body_if_present", lambda _target: {
+        "arrays": [{"rows": 16, "cols": 16}, {"rows": 32, "cols": 32}],
+    })
+    assert tile_edge_for("example") is None
+
+
 def test_an_underivable_edge_declines_rather_than_guessing():
     unit = emit_translation_unit("definitely_not_a_target", {"s": (8, 24, 8)}, {"s": ("i8", "i8", "i32")})
     assert unit.symbols == () or "s" not in unit.symbols
