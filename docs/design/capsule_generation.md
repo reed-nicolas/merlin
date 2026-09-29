@@ -1,7 +1,7 @@
 ---
 title: "Design: how a capsule corpus is generated"
 kind: design
-status: current
+status: superseded
 owner: core
 last_verified: 2026-09-07
 related: [derived_corpus_sources, derived_capsule_axes, capsule_phase_split]
@@ -16,6 +16,13 @@ code_refs:
 ---
 
 # How a capsule corpus is generated
+
+> This is a historical mechanism note, not the current Phase 0 workflow. Its
+> checkout-local corpus paths, tracked-file table and two-flag CLI predate the
+> experiments-owned frozen derivation. Generated capsules and goldens are run
+> artifacts, not source files to commit. Use the current
+> [Phase 0 specification](../guides/phase0_specification.md) and
+> [extending the stack](../guides/extending_the_stack.md) guides for new runs.
 
 This is the mechanism note: what a capsule is, and how one gets made. The *requirement* side — where
 the coverage cells come from — is [deriving the corpus from the spec, the RTL facts and the
