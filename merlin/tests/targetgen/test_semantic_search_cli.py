@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import hashlib
 import json
 
@@ -9,7 +10,7 @@ import pytest
 
 from merlin.targetgen.contract.linalg_iface import parse_linalg_mlir
 from merlin.targetgen.instruction_semantics import normalize_instruction_semantics
-from merlin.targetgen.tool_cli import main
+from merlin.targetgen.tool_cli import build_parser, main
 
 _MLIR = """\
 module attributes {prov.level = "linalg-on-tensors"} {
@@ -25,6 +26,19 @@ module attributes {prov.level = "linalg-on-tensors"} {
   }
 }
 """
+
+
+def test_other_operator_commands_do_not_import_host_private_search(monkeypatch):
+    real_import = builtins.__import__
+
+    def without_search(name, *args, **kwargs):
+        if name == "semantic_search" or name.startswith("merlin.targetgen.semantic_search"):
+            raise ImportError("host-private search implementation is masked")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_search)
+    args = ["fixed-boot", "--target", "fixture", "--source", "input.S", "--out", "x.o", "--clang", "clang"]
+    assert build_parser().parse_args(args).command == "fixed-boot"
 
 
 def test_cli_writes_byte_bound_diagnostic_receipt(tmp_path):

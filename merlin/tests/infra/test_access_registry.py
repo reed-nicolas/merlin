@@ -410,6 +410,41 @@ def test_installed_and_shadowed_evaluators_and_bytecode_are_masked(tmp_path, iso
     assert BW.coverage_gap(BW.apply_answer_masks(unmasked, surfaces), surfaces) == []
 
 
+def test_top_level_private_helpers_are_physically_masked_on_active_python_paths(tmp_path, isolated_policy, monkeypatch):
+    site = tmp_path / ".venv/lib/python3.12/site-packages"
+    alternate = tmp_path / "alternate/site-packages"
+    oracle = _write(site, "atlas_program_emit.py")
+    grader = _write(site, "gemmini_conformance/__init__.py").parent
+    shadowed = _write(alternate, "atlas_program_emit.py")
+    public = _write(site, "public_helper.py")
+    monkeypatch.setattr(
+        A,
+        "sys",
+        SimpleNamespace(path=[str(alternate)], prefix=str(tmp_path / "python"), modules={}),
+    )
+    surfaces = AS.answer_surfaces(isolated_policy)
+    expected = {oracle, grader, shadowed}
+    assert expected <= {surface.path for surface in surfaces}
+    assert all(surface.path != public and surface.path not in public.parents for surface in surfaces)
+    mounted = ["--ro-bind", str(tmp_path), str(tmp_path)]
+    assert expected <= {surface.path for surface in BW.coverage_gap(mounted, surfaces)}
+    assert BW.coverage_gap(BW.apply_answer_masks(mounted, surfaces), surfaces) == []
+
+
+def test_installed_semantic_search_is_masked_as_host_private_tool(tmp_path, isolated_policy):
+    source = _write(tmp_path, "src/merlin/targetgen/semantic_search/search.py")
+    installed = _write(tmp_path, ".venv/lib/python3.12/site-packages/merlin/targetgen/semantic_search/search.py")
+    public = _write(tmp_path, "src/merlin/targetgen/tool_cli.py")
+    assert "merlin.targetgen.semantic_search" in A.declared_modules("grader")
+    surfaces = AS.answer_surfaces(isolated_policy)
+    expected = {source.parent, installed.parent}
+    assert expected <= {surface.path for surface in surfaces}
+    assert all(surface.path != public and surface.path not in public.parents for surface in surfaces)
+    mounted = ["--ro-bind", str(tmp_path), str(tmp_path)]
+    assert expected <= {surface.path for surface in BW.coverage_gap(mounted, surfaces)}
+    assert BW.coverage_gap(BW.apply_answer_masks(mounted, surfaces), surfaces) == []
+
+
 def test_installed_resources_outside_checkout_keep_masks_and_audit_tokens(tmp_path, isolated_policy, monkeypatch):
     checkout = tmp_path / "checkout"
     site = tmp_path / "installed/site-packages"

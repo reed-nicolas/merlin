@@ -194,6 +194,10 @@ MODULE_ACCESS = (
     _module("gemmini_conformance", "grader", directory=True),
     _module("merlin.targetgen.oracle_helpers.npu_emit", "oracle"),  # historical support identity
     _module("atlas_program_emit", "oracle"),
+    # The operator CLI is installed with the broadly bound Python toolchain, but this
+    # search implementation belongs to the host-private diagnostic treatment. A CLI
+    # subcommand is not an agent tool grant; mask its importable implementation too.
+    _module("merlin.targetgen.semantic_search", "grader", directory=True),
     _module("merlin.targetgen.heavy_oracles", "oracle"),
     _module("merlin.targetgen.rtl.mlc_bridge", "oracle"),
     _module("merlin.targetgen.rocc.decode", "grader"),
@@ -247,6 +251,16 @@ def module_paths(item: ModuleAccess) -> tuple[str, ...]:
     return tuple(dict.fromkeys(paths))
 
 
+def _runtime_search_paths(root: Path) -> tuple[Path, ...]:
+    """Checkout and Python search roots, including the checkout's bound environment."""
+    search = [root.absolute(), *(Path(entry or ".").absolute() for entry in sys.path)]
+    for environment in (root / ".venv", Path(sys.prefix)):
+        for library in ("lib", "lib64"):
+            search.extend((environment / library).glob("python*/site-packages"))
+        search.append(environment / "Lib/site-packages")
+    return tuple(dict.fromkeys(search))
+
+
 def runtime_package_roots(root: Path) -> tuple[tuple[str, Path], ...]:
     """Installed/active harness package roots without importing any oracle or grader.
 
@@ -256,11 +270,7 @@ def runtime_package_roots(root: Path) -> tuple[tuple[str, Path], ...]:
     lexical AND resolved paths because a borrowed venv is rebound at both destinations.
     """
     namespaces = tuple(dict.fromkeys(source.namespace for source in PYTHON_SOURCE_ROOTS))
-    search = [Path(entry or ".").absolute() for entry in sys.path]
-    for environment in (root / ".venv", Path(sys.prefix)):
-        for library in ("lib", "lib64"):
-            search.extend((environment / library).glob("python*/site-packages"))
-        search.append(environment / "Lib/site-packages")
+    search = _runtime_search_paths(root)
     candidates = [(namespace, path / namespace) for path in search for namespace in namespaces]
     # Setuptools editable namespaces include a synthetic __path__ entry. Read the ALREADY LOADED
     # finder's declarative mapping instead of executing a path hook or importing a private leaf.
@@ -320,6 +330,16 @@ def module_locations(root: Path, item: ModuleAccess) -> tuple[Path, ...]:
     roots.extend(runtime_package_roots(root))
     paths: dict[Path, None] = {}
     for module in item.modules:
+        # Historical support helpers may be top-level imports, with no ``merlin`` namespace.
+        # Their declarations must mask the physical installed copy too, not merely flag a later
+        # transcript mention. Search the same active/bound Python roots as namespaced modules.
+        if "." not in module:
+            for search in _runtime_search_paths(root):
+                base = search / module
+                for candidate in (base, base.resolve()):
+                    for path in _implementation_paths(candidate, directory=item.directory):
+                        paths[path] = None
+            continue
         for namespace, package in roots:
             if module_matches(module, namespace):
                 tail = module[len(namespace) :].lstrip(".").split(".")

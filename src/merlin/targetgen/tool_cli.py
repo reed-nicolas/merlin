@@ -129,10 +129,14 @@ def _semantic_search(args: argparse.Namespace) -> int:
     if not (model.get("status") == "UNKNOWN" and model.get("instructions") == []):
         model = validate_normalized_instruction_model(model, expected_target=args.target)
     parsed = parse_linalg_mlir(mlir_raw.decode("utf-8"))
+    defaults = SearchLimits()
     result = search_linalg_inventory(
         parsed,
         model,
-        limits=SearchLimits(max_candidates=args.max_candidates, timeout_ms=args.timeout_ms),
+        limits=SearchLimits(
+            max_candidates=args.max_candidates if args.max_candidates is not None else defaults.max_candidates,
+            timeout_ms=args.timeout_ms if args.timeout_ms is not None else defaults.timeout_ms,
+        ),
     )
     receipt = {
         "schema": "merlin.semantic_search_invocation.v1",
@@ -182,8 +186,6 @@ def _outline_integer_matmuls(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    from .semantic_search import SearchLimits
-
     parser = argparse.ArgumentParser(prog="merlin-target-tools", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -235,8 +237,10 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--mlir", required=True, help="exact model2MLIR/capsule linalg-on-tensors MLIR")
     selection.add_argument("--instruction-model", required=True, help="frozen Phase 0 instruction-semantics JSON")
     selection.add_argument("--out", required=True, help="fresh JSON receipt destination")
-    selection.add_argument("--max-candidates", type=int, default=SearchLimits().max_candidates)
-    selection.add_argument("--timeout-ms", type=int, default=SearchLimits().timeout_ms)
+    # Do not import the host-private implementation merely to display/help or run an
+    # unrelated operator command. The semantic-search action resolves its defaults.
+    selection.add_argument("--max-candidates", type=int)
+    selection.add_argument("--timeout-ms", type=int)
     selection.set_defaults(func=_semantic_search)
 
     outline = sub.add_parser(
