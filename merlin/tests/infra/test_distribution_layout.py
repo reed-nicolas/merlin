@@ -124,6 +124,23 @@ def test_source_parity_resolves_optional_owner_and_refuses_unknown_distribution(
     assert _gate().audit_sources([unknown], tmp_path) == ["unknown source distribution: unrelated"]
 
 
+def test_source_parity_resolves_out_of_tree_example_owner(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "merlin"\n')
+    (tmp_path / "src").mkdir()
+    example = tmp_path / "examples/firesim_modelblaster"
+    example.mkdir(parents=True)
+    (example / "pyproject.toml").write_text('[project]\nname = "merlin-firesim-modelblaster"\n')
+    source = example / "src/merlin_firesim_modelblaster/__init__.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("# example adapter\n")
+    wheel = _wheel(tmp_path, "merlin_firesim_modelblaster", {"merlin_firesim_modelblaster/__init__.py": source.read_bytes()})
+    assert _gate().audit_sources([wheel], tmp_path) == []
+    source.write_text("# changed adapter\n")
+    assert _gate().audit_sources([wheel], tmp_path) == [
+        "Python member differs from canonical source: merlin_firesim_modelblaster:merlin_firesim_modelblaster/__init__.py"
+    ]
+
+
 def test_source_parity_refuses_escaping_archive_members(tmp_path):
     (tmp_path / "pyproject.toml").write_text('[project]\nname = "merlin"\n')
     (tmp_path / "src").mkdir()
@@ -209,7 +226,11 @@ def test_non_namespace_discovery_requires_initializers(tmp_path):
 def test_actual_project_inventory_matches_setuptools_discovery():
     setuptools = pytest.importorskip("setuptools")
     root = repo_root()
-    projects = [root / "pyproject.toml", *sorted((root / "packages").glob("*/pyproject.toml"))]
+    projects = [
+        root / "pyproject.toml",
+        *sorted((root / "packages").glob("*/pyproject.toml")),
+        *sorted((root / "examples").glob("*/pyproject.toml")),
+    ]
     for project in projects:
         metadata = tomllib.loads(project.read_text())
         config = metadata["tool"]["setuptools"]["packages"]["find"]
