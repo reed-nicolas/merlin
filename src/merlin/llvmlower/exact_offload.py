@@ -158,7 +158,13 @@ class ExactOffloadSelection:
                 )
             self.check_package(package_dir)
             self.check_backend_contract()
-            if result.get("status") != "pass" or (result.get("oracle") or {}).get("result") != "ran":
+            trace = result.get("trace_check") or {}
+            if (
+                result.get("status") != "pass"
+                or (result.get("oracle") or {}).get("result") != "pass"
+                or trace.get("status") != "pass"
+                or trace.get("drives_accelerator") is not True
+            ):
                 raise ValueError(f"selected {kernel.operation_id} did not pass a running accelerator oracle")
             receipts.append(sha256_text(json.dumps(result, sort_keys=True, default=str)))
         return ExactOffloadSelection(
