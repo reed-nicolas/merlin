@@ -11,6 +11,7 @@ External-baseline K1-RVV comparison harness.
 - `buddy_native_import.py` — Buddy NATIVE torch importer helper (DynamoCompiler; runs under the torch venv).
 - `bundle.py` — Resolve a ``(model, variant)`` to its capture bundle — the shared input every baseline ingests.
 - `k1_workload_policy.py` — K1-only whole-model board feasibility for the optional baseline study.
+- `accuracy_policy.py` — baseline-only model/golden provenance labels and numerical comparison bars.
 - `contract.py` — Result contract for external-baseline K1-RVV runs (the shared honesty schema).
 - `k1_exec.py` — Generic K1 deploy/run for external baselines + a board lock (single physical board).
 - `profile.py` — Two-level profiling: whole-model E2E + per-region "kernel-style" breakdown.

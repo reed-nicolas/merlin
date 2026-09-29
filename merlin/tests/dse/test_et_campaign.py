@@ -42,6 +42,26 @@ def _make_bundle(root, name, *, weights=1024, extra=512, w8a8=True, mlir=True, f
     return d
 
 
+def test_analysis_accuracy_policy_derives_and_refuses_uninformative_bars(tmp_path):
+    from merlin.baselines import accuracy_policy
+    from merlin.capture import bundle
+
+    d = _make_bundle(tmp_path, "reference_int8_consistent")
+    np.save(d / "golden.npy", np.array([1.0, 0.0], dtype=np.float32))
+    np.save(d / "golden_w8a8.npy", np.array([0.9, 0.1], dtype=np.float32))
+    bar = accuracy_policy.int8_accuracy_bar(d)
+    assert bar["floor"]["floor_rel"] == pytest.approx(0.1)
+    assert bar["floor"]["fp32_tier_reachable"] is True
+    assert bar["cos_threshold"] == 0.99
+    assert bar["rel_threshold"] == pytest.approx(0.4)
+
+    np.save(d / "golden_w8a8.npy", np.array([1.0, 0.0], dtype=np.float32))
+    uninformative = accuracy_policy.int8_accuracy_bar(d)
+    assert uninformative["floor"]["floor_rel"] is None
+    assert uninformative["rel_threshold"] == accuracy_policy.ABSOLUTE_INT8_REL
+    assert not hasattr(bundle, "int8_accuracy_bar")
+
+
 @pytest.fixture()
 def recaps(tmp_path, monkeypatch):
     """A fake recaptures root that both bundle.resolve and layout_equivalence read."""

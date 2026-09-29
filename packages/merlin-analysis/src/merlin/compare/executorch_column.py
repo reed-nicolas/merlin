@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 
 from merlin.baselines import aggregate as _agg
-from merlin.baselines import k1_workload_policy
+from merlin.baselines import accuracy_policy, k1_workload_policy
 from merlin.capture import bundle as _bundle
 from merlin.common.paths import repo_root
 
@@ -95,13 +95,13 @@ def gate_basis(model: str) -> str:
     as framework-vs-eager agreement, which is not semantics. The old two-branch label called it
     "semantic (gated against the model's captured trained-weight golden)", and there are no trained
     weights."""
-    if _bundle.golden_unreproducible(model):
+    if accuracy_policy.golden_unreproducible(model):
         return (
             "lowering-exactness (random-init model whose golden is UNREPRODUCIBLE: cos measures "
             "framework-vs-eager-torch on THIS seeded instantiation, NOT a semantic match against "
             "trained weights)"
         )
-    if _bundle.weights_are_random_init(model):
+    if accuracy_policy.weights_are_random_init(model):
         return (
             "lowering-exactness (random-init but REPRODUCIBLE weights: the golden is reachable "
             "and the cos is a real framework-vs-eager-torch agreement, but the weights are not "
@@ -120,7 +120,7 @@ def _result_caveats(model: str) -> str:
             "model is K1 RAM-infeasible whole-model (7B-class VLA vs the 3.8GB board), so any "
             "whole-model wall/cos is from a RAM-constrained or truncated run, not trustworthy"
         )
-    if _bundle.golden_unreproducible(model):
+    if accuracy_policy.golden_unreproducible(model):
         notes.append(
             "random-init model: a semantic cos vs the captured golden is meaningless (the gate "
             "should be lowering-exactness); a low cos here is a golden-provenance artifact, "
