@@ -66,6 +66,14 @@ model, or establish numerical execution. The published Gemmini compiler still
 declines the *whole* upstream Linalg module; an isolated kernel command buffer
 does not change that verdict.
 
+For a new numerical accelerator certificate, the compiler must emit
+`compiler_pointer_abi: {version: 1, arguments: [...]}` in its command buffer.
+Merlin compares that asserted pointer order with the selected target runner's
+`kernel_abi_from_commands` order before execution. A missing or mismatched
+declaration stops qualification; older compiler packages remain inspectable.
+Matching declarations are only a structural prerequisite: the emitted kernel
+must still execute and match the independent numerical reference.
+
 For a capture that has the two named sidecars, run:
 
 ```sh

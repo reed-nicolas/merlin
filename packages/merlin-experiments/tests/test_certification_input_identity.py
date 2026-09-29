@@ -22,6 +22,42 @@ REAL_INTEGRITY = package_runtime.integrity_scan
 REAL_ENTRYPOINT = package_runtime.run_entrypoint
 
 
+def test_qualifying_pointer_abi_refuses_missing_or_swapped_call_order():
+    tensors = {name: {"shape": [1], "dtype": "i8"} for name in ("A", "B", "Y")}
+    cb = {"tensors": tensors}
+    runner = SimpleNamespace(kernel_abi_from_commands=lambda _: {
+        "args": [{"tensor": name} for name in ("B", "A", "Y")],
+    })
+    with pytest.raises(package_runtime.CertFailure, match="declares no compiler_pointer_abi") as missing:
+        certification._qualifying_pointer_abi(cb, runner)
+    assert missing.value.plane == "pointer_abi"
+
+    cb["compiler_pointer_abi"] = {"version": 1, "arguments": ["A", "B", "Y"]}
+    with pytest.raises(package_runtime.CertFailure, match="differs from selected runner harness order") as swapped:
+        certification._qualifying_pointer_abi(cb, runner)
+    assert swapped.value.plane == "pointer_abi"
+
+    matching = SimpleNamespace(kernel_abi_from_commands=lambda _: {
+        "args": [{"tensor": name} for name in ("A", "B", "Y")],
+    })
+    assert certification._qualifying_pointer_abi(cb, matching) == {
+        "status": "pass", "version": 1, "arguments": ["A", "B", "Y"],
+        "scope": "declaration_agreement_only",
+    }
+
+
+def test_matching_pointer_declarations_do_not_replace_numerical_oracle(producer, monkeypatch):
+    monkeypatch.setattr(package_runtime.oot_compile, "run_on_oracle", lambda *args, **kwargs: {
+        "outputs": {"result": [2]},
+        "oracle": {"kind": "synthetic", "derived_from_rtl": False},
+    })
+    result = producer.execute()
+    assert result["pointer_abi"]["scope"] == "declaration_agreement_only"
+    assert result["status"] == "fail"
+    assert result["failure"]["plane"] == "oracle_rtl"
+    assert result["oracle"]["result"] == "fail"
+
+
 def test_certified_source_publishes_and_runs_from_independent_clone(producer, tmp_path, monkeypatch):
     """Synthetic scientific evidence, real local Git transport and package execution."""
     build = tmp_path / "out" / "build"
@@ -172,7 +208,10 @@ def producer(tmp_path, monkeypatch):
     def entry(pkg, name, inp, output=None, **kw):
         calls.append((pkg.directory, name))
         if output:
-            output.write_text(json.dumps({"synthetic": True}))
+            output.write_text(json.dumps({
+                "tensors": {"result": {"shape": [1], "dtype": "i32", "role": "output"}},
+                "compiler_pointer_abi": {"version": 1, "arguments": ["result"]},
+            }))
         return subprocess.CompletedProcess([], 0, "module {}", "")
 
     monkeypatch.setattr(package_runtime, "build_package", build)
@@ -182,7 +221,10 @@ def producer(tmp_path, monkeypatch):
     monkeypatch.setattr(reference, "reference_outputs", lambda *args: {"result": [1]})
     monkeypatch.setattr(simulator, "simulate", lambda *args: {"outputs": {"result": [1]}})
     monkeypatch.setattr(reference, "outputs_match", lambda a, b: a == b)
-    monkeypatch.setattr(base, "get_backend", lambda target: SimpleNamespace(available=lambda engine: True))
+    monkeypatch.setattr(base, "get_backend", lambda target: SimpleNamespace(
+        available=lambda engine: True,
+        kernel_abi_from_commands=lambda cb: {"args": [{"tensor": "result", "access": "write"}]},
+    ))
     monkeypatch.setattr(toolchain, "available", lambda: False)
     monkeypatch.setattr(
         package_runtime.oot_compile,
@@ -368,7 +410,9 @@ def test_real_python_entrypoint_uses_copied_imports_without_bytecode_writes(prod
     (producer.source / "tool").write_text(
         "import json, sys\nfrom pathlib import Path\nfrom helper import VALUE\n"
         "if sys.argv[1] == 'emit_command_buffer':\n"
-        "    Path(sys.argv[3]).write_text(json.dumps({'synthetic': True}))\n"
+        "    Path(sys.argv[3]).write_text(json.dumps({'tensors': "
+        "{'result': {'shape': [1], 'dtype': 'i32', 'role': 'output'}}, "
+        "'compiler_pointer_abi': {'version': 1, 'arguments': ['result']}}))\n"
         "else:\n    print(VALUE)\n"
     )
     manifest = load_yaml(producer.source / "manifest.yaml")
