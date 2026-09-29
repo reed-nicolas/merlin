@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import tempfile
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from subprocess import TimeoutExpired
 
-from merlin.common.digest import sha256_text
+from merlin.common.digest import sha256_bytes, sha256_file, sha256_text
 from merlin.targetgen import package_runtime
 from merlin.targetgen.contract.interface_emit import parse_interface_mlir
 from merlin.targetgen.contract.model_kernel_outline import outline_integer_matmuls
@@ -23,10 +25,25 @@ from merlin.targetgen.contract.model_kernel_route import _emit
 from merlin.targetgen.contract.resident_interface_abi import bind_single_resident_matmul
 from merlin.targetgen.rtl.facts import validate_facts
 
+from .device_build import _objcopy, build_device_objects
 from .device_shim import emit_translation_unit, kernel_abi_for
 from .exact_offload import _package_sha256
 
 SCHEMA = "merlin.staged_model_kernel_admission.v1"
+
+
+def _build_toolchain_sha256() -> dict[str, str]:
+    """Content identities, without embedding machine-local checkout paths in a receipt."""
+    from .toolchain import clang, mlir_translate
+
+    tools = {"clang": clang(), "mlir_translate": mlir_translate(), "objcopy": _objcopy()}
+    identities = {}
+    for name, executable in tools.items():
+        resolved = None if executable is None else shutil.which(str(executable))
+        if resolved is None or not Path(resolved).is_file():
+            raise ValueError(f"candidate build has no readable {name} tool")
+        identities[name] = sha256_file(resolved)
+    return identities
 
 
 def _tile_edge_from_exact_facts(raw: bytes, target: str) -> tuple[int, str | None]:
@@ -282,4 +299,131 @@ def stage_integer_model_admission(
         "qualification": (
             "diagnostic codegen evidence only; no reviewed SW admission, accelerator run, or whole-model proof"
         ),
+    }
+
+
+def build_staged_candidate(
+    staged_report: Mapping,
+    *,
+    model: bytes,
+    target: str,
+    software_spec: bytes,
+    capability_contract: bytes,
+    package_dir: str | Path,
+    operation_id: str,
+    rtl_facts: bytes,
+    workdir: str | Path,
+    codegen_target: str = "riscv",
+    cflags: Sequence[str] | None = None,
+    timeout: int = 30,
+) -> dict:
+    """Build one exact diagnostic kernel and shim; never return an executable selection.
+
+    Re-stage from the selected bytes so a caller cannot turn edited JSON into
+    compiler evidence. The tile edge is passed to the shim explicitly from the
+    same RTL facts bound in the receipt, rather than looked up from ambient cache.
+    """
+    if not isinstance(staged_report, Mapping) or not isinstance(rtl_facts, bytes):
+        raise ValueError("candidate build requires exact same-target RTL facts bytes")
+    if codegen_target == "riscv" and not cflags:
+        raise ValueError("RISC-V candidate build requires explicit board C flags")
+    if cflags is not None and (
+        not isinstance(cflags, (tuple, list))
+        or any(not isinstance(flag, str) or not flag for flag in cflags)
+    ):
+        raise ValueError("candidate build C flags must be explicit nonempty strings")
+    edge, _ = _tile_edge_from_exact_facts(rtl_facts, target)
+    fresh = stage_integer_model_admission(
+        model, target=target, software_spec=software_spec,
+        capability_contract=capability_contract, package_dir=package_dir,
+        operation_id=operation_id, rtl_facts=rtl_facts, timeout=timeout,
+    )
+    binding = fresh["exact_binding"]
+    interface = fresh["selected_interface_mlir"]
+    bound_fields = {key: value for key, value in binding.items() if key != "binding_sha256"}
+    if (
+        staged_report.get("exact_binding") != binding
+        or staged_report.get("selected_interface_mlir") != interface
+        or binding.get("binding_sha256") != sha256_text(json.dumps(bound_fields, sort_keys=True, separators=(",", ":")))
+        or binding["target"] != target
+        or binding["model_sha256"] != sha256_bytes(model)
+        or binding["operation_id"] != operation_id
+        or binding["software_spec_sha256"] != sha256_bytes(software_spec)
+        or binding["capability_contract_sha256"] != sha256_bytes(capability_contract)
+        or binding["rtl_facts_sha256"] != sha256_bytes(rtl_facts)
+        or binding["interface_sha256"] != sha256_text(interface)
+        or binding["package_sha256"] != _package_sha256(Path(package_dir))
+    ):
+        raise ValueError("stale staged candidate: exact source, interface, package, or facts disagree")
+    if (
+        fresh["compiler_evidence"]["status"] != "emitted_unverified"
+        or fresh["shim_evidence"]["status"] != "generated_unexecuted"
+    ):
+        raise ValueError("staged candidate has no complete unverified artifact and shim")
+    abi = kernel_abi_for(target)
+    resident = bind_single_resident_matmul(interface, target=target)
+    if (
+        abi is None or abi.symbol != resident.kernel_symbol
+        or binding["kernel_abi_sha256"] != sha256_text(repr(abi))
+        or binding["kernel_abi_contract_sha256"] != resident.contract_sha256
+    ):
+        raise ValueError("staged candidate pointer ABI disagrees with selected interface")
+    work = Path(workdir)
+    if work.exists() or work.is_symlink():
+        raise ValueError("candidate build needs a fresh workdir")
+    if any(parent.is_symlink() for parent in work.absolute().parents):
+        raise ValueError("candidate build workdir may not traverse a symlink")
+    if work.absolute().is_relative_to(Path(package_dir).resolve()):
+        raise ValueError("candidate build workdir may not modify the selected package")
+    toolchain_sha256 = _build_toolchain_sha256()
+    symbol = "merlin_staged_kernel"
+    built = build_device_objects(
+        target, {symbol: (resident.m, resident.n, resident.k)},
+        {symbol: resident.dtypes}, package_dir=package_dir, workdir=work,
+        operand_dtype=resident.dtypes[0], accum_dtype=resident.dtypes[2],
+        codegen_target=codegen_target, cflags=cflags, timeout=timeout,
+        expected_interfaces={symbol: {"mlir": interface, "sha256": binding["interface_sha256"]}},
+        package_sha256=binding["package_sha256"], tile_edge=edge,
+    )
+    if not built.ok or built.skipped or set(built.kernels) != {symbol} or len(built.objects) != 2:
+        raise ValueError(f"staged exact kernel or guarded shim did not build: {built.skipped}")
+    if (
+        _package_sha256(Path(package_dir)) != binding["package_sha256"]
+        or _build_toolchain_sha256() != toolchain_sha256
+        or kernel_abi_for(target) != abi
+        or bind_single_resident_matmul(interface, target=target).contract_sha256 != resident.contract_sha256
+    ):
+        raise ValueError("staged candidate package or pointer ABI changed during build")
+    objects = []
+    for path in built.objects:
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("staged candidate build did not retain a regular object")
+        raw = path.read_bytes()
+        objects.append({"path": path.name, "sha256": sha256_bytes(raw), "bytes": len(raw)})
+    codegen = {}
+    for name, path in (
+        ("target_artifact", work / f"{symbol}.device.mlir"),
+        ("shim_source", work / "device_shim.c"),
+    ):
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"staged candidate build did not retain {name}")
+        raw = path.read_bytes()
+        codegen[name] = {"sha256": sha256_bytes(raw), "bytes": len(raw)}
+    return {
+        "status": "built_unverified",
+        "exact_binding": binding,
+        "tile_edge": edge,
+        "kernel_symbol": built.kernels[symbol],
+        "codegen_target": codegen_target,
+        "cflags": list(cflags or ()),
+        "toolchain_sha256": toolchain_sha256,
+        "codegen": codegen,
+        "objects": objects,
+        "artifact_bytes": sum(obj["bytes"] for obj in objects),
+        "runtime_descriptor_guards": "compiled_not_executed",
+        "linkability": "not_verified",
+        "valid_window_numerics": "not_verified",
+        "reviewed_sw_semantics": "not_verified",
+        "review_required": True,
+        "whole_model_offload_verified": False,
     }

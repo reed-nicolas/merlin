@@ -232,7 +232,7 @@ def _probe_integer_model_route(args: argparse.Namespace) -> int:
 
 def _stage_integer_model_admission(args: argparse.Namespace) -> int:
     """Write an exact, fail-closed SW-admission development review artifact."""
-    from merlin.llvmlower.staged_admission import stage_integer_model_admission
+    from merlin.llvmlower.staged_admission import build_staged_candidate, stage_integer_model_admission
 
     selected = {}
     inputs = [
@@ -255,12 +255,40 @@ def _stage_integer_model_admission(args: argparse.Namespace) -> int:
     destination = Path(args.out).absolute()
     if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents):
         raise ValueError("admission-review output may not traverse a symlink")
+    if not args.build_dir and (args.cflag or args.codegen_target != "riscv"):
+        raise ValueError("--cflag and --codegen-target require --build-dir")
+    if args.build_dir:
+        if "rtl-facts" not in selected:
+            raise ValueError("--build-dir requires exact --rtl-facts bytes")
+        build_dir = Path(args.build_dir).absolute()
+        if build_dir.exists() or build_dir.is_symlink() or any(
+            parent.is_symlink() for parent in build_dir.parents
+        ):
+            raise ValueError("--build-dir must be fresh and may not traverse a symlink")
+        if destination.is_relative_to(build_dir):
+            raise ValueError("admission review artifact must be outside the fresh build directory")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("x", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2, sort_keys=True, allow_nan=False)
         handle.write("\n")
-    print(json.dumps({"out": str(destination), "candidate_count": result["candidate_count"],
-                      "review_required": result["review_required"]}, sort_keys=True))
+    summary = {"out": str(destination), "candidate_count": result["candidate_count"],
+               "review_required": result["review_required"]}
+    if args.build_dir:
+        receipt = build_staged_candidate(
+            result, model=selected["mlir"], target=args.target,
+            software_spec=selected["software-spec"],
+            capability_contract=selected["capability-contract"], package_dir=args.package,
+            operation_id=args.operation_id, rtl_facts=selected["rtl-facts"],
+            workdir=build_dir, codegen_target=args.codegen_target,
+            cflags=args.cflag, timeout=args.timeout,
+        )
+        receipt_path = build_dir / "candidate-build-receipt.json"
+        with receipt_path.open("x", encoding="utf-8") as handle:
+            json.dump(receipt, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+        summary["build_receipt"] = str(receipt_path)
+        summary["build_status"] = receipt["status"]
+    print(json.dumps(summary, sort_keys=True))
     return 0
 
 
@@ -354,6 +382,11 @@ def build_parser() -> argparse.ArgumentParser:
     stage.add_argument("--package", required=True, help="selected OOT compiler package")
     stage.add_argument("--operation-id", required=True, help="exact model SHA-bound operation ID")
     stage.add_argument("--rtl-facts", help="selected same-target RTL facts for a reproducible shim tile edge")
+    stage.add_argument(
+        "--build-dir", help="fresh directory for one diagnostic kernel and shim; stage report survives build failure"
+    )
+    stage.add_argument("--codegen-target", choices=("riscv", "x86"), default="riscv")
+    stage.add_argument("--cflag", action="append", help="explicit board C flag; repeat as --cflag=-flag")
     stage.add_argument("--timeout", type=int, default=30, help="seconds per selected package entrypoint")
     stage.add_argument("--out", required=True, help="fresh JSON review artifact destination")
     stage.set_defaults(func=_stage_integer_model_admission)

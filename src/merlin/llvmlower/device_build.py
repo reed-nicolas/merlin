@@ -310,6 +310,7 @@ def build_device_objects(
     timeout: int = 900,
     expected_interfaces: Mapping[str, Mapping[str, str]] | None = None,
     package_sha256: str | None = None,
+    tile_edge: int | None = None,
 ) -> DeviceBuild:
     """One kernel object per signature plus the shim object, ready to archive.
 
@@ -338,6 +339,8 @@ def build_device_objects(
             raise ValueError("exact offload must bind every emitted symbol and an OOT package digest")
         if _package_sha256(Path(package_dir)) != package_sha256:
             raise ValueError("OOT compiler package changed after exact model selection")
+    if tile_edge is not None and (type(tile_edge) is not int or tile_edge <= 0):
+        raise ValueError("explicit shim tile edge must be a positive integer")
 
     # WHICH DEVICES THIS PATH CAN BUILD, asked of the device's derived link rather than assumed.
     #
@@ -363,6 +366,8 @@ def build_device_objects(
         pkg = load_package(str(package_dir))
     except Exception as exc:  # noqa: BLE001
         return DeviceBuild(device=device, skipped=(("all", f"package unusable: {exc}"),))
+    if expected_interfaces is not None and pkg.target != device:
+        raise ValueError("exact interface package target differs from selected device")
 
     if expected_interfaces is None:
         from merlin.compile.mesh import _mesh_tile_binding
@@ -418,6 +423,9 @@ def build_device_objects(
         if r.returncode != 0:
             skipped.append((sym, f"package declined {m}x{k}x{n}: {(r.stderr or '').strip()[:200]}"))
             continue
+        if expected_interfaces is not None and f"llvm.func @{abi.symbol}(" not in r.stdout:
+            skipped.append((sym, "exact package artifact has no contract-named LLVM kernel entry"))
+            continue
         art = stem.with_suffix(".device.mlir")
         art.write_text(r.stdout, encoding="utf-8")
 
@@ -453,6 +461,7 @@ def build_device_objects(
         {s: signatures[s] for s in kernels},
         {s: dtypes.get(s, ()) for s in kernels},
         kernel_symbol_for=kernels.get,
+        tile_edge=tile_edge,
     )
     if not unit.symbols:
         return DeviceBuild(
