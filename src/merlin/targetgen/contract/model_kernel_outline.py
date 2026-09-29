@@ -75,15 +75,15 @@ def outline_integer_matmuls(model: bytes, *, target: str) -> dict:
             "target": target,
             "tensors": {
                 "A": {"shape": left, "dtype": "i8", "role": "input"},
-                "W": {"shape": right, "dtype": "i8", "role": "weight"},
+                "B": {"shape": right, "dtype": "i8", "role": "input"},
             },
             "commands": [
                 {
                     "opcode": "RES_PACK",
-                    "operands": {"src": "W", "dst": "W_res"},
+                    "operands": {"src": "B", "dst": "B_res"},
                     "attributes": {"layout": "packed_rhs"},
                 },
-                {"opcode": "MATMUL_RESIDENT", "operands": {"lhs": "A", "rhs": "W_res", "dst": "acc"}},
+                {"opcode": "MATMUL_RESIDENT", "operands": {"lhs": "A", "rhs": "B_res", "dst": "acc"}},
                 {
                     "opcode": "COMMIT",
                     "operands": {"src": "acc", "dst": "Y"},

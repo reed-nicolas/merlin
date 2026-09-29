@@ -85,7 +85,9 @@ def test_exact_integer_model_body_outlines_a_compilable_interface_kernel(tmp_pat
     ]
     interface = (output / candidate["interface_file"]).read_text()
     assert hashlib.sha256(interface.encode()).hexdigest() == candidate["interface_sha256"]
-    commands = parse_interface_mlir(interface)["commands"]
+    parsed = parse_interface_mlir(interface)
+    assert parsed["tensors"]["B"]["role"] == "input"
+    commands = parsed["commands"]
     assert [command["opcode"] for command in commands] == ["RES_PACK", "MATMUL_RESIDENT", "COMMIT"]
     assert commands[-1]["attributes"]["output_dtype"] == "i32"
 
