@@ -15,6 +15,7 @@
 #        --full    with `build`/`package`, the whole model x hart matrix instead of the cheap subset
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+export MERLIN_BOARD_CATALOG="${MERLIN_BOARD_CATALOG:-$REPO_ROOT/examples/board-catalog.yaml}"
 
 BOARD=chipyard_kodiak
 # Kodiak's console is HTIF, served by its own loader's --fesvr, so no vendor SDK is needed here. That

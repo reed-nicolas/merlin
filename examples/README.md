@@ -5,6 +5,20 @@ For target-independent frontend iteration, start with the small
 shows full capture, inspected LLVM lowering and numerical comparison without
 claiming accelerator offload or a deployed RVV runtime.
 
+Board facts are target inputs, not part of the Merlin wheel. The
+[example board catalog](board-catalog.yaml) documents bring-up boards; select it
+explicitly when using the RVV Zephyr/spike/Verilator path:
+
+```sh
+export MERLIN_BOARD_CATALOG="$PWD/examples/board-catalog.yaml"
+merlin-compile --workload <captured-workload> --target rvv --run spike --board spike_riscv64
+```
+
+An OOT target may supply its own catalog with the same schema. Missing catalogs,
+unknown board names, and absent `--board` selections fail before a Zephyr build.
+The Kodiak and gemmelos scripts select this example catalog themselves, while
+honoring an already selected `MERLIN_BOARD_CATALOG`.
+
 ## Target experiment inputs
 
 Start with a target's workflow map. Each map links to its single definition;

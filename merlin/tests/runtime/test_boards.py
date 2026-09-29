@@ -7,6 +7,7 @@ physical DRAM dies before main(). So the descriptor is the contract, and these t
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -46,12 +47,29 @@ def test_kodiak_is_described_by_its_silicon_not_its_dts():
     assert b.console == boards.CONSOLE_HTIF
 
 
-def test_an_unknown_board_falls_back_conservatively_and_says_so():
-    """A new board must be tryable before anyone writes it down, but never with invented facts."""
-    b = boards.board("some_new_tapeout")
-    assert b.dram_bytes == 256 * 1024 * 1024
-    assert b.vector_max_len == 128, "unknown VLEN must assume the V minimum, not a guess"
-    assert "conservative" in b.notes
+def test_an_unknown_board_is_rejected_before_a_build():
+    """No image may be built with invented DRAM, hart or console facts."""
+    with pytest.raises(boards.BoardRegistryError, match="not in the selected catalog"):
+        boards.board("some_new_tapeout")
+
+
+def test_catalog_selection_is_explicit(monkeypatch):
+    monkeypatch.delenv(boards.BOARD_CATALOG_ENV, raising=False)
+    with pytest.raises(boards.BoardRegistryError, match="no board catalog selected"):
+        boards.load_boards()
+
+
+def test_zephyr_build_requires_board_before_creating_output(tmp_path):
+    work = tmp_path / "build"
+    with pytest.raises(zm.ZephyrModelError, match="explicitly selected"):
+        zm.build_app(tmp_path / "model", work)
+    assert not work.exists()
+
+
+def test_cpu_overlay_uses_declared_dt_count_not_board_name():
+    assert "cpu@2" in zm._cpu_disable_overlay(2, 4)
+    with pytest.raises(zm.ZephyrModelError, match="only 2 CPU nodes"):
+        zm._cpu_disable_overlay(3, 2)
 
 
 def test_overrides_win_so_a_delivery_can_state_what_it_built_for():
@@ -162,7 +180,7 @@ def test_the_vector_save_area_is_never_declared_smaller_than_the_tree_default():
     if not floor:
         pytest.skip("this Zephyr tree states no single numeric default for RISCV_VECTOR_MAX_LEN")
 
-    understated = boards.board("some_new_tapeout", vlen=128)
+    understated = boards.Board("some_new_tapeout", dram_bytes=1 << 28, harts=2, vlen=128)
     assert understated.vector_max_len == 128, "the descriptor still reports what it was told"
     assert zm._vector_max_len_bits(understated) == floor, "but the emitted config is floored"
     conf = zm._prj_conf(understated.harts, "rvv", understated)
@@ -170,7 +188,7 @@ def test_the_vector_save_area_is_never_declared_smaller_than_the_tree_default():
 
     # The floor must not CLAMP a board that legitimately has wider registers -- that would recreate the
     # overrun on the one class of board where it is guaranteed to happen.
-    wide = boards.board("some_new_tapeout", vlen=1024)
+    wide = boards.Board("some_new_tapeout", dram_bytes=1 << 28, harts=2, vlen=1024)
     assert zm._vector_max_len_bits(wide) == 1024
 
 
@@ -188,14 +206,15 @@ def test_a_uart_board_without_derived_facts_is_refused():
     failure, because the generic chipyard board's defconfig sets CONFIG_UART_HTIF=y. The image kept a
     host-assisted console and hung in its first print on silicon. There is no safe default here."""
     with pytest.raises(RuntimeError, match="no SDK facts"):
-        zm._prj_conf(2, "rvv", boards.board("x", console=boards.CONSOLE_UART))
+        zm._prj_conf(2, "rvv", boards.Board("x", dram_bytes=1 << 28, harts=2, console=boards.CONSOLE_UART))
 
 
 def test_a_uart_board_turns_htif_off_and_states_both_clock_terms(uart_facts):
     """The driver computes its divisor as (SYS_CLOCK_HW_CYCLES_PER_SEC * RTC_CLOCK_DIVIDER_VALUE)/baud
     - 1, so BOTH terms must describe the chip. The board's own defaults imply a 1 GHz peripheral clock
     and would emit garbage rather than nothing -- which reads as a corrupt program, not a bad UART."""
-    conf = zm._prj_conf(2, "rvv", boards.board("x", console=boards.CONSOLE_UART), uart_facts)
+    uart_board = boards.Board("x", dram_bytes=1 << 28, harts=2, console=boards.CONSOLE_UART)
+    conf = zm._prj_conf(2, "rvv", uart_board, uart_facts)
     assert "CONFIG_UART_HTIF=n" in conf
     assert "CONFIG_UART_SIFIVE=y" in conf and "CONFIG_UART_SIFIVE_PORT_0=y" in conf
     assert "CONFIG_UART_CONSOLE=y" in conf
@@ -209,7 +228,7 @@ def test_a_core_clock_that_is_not_a_multiple_of_the_mtime_rate_is_refused(uart_f
     that model must fail loudly rather than be rounded into a wrong baud rate."""
     odd = type(uart_facts)(**{**uart_facts.__dict__, "mtime_hz": 30_000})
     with pytest.raises(RuntimeError, match="integer multiple"):
-        zm._prj_conf(2, "rvv", boards.board("x", console=boards.CONSOLE_UART), odd)
+        zm._prj_conf(2, "rvv", boards.Board("x", dram_bytes=1 << 28, harts=2, console=boards.CONSOLE_UART), odd)
 
 
 def test_the_scalar_backend_still_carries_no_vector_config():
@@ -449,7 +468,7 @@ def test_which_harts_have_vectors_is_stated_not_assumed():
     # A scalar image may use every hart; that is the point of having one.
     assert kodiak.hart_ids_for("scalar") == (0, 1, 2)
     # Non-contiguous sets are expressible.
-    odd = boards.board("x", harts=3, vector_hart_ids=(0, 2))
+    odd = boards.Board("x", dram_bytes=1 << 28, harts=3, vector_hart_ids=(0, 2))
     assert odd.hart_ids_for("rvv") == (0, 2) and odd.n_vector_harts == 2
     # A homogeneous board keeps the default so its image stays byte-identical.
     assert boards.board("spike_riscv64").hart_ids_for("rvv") == tuple(range(8))
@@ -560,9 +579,7 @@ def test_a_second_configuration_of_a_board_keeps_the_port_and_states_its_own_fac
 
 def test_the_board_table_is_the_registry_file_not_code(tmp_path):
     """BOARDS is loaded from the registry file, so a new board is an entry there, not a shared-code edit."""
-    from merlin.common.paths import data_path
-
-    path = data_path(*boards.BOARDS_FILE)
+    path = Path(os.environ[boards.BOARD_CATALOG_ENV])
     assert path.is_file()
     assert boards.load_boards(path) == boards.BOARDS
     reg = tmp_path / "boards.yaml"

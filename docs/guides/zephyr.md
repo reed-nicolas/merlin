@@ -3,9 +3,9 @@ title: Zephyr runtime backend
 kind: guide
 status: current
 owner: runtime
-last_verified: 2026-07-22
+last_verified: 2026-09-29
 related: [getting_started, reproducibility, runtime, tinyllama_int8_rvv_zephyr]
-code_refs: [src/merlin/runtime/backends/zephyr_model.py]
+code_refs: [src/merlin/runtime/backends/zephyr_model.py, src/merlin/runtime/boards.py]
 ---
 
 # Zephyr runtime backend
@@ -36,6 +36,11 @@ generic module-layout description below needs none):
 - **Required — spike** via `MERLIN_CHIPYARD` (or `MERLIN_SPIKE`) for the SMP RVV-on-Saturn run.
 - **Optional — FireSim** (2-tile SMP) is board/FPGA-gated and **not fresh-machine reproducible** (see
   [Getting started §5](getting_started.md)); **spike substitutes** for the functional whole-model run.
+- **Required — board catalog and selection**: set `MERLIN_BOARD_CATALOG` to a
+  target-owned YAML catalog and pass its board name to `build_app(board=...)` or
+  `merlin-compile --board ...`. The [example catalog](../../examples/board-catalog.yaml)
+  is for demonstrations; it is not bundled into the Merlin wheel. No board or
+  unknown board fails before build output is created.
 
 ## Generated module layout
 

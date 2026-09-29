@@ -15,6 +15,7 @@
 # Flags: --dry-run prints commands without running; --full builds the shipped matrix, not a subset.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+export MERLIN_BOARD_CATALOG="${MERLIN_BOARD_CATALOG:-$REPO_ROOT/examples/board-catalog.yaml}"
 
 # The 50 MHz reset-clock variant is the one to run first: it is the directly gated set, and it needs no
 # PLL bring-up. `BOARD=gemmelos_bearly25_zephyr_500mhz ./run.sh package` builds the raised-clock twin.

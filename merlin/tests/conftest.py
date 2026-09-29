@@ -39,6 +39,9 @@ import pytest
 # extension must not silently supply this checkout's research implementation.
 _CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
 _PACKAGE_ROOT = _CHECKOUT_ROOT / "src"
+# Board facts are OOT data. Tests deliberately select the example catalog before
+# importing any runtime module; an installed Merlin without that selection has none.
+os.environ.setdefault("MERLIN_BOARD_CATALOG", str(_CHECKOUT_ROOT / "examples/board-catalog.yaml"))
 _REPLAY_ROOT = (
     Path(os.environ["MERLIN_REPLAY_PYTHONPATH"]).resolve() if os.environ.get("MERLIN_REPLAY_PYTHONPATH") else None
 )

@@ -27,6 +27,7 @@ them has a failure mode if it is wrong rather than a performance cost:
 from __future__ import annotations
 
 import dataclasses
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -116,6 +117,9 @@ class Board:
     #: the names separate lets the package say WHICH CHIP it is for while the build says which port it
     #: used -- so the README can be honest that it is a generic port, not a bespoke one.
     zephyr_board: str | None = None
+    #: Maximum CPU nodes declared by this Zephyr port's device tree. If the SoC
+    #: has fewer harts, generate a disabling overlay; unknown means no overlay.
+    dt_cpu_nodes: int | None = None
     #: For `console == CONSOLE_UART`: the key that selects this chip's platform directory inside its
     #: SDK checkout, from whose headers the UART/PLL/clock-selector facts are DERIVED at build time
     #: (`runtime.sdk_facts`). It is a lookup key into the target's own tree, not a fact about the
@@ -195,11 +199,9 @@ class Board:
         return int(self.vlen or 128)
 
 
-#: Where the board registry lives: ``merlin/contract/boards.yaml`` (bundled into the wheel with the rest of
-#: the contract tree). The boards are DATA, so targeting a new board is an entry there, not an edit here --
-#: and the per-board reasoning (why each fact is what it is, and what it cost when it was wrong) sits
-#: beside the entry it explains.
-BOARDS_FILE: tuple[str, ...] = ("contract", "boards.yaml")
+#: Board facts belong to the selected target, not to Merlin's installed core. An example
+#: catalog lives in ``examples/board-catalog.yaml``; deployments can use an OOT catalog.
+BOARD_CATALOG_ENV = "MERLIN_BOARD_CATALOG"
 _SCHEMA_VERSION = 1
 
 #: The closed vocabularies a registry entry may use, by field. An unknown value is refused at load: a
@@ -272,16 +274,20 @@ def load_boards(path: str | Path | None = None) -> dict[str, Board]:
 
     Fails closed: a missing file, an unknown field, a value of the wrong type or outside its vocabulary,
     or a missing required fact (``dram_bytes``, ``harts``) raises :class:`BoardRegistryError` naming the
-    board and the field. ``path`` defaults to :data:`BOARDS_FILE` resolved through
-    ``common.paths.data_path`` (the checkout's tree, else the copy bundled in the wheel).
+    board and the field. The caller passes ``path`` or selects an OOT catalog with
+    ``MERLIN_BOARD_CATALOG``. Merlin never guesses a board or loads example target
+    facts implicitly.
     """
     import yaml
 
-    from ..common.paths import data_path
-
-    p = Path(path) if path is not None else data_path(*BOARDS_FILE)
+    selected = path if path is not None else os.environ.get(BOARD_CATALOG_ENV)
+    if not selected:
+        raise BoardRegistryError(
+            f"no board catalog selected; set {BOARD_CATALOG_ENV} to a target-owned YAML file"
+        )
+    p = Path(selected).expanduser().resolve()
     if not p.is_file():
-        raise BoardRegistryError(f"no board registry at {p}; boards are declared in merlin/{'/'.join(BOARDS_FILE)}")
+        raise BoardRegistryError(f"no board catalog at {p}; check {BOARD_CATALOG_ENV}")
     raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict) or not isinstance(raw.get("boards"), dict):
         raise BoardRegistryError(f"{p}: expected a mapping with a `boards:` mapping of name -> facts")
@@ -317,25 +323,23 @@ def load_boards(path: str | Path | None = None) -> dict[str, Board]:
     return out
 
 
-#: Boards we can target, as declared in the registry file (see :data:`BOARDS_FILE`).
-BOARDS: dict[str, Board] = load_boards()
+#: The selected catalog, empty when no target owner selected one. Importing the generic
+#: runtime must remain possible without any target installation.
+BOARDS: dict[str, Board] = load_boards() if os.environ.get(BOARD_CATALOG_ENV) else {}
 
 
 def board(name: str, **overrides) -> Board:
-    """The descriptor for ``name``, with any field overridden.
+    """The selected catalog's descriptor for ``name``, with any field overridden.
 
-    An unknown board is NOT an error: it falls back to conservative defaults (the V-minimum vector
-    width, the 256 MB stock region, HTIF) so a new board can be tried before anyone writes it down —
-    but the caller can override every fact, which is how a delivery states the DRAM and core count it
-    was actually built for.
+    Unknown boards fail closed: invented DRAM, hart, console or vector facts can
+    produce a silently wrong image. Add the board to a target-owned catalog first.
     """
     base = BOARDS.get(name)
     if base is None:
-        base = Board(
-            name=name,
-            dram_bytes=256 * 1024 * 1024,
-            harts=2,
-            notes="not in BOARDS — conservative defaults; state the real facts explicitly",
+        raise BoardRegistryError(
+            f"board {name!r} is not in the selected catalog"
+            + (f" ({os.environ[BOARD_CATALOG_ENV]})" if os.environ.get(BOARD_CATALOG_ENV) else "")
+            + f"; set {BOARD_CATALOG_ENV} and declare its hardware facts"
         )
     if not overrides:
         return base

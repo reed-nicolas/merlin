@@ -105,41 +105,42 @@ class ZephyrModelError(RuntimeError):
 # ---- environment / toolchain resolution -------------------------------------------
 
 
-def _pick(env_var: str, default: str) -> Path:
-    """Prefer the env value, but only if it actually exists — the shell may carry a
-    stale ``ZEPHYR_BASE`` (e.g. a moved ``backup/`` path); fall back to ``.env`` (a real config
-    source, so a checkout configured there resolves without hand-exporting), then to the known-good
-    default, rather than silently failing ``available()``."""
+def _pick(env_var: str) -> Path | None:
+    """Resolve an explicitly configured toolchain path from the shell or ``.env``."""
     from ...common.paths import _dotenv
 
     v = os.environ.get(env_var)
-    if v and Path(v).exists():
-        return Path(v)
-    dv = _dotenv().get(env_var)
-    if dv and Path(dv).exists():
-        return Path(dv)
-    return Path(default)
+    if not v:
+        v = _dotenv().get(env_var)
+    return Path(v).expanduser() if v else None
 
 
 def _zephyr_base() -> Path:
-    return _pick("ZEPHYR_BASE", "/path/to/zephyr-chipyard-sw/zephyr_ws/zephyr")
+    selected = _pick("ZEPHYR_BASE")
+    if selected is None:
+        raise ZephyrModelError("ZEPHYR_BASE is not configured")
+    return selected
 
 
 def _zephyr_sw_root() -> Path:
-    # the samples/ tree (for the chipyard board overlay we clone).
-    return _pick("MERLIN_ZEPHYR_SW", "/path/to/zephyr-chipyard-sw")
+    selected = _pick("MERLIN_ZEPHYR_SW")
+    if selected is None:
+        raise ZephyrModelError("MERLIN_ZEPHYR_SW is not configured")
+    return selected
 
 
 def _sdk_dir() -> Path:
-    # Zephyr's own documented install location. The fallback used to name one person's home,
-    # which meant every other machine silently fell back to a directory that was not there.
-    return _pick("ZEPHYR_SDK_INSTALL_DIR", os.path.expanduser("~/zephyr-sdk-0.17.0"))
+    selected = _pick("ZEPHYR_SDK_INSTALL_DIR")
+    if selected is None:
+        raise ZephyrModelError("ZEPHYR_SDK_INSTALL_DIR is not configured")
+    return selected
 
 
-def _conda_bin() -> Path:
+def _conda_bin() -> Path | None:
     from ...common.paths import env as _env
 
-    return Path(_env("MERLIN_CHIPYARD", "/path/to/chipyard")) / ".conda-env" / "bin"
+    selected = _env("MERLIN_CHIPYARD")
+    return Path(selected) / ".conda-env" / "bin" if selected else None
 
 
 def build_tool(name: str) -> Path | None:
@@ -151,8 +152,9 @@ def build_tool(name: str) -> Path | None:
     made the Zephyr path unbuildable on any machine that has cmake and ninja the normal way -- with no
     env var to say so, and an `available()` that reported the Zephyr tree as the problem.
     """
-    pinned = _conda_bin() / name
-    if pinned.is_file():
+    conda_bin = _conda_bin()
+    pinned = conda_bin / name if conda_bin is not None else None
+    if pinned is not None and pinned.is_file():
         return pinned
     from shutil import which
 
@@ -165,7 +167,9 @@ def _tool_env() -> dict:
     env["ZEPHYR_BASE"] = str(_zephyr_base())
     env["ZEPHYR_TOOLCHAIN_VARIANT"] = "zephyr"
     env["ZEPHYR_SDK_INSTALL_DIR"] = str(_sdk_dir())
-    env["PATH"] = f"{_conda_bin()}:{env.get('PATH', '')}"
+    conda_bin = _conda_bin()
+    if conda_bin is not None and conda_bin.is_dir():
+        env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
     return env
 
 
@@ -1759,16 +1763,16 @@ int main(void) {{
 """
 
 
-def _chipyard_cpu_overlay(n_harts: int, max_dt_cpus: int = 8) -> str:
+def _cpu_disable_overlay(n_harts: int, max_dt_cpus: int) -> str:
     """Disable the DT CPUs the SoC does not have.
 
-    ``chipyard-riscv64.dtsi`` declares 8 CPUs, but a given bitstream/sim has however many
-    tiles its config built; Zephyr's SMP boot hangs trying to wake harts that do not exist.
-    This is GENERATED from ``n_harts`` rather than copied from
-    ``samples/merlin_hetero_runner/boards/chipyard_riscv64.overlay``, which hard-disables
-    cpu@2..7 for the 2-tile FireSim SoC and silently caps every image at 2 harts — invisible
-    but fatal for a 4-tile multicore Saturn run.
+    The board catalog states the port's DT CPU count. An image for fewer harts
+    disables extra nodes so Zephyr does not wait for non-existent processors.
     """
+    if n_harts > max_dt_cpus:
+        raise ZephyrModelError(
+            f"image requests {n_harts} harts, but the selected port declares only {max_dt_cpus} CPU nodes"
+        )
     if n_harts >= max_dt_cpus:
         return ""
     disabled = "".join(f'\t\tcpu@{i} {{ status = "disabled"; }};\n' for i in range(n_harts, max_dt_cpus))
@@ -1804,7 +1808,10 @@ def _kconfig_symbols() -> frozenset[str]:
     comment it out rather than emit it, and an unknown symbol is a HARD build failure ("attempt to
     assign the value 'y' to the undefined symbol"), never a warning.
     """
-    base = _zephyr_base()
+    try:
+        base = _zephyr_base()
+    except ZephyrModelError:
+        return frozenset()
     roots = [base / "arch", base / "kernel", base / "subsys" / "debug"]
     found: set[str] = set()
     try:
@@ -1832,7 +1839,10 @@ def _kconfig_default_int(symbol: str) -> int | None:
     Read from the tree rather than written here because it is the tree that decides what is safe: see
     `_vector_max_len_bits` for why the default is a FLOOR and not just a fallback.
     """
-    base = _zephyr_base()
+    try:
+        base = _zephyr_base()
+    except ZephyrModelError:
+        return None
     roots = [base / "arch", base / "kernel", base / "subsys" / "debug"]
     for root in roots:
         if not root.is_dir():
@@ -2194,7 +2204,7 @@ def build_app(
     model_dir: str | Path,
     work: str | Path,
     *,
-    board: str = "spike_riscv64",
+    board: str | None = None,
     backend: str = "rvv",
     rvv_hart: int = 0,
     arena_mb: int = 64,
@@ -2244,6 +2254,11 @@ def build_app(
     the UART address and the two clock rates its baud divisor depends on are derived from that SDK's
     headers (``runtime.sdk_facts``) rather than written down here.
     """
+    if board is None:
+        raise ZephyrModelError("a board from MERLIN_BOARD_CATALOG must be explicitly selected")
+    from ..boards import board as _board_desc
+
+    brd = _board_desc(board, **({"vlen": vlen} if vlen is not None else {}))
     if matrix is not None:
         matrix.provider()  # Refuse unselected/incomplete support before build output or native tools.
     else:
@@ -2277,9 +2292,6 @@ def build_app(
     # Board facts as DATA (runtime.boards): the console options, the vector-state width, the DT RAM
     # label and the DRAM ceiling all come from the descriptor instead of being assumed. `vlen` given
     # explicitly wins over the board's, so a caller can sweep it.
-    from ..boards import board as _board_desc
-
-    brd = _board_desc(board, **({"vlen": vlen} if vlen is not None else {}))
     if vlen is None and brd.vlen is not None:
         vlen = brd.vlen  # build for the board's real vector length by default
     # A vector model may only fan out over harts that HAVE a vector unit. A heterogeneous SoC is normal
@@ -2598,10 +2610,9 @@ def build_app(
             )
         return f"&{brd.ram_label} {{\n\treg = <{hex(brd.dram_base)} {hex(size)}>;\n}};\n"
 
-    # Keyed on the board we actually BUILD (`build_board`), not on this descriptor's name: a chip with
-    # no Zephyr port of its own is built against a generic port, and testing the descriptor name here
-    # silently skipped this overlay for exactly those boards.
-    cpu_overlay = _chipyard_cpu_overlay(cpus) if brd.build_board.startswith("chipyard") else ""
+    # The port's CPU-node count is target-owned catalog data, never inferred from
+    # its name. Unknown ports do not receive an unrelated overlay.
+    cpu_overlay = _cpu_disable_overlay(cpus, brd.dt_cpu_nodes) if brd.dt_cpu_nodes is not None else ""
     overlay_base = overlay
 
     def _overlay_for(size: int) -> str:
@@ -2712,6 +2723,7 @@ def build_app(
         "elf": elf,
         "app_dir": app,
         "build_dir": build_dir,
+        "board": brd.name,
         "backend": backend,
         "ram_bytes": ram_bytes,
         "build_hash": build_hash,
@@ -3291,7 +3303,7 @@ def build_and_run(
     model_dir: str | Path,
     work: str | Path,
     *,
-    board: str = "spike_riscv64",
+    board: str | None = None,
     backend: str = "rvv",
     rvv_hart: int = 0,
     harts: int = 2,

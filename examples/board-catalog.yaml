@@ -1,7 +1,8 @@
-# Board registry: the facts a generated image needs about the machine it runs on.
+# Example board catalog: target-owned facts for bring-up demonstrations.
 #
-# Loaded by merlin/python/merlin/runtime/boards.py into `boards.BOARDS` (a dict of `Board` descriptors).
-# Targeting a new board is an entry here, not a code change -- the field meanings, and the failure mode
+# Select explicitly with MERLIN_BOARD_CATALOG=examples/board-catalog.yaml.
+# Installed Merlin has no board facts until a target-owned catalog is selected.
+# Targeting a new board is an OOT catalog entry, not a core code change -- the field meanings, and the failure mode
 # each one prevents when it is wrong, are documented on the `Board` dataclass in that module. Unknown
 # fields and unknown enum values are REFUSED at load time rather than ignored.
 #
@@ -33,6 +34,7 @@ boards:
   # stock config of that vector unit is single-core, and the only stock 2-tile SoC puts a vector unit on
   # one tile only, so neither can host a multi-hart RVV image.
   chipyard_riscv64:
+    dt_cpu_nodes: 8
     dram_bytes: 256 MiB
     harts: 4
     vlen: 256
@@ -48,6 +50,7 @@ boards:
   # whisper_tiny -- 464 MB of region -- look like it did not fit on a 16 GB target.
   firesim_dual_saturn:
     zephyr_board: chipyard_riscv64
+    dt_cpu_nodes: 8
     dram_bytes: 16 GiB
     harts: 2
     vlen: 256
@@ -70,6 +73,7 @@ boards:
   # unit is the documented K1 trap (a fixed-width kernel lands at a lower LMUL and leaves three quarters
   # of the datapath idle), so the fact matters even though our vector code is scalable.
   chipyard_kodiak:
+    dt_cpu_nodes: 8
     dram_bytes: 512 MiB
     harts: 3
     vector_harts: 2
@@ -119,6 +123,7 @@ boards:
   # README has to say so rather than inheriting the confidence of the one-core builds.
   kodiak_opu_2core:
     zephyr_board: chipyard_kodiak
+    dt_cpu_nodes: 8
     dram_bytes: 4 GiB
     harts: 2
     vlen: 512
@@ -148,6 +153,7 @@ boards:
   # two vector harts AND the outer-product unit -- not here.
   firesim_kodiak_opu:
     zephyr_board: chipyard_riscv64
+    dt_cpu_nodes: 8
     dram_bytes: 16 GiB
     harts: 1
     vlen: 512
@@ -197,6 +203,7 @@ boards:
   # SMP-boot hang, so this is a fact worth having been told.
   gemmelos_bearly25_zephyr:
     zephyr_board: chipyard_riscv64
+    dt_cpu_nodes: 8
     dram_bytes: 1 GiB
     harts: 2
     vlen: 256
@@ -228,6 +235,7 @@ boards:
   # runtime/c/merlin_socinit_zephyr.c replays their bmark-lib `init_test` order against it.
   gemmelos_bearly25_zephyr_500mhz:
     zephyr_board: chipyard_riscv64
+    dt_cpu_nodes: 8
     dram_bytes: 1 GiB
     harts: 2
     vlen: 256

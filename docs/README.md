@@ -81,7 +81,7 @@ predates the newest change to the code it documents (see `check_docs_freshness.p
 - [Verify a compiler transformation](guides/verification.md) — `current`, verified 2026-09-27 · owner: verification — see also: [phase0_specification](guides/phase0_specification.md), [model_lowering](guides/model_lowering.md), [simulator_selection](guides/simulator_selection.md)
 - [Verify selected hardware properties](guides/hardware_verification.md) — `current`, verified 2026-09-27 · owner: verification — see also: [verification](guides/verification.md), [phase0_specification](guides/phase0_specification.md), [simulator_selection](guides/simulator_selection.md)
 - [Vision, audio and control workloads on Kodiak — multicore RVV under Zephyr](guides/vision_workloads_rvv_zephyr.md) — `current`, verified 2026-08-04 · owner: runtime — see also: [tinyllama_int8_rvv_zephyr](guides/tinyllama_int8_rvv_zephyr.md), [model2mlir](guides/model2mlir.md), [rvv_e2e](guides/rvv_e2e.md), [zephyr](guides/zephyr.md), [compilation_strategies](guides/compilation_strategies.md)
-- [Zephyr runtime backend](guides/zephyr.md) — `current`, verified 2026-07-22 · owner: runtime — see also: [getting_started](guides/getting_started.md), [reproducibility](guides/reproducibility.md), [runtime](reference/runtime.md), [tinyllama_int8_rvv_zephyr](guides/tinyllama_int8_rvv_zephyr.md)
+- [Zephyr runtime backend](guides/zephyr.md) — `current`, verified 2026-09-29 · owner: runtime — see also: [getting_started](guides/getting_started.md), [reproducibility](guides/reproducibility.md), [runtime](reference/runtime.md), [tinyllama_int8_rvv_zephyr](guides/tinyllama_int8_rvv_zephyr.md)
 
 ## Design notes
 

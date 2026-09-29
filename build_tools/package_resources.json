@@ -19,7 +19,6 @@
     "merlin/contract/README.md",
     "merlin/contract/VERSION",
     "merlin/contract/arc_models.yaml",
-    "merlin/contract/boards.yaml",
     "merlin/contract/claim_models.yaml",
     "merlin/contract/command_buffer_abi.yaml",
     "merlin/contract/compute_endpoints.yaml",

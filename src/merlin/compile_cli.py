@@ -253,6 +253,7 @@ def compile_rvv(
     bundle_path: str | Path | None = None,
     capture_bundle: str | Path | None = None,
     deadline_ns: int | None = None,
+    board: str | None = None,
 ) -> dict:
     """RVV whole-model: resolve/capture → lower → build → (run) → (gate vs golden).
 
@@ -273,6 +274,18 @@ def compile_rvv(
     timeout = int(timeout)
     if timeout < 1:
         raise ValueError("timeout must be a positive whole-session budget in seconds")
+    if run in ("spike", "zephyr", "verilator"):
+        if board is None:
+            return {
+                "tool": "merlin-compile",
+                "target": "rvv",
+                "workload": workload,
+                "status": "not_run",
+                "reason": f"{run} requires --board and MERLIN_BOARD_CATALOG",
+            }
+        from .runtime.boards import board as _selected_board
+
+        _selected_board(board)  # Reject unknown boards before capture or work allocation.
 
     # TWO ways a caller pins the capture rather than letting the mutable registry resolve the workload
     # name again -- with DIFFERENT completeness contracts, which is why they stay separate parameters
@@ -486,7 +499,7 @@ def compile_rvv(
     # The Zephyr/spike/verilator routes build a Zephyr image (and are the only ones that can be
     # multicore or sustained); the K1 route builds a Linux binary for the board.
     if run in ("spike", "zephyr", "verilator"):
-        board = "chipyard_riscv64" if run == "verilator" else "spike_riscv64"
+        out["board"] = board
         if not zm.available():
             out["status"] = "not_run"
             out["reason"] = "Zephyr/spike toolchain unavailable (ZEPHYR_BASE / SDK / MERLIN_CHIPYARD)"
@@ -1124,6 +1137,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--package", default=None, help="override the codegen/OOT package dir")
     ap.add_argument(
+        "--board",
+        help="RVV spike/Zephyr/Verilator: board name from the selected MERLIN_BOARD_CATALOG",
+    )
+    ap.add_argument(
         "--corpus-descriptor",
         type=Path,
         help="explicit OOT corpus descriptor; prefer a released descriptor (this CLI does not verify its seal)",
@@ -1144,6 +1161,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if a.corpus_descriptor is not None and (a.target == "rvv" or a.model_preflight):
         ap.error("--corpus-descriptor applies only to OOT capsule compilation")
+    if a.board is not None and a.target != "rvv":
+        ap.error("--board applies only to RVV spike/Zephyr/Verilator execution")
 
     if a.model_preflight and (a.target == "rvv" or not a.capture_bundle or not a.deployment_dtype):
         ap.error("--model-preflight requires an OOT --target, --capture-bundle, and --deployment-dtype")
@@ -1171,6 +1190,7 @@ def main(argv: list[str] | None = None) -> int:
                 harts=a.harts,
                 iters=a.iters,
                 warmup=a.warmup,
+                board=a.board,
             )
         else:
             res = compile_oot(
