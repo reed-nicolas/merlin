@@ -20,6 +20,7 @@ from .witness_basis import build_witness_basis
 
 INPUT_SCHEMA = "merlin.phase0.coverage_inputs.v1"
 SCHEMA = "merlin.phase0.coverage_commitment.v2"
+READINESS_SCHEMA = "merlin.phase0.corpus_readiness.v1"
 INPUT_PATH = Path("_phase0/coverage-inputs.json")
 _SIGNATURE_FIELDS = (
     "mlir_operation",
@@ -647,6 +648,7 @@ def build_commitment(
         application_reports[label] = {
             "capture_sha256": application.get("capture_sha256"),
             "capture_receipt": copy.deepcopy(receipt),
+            "capture_execution_attestation": copy.deepcopy(application.get("capture_execution_attestation")),
             "graph_accounting": copy.deepcopy(graph_accounting),
             "semantic_scope": {
                 "compiler_reference": "selected quantized/prepared capture when quantization is present",
@@ -708,6 +710,149 @@ def require_complete(report: dict) -> None:
         raise ValueError(
             "verified whole-workload Phase 1 requires complete source/precision/transfer and admitted-capsule coverage"
         )
+
+
+def build_phase0_readiness(report: dict) -> dict:
+    """Separate deterministic corpus readiness from compiler-owned qualification.
+
+    A generated corpus can be ready to hand to Phase 1 before a compiler exists.
+    That does *not* certify support-lowering, emitted host/device composition, or
+    target execution. Only those exact obligations are deferred. Every other
+    unknown remains a Phase 0 blocker, including capture execution provenance.
+    """
+    if not isinstance(report, dict):
+        raise ValueError("Phase 0 readiness requires a coverage commitment")
+    blockers = []
+    deferred = []
+    applications = report.get("applications") or {}
+    cohort = report.get("cohort") or {}
+    if report.get("schema") != SCHEMA or report.get("phase") != "phase1":
+        blockers.append({"component": "coverage", "reason": "unsupported selected Phase 1 coverage commitment"})
+    if not is_sha256(report.get("inputs_sha256")) or not is_sha256(cohort.get("sha256")):
+        blockers.append({"component": "selection", "reason": "selected input or cohort byte identity is absent"})
+    if not applications or type(cohort.get("n_capsules")) is not int or cohort["n_capsules"] <= 0:
+        blockers.append({"component": "scope", "reason": "iteration applications or admitted capsules are absent"})
+    if (report.get("independent_evidence") or {}).get("status") != "verified":
+        blockers.append({"component": "evidence", "reason": "selected Phase 0 evidence is not verified"})
+
+    # A materialized M2M receipt is producer-authored. Even a true-looking
+    # closure flag cannot stand in for a separately verified fresh issuer.
+    from .capture_execution_attestation import AttestationNotVerified, require_verified_execution
+
+    for label, application in sorted(applications.items()):
+        attestation = application.get("capture_execution_attestation") or {}
+        capture = attestation.get("capture") or {}
+        materialized = application.get("capture_receipt") or {}
+        try:
+            require_verified_execution(attestation)
+            if (
+                capture.get("model_sha256") != application.get("capture_sha256")
+                or capture.get("receipt_sha256") != materialized.get("receipt_sha256")
+                or not is_sha256(capture.get("model_sha256"))
+                or not is_sha256(capture.get("receipt_sha256"))
+            ):
+                raise AttestationNotVerified("verified issuer does not bind selected capture and receipt bytes")
+        except AttestationNotVerified as exc:
+            blockers.append(
+                {"component": "capture_execution", "application": label, "reason": str(exc)}
+            )
+
+    conformance = report.get("conformance") or {}
+    if (
+        type(conformance.get("n_required")) is not int
+        or type(conformance.get("n_covered")) is not int
+        or conformance["n_required"] < 0
+        or conformance["n_covered"] != conformance["n_required"]
+        or conformance.get("uncovered") != []
+    ):
+        blockers.append({"component": "conformance", "reason": "finite admitted-cohort cell coverage is incomplete"})
+
+    artifact_only = "artifact-backed typed lowering and shape/value preservation are not verified"
+    support_route_only = "compute islands connected through support lowering await a compiler-owned typed route"
+    pending_transfer_only = "conditional SSA uses await reviewed endpoint placement before transfer screening"
+    for blocker in report.get("blockers") or []:
+        component = blocker.get("component")
+        label = blocker.get("application")
+        application = applications.get(label) or {}
+        if component == "support_lowering":
+            operations = application.get("operations") or []
+            matching = [op for op in operations if op.get("id") == blocker.get("obligation")]
+            if (
+                len(matching) == 1
+                and matching[0].get("role") == "support_lowering"
+                and matching[0].get("reasons") == [artifact_only]
+                and matching[0].get("witnesses")
+            ):
+                deferred.append(blocker)
+                continue
+        elif component == "support_dependency" and blocker.get("reason") == support_route_only:
+            edges = ((application.get("graph_accounting") or {}).get("edges") or [])
+            count = sum(edge.get("accounting") == "support_dependency" for edge in edges)
+            if count > 0 and blocker.get("count") == count:
+                deferred.append(blocker)
+                continue
+        elif component == "transfer" and blocker.get("reason") == pending_transfer_only:
+            transfers = application.get("transfers") or []
+            count = sum(row.get("status") == "pending_placement" for row in transfers)
+            if count > 0 and blocker.get("count") == count:
+                deferred.append(blocker)
+                continue
+        elif component == "conformance.composition" and blocker.get("reason") == "required coverage axis was not measured":
+            composition = conformance.get("composition") or {}
+            if (
+                composition.get("status") == "not_measured"
+                and composition.get("phase") == "phase0"
+                and composition.get("required")
+                and set((composition.get("phase1_receipt_required") or {})) == {
+                    "selected_capture", "selected_capsule", "compiler_execution",
+                    "lowering_correspondence", "execution",
+                }
+            ):
+                deferred.append(blocker)
+                continue
+        blockers.append(blocker)
+
+    return {
+        "schema": READINESS_SCHEMA,
+        "status": "ready" if not blockers else "incomplete",
+        "inputs_sha256": report.get("inputs_sha256"),
+        "cohort_sha256": cohort.get("sha256"),
+        "blockers": blockers,
+        "deferred_phase1": deferred,
+        "qualification": (
+            "deterministic Phase 0 corpus handoff only; deferred compiler routes, numerical "
+            "execution and target correctness require independent Phase 1 evidence"
+        ),
+    }
+
+
+def phase0_readiness_identity(readiness: dict, *, required: bool) -> dict:
+    """Aggregate-only identity for a private readiness report bound to a release."""
+    if not isinstance(readiness, dict) or readiness.get("schema") != READINESS_SCHEMA:
+        raise ValueError("unsupported Phase 0 readiness report")
+    return {
+        "schema": READINESS_SCHEMA,
+        "status": readiness.get("status"),
+        "required": required,
+        "cohort_sha256": readiness.get("cohort_sha256"),
+        "inputs_sha256": readiness.get("inputs_sha256"),
+        "n_blockers": len(readiness.get("blockers") or []),
+        "n_deferred_phase1": len(readiness.get("deferred_phase1") or []),
+        "report_sha256": _digest(readiness),
+    }
+
+
+def require_phase0_ready(readiness: dict) -> None:
+    """Require only the honest, source-closed deterministic Phase 0 handoff."""
+    if (
+        not isinstance(readiness, dict)
+        or readiness.get("schema") != READINESS_SCHEMA
+        or readiness.get("status") != "ready"
+        or readiness.get("blockers") != []
+        or not is_sha256(readiness.get("inputs_sha256"))
+        or not is_sha256(readiness.get("cohort_sha256"))
+    ):
+        raise ValueError("reviewed Phase 0 corpus requires verified source, declarations and capsule coverage")
 
 
 def _selected_program(capsule: dict, directory: Path) -> Path | None:

@@ -200,6 +200,74 @@ def test_precompiler_completeness_is_independent_and_uses_only_admitted_capsules
         CC.require_complete(phase2)
 
 
+def test_phase0_readiness_defers_only_compiler_evidence_and_never_promotes_replay(monkeypatch):
+    from merlin_experiments.phase0 import capture_execution_attestation as attestation
+
+    inputs, capsule = _fixture()
+    inputs["evidence"]["status"] = "verified"
+    inputs["accounting"]["applications"]["application"]["capture_receipt"]["receipt_sha256"] = "e" * 64
+    report = _report(inputs, [capsule])
+    application = report["applications"]["application"]
+    application["capture_execution_attestation"] = {
+        "schema": attestation.SCHEMA,
+        "status": "verified_sealed_execution",
+        "fresh_execution": True,
+        "source_closure_verified": True,
+        "issuer": "fixture-verified-issuer",
+        "capture": {"model_sha256": "a" * 64, "receipt_sha256": "e" * 64},
+    }
+    # A producer's true-looking flag and a self-written sealed receipt cannot
+    # establish an issuer. The positive branch below is only a synthetic test
+    # of the policy split, not an actual Phase 0 admission.
+    blocked = CC.build_phase0_readiness(report)
+    assert blocked["status"] == "incomplete"
+    assert any(row["component"] == "capture_execution" for row in blocked["blockers"])
+    with pytest.raises(ValueError, match="verified source"):
+        CC.require_phase0_ready(blocked)
+
+    monkeypatch.setattr(attestation, "_VERIFIED_ISSUERS", frozenset({"fixture-verified-issuer"}))
+    artifact_reason = "artifact-backed typed lowering and shape/value preservation are not verified"
+    application["operations"].append(
+        {"id": "support:0", "role": "support_lowering", "reasons": [artifact_reason], "witnesses": ["functional"]}
+    )
+    application["graph_accounting"]["edges"].append({"accounting": "support_dependency"})
+    application["transfers"] = [{"status": "pending_placement"}]
+    report["conformance"]["composition"] = {
+        "phase": "phase0",
+        "status": "not_measured",
+        "required": {"A->H->A": ["application"]},
+        "phase1_receipt_required": {
+            key: "required" for key in (
+                "selected_capture", "selected_capsule", "compiler_execution", "lowering_correspondence", "execution"
+            )
+        },
+    }
+    report["conformance"]["n_covered"] = 0
+    report["blockers"] = [
+        {"component": "support_lowering", "application": "application", "obligation": "support:0", "reason": artifact_reason},
+        {"component": "support_dependency", "application": "application", "count": 1, "reason": "compute islands connected through support lowering await a compiler-owned typed route"},
+        {"component": "transfer", "application": "application", "count": 1, "reason": "conditional SSA uses await reviewed endpoint placement before transfer screening"},
+        {"component": "conformance.composition", "reason": "required coverage axis was not measured"},
+    ]
+    report["status"] = "incomplete"
+    readiness = CC.build_phase0_readiness(report)
+    assert readiness["status"] == "ready"
+    assert readiness["blockers"] == []
+    assert len(readiness["deferred_phase1"]) == 4
+    CC.require_phase0_ready(readiness)
+    with pytest.raises(ValueError, match="Phase 1"):
+        CC.require_complete(report)
+    identity = CC.phase0_readiness_identity(readiness, required=True)
+    assert identity["n_deferred_phase1"] == 4
+    assert identity["report_sha256"] == CC._digest(readiness)
+
+    report["blockers"].append({"component": "operation", "reason": "unreviewed placement"})
+    assert CC.build_phase0_readiness(report)["status"] == "incomplete"
+    report["blockers"].pop()
+    report["independent_evidence"]["status"] = "diagnostic"
+    assert CC.build_phase0_readiness(report)["status"] == "incomplete"
+
+
 def test_unknown_source_precision_or_capability_never_becomes_verified():
     inputs, capsule = _fixture()
     for component in (

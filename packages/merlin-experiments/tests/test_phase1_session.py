@@ -24,6 +24,34 @@ from merlin.common.paths import data_path, module_source_path, python_import_roo
 from merlin.targetgen.sandbox import bwrap as BW
 
 
+def test_phase1_requires_the_exact_reviewed_phase0_handoff(monkeypatch):
+    from merlin_experiments.phase0 import coverage_commitment as CC
+
+    report = {"selected": "frozen-input"}
+    readiness = {
+        "schema": CC.READINESS_SCHEMA,
+        "status": "ready",
+        "blockers": [],
+        "inputs_sha256": "a" * 64,
+        "cohort_sha256": "b" * 64,
+        "deferred_phase1": [{"component": "support_lowering"}],
+    }
+    monkeypatch.setattr(
+        CC,
+        "build_phase0_readiness",
+        lambda observed: readiness if observed == report else {**readiness, "cohort_sha256": "c" * 64},
+    )
+    review = {
+        "whole_workload_phase1": {"required": True},
+        "phase0_readiness": CC.phase0_readiness_identity(readiness, required=True),
+    }
+    S._verify_phase0_handoff(review, report)
+    with pytest.raises(ValueError, match="differs from the reviewed corpus"):
+        S._verify_phase0_handoff(review, {"selected": "changed-input"})
+    with pytest.raises(ValueError, match="differs from the reviewed corpus"):
+        S._verify_phase0_handoff({"whole_workload_phase1": {"required": True}}, report)
+
+
 def assemble(bundle, ws, sandbox, *, context):
     assert sandbox == "bwrap"
     BW.materialize_bundle_inputs(ws, bundle, repo=Path(os.environ["SESSION_TEST_ROOT"]))

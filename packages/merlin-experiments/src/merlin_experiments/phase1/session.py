@@ -35,6 +35,30 @@ _MODEL_HOST_SNAPSHOT_ROOT_ENV = "MERLIN_MODEL_HOST_LANE_SNAPSHOT_ROOT"
 _MODEL_HOST_SNAPSHOT_REQUIRED_ENV = "MERLIN_MODEL_HOST_LANE_SNAPSHOT_REQUIRED"
 
 
+def _verify_phase0_handoff(corpus_review: dict | None, workload_coverage: dict | None) -> None:
+    """Bind the reviewed Phase 0 handoff to the frozen corpus view.
+
+    Compiler-produced support lowering and execution cannot be required before the
+    Phase 1 agent starts. They remain obligations of the later strict qualification;
+    this check admits only a reviewed, source-closed deterministic corpus.
+    """
+    review = corpus_review or {}
+    if not (review.get("whole_workload_phase1") or {}).get("required"):
+        return
+    from ..phase0.coverage_commitment import (
+        build_phase0_readiness,
+        phase0_readiness_identity,
+        require_phase0_ready,
+    )
+
+    readiness = build_phase0_readiness(workload_coverage or {})
+    expected = review.get("phase0_readiness")
+    observed = phase0_readiness_identity(readiness, required=True)
+    if expected != observed:
+        raise ValueError("frozen Phase 0 readiness differs from the reviewed corpus")
+    require_phase0_ready(readiness)
+
+
 @dataclass(frozen=True)
 class RunRequest:
     context: InvocationContext
@@ -155,10 +179,7 @@ class PreparedRun:
                 repo=self.request.context.repo,
                 reviewed_roots=self.reviewed_roots,
             )
-            if (self.environment.get("corpus_review") or {}).get("whole_workload_phase1", {}).get("required"):
-                from ..phase0.coverage_commitment import require_complete
-
-                require_complete(view.workload_coverage or {})
+            _verify_phase0_handoff(self.environment.get("corpus_review"), view.workload_coverage)
 
 
 def task_scope(
@@ -360,10 +381,7 @@ def prepare(
             _reviewed_corpus_roots = tuple(_te().graded_roots())
         _bundle_snapshot_record = _BWS.snapshot_record(ws)
         _corpus_view = CI.resolve(ws, bundle, _corpus_record, repo=context.repo, reviewed_roots=_reviewed_corpus_roots)
-        if (_corpus_review or {}).get("whole_workload_phase1", {}).get("required"):
-            from ..phase0.coverage_commitment import require_complete
-
-            require_complete(_corpus_view.workload_coverage or {})
+        _verify_phase0_handoff(_corpus_review, _corpus_view.workload_coverage)
         _public_root, _policy_root = _corpus_view.public, _corpus_view.policy
         _contract_root = _corpus_view.contract
         if _corpus_seal:

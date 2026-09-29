@@ -602,10 +602,17 @@ def admission(descriptor: Path, *, coverage_output: Path | None = None) -> dict:
     capsule_runner.discover_capsules(te.graded_roots(), labels={"public", "dev"})
     materialized = materialize_public_cohort(te, tier_ceiling=_TIER_ORDER[-1])
     public = validate_materialized_cohort(materialized, te)
-    from ..phase0.coverage_commitment import observe_cohort, read_inputs, requires_workload_coverage
+    from ..phase0.coverage_commitment import (
+        build_phase0_readiness,
+        observe_cohort,
+        phase0_readiness_identity,
+        read_inputs,
+        requires_workload_coverage,
+    )
 
     coverage_inputs = read_inputs(te.capsule_corpus.parent)
     completeness = observe_cohort(coverage_inputs, materialized, target=te.target)
+    readiness = build_phase0_readiness(completeness)
     workload_required = requires_workload_coverage(te, coverage_inputs)
     if coverage_output is not None:
         private_json(coverage_output, completeness)
@@ -627,6 +634,7 @@ def admission(descriptor: Path, *, coverage_output: Path | None = None) -> dict:
         "hidden_admitted": admitted,
         "public_commitment": public["admitted_name_set_sha256"],
         "scope": "native cohort admission only; numerical and hardware readiness not executed",
+        "phase0_readiness": phase0_readiness_identity(readiness, required=workload_required),
         "whole_workload_phase1": {
             "status": completeness["status"],
             "cohort_sha256": completeness["cohort"]["sha256"],

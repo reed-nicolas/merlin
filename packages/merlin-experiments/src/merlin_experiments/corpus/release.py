@@ -484,15 +484,22 @@ def verify(seal_path: Path, descriptor: Path) -> dict:
         "release": str(root),
         "review_digest": sealed["review_digest"],
         "payload_sha256": identity["payload_sha256"],
+        "phase0_readiness": (prepared.get("admission") or {}).get("phase0_readiness"),
         "whole_workload_phase1": workload,
     }
 
 
 def _verify_workload_coverage(root: Path, prepared: dict) -> dict:
-    """Do not let a corpus-review seal silently become whole-workload approval."""
+    """Require the deterministic handoff, without pre-certifying Phase 1."""
     from merlin.targetgen.target_experiment import load_target_experiment
 
-    from ..phase0.coverage_commitment import read_inputs, require_complete, requires_workload_coverage
+    from ..phase0.coverage_commitment import (
+        build_phase0_readiness,
+        phase0_readiness_identity,
+        read_inputs,
+        require_phase0_ready,
+        requires_workload_coverage,
+    )
     from ..runner import _read_json
 
     descriptor = root / "payload" / "experiment" / "target_experiment.yaml"
@@ -512,8 +519,12 @@ def _verify_workload_coverage(root: Path, prepared: dict) -> dict:
     if _digest(report) != summary.get("report_sha256") or summary.get("required") != required:
         raise SpecError("workload coverage report differs from prepared corpus admission")
     if required:
+        readiness = build_phase0_readiness(report)
+        selected_readiness = (prepared.get("admission") or {}).get("phase0_readiness")
+        if phase0_readiness_identity(readiness, required=True) != selected_readiness:
+            raise SpecError("Phase 0 readiness differs from prepared corpus admission")
         try:
-            require_complete(report)
+            require_phase0_ready(readiness)
         except ValueError as exc:
             raise SpecError(str(exc)) from exc
     return summary

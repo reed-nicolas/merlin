@@ -21,6 +21,45 @@ from merlin_experiments.runner import fingerprint
 from merlin_experiments.spec import SpecError
 
 
+def test_release_uses_phase0_readiness_without_promoting_phase1(monkeypatch, tmp_path):
+    from merlin.targetgen import target_experiment
+    from merlin_experiments.phase0 import coverage_commitment as commitment
+
+    root = tmp_path / "release"
+    private = root / "private"
+    private.mkdir(parents=True)
+    # Compiler-owned support-lowering remains incomplete in the original
+    # certificate. This wiring test supplies a synthetic policy verdict only;
+    # real readiness still requires a verified capture issuer.
+    report = {"schema": commitment.SCHEMA, "phase": "phase1", "status": "incomplete", "blockers": [
+        {"component": "support_lowering", "reason": "pending compiler evidence"}
+    ]}
+    coverage = private / "workload-coverage.json"
+    coverage.write_text(json.dumps(report))
+    coverage.chmod(0o600)
+    readiness = {
+        "schema": commitment.READINESS_SCHEMA,
+        "status": "ready",
+        "inputs_sha256": "a" * 64,
+        "cohort_sha256": "b" * 64,
+        "blockers": [],
+        "deferred_phase1": report["blockers"],
+    }
+    monkeypatch.setattr(target_experiment, "load_target_experiment", lambda _: SimpleNamespace(capsule_corpus=root))
+    monkeypatch.setattr(commitment, "read_inputs", lambda _: {"selected": True})
+    monkeypatch.setattr(commitment, "requires_workload_coverage", lambda *_: True)
+    monkeypatch.setattr(commitment, "build_phase0_readiness", lambda observed: readiness if observed == report else {})
+    summary = {"required": True, "status": "incomplete", "report_sha256": corpus_release._digest(report)}
+    prepared = {"admission": {
+        "whole_workload_phase1": summary,
+        "phase0_readiness": commitment.phase0_readiness_identity(readiness, required=True),
+    }}
+    assert corpus_release._verify_workload_coverage(root, prepared) == summary
+    prepared["admission"]["phase0_readiness"]["report_sha256"] = "0" * 64
+    with pytest.raises(SpecError, match="readiness differs"):
+        corpus_release._verify_workload_coverage(root, prepared)
+
+
 def test_generation_lineage_reconciles_selected_inputs_and_exact_capsules(monkeypatch, tmp_path):
     from merlin_experiments.phase0 import evidence
     from merlin_experiments.phase0.coverage_commitment import INPUT_PATH, INPUT_SCHEMA
