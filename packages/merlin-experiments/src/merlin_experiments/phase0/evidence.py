@@ -29,6 +29,50 @@ def _canonical_digest(value: Any) -> str:
     return _digest(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode())
 
 
+def _existing_receipt_path(member: Mapping) -> Path | None:
+    path = member.get("path") if isinstance(member, Mapping) else None
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        return Path(path).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _same_selected_file(left: Mapping, right: Mapping) -> bool:
+    """Compare byte-bound file identities across equivalent symlink spellings."""
+    from merlin.common.digest import is_sha256
+
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    digest = left.get("sha256")
+    resolved = _existing_receipt_path(left)
+    return (
+        is_sha256(digest)
+        and digest == right.get("sha256")
+        and resolved is not None
+        and resolved == _existing_receipt_path(right)
+    )
+
+
+def _same_source_consistency(left: Mapping, right: Mapping) -> bool:
+    """Compare full receipts after resolving only their selected source paths."""
+
+    def resolved_sources(document: Mapping) -> dict | None:
+        if not isinstance(document, Mapping) or not isinstance(document.get("sources"), list):
+            return None
+        result = copy.deepcopy(document)
+        for source in result.get("sources", []):
+            resolved = _existing_receipt_path(source)
+            if resolved is None:
+                return None
+            source["path"] = str(resolved)
+        return result
+
+    normalized_left, normalized_right = resolved_sources(left), resolved_sources(right)
+    return normalized_left is not None and normalized_right is not None and normalized_left == normalized_right
+
+
 def _reference_inventory_root(role: str, root: Path, software_doc: Mapping) -> Path:
     """Select the source package used by a declared numerical engine.
 
@@ -736,7 +780,7 @@ def select_evidence(
                 if (
                     genericization.get("kind") != "circt_generic_serialization"
                     or genericization.get("returncode") != 0
-                    or source != production["sources"]["core_hw"]
+                    or not _same_selected_file(source, production["sources"]["core_hw"])
                     or output != {"path": inputs.get("generic_hw_path"), "sha256": inputs.get("generic_hw_sha256")}
                     or not isinstance(command, list)
                     or len(command) != 5
@@ -750,7 +794,7 @@ def select_evidence(
                     raise ValueError("CIRCT genericization source/output/tool binding differs")
                 consistency["genericization"] = copy.deepcopy(genericization)
                 consistency["sources"].append({"role": "core_hw_generic", **output})
-            if consistency != loaded_facts.get("source_consistency"):
+            if not _same_source_consistency(consistency, loaded_facts.get("source_consistency") or {}):
                 diagnostics.append(
                     {
                         "component": "source-consistency",

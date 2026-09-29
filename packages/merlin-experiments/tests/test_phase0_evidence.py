@@ -13,7 +13,7 @@ from merlin_experiments.phase0.provenance import _scrub_capsule_dir
 from merlin.perf import profile
 from merlin.runtime.backends import base
 from merlin.targetgen import readout_facet, target_registry
-from merlin.targetgen.rtl import facts
+from merlin.targetgen.rtl import facts, source_selection
 
 
 def test_specir_source_inventory_excludes_unrelated_generated_project_files(tmp_path):
@@ -54,6 +54,115 @@ def _selection(monkeypatch, tmp_path, body=None):
     monkeypatch.setattr(readout_facet, "capture_inputs", lambda *a, **k: {"scalar_abi": None, "readouts": None})
     monkeypatch.setattr(base, "execution_capability_facts", lambda target: {})
     return evidence.select_evidence("fixture", facts_path=raw), raw, code
+
+
+def test_phase0_accepts_symlink_alias_for_byte_bound_rtl_production(monkeypatch, tmp_path):
+    _, facts_path, _ = _selection(monkeypatch, tmp_path)
+    source_root = tmp_path / "rtl-source"
+    source_root.mkdir()
+    alias = tmp_path / "rtl-alias"
+    alias.symlink_to(source_root, target_is_directory=True)
+    core = source_root / "core.hw.mlir"
+    core.write_text("module {}\n")
+    generic = source_root / "core.generic.mlir"
+    generic.write_text("module {}\n")
+    tool = source_root / "circt-opt"
+    tool.write_text("tool bytes\n")
+
+    def member(path):
+        return {"path": str(path), "sha256": source_selection.digest(path)}
+
+    bundle = source_root / "source-selection.json"
+    bundle.write_text(
+        json.dumps(
+            {
+                "schema": source_selection.SCHEMA,
+                "target": "fixture",
+                "sources": {
+                    role: member(alias / core.name) for role in ("core_hw", "soc_hw", "firrtl", "hierarchy")
+                },
+            }
+        )
+    )
+
+    def production(selected):
+        return {
+            "status": "verified",
+            "sources": [{"role": role, **data} for role, data in sorted(selected["sources"].items())],
+        }
+
+    monkeypatch.setattr(source_selection, "production_consistency", production)
+    selected = source_selection.load_selection(bundle, target="fixture")
+    recorded = production(selected)
+    for source in recorded["sources"]:
+        source["path"] = str(alias / core.name)
+    genericization = {
+        "kind": "circt_generic_serialization",
+        "returncode": 0,
+        "input": member(alias / core.name),
+        "output": member(generic),
+        "tool": member(tool),
+        "command": [str(tool), "--mlir-print-op-generic", str(alias / core.name), "-o", str(generic)],
+    }
+    recorded["genericization"] = genericization
+    recorded["sources"].append({"role": "core_hw_generic", **genericization["output"]})
+    facts_path.write_text(
+        json.dumps(
+            {
+                "inputs": {
+                    "target": "fixture",
+                    "source_bundle_path": str(bundle),
+                    "generic_hw_path": str(generic),
+                    "generic_hw_sha256": source_selection.digest(generic),
+                },
+                "source_consistency": recorded,
+                "facts": {"arrays": [{"rows": 4, "cols": 4}], "memories": []},
+            }
+        )
+    )
+    observed = evidence.select_evidence("fixture", facts_path=facts_path)
+    assert not [row for row in observed.diagnostics if row["component"] == "source-consistency"]
+
+    genericization["input"]["path"] = str(generic)
+    facts_path.write_text(
+        json.dumps(
+            {
+                "inputs": observed.loaded_facts["inputs"],
+                "source_consistency": recorded,
+                "facts": {"arrays": [{"rows": 4, "cols": 4}], "memories": []},
+            }
+        )
+    )
+    altered = evidence.select_evidence("fixture", facts_path=facts_path)
+    assert any(
+        row["component"] == "source-consistency" and row["status"] == "contradiction"
+        for row in altered.diagnostics
+    )
+
+    genericization["input"].pop("path")
+    facts_path.write_text(
+        json.dumps(
+            {
+                "inputs": observed.loaded_facts["inputs"],
+                "source_consistency": recorded,
+                "facts": {"arrays": [{"rows": 4, "cols": 4}], "memories": []},
+            }
+        )
+    )
+    malformed = evidence.select_evidence("fixture", facts_path=facts_path)
+    assert any(
+        row["component"] == "source-consistency" and row["status"] == "contradiction"
+        for row in malformed.diagnostics
+    )
+
+
+def test_rtl_receipt_alias_comparison_refuses_absent_files(tmp_path):
+    missing = {"path": str(tmp_path / "absent"), "sha256": "a" * 64}
+    assert not evidence._same_selected_file(missing, missing)
+    assert not evidence._same_source_consistency(
+        {"sources": [{"role": "core_hw", **missing}]},
+        {"sources": [{"role": "core_hw", **missing}]},
+    )
 
 
 def test_exact_raw_bytes_and_derived_hashes_are_distinct(monkeypatch, tmp_path):
