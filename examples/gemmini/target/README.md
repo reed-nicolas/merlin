@@ -243,12 +243,35 @@ Verilated model, and rebuilt simulator remain alongside it. This is
 reproducible build provenance for the selected core inside one full SoC binary,
 not a proof of RTL behavior. Spike's `libgemmini.so` is a separately hashed
 functional model: neither this build check nor agreement with its output makes
-Spike RTL-derived. A different Chipyard build, toolchain, or kernel receipt
-requires a new attestation.
+Spike RTL-derived. A different Chipyard build or toolchain requires a new
+attestation. A later kernel receipt can reuse it only through the byte binding
+below.
 On a read-only Chipyard tree, the attester copies the selected FIRRTL and projects
 only the two hierarchy-output annotation filenames into its ignored artifact;
 it records both annotation hashes and the exact path changes, then still requires
 byte-for-byte equality of generated core RTL, Verilator C++, and the executable.
+
+If a later kernel receipt uses the **same selected source and simulator bytes**,
+bind it to the existing build attestation without rebuilding Chipyard:
+
+```sh
+python examples/gemmini/target/bind_native_simulator.py \
+  --attestation out/artifacts/probes/gemmini-verilator-build-1/receipt.json \
+  --attested-kernel-receipt out/artifacts/probes/gemmini-kernel-1/receipt.json \
+  --current-kernel-receipt out/artifacts/probes/gemmini-kernel-2/receipt.json \
+  --source-evidence /generated/gemmini/source-1 \
+  --simulator /selected/chipyard/sims/verilator/simulator-chipyard.harness-GemminiRocketConfig \
+  --output-root out/artifacts/probes/gemmini-verilator-binding-2
+```
+
+This checks the old receipt named by the attestation, both execution receipts
+and their saved same-ELF/console files, selected source, current simulator,
+retained rebuilt binary, and every retained selected-core RTL file against
+their recorded SHA-256 values. A new ELF is
+allowed: the binding links the same RTL binary, not the programs' numerical
+results. It writes a separate generated receipt without editing existing
+evidence. Source-to-FIRRTL generation and the attester's build procedure are
+not reverified by this inexpensive step.
 
 ### Diagnose one headline-derived kernel window
 
@@ -278,7 +301,7 @@ The default generates `capsule.yaml`, `capsule.interface.mlir` and
 `generation.json` without running a simulator. Add `--native` for independent
 scalar-versus-Gemmini Spike output checks; add `--rtl` to execute the same ELF
 on Verilator. Native mode requires the explicitly selected OOT support contract,
-`MERLIN_TARGET_PATH` pointing to that support package, and `MERLIN_CHIPYARD`
+`MERLIN_TARGET_PATH` pointing to that support package, and `MERLIN_EXT_CHIPYARD`
 pointing to the selected Chipyard toolchain/simulator build. The example's
 Phase 0 contract supplies the authored corpus issue order; the probe checks
 that its shared compute-unit and encoding declarations agree with the OOT
@@ -287,6 +310,26 @@ Before native execution, the probe checks that the source projection, capsule
 and interface still match `generation.json`. The numerical receipt records the
 SHA-256 of all three generated files, so a result cannot be silently reassigned
 to a different generated diagnostic.
+Add `--acc-scale 0.5` to generate an i8 readout capsule with a non-identity,
+exactly representable FP32 per-tensor scale. This selects the OOT LLVM-MLIR
+emitter (the legacy C conformance driver only accepts raw i32 output); set
+`MERLIN_RTL_FACTS` to the same selected facts, `MERLIN_M2M_VENV` to the selected
+MLIR toolchain environment, and `MERLIN_CLANG` to the selected compiler. The
+probe checks the emitted harness's literal inputs against an independent
+scalar FP32-scale, round-to-nearest-even, saturating int8 reference on Spike
+and, with `--rtl`, the same ELF on Verilator. The receipt records the emitter,
+lowered MLIR, harness and ELF digests. This remains a synthetic window, not
+quantized-model equivalence; its numerical receipt alone is not a qualified
+simulator source pin.
+For a newly generated `merlin.gemmini-headline-window-numerical.v1` receipt,
+use the same `bind_native_simulator.py` command above with its
+`numerical_receipt.json` as `--current-kernel-receipt` and add
+`--facts-evidence /generated/gemmini/verified-facts`. The binder checks that
+the generated capsule/interface, selected facts and validation, saved ELF,
+Spike/Verilator consoles, selected source and simulator executable all retain
+the exact recorded bytes. Older headline receipts without a simulator hash
+cannot be retrospectively promoted. A successful binding still says nothing
+about numerical equivalence to TinyLlama, SmolVLA or ResNet50.
 Each simulator has a 180-second wall timeout. The source capture supplies
 geometry only: FP32/BF16 model captures do not establish an int8 model path.
 An actual quantized capture and integerization evidence are required before
@@ -296,10 +339,20 @@ not required to check this synthetic Gemmini kernel's arithmetic.
 For an integerized capture, inspect `frontend-trace.json`'s
 `mlir.operations` for an `linalg.generic` with a prepared-graph source ID and
 `tensor<...xi8>` operands. Pass that ID to `--source-node-id`; the probe checks
-the parsed operation, not just those trace labels. For the selected ResNet50
-W8A8 diagnostic capture, `g:prepared:root:n361` names a 12544×147×64
-body; the 16-wide RTL mesh derives a 16×19×16 synthetic window. A native
-Spike run of that window matched scalar arithmetic, but neither the model's
-own values nor a whole-model accelerator route were executed. The selected
-local Chipyard build did not expose Verilator or GSIM, so this is a functional
-Spike check, not an RTL-simulator certificate.
+the parsed operation, not just those trace labels. The following are example
+source selections, not hard-coded corpus entries:
+
+| Capture | Source node | Observed contraction | 16-wide diagnostic window |
+| --- | --- | --- | --- |
+| TinyLlama 8-token prefill (`k_proj`, FP32 capture) | `g:prepared:root:n280` | 8×2048×256 | 8×32×16 |
+| SmolVLA int8 denoise | `g:prepared:root:n321` | 50×32×720 | 16×32×16 |
+| ResNet50 W8A8 | `g:prepared:root:n361` | 12544×147×64 | 16×19×16 |
+
+Each run needs a fresh `--output-root`; its `generation.json` and
+`numerical_receipt.json` identify the capture, selected facts and contracts,
+lowered MLIR, ELF and saved console bytes. With `--native --rtl`, the receipt
+records a same-ELF Spike/Verilator comparison. To tie that comparison to the
+selected RTL source and exact simulator executable, run the separate binary
+binder with the verified facts and original build attestation. A passing
+synthetic window is a representative kernel check, **not** numerical
+equivalence of any of these complete models or proof of model-wide coverage.
