@@ -93,17 +93,21 @@ for the explicit reviewed phase-0 handoff below.
 
 ## Reviewed phase-0 handoff
 
-After a successful phase-0 run, prepare a fresh release under the configured
-artifact root. Preparation copies the complete descriptor-selected source pool,
-retains classified hand-authored members, overlays receipt-declared generated
-members, stages task resources and the native broker shim, and regenerates native
-bundles. It refuses unresolved provenance, removals, collisions, symlinks, and
-descriptor admission-count changes; it never changes the canonical corpus.
+After a complete phase-0 run, prepare a fresh release under the configured
+artifact root. New target workflows use `--generated-only`: the released public
+corpus comes from this run's receipt-declared generated members, not the retained
+checkout corpus. Supply `--private-baseline` separately when the experiment needs
+an operator-owned hidden cohort. Omitting `--generated-only` is the historical
+overlay workflow, which copies classified hand-authored members from the
+descriptor-selected source pool. Both modes stage task resources and native
+broker shims, regenerate bundles, refuse unresolved provenance and collisions,
+and leave the original inputs unchanged.
 
 ```sh
 merlin experiment run gemmini-functional --phase 0 --run-dir /absolute/phase0-run
 merlin experiment corpus coverage /absolute/phase0-run --spec /absolute/selected-conformance.yaml
-merlin experiment corpus prepare /absolute/phase0-run --output /configured/out/artifacts/protocols/review-1
+merlin experiment corpus prepare /absolute/phase0-run --generated-only \
+  --output /configured/out/artifacts/protocols/review-1
 merlin experiment corpus inspect /configured/out/artifacts/protocols/review-1
 # Only after an operator has inspected the prepared inputs and private diagnostics:
 merlin experiment corpus seal /configured/out/artifacts/protocols/review-1 \

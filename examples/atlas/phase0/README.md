@@ -140,6 +140,11 @@ cohort cannot borrow functional source coverage or claim whole-model validation.
 
 Review coverage, placement and independent numerical checks before preparing
 [the reviewed Phase 0 handoff](../../../experiments/README.md#reviewed-phase-0-handoff).
+For a new Atlas release, use that handoff's `--generated-only` mode; the
+descriptor's retained BF16 corpus is historical input, not proof that this
+FP8 selection can execute those members. Supply any required hidden cohort as
+a separate private baseline. Do not seal a run with omitted source capsules or
+missing L2/L3 oracles.
 Changing a status field cannot qualify old artifacts. New inputs require newly
 frozen runs; preserve old outputs unchanged. See [the artifact map](../artifacts/README.md)
 and [whole-model walkthrough](../whole-model/README.md) for member MLIR, external
