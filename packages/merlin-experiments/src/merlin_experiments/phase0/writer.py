@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 from pathlib import Path
 
 import yaml
@@ -21,6 +22,12 @@ from .numerics import (
     float_semantics,
     specir_oracle_source_identity,
 )
+
+
+def _m2m_unavailable_reason() -> str:
+    if "MERLIN_PHASE0_FROZEN_SOURCE_MAP" in os.environ:
+        return "frozen Phase 0 has no selected Model2MLIR capture runtime"
+    return "model2MLIR capture runtime unavailable (set MERLIN_M2M_PYTHON)"
 
 
 def _entry_regime(entry, binding):
@@ -494,7 +501,7 @@ def _write_capsule_inner(entry, binding, out_root, facts_sha: str = ""):
             return CSRC.write_model_capsule(entry, eb, out_root, artifact=artifact)
         src = CSRC.PytorchRefSource()
         if not src.available():
-            print(f"  [skip] {entry['name']}: model capsule needs the m2m venv (set MERLIN_M2M_PYTHON)")
+            print(f"  [skip] {entry['name']}: {_m2m_unavailable_reason()}")
             return None
         # A DERIVED micro model writes its own loader first. Without this the entry names a loader that
         # does not exist, and the capsule that the composition axis exists to produce cannot be built.
@@ -537,7 +544,7 @@ def _write_capsule_inner(entry, binding, out_root, facts_sha: str = ""):
             # A pytorch capsule needs the m2m venv (torch) at generation time. It is additive: skip it
             # (loudly) rather than sink the whole target, so a checkout without the venv still regenerates
             # the direct-MLIR corpus. A capture that STARTS but fails (opaque/crash) still raises.
-            print(f"  [skip] {entry['name']}: pytorch source needs the m2m venv (set MERLIN_M2M_PYTHON)")
+            print(f"  [skip] {entry['name']}: {_m2m_unavailable_reason()}")
             return None
         return CSRC.write_pytorch_capsule(entry, eb, out_root, source=src)
     # Spec source: a capsule whose PROGRAM + bit-exact golden come from the specir verification spec itself
