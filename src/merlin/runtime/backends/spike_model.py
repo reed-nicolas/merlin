@@ -199,6 +199,7 @@ def build(
             raise ValueError("exact operation selection and shape selector cannot both route the model")
         if not device.exact_selection.certified:
             raise ValueError("exact operation selection has no independent accelerator certification")
+        device.exact_selection.check_release()
         device.exact_selection.check_package(device.package_dir)
         device.exact_selection.check_backend_contract()
     model_dir, work = Path(model_dir).resolve(), Path(work).resolve()

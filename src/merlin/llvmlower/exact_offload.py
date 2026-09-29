@@ -1,10 +1,13 @@
 """Exact captured-model selection for the whole-model device rewrite.
 
 This is a placement *identity*, not a claim that a diagnostic outline has passed
-Phase 1.  It binds one immutable model, its selected operation IDs, the actual
-interface bytes, and one OOT compiler tree.  The rewrite and build independently
-recheck these identities; a changed preparation pass or package must not turn a
-selection for one operation into a shape-based choice of another.
+Phase 1. It binds one immutable model, its selected operation IDs, the actual
+interface bytes, one OOT compiler tree, and a reviewed Phase 0 release checked by
+the installed host verifier. The rewrite and build recheck these identities; a changed
+preparation pass or package must not turn a selection for one operation into a
+shape-based choice of another. The release verifier belongs to the optional
+experiment owner, so core does not read experiment paths. This is a trusted-host
+evidence gate, not isolation against arbitrary Python running in that host process.
 """
 
 from __future__ import annotations
@@ -13,9 +16,10 @@ import json
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from importlib.metadata import entry_points
 from pathlib import Path
 
-from merlin.common.digest import is_sha256, sha256_text
+from merlin.common.digest import is_sha256, sha256_bytes, sha256_text
 from merlin.common.tree_hash import hash_tree
 from merlin.targetgen.contract.model_kernel_outline import SCHEMA as OUTLINE_SCHEMA
 from merlin.targetgen.contract.model_kernel_outline import outline_integer_matmuls
@@ -29,6 +33,15 @@ class SelectedKernel:
 
 
 @dataclass(frozen=True)
+class ReleaseBinding:
+    """Data selected by the trusted host; no caller-supplied verifier code."""
+
+    seal_path: Path
+    descriptor: Path
+    application: str
+    review_digest: str
+
+@dataclass(frozen=True)
 class ExactOffloadSelection:
     target: str
     model_sha256: str
@@ -36,7 +49,10 @@ class ExactOffloadSelection:
     transport: str
     abi_sha256: str
     kernels: tuple[SelectedKernel, ...]
+    software_spec_sha256: str
+    capability_contract_sha256: str
     certification_sha256: tuple[str, ...] = ()
+    release_binding: ReleaseBinding | None = None
 
     @classmethod
     def from_outline(
@@ -107,7 +123,10 @@ class ExactOffloadSelection:
             kernels.append(SelectedKernel(operation_id, interface, interface_sha))
         package_sha256 = _package_sha256(Path(package_dir))
         transport, abi_sha256 = _backend_identity(target)
-        return cls(str(target), str(digest), package_sha256, transport, abi_sha256, tuple(kernels))
+        return cls(
+            str(target), str(digest), package_sha256, transport, abi_sha256, tuple(kernels),
+            sha256_bytes(software_spec), sha256_bytes(capability_contract),
+        )
 
     def certify(
         self, package_dir: str | Path, *, runs_root: str | Path, simulator: str, timeout: int
@@ -122,6 +141,7 @@ class ExactOffloadSelection:
             raise ValueError("certification needs an explicit simulator and positive timeout")
         from merlin.targetgen import oot_runner
 
+        self.check_release()
         self.check_package(package_dir)
         self.check_backend_contract()
         root = Path(runs_root)
@@ -143,7 +163,8 @@ class ExactOffloadSelection:
             receipts.append(sha256_text(json.dumps(result, sort_keys=True, default=str)))
         return ExactOffloadSelection(
             self.target, self.model_sha256, self.package_sha256, self.transport,
-            self.abi_sha256, self.kernels, tuple(receipts)
+            self.abi_sha256, self.kernels, self.software_spec_sha256,
+            self.capability_contract_sha256, tuple(receipts), self.release_binding,
         )
 
     @property
@@ -161,9 +182,35 @@ class ExactOffloadSelection:
         if _backend_identity(self.target) != (self.transport, self.abi_sha256):
             raise ValueError("selected transport or pointer ABI changed after exact placement")
 
+    def check_release(self) -> None:
+        binding = self.release_binding
+        if (
+            type(binding) is not ReleaseBinding
+            or not is_sha256(binding.review_digest)
+            or not isinstance(binding.seal_path, Path)
+            or not isinstance(binding.descriptor, Path)
+            or not isinstance(binding.application, str)
+            or not binding.application
+        ):
+            raise ValueError("exact offload needs a verified reviewed Phase 0 release")
+        if _release_verifier()(binding, self) != binding.review_digest:
+            raise ValueError("exact offload release verifier did not return the selected review identity")
+
     @property
     def by_operation_id(self) -> dict[str, SelectedKernel]:
         return {kernel.operation_id: kernel for kernel in self.kernels}
+
+
+def _release_verifier():
+    """Resolve the installed host owner, never executable code carried by a selection.
+
+    This is a trusted-process API, not a sandbox against arbitrary Python running
+    in the host process. An absent or ambiguous owner refuses exact offload.
+    """
+    providers = tuple(entry_points(group="merlin.exact_offload_release"))
+    if len(providers) != 1 or providers[0].name != "reviewed_phase0":
+        raise ValueError("exact offload requires one installed reviewed Phase 0 release verifier")
+    return providers[0].load()
 
 
 def _backend_identity(target: str) -> tuple[str, str]:

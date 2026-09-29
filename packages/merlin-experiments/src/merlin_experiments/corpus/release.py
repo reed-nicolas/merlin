@@ -12,7 +12,7 @@ import hashlib
 import json
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -37,6 +37,128 @@ class VerifiedCorpusSnapshot:
 
     review: dict
     private_instruction_model: Path | None
+
+
+@dataclass(frozen=True)
+class ExactOffloadReleaseBinding:
+    """Reopen the reviewed source lineage whenever exact offload is used.
+
+    The seal alone approves a corpus, not an arbitrary model. This adapter also
+    requires the model and both authored contracts to be exact selected Phase 0
+    evidence sources. A transformed model needs its own selected capture receipt.
+    """
+
+    seal_path: Path
+    descriptor: Path
+    application: str
+    review_digest: str
+
+    def verify(self, selection) -> None:
+        from merlin.common.digest import sha256_bytes
+
+        from ..phase0.evidence import load_exported_evidence
+        from ..runner import fingerprint
+
+        review = verify(self.seal_path, self.descriptor)
+        if review["review_digest"] != self.review_digest:
+            raise SpecError("exact offload release review identity changed")
+        root = Path(review["release"])
+        prepared = _read(root / "private" / "preparation.json")
+        lineage = prepared.get("generation_lineage")
+        if not isinstance(lineage, dict):
+            raise SpecError("exact offload requires a lineage-bound Phase 0 release")
+        plan, attempt, generated = source_run(Path(prepared["source_run"]))
+        phase = plan["phases"]["0"]
+        selected = phase["inputs"]
+        if (
+            plan.get("target") != selection.target
+            or prepared.get("target") != selection.target
+            or prepared.get("source_plan_sha256") != fingerprint(Path(prepared["source_run"]) / "resolved-plan.json")
+            or prepared.get("source_output_sha256") != attempt["output_sha256"]
+            or prepared.get("source_descriptor_sha256") != fingerprint(Path(selected["descriptor"]))
+            or generation_lineage(plan, generated) != lineage
+        ):
+            raise SpecError("exact offload differs from the sealed Phase 0 source run")
+        bundle_path = plan.get("phase0_evidence_bundle")
+        if not isinstance(bundle_path, str) or not bundle_path:
+            raise SpecError("exact offload release has no selected Phase 0 evidence bundle")
+        bundle = Path(bundle_path)
+        if fingerprint(bundle / "evidence-manifest.json") != lineage.get("evidence_manifest_sha256"):
+            raise SpecError("exact offload Phase 0 evidence differs from sealed generation lineage")
+        evidence = load_exported_evidence(bundle)
+        if evidence.target != selection.target or evidence.status != "verified":
+            raise SpecError("exact offload requires verified same-target Phase 0 evidence")
+        inventory_identity = evidence.application_inventory_identity
+        inventory = evidence.application_inventory
+        if (
+            not isinstance(inventory_identity, dict)
+            or inventory_identity.get("status") != "digest_bound"
+            or not isinstance(inventory, dict)
+            or not isinstance(inventory.get("applications"), dict)
+        ):
+            raise SpecError("exact offload requires a digest-bound application inventory")
+        application = inventory["applications"].get(self.application)
+        if not isinstance(application, dict) or application.get("capture_sha256") != selection.model_sha256:
+            raise SpecError("exact offload model is not the selected Phase 0 application capture")
+        inventory_sources = [source for source in evidence.source_snapshots if source.role == "application-inventory"]
+        if len(inventory_sources) != 1:
+            raise SpecError("exact offload application inventory has no unique selected source")
+        capture_source = application.get("capture_source_path")
+        if not isinstance(capture_source, str) or not capture_source:
+            raise SpecError("exact offload application capture has no selected source path")
+        capture_path = Path(capture_source)
+        if not capture_path.is_absolute():
+            capture_path = inventory_sources[0].path.parent / capture_path
+        for role, selected_path, expected in (
+            ("software-spec", selected.get("software_spec"), selection.software_spec_sha256),
+            ("target-contract", selected.get("capability_contract"), selection.capability_contract_sha256),
+            (f"application-capture:{self.application}", str(capture_path), selection.model_sha256),
+        ):
+            sources = [source for source in evidence.source_snapshots if source.role == role]
+            if (
+                len(sources) != 1
+                or not isinstance(selected_path, str)
+                or sources[0].path.resolve() != Path(selected_path).resolve()
+                or sha256_bytes(sources[0].content) != expected
+            ):
+                raise SpecError(f"exact offload {role} bytes are not selected by the reviewed Phase 0 release")
+        if (
+            verify(self.seal_path, self.descriptor) != review
+            or fingerprint(bundle / "evidence-manifest.json") != lineage["evidence_manifest_sha256"]
+        ):
+            raise SpecError("exact offload release or selected evidence changed during verification")
+
+
+def verify_exact_offload_binding(binding, selection) -> str:
+    """Installed host verifier for core's data-only exact release binding."""
+    from merlin.llvmlower.exact_offload import ReleaseBinding
+
+    if type(binding) is not ReleaseBinding:
+        raise SpecError("exact offload release binding must be core's data-only record")
+    ExactOffloadReleaseBinding(
+        binding.seal_path, binding.descriptor, binding.application, binding.review_digest
+    ).verify(selection)
+    return binding.review_digest
+
+
+def bind_exact_offload(selection, *, seal_path: Path, descriptor: Path, application: str):
+    """Attach the host-owned reviewed release verifier to a core exact selection.
+
+    This is a read-only trusted-host gate, not an in-process sandbox. Core has no
+    dependency on experiment orchestration; its numerical oracle and rewrite
+    resolve the installed verifier again at use time.
+    """
+    if not isinstance(application, str) or not application:
+        raise SpecError("exact offload requires an explicit application label")
+    from merlin.llvmlower.exact_offload import ReleaseBinding
+
+    review = verify(seal_path, descriptor)
+    binding = ReleaseBinding(
+        seal_path.expanduser().absolute(), descriptor.expanduser().absolute(),
+        application, review["review_digest"],
+    )
+    verify_exact_offload_binding(binding, selection)
+    return replace(selection, release_binding=binding)
 
 
 def _read(path: Path) -> dict:

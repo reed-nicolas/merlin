@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -162,10 +163,12 @@ def test_exact_integer_model_body_outlines_a_compilable_interface_kernel(tmp_pat
 
 def test_exact_model_selection_reaches_device_rewrite_without_shape_redecision(tmp_path, monkeypatch):
     """JSON edits cannot admit a candidate; a re-derived and certified byte/ID can route."""
-    from merlin.llvmlower.device_offload import load_sidecar, rewrite_prepared_file
-    from merlin.llvmlower.exact_offload import ExactOffloadSelection
-    from merlin.targetgen import oot_runner
     import yaml
+
+    from merlin.llvmlower import exact_offload
+    from merlin.llvmlower.device_offload import load_sidecar, rewrite_prepared_file
+    from merlin.llvmlower.exact_offload import ExactOffloadSelection, ReleaseBinding
+    from merlin.targetgen import oot_runner
 
     root = repo_root() / "examples/gemmini/target"
     model = _INTEGER_BODY.encode()
@@ -217,6 +220,29 @@ def test_exact_model_selection_reaches_device_rewrite_without_shape_redecision(t
     prepared.write_text(_INTEGER_BODY)
     with pytest.raises(ValueError, match="no independent accelerator certification"):
         rewrite_prepared_file(prepared, tmp_path / "before_cert", "gemmini", exact_selection=selection)
+    with pytest.raises(ValueError, match="verified reviewed Phase 0 release"):
+        rewrite_prepared_file(
+            prepared, tmp_path / "tuple_only", "gemmini",
+            exact_selection=replace(selection, certification_sha256=("0" * 64,)),
+        )
+    with pytest.raises(ValueError, match="verified reviewed Phase 0 release"):
+        selection.certify(package, runs_root=tmp_path / "unbound_runs", simulator="test_oracle", timeout=3)
+
+    # Test-only installed-owner stand-in: the host release adapter has its own tests.
+    class SyntheticReleaseBinding:
+        review_digest = "a" * 64
+
+        def verify(self, _selection):
+            return None
+
+    with pytest.raises(ValueError, match="verified reviewed Phase 0 release"):
+        replace(selection, release_binding=SyntheticReleaseBinding()).check_release()
+    binding = ReleaseBinding(tmp_path / "seal.json", tmp_path / "descriptor.yaml", "app", "a" * 64)
+    monkeypatch.setattr(exact_offload, "_release_verifier", lambda: lambda _binding, _selection: None)
+    with pytest.raises(ValueError, match="did not return the selected review identity"):
+        replace(selection, release_binding=binding).check_release()
+    monkeypatch.setattr(exact_offload, "_release_verifier", lambda: lambda _binding, _selection: binding.review_digest)
+    selection = replace(selection, release_binding=binding)
 
     def skipped_certify(_package, _interface, **_kwargs):
         return {"status": "pass", "oracle": {"result": "skipped"}}
@@ -239,6 +265,9 @@ def test_exact_model_selection_reaches_device_rewrite_without_shape_redecision(t
     assert rewrite.moved == 1
     sidecar = load_sidecar(tmp_path / "build")
     assert sidecar["routed"][0]["operation_id"] == operation_id
+    assert sidecar["release_review_digest"] == binding.review_digest
+    assert sidecar["software_spec_sha256"] == hashlib.sha256(spec).hexdigest()
+    assert sidecar["capability_contract_sha256"] == hashlib.sha256(contract).hexdigest()
     assert next(iter(sidecar["expected_interfaces"].values()))["sha256"] == (
         reviewed["candidates"][0]["interface_sha256"]
     )
@@ -262,6 +291,7 @@ def test_exact_model_selection_reaches_device_rewrite_without_shape_redecision(t
         normalized_outline, model=normalized_bytes, target="gemmini", software_spec=spec,
         capability_contract=contract, package_dir=package, operation_ids=(normalized_id,),
     )
+    normalized_selection = replace(normalized_selection, release_binding=binding)
     monkeypatch.setattr(
         oot_runner, "certify",
         lambda _package, interface, **_kwargs: {

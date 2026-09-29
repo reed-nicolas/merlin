@@ -66,6 +66,9 @@ class DeviceRewrite:
     transport: str | None = None
     abi_sha256: str | None = None
     certification_sha256: tuple[str, ...] = ()
+    release_review_digest: str | None = None
+    software_spec_sha256: str | None = None
+    capability_contract_sha256: str | None = None
     #: symbol -> exact Phase 0 interface bytes and hash, if selected by operation ID.
     expected_interfaces: dict[str, dict[str, str]] = field(default_factory=dict)
 
@@ -95,6 +98,9 @@ class DeviceRewrite:
                     "transport": self.transport,
                     "abi_sha256": self.abi_sha256,
                     "certification_sha256": list(self.certification_sha256),
+                    "release_review_digest": self.release_review_digest,
+                    "software_spec_sha256": self.software_spec_sha256,
+                    "capability_contract_sha256": self.capability_contract_sha256,
                     "expected_interfaces": self.expected_interfaces,
                 },
                 indent=1,
@@ -274,6 +280,7 @@ def rewrite_contractions_to_device(
     if exact_selection is not None and not exact_selection.certified:
         raise ValueError("exact operation selection has no independent accelerator certification")
     if exact_selection is not None:
+        exact_selection.check_release()
         exact_selection.check_backend_contract()
     if exact_selection is None and select is None:
         return DeviceRewrite(device=device, skipped=(("all", "no selector supplied, so nothing is routed"),))
@@ -411,6 +418,9 @@ def rewrite_contractions_to_device(
         transport=exact_selection.transport if exact_selection is not None else None,
         abi_sha256=exact_selection.abi_sha256 if exact_selection is not None else None,
         certification_sha256=exact_selection.certification_sha256 if exact_selection is not None else (),
+        release_review_digest=exact_selection.release_binding.review_digest if exact_selection is not None else None,
+        software_spec_sha256=exact_selection.software_spec_sha256 if exact_selection is not None else None,
+        capability_contract_sha256=exact_selection.capability_contract_sha256 if exact_selection is not None else None,
         expected_interfaces=expected_interfaces,
     )
     if sidecar_dir is not None:
