@@ -143,6 +143,21 @@ def _verify_phase0_sources(plan: dict) -> None:
             except (OSError, ValueError) as exc:
                 raise SpecError(f"frozen Phase 0 sources changed: {exc}") from exc
             continue
+        selection = command.get("phase0_m2m_selection")
+        if selection is not None:
+            from .phase0.m2m_runtime import observe
+
+            try:
+                profile = command["inputs"].get("synth_profile")
+                current = observe(
+                    Path(selection["root"]),
+                    Path(selection["python"]),
+                    synth_profile=Path(profile) if profile else None,
+                )
+            except (OSError, ValueError) as exc:
+                raise SpecError(f"selected Model2MLIR runtime is unavailable: {exc}") from exc
+            if current != selection:
+                raise SpecError("selected Model2MLIR runtime changed before freezing")
         entrypoint, expected = _phase0_source_inputs()
         if command["env"].get("PYTHONSAFEPATH") != "1" or command["env"].get("PYTHONPATH", "").split(os.pathsep)[
             0
@@ -390,6 +405,8 @@ def resolve_plan(
     phase0_hidden_profile: Path | None = None,
     phase0_rtl_facts: Path | None = None,
     phase0_evidence_mode: str | None = None,
+    phase0_m2m_root: Path | None = None,
+    phase0_m2m_python: Path | None = None,
 ) -> dict:
     from merlin.common.paths import out_dir, repo_root
 
@@ -405,6 +422,8 @@ def resolve_plan(
         raise SpecError("select both --corpus-seal and --bundle-manifest for a new reviewed Phase 1 run")
     if (phase0_conformance_spec is None) != (phase0_synth_profile is None):
         raise SpecError("select both --phase0-conformance-spec and --phase0-synth-profile")
+    if (phase0_m2m_root is None) != (phase0_m2m_python is None):
+        raise SpecError("select both --phase0-m2m-root and --phase0-m2m-python")
     if (
         any(
             path is not None
@@ -414,6 +433,8 @@ def resolve_plan(
                 phase0_hidden_profile,
                 phase0_rtl_facts,
                 phase0_evidence_mode,
+                phase0_m2m_root,
+                phase0_m2m_python,
             )
         )
         and phase != "0"
@@ -436,6 +457,9 @@ def resolve_plan(
         if phase0_evidence_mode not in ("diagnostic", "verified"):
             raise SpecError("Phase 0 evidence mode must be diagnostic or verified")
         phase0_selection["evidence_mode"] = phase0_evidence_mode
+    for name, path in (("m2m_root", phase0_m2m_root), ("m2m_python", phase0_m2m_python)):
+        if path is not None:
+            phase0_selection[name] = str(path.expanduser().absolute())
     commands = {}
     corpus_closures = {}
     phase1_operator_inputs = None
@@ -468,6 +492,24 @@ def resolve_plan(
                 config["bundle"] = read_yaml(selected_bundle).get("bundle_id")
             adapter.validate(config)
         command = adapter.resolve(spec, config, root, destination)
+        if adapter.name == "capsule_derivation" and command.get("phase0_m2m_selection"):
+            if not command["inputs"].get("software_spec"):
+                raise SpecError("selected Model2MLIR capture requires explicit Phase 0 software evidence")
+            if config.get("evidence_mode") != "diagnostic":
+                raise SpecError("live Model2MLIR capture runtime is diagnostic only; select diagnostic evidence mode")
+            from .phase0.m2m_runtime import observe
+
+            choice = command["phase0_m2m_selection"]
+            try:
+                profile = command["inputs"].get("synth_profile")
+                command["phase0_m2m_selection"] = observe(
+                    Path(choice["m2m_root"]),
+                    Path(choice["m2m_python"]),
+                    synth_profile=Path(profile) if profile else None,
+                )
+                command["input_owner_roots"].append(command["phase0_m2m_selection"]["base"])
+            except (OSError, ValueError) as exc:
+                raise SpecError(f"invalid selected Model2MLIR runtime: {exc}") from exc
         commands[number] = command
         inputs[f"phase{number}:entrypoint"] = command["entrypoint"]
         for name, value in command["inputs"].items():

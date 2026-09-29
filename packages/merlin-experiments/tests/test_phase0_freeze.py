@@ -310,3 +310,86 @@ def test_legacy_metadata_does_not_trigger_source_freezing():
 def test_explicit_software_selection_requires_planned_evidence():
     with pytest.raises(ValueError, match="lacks planned"):
         freeze.stage({"phases": {"0": {"inputs": {"software_spec": "explicit.yaml"}}}})
+
+
+def test_selected_m2m_runtime_is_explicit_and_rechecked_without_original_source(tmp_path):
+    from merlin_experiments.phase0 import m2m_runtime
+
+    source = tmp_path / "model2mlir"
+    (source / "m2m").mkdir(parents=True)
+    (source / "m2m/__init__.py").write_text("# selected package\n")
+    (source / "workloads" / "small_model").mkdir(parents=True)
+    (source / "workloads" / "small_model" / "loader.py").write_text("# selected model loader\n")
+    synth = tmp_path / "synthesis.yaml"
+    synth.write_text(yaml.safe_dump({"capsules": [{"kind": "model", "model": "small_model"}]}))
+    base = tmp_path / "python-base"
+    (base / "bin").mkdir(parents=True)
+    executable = base / "bin/python3.12"
+    executable.write_bytes(b"selected interpreter bytes")
+    executable.chmod(0o755)
+    venv = tmp_path / "capture-venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text(f"home = {base / 'bin'}\n")
+    (venv / "bin/python").symlink_to(executable)
+    (venv / "site-module.py").write_text("VERSION = 1\n")
+
+    selected = m2m_runtime.observe(source, venv / "bin/python", synth_profile=synth)
+    frozen = m2m_runtime.stage(selected, tmp_path / "run/m2m-source")
+    shutil.rmtree(source)
+    m2m_runtime.verify(frozen)
+    assert (Path(frozen["frozen_root"]) / "workloads/small_model/loader.py").is_file()
+    assert m2m_runtime.environment(frozen)["MERLIN_MODEL2MLIR"] == frozen["frozen_root"]
+    assert frozen["phase0_admission"] == "not_granted"
+    (venv / "site-module.py").write_text("VERSION = 2\n")
+    with pytest.raises(ValueError, match="host runtime changed"):
+        m2m_runtime.verify(frozen)
+
+
+def test_installed_phase0_freezes_selected_m2m_routing_and_resumes(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, "path")
+    source = tmp_path / "selected-m2m"
+    (source / "m2m").mkdir(parents=True)
+    (source / "m2m/__init__.py").write_text("# selected package\n")
+    base = tmp_path / "selected-base"
+    (base / "bin").mkdir(parents=True)
+    executable = base / "bin/python3.12"
+    executable.write_bytes(b"selected interpreter bytes")
+    executable.chmod(0o755)
+    venv = tmp_path / "selected-venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text(f"home = {base / 'bin'}\n")
+    (venv / "bin/python").symlink_to(executable)
+    document = yaml.safe_load(fixture["definition"].read_text())
+    document["phases"]["0"]["config"].update(m2m_root=str(source), m2m_python=str(venv / "bin/python"))
+    fixture["definition"].write_text(yaml.safe_dump(document))
+    driver = tmp_path / "run-selected.py"
+    driver.write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "from merlin_experiments.runner import resolve_plan, run\n"
+        "from merlin_experiments.spec import load_spec\n"
+        "raise SystemExit(run(resolve_plan(load_spec(os.environ['DEFINITION']), phase='0', "
+        "run_dir=Path(os.environ['RUN_DIR']))))\n"
+    )
+    environment = dict(fixture["environment"], DEFINITION=str(fixture["definition"]), RUN_DIR=str(fixture["run"]))
+    result = subprocess.run(
+        [sys.executable, "-P", str(driver)],
+        cwd=fixture["workspace"],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    logs = "\n".join(path.read_text() for path in fixture["run"].glob("*.log"))
+    assert result.returncode == 0, result.stdout + result.stderr + logs
+    plan = json.loads((fixture["run"] / "resolved-plan.json").read_text())
+    selected = plan["phases"]["0"]["phase0_m2m_selection"]
+    assert Path(selected["frozen_root"]).is_relative_to(fixture["run"])
+    assert plan["phases"]["0"]["env"]["MERLIN_M2M_DIR"] == selected["frozen_root"]
+    assert selected["phase0_admission"] == "not_granted"
+    shutil.rmtree(source)
+    freeze.verify(plan)
+    from merlin_experiments.runner import resume
+
+    monkeypatch.setenv("MERLIN_OUT_ROOT", plan["storage_root"])
+    assert resume(fixture["run"]) == 0

@@ -3,9 +3,9 @@ title: model2MLIR frontend
 kind: guide
 status: current
 owner: frontends
-last_verified: 2026-09-27
+last_verified: 2026-09-29
 related: [getting_started, extending_the_stack, phase0_specification, model_lowering, reproducibility]
-code_refs: [src/merlin/frontends, src/merlin/capture/bundle.py, src/merlin/targetgen/_m2m_capture_worker.py, src/merlin/targetgen/frontend_trace.py]
+code_refs: [src/merlin/frontends, src/merlin/capture/bundle.py, src/merlin/targetgen/_m2m_capture_worker.py, src/merlin/targetgen/frontend_trace.py, packages/merlin-experiments/src/merlin_experiments/phase0/m2m_runtime.py]
 ---
 
 # model2MLIR frontend
@@ -35,6 +35,13 @@ install framework/nightly dependencies. Inspect its choices before running it;
 record the resulting repository revisions and package versions for each capture.
 An installed dependency or a filename alone does not establish a reproducible
 toolchain or a supported model precision.
+
+For a frozen Phase 0 diagnostic run, select both the checkout and interpreter
+explicitly with `--phase0-m2m-root` and `--phase0-m2m-python`; shell aliases are
+not inherited. The run's `phase0/private/m2m-runtime.json` records copied M2M
+source/workload inventories and the checked host Python environment. It does
+not certify a sealed capture or grant Phase 0 admission. See
+[Phase 0 specification](phase0_specification.md#select-a-frontend-capture-runtime-for-a-frozen-diagnostic-run).
 
 Weights and model loaders are separate inputs. Select the intended checkpoint,
 revision, representative input source and preprocessing explicitly. Loading a

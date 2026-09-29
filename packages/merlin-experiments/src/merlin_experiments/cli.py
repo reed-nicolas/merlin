@@ -55,6 +55,12 @@ def main(argv: list[str] | None = None) -> int:
             choices=("diagnostic", "verified"),
             help="diagnostic preserves unknowns; verified refuses unresolved required evidence",
         )
+        child.add_argument(
+            "--phase0-m2m-root", type=Path, help="explicit Model2MLIR source root for diagnostic capture"
+        )
+        child.add_argument(
+            "--phase0-m2m-python", type=Path, help="explicit Model2MLIR venv Python for diagnostic capture"
+        )
     commands.add_parser("status").add_argument("run_dir", type=Path)
     commands.add_parser("lineage", help="read frozen phase inputs and handoffs without executing engines").add_argument(
         "run_dir", type=Path
@@ -211,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
                 phase0_rtl_facts=args.phase0_rtl_facts,
                 phase0_evidence_mode=args.phase0_evidence_mode,
                 phase0_hidden_profile=args.phase0_hidden_profile,
+                phase0_m2m_root=args.phase0_m2m_root,
+                phase0_m2m_python=args.phase0_m2m_python,
             )
             if args.verb == "inspect":
                 result = plan

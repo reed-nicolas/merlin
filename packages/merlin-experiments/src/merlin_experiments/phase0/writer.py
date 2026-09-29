@@ -26,8 +26,19 @@ from .numerics import (
 
 def _m2m_unavailable_reason() -> str:
     if "MERLIN_PHASE0_FROZEN_SOURCE_MAP" in os.environ:
+        if os.environ.get("MERLIN_PHASE0_M2M_REQUIRED") == "1":
+            return "selected Model2MLIR capture runtime is unavailable"
         return "frozen Phase 0 has no selected Model2MLIR capture runtime"
     return "model2MLIR capture runtime unavailable (set MERLIN_M2M_PYTHON)"
+
+
+def _skip_or_require_m2m(entry: dict) -> None:
+    reason = _m2m_unavailable_reason()
+    required = os.environ.get("MERLIN_PHASE0_M2M_REQUIRED") == "1"
+    verified = os.environ.get("MERLIN_PHASE0_EVIDENCE_MODE") == "verified"
+    if required or verified:
+        raise ValueError(f"{entry['name']}: {reason}; requested frontend capsule cannot be omitted")
+    print(f"  [skip] {entry['name']}: {reason}")
 
 
 def _entry_regime(entry, binding):
@@ -501,7 +512,7 @@ def _write_capsule_inner(entry, binding, out_root, facts_sha: str = ""):
             return CSRC.write_model_capsule(entry, eb, out_root, artifact=artifact)
         src = CSRC.PytorchRefSource()
         if not src.available():
-            print(f"  [skip] {entry['name']}: {_m2m_unavailable_reason()}")
+            _skip_or_require_m2m(entry)
             return None
         # A DERIVED micro model writes its own loader first. Without this the entry names a loader that
         # does not exist, and the capsule that the composition axis exists to produce cannot be built.
@@ -541,10 +552,9 @@ def _write_capsule_inner(entry, binding, out_root, facts_sha: str = ""):
 
         src = CSRC.PytorchRefSource()
         if not src.available():
-            # A pytorch capsule needs the m2m venv (torch) at generation time. It is additive: skip it
-            # (loudly) rather than sink the whole target, so a checkout without the venv still regenerates
-            # the direct-MLIR corpus. A capture that STARTS but fails (opaque/crash) still raises.
-            print(f"  [skip] {entry['name']}: {_m2m_unavailable_reason()}")
+            # Diagnostic derivation without a selected runtime may skip a
+            # frontend capsule. Selected or verified runs must fail closed.
+            _skip_or_require_m2m(entry)
             return None
         return CSRC.write_pytorch_capsule(entry, eb, out_root, source=src)
     # Spec source: a capsule whose PROGRAM + bit-exact golden come from the specir verification spec itself

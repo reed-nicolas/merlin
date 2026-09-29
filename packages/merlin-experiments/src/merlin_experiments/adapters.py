@@ -196,6 +196,8 @@ class Adapter:
                 "hardware_spec",
                 "rtl_facts",
                 "evidence_mode",
+                "m2m_root",
+                "m2m_python",
             }
             if explicit & config.keys():
                 if not {"recipe", "performance_template"} <= config.keys():
@@ -204,6 +206,8 @@ class Adapter:
                     raise SpecError("explicit phase-0 recipe inputs are mutually exclusive with profiles_root")
                 if config.get("comparison_manifest"):
                     raise SpecError("explicit phase-0 recipe does not support comparison_manifest")
+            if ("m2m_root" in config) != ("m2m_python" in config):
+                raise SpecError("select both m2m_root and m2m_python for a frozen capture runtime")
 
     def resolve(self, spec, config: dict, root: Path, run_dir: Path) -> dict:
         from merlin.common.paths import out_dir, python_import_roots
@@ -212,7 +216,12 @@ class Adapter:
         inputs = {}
         for name, option in self.options.items():
             if name in values and option.kind in ("input", "workspace", "path"):
-                values[name] = str(spec.resolve(values[name]))
+                if self.name == "capsule_derivation" and name == "m2m_python":
+                    # A venv's bin/python is normally a symlink to base Python.
+                    # Keep its lexical path so the selected venv is not lost.
+                    values[name] = os.path.abspath(spec.path.parent / Path(values[name]).expanduser())
+                else:
+                    values[name] = str(spec.resolve(values[name]))
                 if option.kind == "input":
                     inputs[name] = values[name]
         if self.name == "measured_claims":
@@ -297,6 +306,11 @@ class Adapter:
             "cwd": str(root),
             "inputs": inputs,
             **(
+                {"phase0_m2m_selection": {name: values[name] for name in ("m2m_root", "m2m_python")}}
+                if self.name == "capsule_derivation" and "m2m_root" in values
+                else {}
+            ),
+            **(
                 {"requires_reviewed_corpus": values.get("require_reviewed_corpus", False)}
                 if self.name == "capsule_bench"
                 else {}
@@ -308,6 +322,11 @@ class Adapter:
             "workspaces": [
                 values[name] for name, option in self.options.items() if name in values and option.kind == "workspace"
             ],
+            **(
+                {"input_owner_roots": [values["m2m_root"], str(Path(values["m2m_python"]).parent.parent)]}
+                if self.name == "capsule_derivation" and "m2m_root" in values
+                else {}
+            ),
         }
 
 
@@ -338,6 +357,8 @@ ADAPTERS = {
             "smt_profile": Option("input"),
             "hidden_profile": Option("input"),
             "comparison_manifest": Option("bool"),
+            "m2m_root": Option("path", flag=""),
+            "m2m_python": Option("path", flag=""),
         },
         module=PHASE0_MODULE,
     ),

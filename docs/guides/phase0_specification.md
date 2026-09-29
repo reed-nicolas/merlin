@@ -3,7 +3,7 @@ title: Defining and inspecting Phase 0 inputs
 kind: guide
 status: current
 owner: targetgen
-last_verified: 2026-09-28
+last_verified: 2026-09-29
 related: [generating_capsules, adding_a_target, integrations]
 code_refs:
   - src/merlin/targetgen/software_spec.py
@@ -11,6 +11,7 @@ code_refs:
   - src/merlin/targetgen/rtl/circt_introspect.py
   - packages/merlin-experiments/src/merlin_experiments/phase0/evidence.py
   - packages/merlin-experiments/src/merlin_experiments/phase0/generation.py
+  - packages/merlin-experiments/src/merlin_experiments/phase0/m2m_runtime.py
 ---
 
 # Define the software contract before generating tests
@@ -19,6 +20,31 @@ Phase 0 combines selected hardware evidence, a software specification, and workl
 policy. See the matching [Atlas](../../examples/atlas/phase0/README.md) and
 [Gemmini](../../examples/gemmini/phase0/README.md) examples. The installed generator belongs
 to `merlin-experiments`; target-specific inputs belong to examples or selected OOT support.
+
+## Select a frontend capture runtime for a frozen diagnostic run
+
+Frozen Phase 0 never inherits `MERLIN_M2M_DIR`, `MERLIN_MODEL2MLIR`, or
+`MERLIN_M2M_PYTHON` from the invoking shell. If the selected synthesis profile
+requires live PyTorch capsules, provide both `--phase0-m2m-root` and
+`--phase0-m2m-python` to `merlin experiment run ... --phase 0`, with
+`--phase0-evidence-mode diagnostic`. The same two fields may be declared as
+`m2m_root` and `m2m_python` in a Phase 0 experiment definition. Neither field
+belongs in a target's SW spec.
+
+The run copies the selected `m2m` package and exact workload directories named
+by live model entries, then records their membership and bytes in
+`phase0/private/m2m-runtime.json`. It checks the selected virtual environment
+and base Python byte inventories before freezing and on resume, and routes all
+M2M aliases to the copied source. A requested frontend capsule cannot silently
+disappear when the selected interpreter becomes unavailable. A workload that
+names a different interpreter or external source requires a separate materialized
+capture; it is not silently run in the wrong environment.
+
+This is **diagnostic host execution**, not verified capture admission: the venv
+and base Python remain at selected host paths, native libraries and arbitrary
+loader file reads are not isolated, and old capture receipts gain no historical
+authentication. For a reviewed corpus, select newly materialized, independently
+verified capture inputs rather than promoting this runtime receipt.
 
 ## Start with five decisions
 
