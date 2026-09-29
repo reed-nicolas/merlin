@@ -66,6 +66,13 @@ relative command-line output path still yields an absolute source reference.
 Phase 0 later copies the receipt-bound weights and rewrites that one reference
 to the capsule-local sidecar; do not edit the captured MLIR by hand.
 FP32 captures inventory frontend demand; they do not imply FP32 device support.
+If the selected Model2MLIR build lacks the same-conversion bundle/receipt APIs,
+`--materialize-bundle` fails before capture. For raw frontend inventory only,
+replace it with `--diagnostic-model-copy` and use a fresh output directory.
+This copies the exact converted MLIR to `model.mlir` and hashes the observed
+files in `diagnostic-capture.json`, but emits no `capture_receipt.json`, runtime
+input/golden ABI, or Phase 0 admission. It cannot substitute for a verified
+materialized derivation input.
 
 TinyLlama, SmolVLA and ResNet50 remain held-out validation workloads. Their
 captures and layer frequencies do not select or tune the derivation corpus.
@@ -95,9 +102,13 @@ revision. Before freezing a run that will execute those members, select
 `MERLIN_EXT_CHIPYARD` for the Chipyard tree containing the concrete Gemmini L3
 simulator. For separate capture/derivation, set `MERLIN_M2M_DIR` to the selected
 Model2MLIR source tree and `MERLIN_M2M_PYTHON` to its pinned interpreter.
-The frozen Phase 0 runner does not inherit those ambient variables: it binds
-already-materialized captures, while on-demand PyTorch-sourced capsules remain
-unwritten until their capture tool/runtime has an explicit frozen selection.
+The frozen Phase 0 runner does not inherit those ambient variables. For live
+PyTorch-sourced capsules, explicitly select the source tree and interpreter
+with `--phase0-m2m-root` and `--phase0-m2m-python` on the run command. That
+selection copies and checks the chosen source package and workload loaders,
+and checks the host interpreter tree on launch and resume. It remains a
+diagnostic managed-host execution, not a sandboxed capture-source attestation
+or verified Phase 0 admission.
 The L3 performance members cannot execute if the
 simulator cannot be resolved; a missing exporter also leaves source capsules unwritten.
 Static-int8 source capsules require `m2m/capture/pt2e_integerize.py` in the
@@ -223,14 +234,17 @@ from an older provider cannot be reused just because their MLIR parses.
 Select the realized requirement/profile together for inspect, preflight and run:
 the selected materialized bundles already bind their Model2MLIR capture outputs.
 The frozen runner does not recapture from an ambient sibling checkout or
-inherit a live capture interpreter. Source capsules that still need one are
-reported as omissions, not as verified Phase 0 coverage.
+inherit a live capture interpreter. Source capsules require the explicit
+diagnostic runtime selection below; if it or a required API is missing they
+remain omissions, not verified Phase 0 coverage.
 
 ```sh
 merlin experiment run gemmini-functional --phase 0 \
   --phase0-rtl-facts "$RTL_ROOT/facts.json" \
   --phase0-conformance-spec "$REALIZED_DERIVATION_ROOT/requirements.yaml" \
   --phase0-synth-profile "$REALIZED_DERIVATION_ROOT/synthesis.yaml" \
+  --phase0-m2m-root "$MODEL2MLIR_ROOT" \
+  --phase0-m2m-python "$CAPTURE_PYTHON" \
   --phase0-evidence-mode diagnostic --run-dir "$RUN_ROOT"
 ```
 

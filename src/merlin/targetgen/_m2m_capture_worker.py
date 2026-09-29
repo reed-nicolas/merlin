@@ -27,6 +27,7 @@ import json
 import math
 import os
 import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -45,6 +46,48 @@ _SCHEME = {
 }
 
 _CAPTURE_ABI_VERSION = 6
+
+
+def _diagnostic_model_copy(out: Path, loader: Path) -> None:
+    """Expose the exact converted MLIR for inventory, never as an admitted bundle.
+
+    This deliberately omits the capture receipt and runtime input/golden ABI. An
+    older Model2MLIR may have converted the model but cannot provide the modern
+    same-conversion materialization contract.
+    """
+    def digest(path: Path) -> str:
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+
+    if (out / "capture_receipt.json").exists() or (out / "model.mlir").exists():
+        raise ValueError("diagnostic copy cannot reuse a materialized capture directory")
+    shutil.copyfile(out / "linalg.mlir", out / "model.mlir")
+    names = (
+        "model.mlir",
+        "linalg.mlir",
+        "weights.safetensors",
+        "weights.safetensors.manifest.json",
+        "inputs.json",
+        "golden.json",
+        "frontend-trace.json",
+        "pytorch-opset.json",
+        "meta.json",
+    )
+    artifacts = {
+        name: {"bytes": (out / name).stat().st_size, "sha256": digest(out / name)}
+        for name in names
+    }
+    record = {
+        "schema": "merlin.diagnostic_m2m_model.v1",
+        "status": "diagnostic_raw_conversion",
+        "phase0_admission": "not_granted",
+        "source_closure_verified": False,
+        "materialized_abi": False,
+        "reason": "raw conversion has no same-conversion Model2MLIR bundle or producer capture receipt",
+        "loader": {"path": str(loader.absolute()), "sha256": digest(loader)},
+        "artifacts": artifacts,
+    }
+    (out / "diagnostic-capture.json").write_text(json.dumps(record, sort_keys=True, indent=2) + "\n")
 
 
 def _seed_capture(seed: int, torch) -> dict:
@@ -494,7 +537,14 @@ def main(argv=None) -> int:
         action="store_true",
         help="also emit the full model2MLIR runtime bundle from this exact conversion and model instance",
     )
+    ap.add_argument(
+        "--diagnostic-model-copy",
+        action="store_true",
+        help="copy raw converted MLIR for inventory with byte hashes, without a capture receipt or Phase 0 admission",
+    )
     a = ap.parse_args(argv)
+    if a.materialize_bundle and a.diagnostic_model_copy:
+        ap.error("--materialize-bundle and --diagnostic-model-copy are mutually exclusive")
     if not 0 <= a.seed < 2**32:
         ap.error("--seed must be an unsigned 32-bit integer")
     if not all(math.isfinite(value) and value >= 0 for value in (a.agreement_atol, a.agreement_rtol)):
@@ -513,10 +563,23 @@ def main(argv=None) -> int:
     import torch
     from m2m.coverage import opaque_report
 
+    if a.materialize_bundle:
+        from m2m.capture.bundle import write_bundle
+
+        required = {"source_path", "capture_trace", "conversion_result"}
+        actual = set(inspect.signature(write_bundle).parameters)
+        if not required <= actual or importlib.util.find_spec("m2m.capture.provenance") is None:
+            raise RuntimeError(
+                "selected Model2MLIR lacks same-conversion bundle/receipt APIs; "
+                "use --diagnostic-model-copy only for unadmitted raw-model inventory"
+            )
+
     # Model2MLIR embeds this path in prov.weights_file. A relative --out would
     # otherwise leave a CWD-relative reference in the saved MLIR, which a
     # relocated/frozen corpus cannot safely resolve against its selected bytes.
     out = Path(a.out).absolute()
+    if a.diagnostic_model_copy and out.exists() and any(out.iterdir()):
+        raise ValueError("diagnostic model copy requires a fresh output directory")
     out.mkdir(parents=True, exist_ok=True)
     determinism = _seed_capture(a.seed, torch)
     modules_before_loader = set(sys.modules)
@@ -885,6 +948,8 @@ def main(argv=None) -> int:
         **provenance,
     }
     (out / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    if a.diagnostic_model_copy:
+        _diagnostic_model_copy(out, Path(a.loader))
     if a.materialize_bundle:
         from m2m.capture.bundle import write_bundle
 
