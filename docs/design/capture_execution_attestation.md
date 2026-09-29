@@ -143,3 +143,19 @@ policy. Neither version is an authenticated historical-execution attestation or
 Phase 0 admission; the result explicitly says `phase0_admission: not_granted`.
 Loaders that read ambient environment values or require checkpoints outside the
 selected trees remain unsupported by this bounded policy.
+
+Phase 0's experiments-owned `assess_sealed_m2m_capture` accepts a selected
+`model.mlir` path and the caller's exact model and capture-receipt SHA-256 digests.
+It requires that path to be the run's `capture/model.mlir`, verifies the adjacent
+materialized receipt, invokes the sealed v2 replay verifier, and rechecks the
+selected bytes afterward. V2 replay now compares the copied M2M package,
+workload, venv, base Python, and schemas against their selected tree digests,
+and checks the selected worker bytes. The Merlin package tree is compared when
+the schemas were selected within it; an external schema tree is injected into
+the copied package after its original tree digest was recorded, so its complete
+copied bytes remain bound by the sealed snapshot and the schema's own digest.
+The assessment reports `replay_verified_nonadmissible` and
+`phase0_admission: not_granted` on success. The unsigned M2M plan cannot
+authenticate the original clean Git revision or runtime provenance, and the
+selected Python/framework/model-data closure lacks an independent pin. The
+Phase 0 verified-issuer gate therefore remains closed.
