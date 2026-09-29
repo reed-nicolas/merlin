@@ -12,23 +12,23 @@ from merlin_experiments.capture_execution import sealed_m2m
 from merlin_experiments.capture_execution.sealed_m2m import (
     SealedM2MError,
     _capture_api_missing,
-    _frontend_trace_api_missing,
-    _static_integer_reference_api_missing,
     _command,
     _command_v2,
+    _frontend_trace_api_missing,
     _ldd_library_path,
     _policy,
     _recipe_selection,
     _snapshot_tree,
     _source_tree,
+    _static_integer_reference_api_missing,
     prepare_plan,
 )
 from merlin_experiments.phase0.capture_execution_attestation import AttestationNotVerified, require_verified_execution
 
 from merlin.common.paths import module_source_path, schemas_dir
 from merlin.targetgen import application_inventory
-from merlin.targetgen.quant_recipe import digest as recipe_digest
 from merlin.targetgen._m2m_capture_worker import _diagnostic_model_copy
+from merlin.targetgen.quant_recipe import digest as recipe_digest
 
 
 def test_selected_capture_api_refuses_second_conversion_before_runtime_snapshot(tmp_path, monkeypatch):
@@ -203,6 +203,13 @@ def test_v2_materialized_receipt_binds_the_executed_package_worker(tmp_path, mon
     (output / "capture_receipt.json").write_text(json.dumps(receipt))
     with pytest.raises(SealedM2MError, match="snapshotted entrypoints"):
         sealed_m2m._materialized(output, source, output, worker_member=worker_member)
+    receipt["tool"]["executed_entrypoint"]["path"] = "/source/" + worker_member
+    receipt["tool"]["source_sha256"] = {str(source / "m2m-src/m2m/api.py"): sealed_m2m._file_digest(
+        source / "m2m-src/m2m/api.py"
+    )}
+    (output / "capture_receipt.json").write_text(json.dumps(receipt))
+    with pytest.raises(SealedM2MError, match="unsafe M2M source member"):
+        sealed_m2m._materialized(output, source, output, worker_member=worker_member)
 
 
 def test_v2_staged_source_loads_selected_quant_format_registry_without_host_checkout(tmp_path):
@@ -307,7 +314,13 @@ def test_cpu_receipts_replay_only_under_their_selected_policy(tmp_path, monkeypa
             "command_template_sha256": sealed_m2m._digest(template.encode())}
     if not old:
         plan.update({"dtype": "int8", "recipe": {"sha256": "selected"},
-                     "selected_trees": {"schemas": input_identity}})
+                     "m2m_commit": "a" * 40,
+                     "base": "/usr", "merlin_root": "/selected/merlin",
+                     "schemas_root": "/selected/merlin/_data/schemas",
+                     "worker_sha256": "receipt",
+                     "selected_trees": {name: input_identity for name in (
+                         "venv", "base", "m2m", "workload", "merlin", "schemas"
+                     )}})
     receipt = {
         "schema": schema, "status": "pending_replay",
         "issuer_sha256": sealed_m2m._V1_ISSUER_SHA256 if old else "current-issuer", "nonce": "0" * 32,
@@ -322,7 +335,7 @@ def test_cpu_receipts_replay_only_under_their_selected_policy(tmp_path, monkeypa
     (run / "sealed_m2m_pending.json").write_text(json.dumps(receipt))
     monkeypatch.setattr(sealed_m2m, "_validate_snapshots", lambda *_, **__: None)
     monkeypatch.setattr(sealed_m2m, "_snapshot_tree", lambda path: (
-        input_identity if Path(path) in (source, runtime, source / "merlin-src/merlin/_data/schemas")
+        input_identity if Path(path).is_relative_to(source) or Path(path).is_relative_to(runtime)
         else output_identity
     ))
     monkeypatch.setattr(sealed_m2m, "_materialized", lambda *_: materialized)
@@ -342,6 +355,11 @@ def test_cpu_receipts_replay_only_under_their_selected_policy(tmp_path, monkeypa
         receipt["schemas"] = {"sha256": "unselected"}
         (run / "sealed_m2m_pending.json").write_text(json.dumps(receipt))
         with pytest.raises(SealedM2MError, match="schema bytes differ"):
+            sealed_m2m.replay_verify(run)
+        receipt["schemas"] = input_identity
+        receipt["plan"]["selected_trees"]["m2m"] = {"sha256": "unselected"}
+        (run / "sealed_m2m_pending.json").write_text(json.dumps(receipt))
+        with pytest.raises(SealedM2MError, match="selected m2m bytes differ"):
             sealed_m2m.replay_verify(run)
 
 

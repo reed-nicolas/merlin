@@ -17,7 +17,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .python_preflight import _loader_env_reads
@@ -426,8 +426,12 @@ def _materialized(output: Path, source: Path, output_mount: Path,
     ):
         raise SealedM2MError("M2M receipt lacks its complete direct source inventory")
     for name, digest in sources.items():
+        if (not isinstance(name, str) or not name.startswith("m2m/")
+                or PurePosixPath(name).as_posix() != name or ".." in PurePosixPath(name).parts
+                or "\\" in name or "\x00" in name):
+            raise SealedM2MError(f"unsafe M2M source member: {name!r}")
         path = source / "m2m-src" / name
-        if not isinstance(name, str) or ".." in Path(name).parts or not path.is_file() or _file_digest(path) != digest:
+        if not path.is_file() or _file_digest(path) != digest:
             raise SealedM2MError(f"M2M source digest differs: {name}")
     return {"status": result["status"], "receipt_sha256": result["receipt_sha256"]}
 
@@ -620,9 +624,37 @@ def replay_verify(run_dir: Path, *, bwrap_binary: Path | None = None) -> dict[st
     ):
         raise SealedM2MError("sealed M2M snapshot or capture bytes differ")
     if schema == SCHEMA:
-        schemas = _snapshot_tree(source / "merlin-src/merlin/_data/schemas")
-        if schemas != (plan.get("selected_trees") or {}).get("schemas") or schemas != doc.get("schemas"):
-            raise SealedM2MError("selected Merlin schema bytes differ from the v2 plan or receipt")
+        selected_trees = plan.get("selected_trees") or {}
+        if not isinstance(selected_trees, dict):
+            raise SealedM2MError("v2 plan lacks exact selected source/runtime tree identities")
+        commit = plan.get("m2m_commit")
+        if (not isinstance(commit, str) or len(commit) != 40
+                or any(character not in "0123456789abcdef" for character in commit)):
+            raise SealedM2MError("v2 plan lacks a pinned M2M revision identity")
+        selected_roots = {
+            "venv": runtime / "opt/capture-venv",
+            "m2m": source / "m2m-src/m2m",
+            "workload": source / "workload",
+            "schemas": source / "merlin-src/merlin/_data/schemas",
+        }
+        base = plan.get("base")
+        if (not isinstance(base, str) or not base.startswith("/") or base == "/"
+                or Path(base).as_posix() != base or ".." in Path(base).parts):
+            raise SealedM2MError("selected base Python path is absent or unsafe")
+        selected_roots["base"] = runtime / base.lstrip("/")
+        if set(selected_trees) != set(selected_roots) | {"merlin"}:
+            raise SealedM2MError("v2 plan lacks exact selected source/runtime tree identities")
+        # The external-schema policy adds the selected schema tree to the
+        # Merlin package after its original selected-tree digest was taken.
+        if plan.get("schemas_root") == str(Path(str(plan.get("merlin_root"))) / "_data/schemas"):
+            selected_roots["merlin"] = source / "merlin-src/merlin"
+        for name, path in selected_roots.items():
+            if _snapshot_tree(path) != selected_trees[name]:
+                raise SealedM2MError(f"selected {name} bytes differ from the v2 plan")
+        if _file_digest(source / "merlin-src/merlin/targetgen/_m2m_capture_worker.py") != plan.get("worker_sha256"):
+            raise SealedM2MError("selected Merlin worker bytes differ from the v2 plan")
+        if selected_trees["schemas"] != doc.get("schemas"):
+            raise SealedM2MError("selected Merlin schema bytes differ from the v2 receipt")
     materialized = (_materialized(output, source, output) if schema == SCHEMA_V1
                     else _materialized_v2(output, source, output, plan))
     if materialized != doc.get("materialized"):
