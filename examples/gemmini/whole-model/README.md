@@ -76,6 +76,19 @@ The outline's focused test numerically checks its isolated signed `i8×i8→i32`
 interface on a non-square K-tail against scalar arithmetic. It does not execute
 the OOT compiler output, connect the host operations, or compare a model golden.
 
+An opt-in whole-model handoff now exists for *qualified* outlines. Its identity
+is the normalized MLIR file produced by `prepare_for_lowering`, not an earlier
+raw capture that preparation may rewrite. `ExactOffloadSelection.from_outline`
+re-derives the candidate IDs and interfaces from that file and the selected SW
+spec/contract bytes; it refuses the current `unknown` SW admission. Its
+`certify` step runs the selected interface through the OOT numerical oracle
+with an accelerator trace, and only then may `DeviceRouting(exact_selection=...)`
+replace those exact operations. The rewrite and object build recheck model,
+package, transport, pointer ABI and interface identities; unselected operations
+stay on the host path. This is not a full-model numerical certificate. The
+present example has neither reviewed admission nor a demonstrated OOT
+whole-model execution, so its outline remains diagnostic.
+
 For a new numerical accelerator certificate, the compiler must emit
 `compiler_pointer_abi: {version: 1, arguments: [...]}` in its command buffer.
 Merlin compares that asserted pointer order with the selected target runner's

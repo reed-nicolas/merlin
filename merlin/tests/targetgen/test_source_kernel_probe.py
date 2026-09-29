@@ -160,6 +160,136 @@ def test_exact_integer_model_body_outlines_a_compilable_interface_kernel(tmp_pat
     assert outline_integer_matmuls(nonzero_init.encode(), **selection)["candidates"] == []
 
 
+def test_exact_model_selection_reaches_device_rewrite_without_shape_redecision(tmp_path, monkeypatch):
+    """JSON edits cannot admit a candidate; a re-derived and certified byte/ID can route."""
+    from merlin.llvmlower.device_offload import load_sidecar, rewrite_prepared_file
+    from merlin.llvmlower.exact_offload import ExactOffloadSelection
+    from merlin.targetgen import oot_runner
+    import yaml
+
+    root = repo_root() / "examples/gemmini/target"
+    model = _INTEGER_BODY.encode()
+    original_spec = (root / "software-spec.yaml").read_bytes()
+    contract = (root / "contracts/target_contract.yaml").read_bytes()
+    outline = outline_integer_matmuls(
+        model, target="gemmini", software_spec=original_spec, capability_contract=contract,
+    )
+    operation_id = outline["candidates"][0]["operation_id"]
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "manifest.yaml").write_text("target: gemmini\n")
+    with pytest.raises(ValueError, match="reviewed SW admission"):
+        ExactOffloadSelection.from_outline(
+            outline, model=model, target="gemmini", software_spec=original_spec,
+            capability_contract=contract, package_dir=package, operation_ids=(operation_id,),
+        )
+
+    doctored = json.loads(json.dumps(outline))
+    doctored["candidates"][0]["software_admission"]["status"] = "admitted"
+    with pytest.raises(ValueError, match="deterministic re-derivation"):
+        ExactOffloadSelection.from_outline(
+            doctored, model=model, target="gemmini", software_spec=original_spec,
+            capability_contract=contract, package_dir=package, operation_ids=(operation_id,),
+        )
+
+    # Synthetic reviewed declaration and oracle stand-in test plumbing only;
+    # they are not evidence that today's Gemmini inputs were certified.
+    spec_doc = yaml.safe_load(original_spec)
+    spec_doc["status"] = "reviewed"
+    for absent_observation in ("layouts", "tails", "aliasing"):
+        spec_doc["operations"]["contraction"].pop(absent_observation)
+    spec = yaml.safe_dump(spec_doc).encode()
+    reviewed = outline_integer_matmuls(model, target="gemmini", software_spec=spec, capability_contract=contract)
+    selection = ExactOffloadSelection.from_outline(
+        reviewed, model=model, target="gemmini", software_spec=spec,
+        capability_contract=contract, package_dir=package, operation_ids=(operation_id,),
+    )
+    materialized = json.loads(json.dumps(reviewed))
+    interface_text = materialized["candidates"][0].pop("interface_mlir")
+    materialized["candidates"][0]["interface_file"] = "kernel-000004.interface.mlir"
+    (tmp_path / "kernel-000004.interface.mlir").write_text(interface_text)
+    assert ExactOffloadSelection.from_outline(
+        materialized, model=model, target="gemmini", software_spec=spec,
+        capability_contract=contract, package_dir=package, operation_ids=(operation_id,),
+        interface_root=tmp_path,
+    ) == selection
+    prepared = tmp_path / "prepared.mlir"
+    prepared.write_text(_INTEGER_BODY)
+    with pytest.raises(ValueError, match="no independent accelerator certification"):
+        rewrite_prepared_file(prepared, tmp_path / "before_cert", "gemmini", exact_selection=selection)
+
+    def skipped_certify(_package, _interface, **_kwargs):
+        return {"status": "pass", "oracle": {"result": "skipped"}}
+
+    monkeypatch.setattr(oot_runner, "certify", skipped_certify, raising=False)
+    with pytest.raises(ValueError, match="running accelerator oracle"):
+        selection.certify(package, runs_root=tmp_path / "skipped_runs", simulator="test_oracle", timeout=3)
+
+    def fake_certify(_package, interface, **kwargs):
+        assert interface.read_text() == reviewed["candidates"][0]["interface_mlir"]
+        assert kwargs["require_accelerator_trace"] is True
+        return {"status": "pass", "oracle": {"result": "ran"}, "test_only": True}
+
+    monkeypatch.setattr(oot_runner, "certify", fake_certify, raising=False)
+    selection = selection.certify(package, runs_root=tmp_path / "cert_runs", simulator="test_oracle", timeout=3)
+    monkeypatch.setattr(
+        "merlin.system.offload.device_dtype_triples", lambda _target: (("i8", "i8", "i32"),)
+    )
+    rewrite = rewrite_prepared_file(prepared, tmp_path / "build", "gemmini", exact_selection=selection)
+    assert rewrite.moved == 1
+    sidecar = load_sidecar(tmp_path / "build")
+    assert sidecar["routed"][0]["operation_id"] == operation_id
+    assert next(iter(sidecar["expected_interfaces"].values()))["sha256"] == (
+        reviewed["candidates"][0]["interface_sha256"]
+    )
+
+    # Exercise the actual whole-model preparation seam. Its normalized MLIR,
+    # not the earlier raw capture text, is the selected byte identity.
+    from merlin.llvmlower.device_build import DeviceRouting
+    from merlin.runtime.backends.zephyr_model import prepare_for_lowering
+
+    source = tmp_path / "source.mlir"
+    source.write_bytes(model)
+    preflight = tmp_path / "preflight"
+    preflight.mkdir()
+    normalized, _ = prepare_for_lowering(source, preflight, blocking=False)
+    normalized_bytes = normalized.read_bytes()
+    normalized_outline = outline_integer_matmuls(
+        normalized_bytes, target="gemmini", software_spec=spec, capability_contract=contract
+    )
+    normalized_id = normalized_outline["candidates"][0]["operation_id"]
+    normalized_selection = ExactOffloadSelection.from_outline(
+        normalized_outline, model=normalized_bytes, target="gemmini", software_spec=spec,
+        capability_contract=contract, package_dir=package, operation_ids=(normalized_id,),
+    )
+    monkeypatch.setattr(
+        oot_runner, "certify",
+        lambda _package, interface, **_kwargs: {
+            "status": "pass", "oracle": {"result": "ran"},
+            "interface_sha256": hashlib.sha256(interface.read_bytes()).hexdigest(), "test_only": True,
+        },
+    )
+    normalized_selection = normalized_selection.certify(
+        package, runs_root=tmp_path / "normalized_cert", simulator="test_oracle", timeout=3
+    )
+    routed_work = tmp_path / "routed_work"
+    routed_work.mkdir()
+    routed_model, _ = prepare_for_lowering(
+        source, routed_work, blocking=False,
+        device=DeviceRouting("gemmini", package, "int8", "i32", exact_selection=normalized_selection),
+    )
+    assert "func.call" in routed_model.read_text()
+    assert load_sidecar(routed_work)["routed"][0]["operation_id"] == normalized_id
+
+    changed = tmp_path / "changed.mlir"
+    changed.write_text(_INTEGER_BODY + "\n")
+    with pytest.raises(ValueError, match="prepared model bytes changed"):
+        rewrite_prepared_file(changed, tmp_path / "other", "gemmini", exact_selection=selection)
+    (package / "manifest.yaml").write_text("target: another\n")
+    with pytest.raises(ValueError, match="package tree changed"):
+        selection.check_package(package)
+
+
 def test_model_stitching_keeps_host_producer_and_consumer_edges_explicit():
     root = repo_root() / "examples/gemmini/target"
     model = _INTEGER_BODY.replace(

@@ -49,6 +49,8 @@ class DeviceRouting:
     accum_dtype: str
     select: "Callable[[Any], bool] | None" = None
     numeric_policy: dict | None = None
+    #: Exact Phase 0 operation/interface identities; mutually exclusive with a shape selector.
+    exact_selection: Any | None = None
 
 
 def routing_for_placement(placement, device: str, package_dir: str | Path, *, numeric_policy=None) -> "DeviceRouting":
@@ -306,6 +308,8 @@ def build_device_objects(
     codegen_target: str = "riscv",
     cflags: "Sequence[str] | None" = None,
     timeout: int = 900,
+    expected_interfaces: Mapping[str, Mapping[str, str]] | None = None,
+    package_sha256: str | None = None,
 ) -> DeviceBuild:
     """One kernel object per signature plus the shim object, ready to archive.
 
@@ -318,6 +322,7 @@ def build_device_objects(
     """
     from merlin.targetgen import corpus_spec as CS
     from merlin.targetgen.oot_runner import load_package, run_entrypoint
+    from merlin.common.digest import sha256_text
 
     from .device_shim import emit_translation_unit, kernel_abi_for
     from .toolchain import clang, mlir_translate
@@ -325,6 +330,14 @@ def build_device_objects(
     work = Path(workdir)
     work.mkdir(parents=True, exist_ok=True)
     skipped: list[tuple[str, str]] = []
+
+    if expected_interfaces is not None:
+        from .exact_offload import _package_sha256
+
+        if set(expected_interfaces) != set(signatures) or not package_sha256:
+            raise ValueError("exact offload must bind every emitted symbol and an OOT package digest")
+        if _package_sha256(Path(package_dir)) != package_sha256:
+            raise ValueError("OOT compiler package changed after exact model selection")
 
     # WHICH DEVICES THIS PATH CAN BUILD, asked of the device's derived link rather than assumed.
     #
@@ -351,9 +364,10 @@ def build_device_objects(
     except Exception as exc:  # noqa: BLE001
         return DeviceBuild(device=device, skipped=(("all", f"package unusable: {exc}"),))
 
-    from merlin.compile.mesh import _mesh_tile_binding
+    if expected_interfaces is None:
+        from merlin.compile.mesh import _mesh_tile_binding
 
-    binding = _mesh_tile_binding(device, operand_dtype, accum_dtype, numeric_policy=numeric_policy)
+        binding = _mesh_tile_binding(device, operand_dtype, accum_dtype, numeric_policy=numeric_policy)
 
     objs: list[Path] = []
     kernels: dict[str, str] = {}
@@ -371,21 +385,40 @@ def build_device_objects(
         want = kernel_symbol(abi.symbol, index)
         stem = work / f"{sym}"
 
-        entry = {
-            "name": sym,
-            "op": "matmul",
-            "kind": "op",
-            "source_role": "mesh_tile_synthesized",
-            "source_reference": f"offloaded layer {m}x{k}x{n} for {device}",
-            "M": m,
-            "K": k,
-            "N": n,
-        }
-        try:
-            _capsule, iface = CS.build(entry, binding)
-        except Exception as exc:  # noqa: BLE001
-            skipped.append((sym, f"interface capsule: {exc}"))
-            continue
+        if expected_interfaces is None:
+            entry = {
+                "name": sym,
+                "op": "matmul",
+                "kind": "op",
+                "source_role": "mesh_tile_synthesized",
+                "source_reference": f"offloaded layer {m}x{k}x{n} for {device}",
+                "M": m,
+                "K": k,
+                "N": n,
+            }
+            try:
+                _capsule, iface = CS.build(entry, binding)
+            except Exception as exc:  # noqa: BLE001
+                skipped.append((sym, f"interface capsule: {exc}"))
+                continue
+        else:
+            from merlin.targetgen.contract.interface_emit import parse_interface_mlir
+
+            chosen = expected_interfaces[sym]
+            iface = chosen.get("mlir")
+            if not isinstance(iface, str) or sha256_text(iface) != chosen.get("sha256"):
+                raise ValueError(f"{sym} no longer matches its selected interface bytes")
+            parsed = parse_interface_mlir(iface)
+            tensors = parsed["tensors"]
+            commands = parsed["commands"]
+            if parsed["target"] != device or [
+                (tensors.get(name) or {}).get("shape") for name in ("A", "B")
+            ] != [[m, k], [k, n]] or [
+                (tensors.get(name) or {}).get("dtype") for name in ("A", "B")
+            ] != [dtypes[sym][0], dtypes[sym][1]] or [cmd["opcode"] for cmd in commands] != [
+                "RES_PACK", "MATMUL_RESIDENT", "COMMIT"
+            ] or commands[-1].get("attributes", {}).get("output_dtype") != dtypes[sym][2]:
+                raise ValueError(f"{sym} selected interface disagrees with device, shape, or precision")
         ifc = stem.with_suffix(".iface.mlir")
         ifc.write_text(iface, encoding="utf-8")
 

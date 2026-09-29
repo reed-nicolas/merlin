@@ -1019,10 +1019,18 @@ def prepare_for_lowering(
     # below must be derived from the IR that REMAINS. Inert unless a routing was supplied, and inert
     # again unless that routing carries a selector -- the placement decision is made elsewhere
     # (merlin.system.place) and passed in, never taken here.
-    if device is not None and getattr(device, "select", None) is not None:
+    if device is not None and (
+        getattr(device, "select", None) is not None or getattr(device, "exact_selection", None) is not None
+    ):
         from ...llvmlower.device_offload import rewrite_prepared_file as _dev_rewrite
 
-        moved = _dev_rewrite(prepared, work, device.device, select=device.select)
+        exact = getattr(device, "exact_selection", None)
+        if exact is not None:
+            exact.check_package(device.package_dir)
+            exact.check_backend_contract()
+        moved = _dev_rewrite(
+            prepared, work, device.device, select=device.select, exact_selection=exact
+        )
         print(
             f"[device] routed {moved.moved} contraction(s) to {device.device} across "
             f"{len(moved.signatures)} signature(s)"
