@@ -475,6 +475,7 @@ LIMITATIONS = [
     "Packaging and selected functional regressions only; no numerical/hardware certification.",
     "External venv and import-origin checks are not a security isolation guarantee.",
     "Dependency resolution uses configured indexes; exact resulting freeze is retained, not a lockfile replay.",
+    "Unrecorded dependency overrides are removed from child environments; a local diagnostic override is not qualification.",
     "External venv is deliberately retained on success or failure; this command never deletes evidence.",
 ]
 
@@ -484,7 +485,12 @@ def digest(path):
 
 
 def clean_environment():
-    return {k: v for k, v in os.environ.items() if not k.startswith(("MERLIN", "PYTHON", "AET_", "CHIA_"))}
+    excluded = {"UV_OVERRIDE", "UV_EXCLUDE", "UV_CONSTRAINT", "UV_BUILD_CONSTRAINT"}
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("MERLIN", "PYTHON", "AET_", "CHIA_")) and k not in excluded
+    }
 
 
 def resolve_ref(root, ref):
