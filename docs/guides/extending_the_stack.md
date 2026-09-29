@@ -122,6 +122,18 @@ transfers, runtime behavior and compiler passes remain OOT and need independent
 execution evidence. This initial implementation is a narrow semantic seam for
 growing verified rules, not unrestricted algebraic optimization.
 
+When a reviewed experiment selects a Phase 0 evidence bundle, its
+`software/instruction-semantics.json` is copied into the sealed corpus release
+as an owner-only input. Phase 1 records
+`semantic_search_diagnostic.json` beside the host run record from the frozen
+public Linalg capsules; it is not served to the agent or used by the grader.
+Phase 2 may record `_host_semantic_diagnostics/semantic_search.json` inside a
+fresh optimization stage, using its frozen model capsule and matching Phase 0
+evidence when that link exists. Missing or unknown instruction semantics remain
+explicitly unavailable; neither receipt grants target support or changes timing or
+qualification. To make search an agent-visible tool, define and evaluate a
+separate experiment treatment rather than changing an existing run in place.
+
 ## Phase 0: deterministic derivation, not an agent
 
 Phase 0 must be a deterministic transformation of selected input bytes, explicit policy
