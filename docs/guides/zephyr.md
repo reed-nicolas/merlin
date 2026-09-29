@@ -40,7 +40,8 @@ generic module-layout description below needs none):
   `zephyr_model.available()` checks the combined build-and-Spike path;
   `build_app` uses the build-only check.
 - **Optional — FireSim** (2-tile SMP) is board/FPGA-gated and **not fresh-machine reproducible** (see
-  [Getting started §5](getting_started.md)); **spike substitutes** for the functional whole-model run.
+  [Getting started §5](getting_started.md)). It also needs a separately installed,
+  explicitly selected [FireSim runner](firesim.md); **spike substitutes** for the functional whole-model run.
 - **Required — board catalog and selection**: set `MERLIN_BOARD_CATALOG` to a
   target-owned YAML catalog and pass its board name to `build_app(board=...)` or
   `merlin-compile --board ...`. The [example catalog](../../examples/board-catalog.yaml)

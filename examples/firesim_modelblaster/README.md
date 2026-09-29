@@ -10,6 +10,9 @@ export MERLIN_FIRESIM_RUNNER=modelblaster
 export MERLIN_MODELBLASTER=/absolute/path/to/ModelBlaster
 ```
 
+This is a breaking migration for callers that relied on Merlin silently
+importing ModelBlaster or embedding its terminal marker in every Zephyr image.
+
 When building the image, supply
 `completion_metric_prefix=runner.completion_metric_prefix` from the selected
 adapter to `zephyr_model.build_app`. The adapter checks the ELF for this marker

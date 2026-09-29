@@ -159,6 +159,10 @@ arrived; that is someone else's job about to start the moment you bring the daem
 Install the optional [ModelBlaster runner example](../../examples/firesim_modelblaster/README.md)
 or a separately maintained runner distribution, and select its entry-point name
 with `MERLIN_FIRESIM_RUNNER` in `.env`. Merlin's core wheel contains no runner.
+This is a breaking migration from older checkouts: `run_on_firesim` no longer
+imports ModelBlaster implicitly, and generic `build_app` no longer embeds its
+terminal marker. Existing FireSim callers must install/select a runner and
+pass its `completion_metric_prefix` when building the ELF.
 From Merlin, the queue is the default and needs no argument:
 
 ```python

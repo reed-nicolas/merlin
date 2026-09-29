@@ -39,8 +39,9 @@ def select_runner(name: str | None = None) -> FireSimRunner:
     selected = name or env("MERLIN_FIRESIM_RUNNER")
     if not selected:
         raise FireSimRunnerError(
-            "select an installed FireSim runner with runner_name= or MERLIN_FIRESIM_RUNNER; "
-            "no checkout or target is an implicit execution provider"
+            "install a FireSim runner distribution with `python -m pip install /path/to/runner.whl` "
+            "(entry-point group merlin.firesim_runners), then select its name with runner_name= "
+            "or MERLIN_FIRESIM_RUNNER; no checkout or target is an implicit execution provider"
         )
     providers = tuple(entry_points(group=RUNNER_GROUP))
     matches = tuple(provider for provider in providers if provider.name == selected)
@@ -48,7 +49,8 @@ def select_runner(name: str | None = None) -> FireSimRunner:
         available = sorted(provider.name for provider in providers)
         raise FireSimRunnerError(
             f"FireSim runner {selected!r} has {len(matches)} installed providers "
-            f"(expected exactly one; available: {available})"
+            f"(expected exactly one; available: {available}). Install a runner wheel if missing, "
+            "or remove duplicate installed providers"
         )
     try:
         runner = matches[0].load()
