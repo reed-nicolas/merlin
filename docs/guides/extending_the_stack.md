@@ -101,6 +101,7 @@ Run it on a fresh output path, using the exact target and frozen model from one
 Phase 0 run:
 
 ```sh
+python -m pip install '.[semantic-search]'  # from a Merlin source checkout
 merlin-target-tools semantic-search --target "$TARGET" \
   --mlir "$CAPTURE_LINALG_MLIR" \
   --instruction-model "$PHASE0/software/instruction-semantics.json" \
