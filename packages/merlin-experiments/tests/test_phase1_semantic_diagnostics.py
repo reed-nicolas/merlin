@@ -35,7 +35,17 @@ def _inputs(tmp_path: Path, monkeypatch):
     (public / "public-one/capsule.linalg.mlir").write_text(_LINALG)
     (public / "dev-one/capsule.linalg.mlir").write_text(_LINALG)
     model = private / "instruction-semantics.json"
-    model.write_text(json.dumps({"schema": "merlin.instruction_semantics.v1", "status": "UNKNOWN"}))
+    model.write_text(
+        json.dumps(
+            {
+                "schema": "merlin.instruction_semantics.v1",
+                "target": "test-target",
+                "status": "UNKNOWN",
+                "unknowns": ["selected_target_contract_has_no_instruction_semantics_resource"],
+                "instructions": [],
+            }
+        )
+    )
 
     def capsules(root, *, labels, contract):
         assert root == public
@@ -61,6 +71,68 @@ def test_private_receipt_uses_only_public_linalg_and_unknown_is_not_a_verdict(tm
     assert document["rows"][0]["inventory"]["regions"][0]["receipt"]["status"] == "unknown"
     assert "verdict" not in document
     SD.verify(record, run, workspace=workspace, model_path=model, public_root=public)
+
+
+def test_phase1_search_requires_a_normalized_sw_spec_and_facts_model(tmp_path, monkeypatch):
+    from merlin.targetgen.contract.linalg_iface import parse_linalg_mlir
+    from merlin.targetgen.instruction_semantics import normalize_instruction_semantics
+    from merlin.targetgen.semantic_search import search_linalg_inventory
+
+    run, workspace, public, contract, model_path = _inputs(tmp_path, monkeypatch)
+    parsed = parse_linalg_mlir(_LINALG)
+    operation = parsed["ops"][0]
+    raw_model = {
+        "schema": "merlin.instruction_semantics.v1",
+        "target": "test-target",
+        "memory_spaces": {},
+        "instructions": [
+            {
+                "id": "add",
+                "operands": [{"name": name, "type": "tensor<1xi32>"} for name in ("lhs", "rhs", "init")],
+                "results": [{"name": "out", "type": "tensor<1xi32>"}],
+                "computation": {
+                    "kind": "linalg.generic",
+                    "indexing_maps": operation["indexing_maps"],
+                    "iterator_types": operation["iterator_types"],
+                    "scalar_body": operation["scalar_body"],
+                },
+                "parameters": {},
+                "constraints": {},
+                "effects": [],
+                "software_operation": "add",
+            }
+        ],
+    }
+    # The low-level matcher permits raw models for exploratory unit probes.
+    # Phase 1 must not promote such a pattern into a device-candidate receipt.
+    assert search_linalg_inventory(parsed, raw_model)["summary"]["device_candidates"] == 1
+    model_path.write_text(json.dumps(raw_model))
+    SD.create(run, workspace=workspace, model_path=model_path, public_root=public, contract_root=contract)
+    [row] = json.loads((run / "semantic_search_diagnostic.json").read_text())["rows"]
+    assert row["status"] == "unavailable"
+    assert "normalized instruction model" in row["reason"]
+    assert "inventory" not in row
+
+    # The exact same typed pattern is selectable after Phase 0 binds a reviewed
+    # software declaration and selected hardware facts into a normalized model.
+    normalized = normalize_instruction_semantics(
+        raw_model,
+        software_spec={
+            "schema": "merlin.software_spec.v1",
+            "target": "test-target",
+            "status": "reviewed",
+            "operations": [{"id": "add", "placement": "accelerator", "signature": {"dtypes": ["i32"], "ranks": [1]}}],
+        },
+        rtl_facts={"facts": {}},
+        target="test-target",
+    )
+    assert normalized["status"] == "described"
+    another_run = tmp_path / "another-run"
+    another_run.mkdir()
+    model_path.write_text(json.dumps(normalized))
+    SD.create(another_run, workspace=workspace, model_path=model_path, public_root=public, contract_root=contract)
+    [row] = json.loads((another_run / "semantic_search_diagnostic.json").read_text())["rows"]
+    assert row["inventory"]["summary"]["device_candidates"] == 1
 
 
 def test_declared_input_without_linalg_provenance_is_diagnostic_error(tmp_path, monkeypatch):

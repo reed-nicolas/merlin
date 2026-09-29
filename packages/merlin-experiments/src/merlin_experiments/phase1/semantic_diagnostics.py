@@ -14,6 +14,7 @@ from pathlib import Path
 
 from merlin.targetgen.capsule_common import discover_capsules
 from merlin.targetgen.contract.linalg_iface import is_linalg_on_tensors, parse_linalg_mlir
+from merlin.targetgen.instruction_semantics import validate_normalized_instruction_model
 from merlin.targetgen.sandbox import bwrap as BW
 from merlin.targetgen.semantic_search import SearchLimits, search_linalg_inventory
 
@@ -123,6 +124,21 @@ def create(
         model = json.loads(model_bytes)
         if not isinstance(model, Mapping):
             raise ValueError("instruction model must be a JSON object")
+        # Phase 0 emits this one non-selectable stub when no OOT instruction
+        # description was selected. Every other model must carry the reviewed
+        # SW-spec/CIRCT-fact identities and a self-consistent normalized body.
+        stub_fields = {"schema", "target", "status", "unknowns", "instructions"}
+        if model.get("status") == "UNKNOWN" and model.get("instructions") == [] and set(model) == stub_fields:
+            if (
+                model.get("schema") != "merlin.instruction_semantics.v1"
+                or not isinstance(model.get("target"), str)
+                or not model["target"]
+                or not isinstance(model.get("unknowns"), list)
+                or not model["unknowns"]
+            ):
+                raise ValueError("Phase 0 instruction-model stub is malformed")
+        else:
+            model = validate_normalized_instruction_model(model)
         model_error = None
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         model = None
