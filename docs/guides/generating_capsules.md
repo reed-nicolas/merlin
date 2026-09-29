@@ -3,7 +3,7 @@ title: Generating capsules for a target
 kind: guide
 status: current
 owner: targetgen
-last_verified: 2026-09-28
+last_verified: 2026-09-29
 related: [adding_a_target, gemmini_experiment, capsule_bench, integrations, phase0_specification]
 code_refs:
   - experiments/catalog.yaml
@@ -123,6 +123,12 @@ even when its files are under the reviewed release.
 Inspection reports aggregate counts and commitments. Detailed diagnostics and review records
 are owner-only under `private/`. Keep hidden capsules, goldens and private weights out of public
 examples, shared packages and agent-visible bundles. Being gitignored is not access control.
+For a run with selected evidence, `private/preparation.json` also records the exact
+requirement, evidence, generation receipt and generated manifest digests, the
+capsule roster, omissions and both cohort-coverage commitments. `corpus inspect`
+shows only `generation_lineage_sha256`; sealing rechecks the private record against
+the frozen run. A missing or changed member requires a new preparation, not a
+manual manifest edit.
 
 Only after reviewing the prepared inputs and private diagnostics, acknowledge the exact
 digest returned by inspection:
