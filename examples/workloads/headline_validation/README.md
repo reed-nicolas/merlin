@@ -62,6 +62,26 @@ scope, and `capture_receipt.json` in every selected bundle. The SmolVLA root
 and the prefix/cache/flow bindings. The receipt's
 `source_closure_verified: false` is a blocking fact for verified release, not
 a field to edit. A capture may still be useful for diagnostic compiler checks.
+Inspect the whole declared session with the selected Merlin compiler interpreter
+before treating independently lowered stages as one program:
+
+```sh
+PYTHONPATH=src:packages/merlin-experiments/src "$MERLIN_COMPILER_PYTHON" - "$CAPTURE" <<'PY'
+import sys
+from pathlib import Path
+from merlin_experiments.model_qualification import inspect_workflow
+
+report = inspect_workflow(Path(sys.argv[1]))
+print([(row["name"], row["missing_runtime_inputs"]) for row in report["programs"]])
+print(report["session_abi"], report["session_capture"])
+PY
+```
+
+For TinyLlama and SmolVLA, `session_abi.status` of `verified_structure` checks the
+ordered stage roster and typed cross-stage MLIR bindings; `session_capture.status`
+of `producer_receipts_bound` checks the root receipt against the selected stage
+receipts. ResNet50's version-1 single-program session has no cross-stage ABI.
+These checks do not verify source closure or numerical execution.
 Inspect each stage's
 `frontend-trace.json` separately: `ok: true` and zero opaque calls do not imply
 complete PyTorch-to-MLIR operation correspondence. A `diagnostic` trace leaves
