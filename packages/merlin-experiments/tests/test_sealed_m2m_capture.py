@@ -7,6 +7,7 @@ import pytest
 from merlin_experiments.capture_execution.sealed_m2m import (
     SealedM2MError,
     _command,
+    _ldd_library_path,
     _policy,
     _snapshot_tree,
     _source_tree,
@@ -52,6 +53,15 @@ def test_plan_cannot_raise_snapshot_cap(tmp_path):
     with pytest.raises(SealedM2MError, match="no larger than 15 GB"):
         prepare_plan(m2m_root=tmp_path, workload_root=tmp_path, worker=tmp_path,
                      venv=tmp_path, max_snapshot_bytes=15_000_000_001)
+
+
+def test_ldd_dependency_parser_accepts_only_structural_library_paths():
+    assert _ldd_library_path("libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x123)") == Path(
+        "/lib/x86_64-linux-gnu/libc.so.6"
+    )
+    assert _ldd_library_path("/lib64/ld-linux-x86-64.so.2 (0x123)") == Path("/lib64/ld-linux-x86-64.so.2")
+    assert _ldd_library_path("linux-vdso.so.1 (0x123)") is None
+    assert _ldd_library_path("libmissing.so => not found") is None
 
 
 def test_scoped_replay_proof_cannot_be_used_as_phase0_admission():

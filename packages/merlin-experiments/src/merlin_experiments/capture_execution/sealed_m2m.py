@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import secrets
 import shutil
 import stat
@@ -146,6 +145,20 @@ def _venv_home(venv: Path) -> Path:
     return base
 
 
+def _ldd_library_path(line: str) -> Path | None:
+    """Parse the two ordinary `ldd` dependency forms without matching line text."""
+    fields = line.partition("(")[0].split()
+    if len(fields) == 3 and fields[1] == "=>":
+        raw = fields[2]
+    elif len(fields) == 1:
+        raw = fields[0]
+    else:
+        return None
+    if raw.startswith(("/lib", "/usr/lib")):
+        return Path(raw)
+    return None
+
+
 def _system_libs(interpreter: Path, torch_so: Path, numpy_so: Path) -> tuple[Path, ...]:
     external: set[Path] = set()
     for binary in (interpreter, torch_so, numpy_so):
@@ -154,9 +167,8 @@ def _system_libs(interpreter: Path, torch_so: Path, numpy_so: Path) -> tuple[Pat
         if result.returncode or "not found" in result.stdout:
             raise SealedM2MError(f"ELF dependencies unavailable for {binary.name}")
         for line in result.stdout.splitlines():
-            match = re.search(r"(?:^|\s)(?:=>\s+)?(/(?:lib|usr/lib)[^\s()]*)\s+\(", line)
-            if match:
-                path = Path(match.group(1))
+            path = _ldd_library_path(line)
+            if path is not None:
                 if not path.is_file() or not path.resolve().is_file():
                     raise SealedM2MError(f"unavailable system ELF library: {path}")
                 external.add(path)
