@@ -45,9 +45,9 @@ def test_a_board_that_declares_no_simulator_fails_closed(monkeypatch, tmp_path):
         zm.run_on_verilator(tmp_path / "x.elf", board=bare.name)
 
 
-def test_the_default_board_keeps_the_variable_and_config_it_always_had():
-    desc = boards.board(zm.VERILATOR_BOARD)
-    cfg, env_name = zm._verilator_facts(zm.VERILATOR_BOARD, None)
+def test_the_declared_board_keeps_the_variable_and_config_it_always_had():
+    desc = boards.board("chipyard_riscv64")
+    cfg, env_name = zm._verilator_facts(desc.name, None)
     assert cfg and cfg == desc.rtl_sim_config
     assert env_name == target_env_name(desc.target, "VERILATOR")
     # The names existing setups export and build; derived now, but unchanged.

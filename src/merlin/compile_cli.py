@@ -537,12 +537,12 @@ def compile_rvv(
         out["binary"] = str(b["elf"])
         out["status"] = "compiled"
         if run == "verilator":
-            sim = zm.verilator_sim()
+            sim = zm.verilator_sim(board=board)
             if sim is None:
                 out["status"] = "not_run"
                 out["reason"] = "no compatible multicore Verilator simulator is available for the selected target"
                 return out
-            res = zm.run_on_verilator(b["elf"], timeout=timeout, references=refs or None)
+            res = zm.run_on_verilator(b["elf"], board=board, timeout=timeout, references=refs or None)
         else:
             res = zm.run_on_spike(b["elf"], harts=max(2, harts), mem_bytes=b["ram_bytes"], timeout=timeout)
             if refs:

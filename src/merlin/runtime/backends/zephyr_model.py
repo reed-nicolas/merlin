@@ -1926,18 +1926,16 @@ def image_cpus(brd, harts: int, rvv_hart: int = 0) -> int:
     return min(need, int(brd.harts)) if getattr(brd, "harts", None) else need
 
 
-def _prj_conf(cpus: int, backend: str, brd=None, console_facts=None, debug: bool = False) -> str:
-    """Generated app config. ``brd`` is a :class:`runtime.boards.Board`; None keeps the
-    historical chipyard/HTIF defaults so existing callers are byte-identical.
+def _prj_conf(cpus: int, backend: str, brd, console_facts=None, debug: bool = False) -> str:
+    """Generated app config for the selected :class:`runtime.boards.Board`.
 
     ``console_facts`` is a :class:`runtime.sdk_facts.UartConsoleFacts` and is REQUIRED when the board
     declares a UART console: the baud divisor the RTOS driver computes depends on two clock numbers
     that belong to the chip, and defaulting either of them produces a console that emits garbage.
     """
     from ..boards import CONSOLE_HTIF, CONSOLE_UART
-    from ..boards import board as _board
-
-    brd = brd if brd is not None else _board("spike_riscv64")
+    if brd is None:
+        raise ZephyrModelError("a board descriptor is required for Zephyr app configuration")
     # HTIF: the direct-putchar path races under SMP (a worker on hart != 0 printing) and silently
     # wedges, so use the buffered + syscall path. It is also the fix for an apparent hang: unbuffered
     # HTIF emits ONE CHARACTER per host round-trip, which on a ~20 MHz core looks like the model never
@@ -2775,14 +2773,6 @@ def run_on_spike(
     return _parse_console(console, proc.returncode)
 
 
-# The Zephyr board whose images the chipyard Verilator harness runs by default: the generic chipyard
-# board, whose HTIF console is what the harness speaks. WHICH SoC config elaborates it, and which
-# target's variable locates a prebuilt binary, are facts of that board's registry entry
-# (`rtl_sim_config`, `target` in merlin/contract/boards.yaml), not constants of this module -- a
-# multicore vector SoC needs a config of its own, and naming one here welded this path to one target.
-VERILATOR_BOARD = "chipyard_riscv64"
-
-
 def _verilator_facts(board: str, config: str | None) -> tuple[str | None, str | None]:
     """``(config, env_name)`` for ``board``'s Verilator sim: the SoC config (``config`` if given, else the
     board's declared ``rtl_sim_config``) and the binary override ``MERLIN_<TARGET>_VERILATOR`` derived from
@@ -2796,7 +2786,7 @@ def _verilator_facts(board: str, config: str | None) -> tuple[str | None, str | 
     return cfg, env_name
 
 
-def verilator_sim(config: str | None = None, *, board: str = VERILATOR_BOARD) -> Path | None:
+def verilator_sim(config: str | None = None, *, board: str) -> Path | None:
     """Path to the chipyard Verilator sim for ``board`` (or an explicit ``config``), or None when it is
     not built.
 
@@ -2821,7 +2811,7 @@ def verilator_sim(config: str | None = None, *, board: str = VERILATOR_BOARD) ->
 def run_on_verilator(
     elf: str | Path,
     *,
-    board: str = VERILATOR_BOARD,
+    board: str,
     config: str | None = None,
     timeout: int = 7200,
     references: dict | None = None,

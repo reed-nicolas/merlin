@@ -75,6 +75,13 @@ def test_the_config_follows_the_board():
     assert "CONFIG_FPU_SHARING=n" in conf
 
 
+def test_zephyr_config_requires_an_explicit_board_descriptor():
+    import pytest
+
+    with pytest.raises(zm.ZephyrModelError, match="board descriptor is required"):
+        zm._prj_conf(2, "rvv", None)
+
+
 def test_kodiak_lets_zephyr_manage_vector_state():
     """Kodiak's vector config, and the reasoning that had to be corrected twice to arrive at it.
 
