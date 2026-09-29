@@ -44,7 +44,11 @@ def derive_performance_scope(scope: dict, software_spec: dict) -> dict:
         regions = instance.get("regions") or []
         signature = instance.get("signature")
         families = [row.get("semantic_family") for row in regions]
-        if signature != " -> ".join(families) or len(regions) < 3:
+        if (
+            len(regions) < 2
+            or any(not isinstance(family, str) or not family for family in families)
+            or signature != " -> ".join(families)
+        ):
             raise ValueError("typed scope instance has inconsistent region signature")
         try:
             emitted_ops = scope_chain_region_ops(families)

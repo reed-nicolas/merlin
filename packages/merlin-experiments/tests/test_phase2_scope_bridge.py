@@ -101,6 +101,30 @@ def test_scope_sw_screen_checks_emitted_regions_without_inventing_device_maps() 
     assert again["source_reference"] == first["source_reference"]
 
 
+def test_short_captured_chains_remain_accounted_but_not_priceable() -> None:
+    """A real two-region source chain is not a malformed three-region PN candidate."""
+    signatures = ("movement -> contraction", "contraction -> elementwise_map")
+    scope = {
+        "required": [{"signature": signature, "occurrences": 1} for signature in signatures],
+        "typed_required_instances": {
+            "schema": "merlin.phase0.typed_scope_instances.v1",
+            "instances": [
+                {
+                    "instance_id": f"source-{index}",
+                    "signature": signature,
+                    "regions": [{"semantic_family": family} for family in signature.split(" -> ")],
+                }
+                for index, signature in enumerate(signatures)
+            ],
+        },
+    }
+    performance = derive_performance_scope(scope, {"operations": []})
+    assert performance["status"] == "unresolved"
+    assert performance["required"] == []
+    assert {row["signature"] for row in performance["unresolved"]} == set(signatures)
+    assert all(row["status"] == "emitter_unimplemented" for row in performance["unresolved"])
+
+
 def test_required_scope_instances_bind_exact_source_ops_types_and_edges(tmp_path) -> None:
     entry = {
         "name": "scope", "kind": "model_slice", "source_role": "derived_sweep",
