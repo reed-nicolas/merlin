@@ -240,6 +240,158 @@ def _integer_reference_bound(entry: dict, cap: dict) -> dict:
     return result
 
 
+def _source_integer_reference_bound(entry: dict, cap: dict, directory: Path) -> dict:
+    """Bound exact source i8 matmul inputs, including the zero initial sum.
+
+    A source-backed model or quantized PyTorch graph can contain contractions
+    whose internal operands are not the capsule's external inputs. Isolated
+    PyTorch integer matmul has captured bytes; spec matmul has program operands
+    that must be checked alongside its separately materialized capsule inputs.
+    """
+    semantics = entry.get("numerical_semantics") or {}
+    internal = semantics.get("internal_arithmetic") or {}
+    if internal.get("full_operation_overflow_policy") != "bounded_exact_requires_each_partial_sum":
+        raise ValueError("source-backed integer contraction lacks a selected internal-width bound policy")
+    if entry.get("source") == "spec" or entry.get("spec_ref"):
+        return _spec_integer_reference_bound(entry, cap, directory)
+    operation = cap.get("operation") or {}
+    attrs = operation.get("attributes") or {}
+    if (
+        entry.get("kind") == "model"
+        or entry.get("op") == "model"
+        or not (entry.get("source") == "pytorch" or entry.get("pytorch_ref"))
+        or entry.get("capture_op") != "int_matmul"
+        or operation.get("op") != "matmul"
+        or cap.get("kind") == "model"
+        or (cap.get("numeric_policy") or {}) != {"compare": "exact_int", "dtype": "i32"}
+        or semantics.get("operand_dtype") not in {"int8", "i8"}
+        or semantics.get("accumulator_dtype") != "i32"
+        or attrs.get("epilogue") not in ([], ())
+        or len(cap.get("inputs") or []) != 2
+        or not CG.is_exact_pytorch_integer_source(cap)
+    ):
+        raise ValueError("source-backed integer contraction lacks a verified isolated i8 matmul and exact inputs")
+    scoped = {**cap, "__dir__": str(directory)}
+    # This checks the saved host output against an independent recomputation
+    # from the captured bytes. It also refuses missing/mismatched input bytes.
+    CG.golden(scoped, directory)
+    bound = _integer_reference_bound(entry, scoped)
+    if bound["status"] != "proven_safe":
+        raise ValueError("source-backed integer contraction has no proven internal partial-sum bound")
+    return bound
+
+
+def _spec_integer_reference_bound(entry: dict, cap: dict, directory: Path) -> dict:
+    """Bound both the spec program and the separately materialized capsule operands."""
+    from merlin.targetgen.operation_numerics import integer_partial_sum_bound
+
+    operation = cap.get("operation") or {}
+    attrs = operation.get("attributes") or {}
+    lhs_name, rhs_name, out_name = (attrs.get(key) for key in ("lhs", "weight", "out"))
+    inputs = cap.get("inputs") or []
+    by_name = {row.get("name"): row for row in inputs if isinstance(row, dict)}
+    if (
+        entry.get("kind") == "model"
+        or entry.get("op") != "matmul"
+        or operation.get("op") != "matmul"
+        or cap.get("kind") == "model"
+        or not isinstance(entry.get("spec_ref"), str)
+        or cap.get("spec_ref") != entry["spec_ref"]
+        or (cap.get("numeric_policy") or {}) != {"compare": "exact_int", "dtype": "i32"}
+        or attrs.get("epilogue") not in ([], ())
+        or not all(isinstance(name, str) for name in (lhs_name, rhs_name, out_name))
+        or len(inputs) != 2
+        or set(by_name) != {lhs_name, rhs_name}
+        or (entry.get("numerical_semantics") or {}).get("operand_dtype") not in {"int8", "i8"}
+        or (entry.get("numerical_semantics") or {}).get("accumulator_dtype") != "i32"
+    ):
+        raise ValueError("spec-backed integer contraction lacks an isolated exact i8 matmul")
+    golden = yaml.safe_load((directory / "golden.yaml").read_text(encoding="utf-8")) or {}
+    if not isinstance(golden, dict):
+        raise ValueError("spec-backed integer contraction lacks an independent golden document")
+    provenance = golden.get("oracle_provenance") or {}
+    if not isinstance(provenance, dict):
+        raise ValueError("spec-backed integer contraction lacks exact program operand provenance")
+    saved_inputs = provenance.get("inputs") or {}
+    if (
+        golden.get("golden_source") != f"specir_program_{entry['spec_ref'].partition(':')[0]}"
+        or provenance.get("spec_ref") != entry["spec_ref"]
+        or not isinstance(saved_inputs, dict)
+        or set(saved_inputs) != {lhs_name, rhs_name}
+    ):
+        raise ValueError("spec-backed integer contraction lacks exact program operand provenance")
+
+    def matrix(name: str, role: str) -> list[list[int]]:
+        spec, saved = by_name[name], saved_inputs[name]
+        shape = spec.get("shape")
+        rows = saved.get("decoded") if isinstance(saved, dict) else None
+        if (
+            spec.get("role") != role
+            or spec.get("dtype") != "i8"
+            or not isinstance(saved, dict)
+            or not isinstance(shape, list)
+            or len(shape) != 2
+            or any(type(dim) is not int or dim < 1 for dim in shape)
+            or saved.get("shape") != shape
+            or not isinstance(rows, list)
+            or len(rows) != shape[0]
+            or any(
+                not isinstance(row, list)
+                or len(row) != shape[1]
+                or any(type(value) is not int or not -128 <= value <= 127 for value in row)
+                for row in rows
+            )
+        ):
+            raise ValueError("spec-backed integer contraction has incomplete exact i8 operand values")
+        return rows
+
+    lhs, rhs = matrix(lhs_name, "input"), matrix(rhs_name, "weight")
+    if len(lhs[0]) != len(rhs):
+        raise ValueError("spec-backed integer matmul has mismatched reduction extents")
+    recomputed = [
+        [sum(lhs[m][k] * rhs[k][n] for k in range(len(rhs))) for n in range(len(rhs[0]))]
+        for m in range(len(lhs))
+    ]
+    outputs = golden.get("outputs")
+    observed = outputs.get(out_name) if isinstance(outputs, dict) else None
+    if (
+        not isinstance(observed, list)
+        or any(not isinstance(row, list) or any(type(value) is not int for value in row) for row in observed)
+        or observed != recomputed
+    ):
+        raise ValueError("spec-backed integer golden differs from exact operand recomputation")
+    program_bound = integer_partial_sum_bound(
+        entry["numerical_semantics"],
+        reduction_extent=len(rhs),
+        lhs_values=[value for row in lhs for value in row],
+        rhs_values=[value for row in rhs for value in row],
+    )
+    if program_bound["status"] != "proven_safe":
+        raise ValueError(f"spec-backed integer golden cannot qualify selected internal MAC width: {program_bound}")
+    capsule_bound = _integer_reference_bound(entry, cap)
+    if capsule_bound["status"] != "proven_safe":
+        raise ValueError("spec-backed integer capsule inputs have no proven internal partial-sum bound")
+    dominant = max((program_bound, capsule_bound), key=lambda bound: bound["bound"])
+    return {
+        **dominant,
+        "scope": "spec-program and separately materialized integer-capsule matmul operands",
+        "members": [
+            {"operand_stream": "spec_program", "partial_sum_bound": program_bound},
+            {"operand_stream": "capsule_materialized", "partial_sum_bound": capsule_bound},
+        ],
+    }
+
+
+def _is_source_backed(entry: dict) -> bool:
+    return bool(
+        entry.get("kind") == "model"
+        or entry.get("op") == "model"
+        or entry.get("source") in {"pytorch", "spec"}
+        or entry.get("pytorch_ref")
+        or entry.get("spec_ref")
+    )
+
+
 # ------------------------------------------------------------------------------------------------
 def _write_capsule(entry, binding, out_root, facts_sha: str = ""):
     """Write one capsule, then GUARANTEE it carries its generalization-intent block.
@@ -259,6 +411,22 @@ def _write_capsule(entry, binding, out_root, facts_sha: str = ""):
         return written
     cap = yaml.safe_load(capf.read_text()) or {}
     dirty = False
+    regime, _ = _entry_regime(entry, binding)
+    if regime == "int" and _is_source_backed(entry):
+        bound = _source_integer_reference_bound(entry, cap, d)
+        golden_path = d / "golden.yaml"
+        golden = yaml.safe_load(golden_path.read_bytes())
+        source = golden.get("golden_source") if isinstance(golden, dict) else None
+        if source != "host_torch_eager" and not (isinstance(source, str) and source.startswith("specir_program_")):
+            raise ValueError("source-backed integer bound requires its independently captured golden")
+        cap["integer_partial_sum_bound"] = bound
+        golden["integer_partial_sum_bound"] = bound
+        golden["qualification"] = (
+            "source-backed integer contraction with concrete operand-stream internal-width bounds; "
+            "target execution and full-mesh ordering unverified"
+        )
+        golden_path.write_text(yaml.safe_dump(golden, sort_keys=False), encoding="utf-8")
+        dirty = True
     if not (cap.get("semantic") or {}).get("generalization_axis"):
         _, eb = _entry_regime(entry, binding)
         cap["semantic"] = CS._semantic_block(entry, eb)
