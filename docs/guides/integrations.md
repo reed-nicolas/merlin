@@ -37,6 +37,13 @@ code resolves inputs and translates contracts across those seams. LLVM/CIRCT and
 versions retain their own build, regression and numerical qualification requirements; package
 relocation does not certify a new upstream version.
 
+On 2026-09-29, read-only upstream `main` checks matched the experiments package's
+immutable pins: [Chia](https://github.com/ucb-bar/chia) at
+`dd976318012f1a9807a339bb7856da157cd24f87` and
+[AET](https://github.com/ucb-bar/agentic-eval-tool) at
+`903d4def8995e4697c6f214cc26c60a5a38d0554`. Matching a branch head is a
+dependency-selection check, not live worker-loss or scientific qualification.
+
 ## Historical compatibility snapshot (2026-09-23)
 
 Read-only upstream branch checks found official [Chia](https://github.com/ucb-bar/chia)
