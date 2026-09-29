@@ -8,9 +8,6 @@ import sysconfig
 from pathlib import Path
 
 import pytest
-from merlin.targetgen import application_inventory
-from merlin.common.paths import module_source_path, schemas_dir
-from merlin.targetgen.quant_recipe import digest as recipe_digest
 from merlin_experiments.capture_execution import sealed_m2m
 from merlin_experiments.capture_execution.sealed_m2m import (
     SealedM2MError,
@@ -24,6 +21,10 @@ from merlin_experiments.capture_execution.sealed_m2m import (
     prepare_plan,
 )
 from merlin_experiments.phase0.capture_execution_attestation import AttestationNotVerified, require_verified_execution
+
+from merlin.common.paths import module_source_path, schemas_dir
+from merlin.targetgen import application_inventory
+from merlin.targetgen.quant_recipe import digest as recipe_digest
 
 
 def test_normalized_venv_inventory_matches_copied_bytes(tmp_path):
