@@ -125,6 +125,12 @@ The direct installed CLI below selects the same treatment. For an installed
 [`baseline-functional-template`](../../../experiments/definitions/baseline-functional-template.yaml)
 with its required operator inputs; changing treatment changes the experiment.
 
+Phase 1's semantic-search receipt is a host-private diagnostic over the frozen
+public capsules. It is not shown to the agent, does not select a treatment, and
+does not count as compiler or grading evidence. An agent-visible search helper
+would be a separately declared and frozen treatment so its results can be
+compared fairly with the current experiment.
+
 For direct invocation, set the variables below to actual operator-selected inputs.
 `CORPUS_SEAL` is the release's `private/seal.json`; `DESCRIPTOR` must belong to
 that release. `RESOURCE_ROOT` resolves declared resource paths. `BUNDLE_ID` must
