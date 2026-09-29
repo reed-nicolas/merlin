@@ -70,21 +70,6 @@ entries:
       manifest the gate can read, the tables become a lookup and the literals go. That declaration does
       not exist today for any of them.
 
-  # ---------------------------------------------------------------- merged-in coupling, not yet read
-  - id: answer-surface-and-prompt-name-reference-targets
-    kind: target_coupling
-    status: untriaged
-    owner: capsule-bench
-    items:
-      - src/merlin/common/access.py
-    surfaced_by: >-
-      The overfit-register gate, on merging reconcile/gemmini-feat-v2 into feat/target-generalization for
-      the gemmini arm-4 model-comparison campaign. Both modules gained the coupling on that side of the
-      merge, not in this branch's work; the register itself merged clean and so did not carry a matching
-      declaration. Declared rather than absorbed, per this file's own rule. Nobody has yet read either
-      module to say whether the fact is derivable, so no rationale or removal condition is invented here.
-    surfaced_on: 2026-08-18
-
   # ---------------------------------------------------------------- run-time concession
   - id: simt-spawn-width-capped-below-declared-hardware
     kind: runtime_concession
