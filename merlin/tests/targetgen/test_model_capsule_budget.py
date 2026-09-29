@@ -212,6 +212,10 @@ def test_must_accelerate_requires_runtime_outline_to_preserve_planned_groups():
     row = _valid_model_row()
     missing = CGR.model_execution_check(row, capsule)
     assert "planned_outlined_alignment_unverified" in missing["violations"]
+    withheld = CGR.enforce_model_execution_check(
+        {**row, "status": "pass", "tiers": {}}, capsule, target="gemmini"
+    )
+    assert withheld["status"] == "incomplete" and withheld["failure"]["plane"] == "model_placement"
 
     alignment = {
         "schema": "planned_outlined_alignment_v1",

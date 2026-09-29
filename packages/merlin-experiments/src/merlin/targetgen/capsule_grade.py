@@ -571,10 +571,11 @@ def enforce_model_execution_check(result: dict, capsule: dict | None, *, target:
         v.startswith("model_requested_oracle_engine_")
         or v.endswith("_oracle_engine_mismatch")
         or v.endswith("_oracle_engine_missing_or_invalid")
-        or v == "planned_outlined_alignment_unverified"
         for v in violations
     )
-    status = "unavailable" if engine_unmeasured else "fail"
+    alignment_unmeasured = "planned_outlined_alignment_unverified" in violations
+    evidence_unmeasured = engine_unmeasured or alignment_unmeasured
+    status = "unavailable" if evidence_unmeasured else "fail"
     detail = "whole-model execution proof failed: " + ", ".join(violations)
     for tier in CR._rtl_tiers_of(target):
         record = (result.get("tiers") or {}).get(tier)
@@ -584,10 +585,14 @@ def enforce_model_execution_check(result: dict, capsule: dict | None, *, target:
     # Preserve a pre-existing stronger failure.  The dangerous case is the flattering pass that escaped
     # into durable QA; convert that to an honest no-measurement or protocol verdict.
     if result.get("status") == "pass":
-        result["status"] = "incomplete" if engine_unmeasured else "fail"
+        result["status"] = "incomplete" if evidence_unmeasured else "fail"
         result["failure"] = {
-            "plane": "required_rtl_engine" if engine_unmeasured else "model_execution",
-            "category": "NOT_RUN_IS_NOT_PASS" if engine_unmeasured else "PROTOCOL_VIOLATION",
+            "plane": (
+                "required_rtl_engine"
+                if engine_unmeasured
+                else "model_placement" if alignment_unmeasured else "model_execution"
+            ),
+            "category": "NOT_RUN_IS_NOT_PASS" if evidence_unmeasured else "PROTOCOL_VIOLATION",
             "detail": detail,
         }
     return result
