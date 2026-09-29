@@ -345,10 +345,13 @@ source selections, not hard-coded corpus entries:
 | Capture | Source node | Observed contraction | 16-wide diagnostic window |
 | --- | --- | --- | --- |
 | TinyLlama 8-token prefill (`k_proj`, FP32 capture) | `g:prepared:root:n280` | 8×2048×256 | 8×32×16 |
+| TinyLlama 8-token prefill (`k_proj`, int8 capture) | `g:prepared:root:n283` | 8×2048×256 | 8×32×16 |
 | SmolVLA int8 denoise | `g:prepared:root:n321` | 50×32×720 | 16×32×16 |
 | ResNet50 W8A8 | `g:prepared:root:n361` | 12544×147×64 | 16×19×16 |
 
-Each run needs a fresh `--output-root`; its `generation.json` and
+For the int8 TinyLlama row, the prepared `_int_mm` node traces to the original
+layer-0 `k_proj` `aten.linear` call. Each run needs a fresh `--output-root`;
+its `generation.json` and
 `numerical_receipt.json` identify the capture, selected facts and contracts,
 lowered MLIR, ELF and saved console bytes. With `--native --rtl`, the receipt
 records a same-ELF Spike/Verilator comparison. To tie that comparison to the
