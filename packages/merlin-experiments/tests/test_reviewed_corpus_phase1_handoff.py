@@ -132,7 +132,23 @@ def bridge(tmp_path, monkeypatch, request):
         "MERLIN_BUNDLE_CAS",
     ):
         monkeypatch.setenv(name, fixture["environment"][name])
-    report = release.prepare(fixture["run"], fixture["release"])
+    # The model-present variant substitutes only Phase 0's archived model
+    # selection; release preparation, sealing and native snapshot verification
+    # still execute their real byte and private-view gates.
+    synthetic_model = getattr(request, "param", None) == "semantic_model"
+    if synthetic_model:
+
+        def selected_model(_plan, private):
+            member = private / "instruction-semantics.json"
+            member.write_text('{"schema":"merlin.instruction_semantics.v1","status":"UNKNOWN"}\n')
+            member.chmod(0o400)
+            return {"sha256": fingerprint(member), "source_evidence_sha256": "synthetic-fixture"}
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(release, "_stage_instruction_model", selected_model)
+            report = release.prepare(fixture["run"], fixture["release"])
+    else:
+        report = release.prepare(fixture["run"], fixture["release"])
     assert report["state"] == "awaiting_operator_review"
     descriptor = Path(report["descriptor"])
     seal_path = fixture["release"] / "private/seal.json"
@@ -146,7 +162,7 @@ def bridge(tmp_path, monkeypatch, request):
     )
     identity = release.verify(Path(sealed["seal"]), descriptor)
     target = load_target_experiment(descriptor)
-    bundle_id = getattr(request, "param", "raw_baseline_public_v0")
+    bundle_id = "raw_baseline_public_v0" if synthetic_model else getattr(request, "param", "raw_baseline_public_v0")
     manifest = descriptor.parent / "input_bundles" / bundle_id / "input_bundle_manifest.yaml"
     bundle = yaml.safe_load(manifest.read_text())
     run = fixture["workspace"] / "phase1-inputs"
@@ -164,10 +180,12 @@ def bridge(tmp_path, monkeypatch, request):
     workspace.mkdir()
     BW.materialize_bundle_inputs(workspace, prepared.bundle, repo=fixture["workspace"])
     BW.require_snapshot_ownership(BW.verify_bundle_snapshot(workspace, prepared.bundle, repo=fixture["workspace"]))
-    assert (
-        release.verify_snapshot(Path(sealed["seal"]), descriptor, workspace, prepared.bundle, repo=fixture["workspace"])
-        == identity
+    snapshot_review = release.verify_snapshot(
+        Path(sealed["seal"]), descriptor, workspace, prepared.bundle, repo=fixture["workspace"]
     )
+    model_snapshot = snapshot_review.pop("instruction_semantics_snapshot", None)
+    assert (model_snapshot is not None) == synthetic_model
+    assert snapshot_review == identity
     view = CI.resolve(
         workspace,
         prepared.bundle,
@@ -188,6 +206,7 @@ def bridge(tmp_path, monkeypatch, request):
         authored_bundle=bundle,
         view=view,
         original_popen=original_popen,
+        model_snapshot=model_snapshot,
     )
 
 
@@ -228,6 +247,70 @@ def test_reviewed_derivation_reaches_real_v4_phase1_views_and_resume(bridge):
     assert (
         release.verify_snapshot(b.seal, b.descriptor, b.workspace, resumed.bundle, repo=b.fixture["workspace"])
         == b.identity
+    )
+
+
+@pytest.mark.parametrize("bridge", ["semantic_model"], indirect=True)
+def test_reviewed_model_reaches_private_phase1_diagnostic_and_resumes(bridge, monkeypatch):
+    from merlin_experiments.phase1 import authoring, workspace_transport
+
+    from merlin.targetgen.sandbox import preflight
+
+    b = bridge
+    monkeypatch.setattr(
+        preflight,
+        "require_working_sandbox",
+        lambda **_kwargs: preflight.SandboxProbe("ok", "synthetic host"),
+    )
+    monkeypatch.setattr(PHASE1_SESSION, "repo_sha", lambda **_kwargs: "synthetic-unversioned-workspace")
+    monkeypatch.setattr(CR, "oracle_available", lambda *_args: (False, "synthetic unavailable oracle"))
+
+    def synthetic_probe(*_args, **_kwargs):
+        return {"pilot_golden_visible_to_agent": "OK"}
+
+    monkeypatch.setattr(workspace_transport, "probe", synthetic_probe)
+    original_sources = PHASE1_SESSION.SI.paths
+
+    def inventoried_test_transport(**kwargs):
+        sources = original_sources(**kwargs)
+        sources["phase1:source:test-probe"] = str(Path(__file__).resolve())
+        return sources
+
+    monkeypatch.setattr(PHASE1_SESSION.SI, "paths", inventoried_test_transport)
+    prepared_runs = []
+
+    def inspect_only(prepared, _runtime):
+        prepared_runs.append(prepared)
+        return 0
+
+    monkeypatch.setattr(authoring, "execute", inspect_only)
+    monkeypatch.setenv("MERLIN_CORPUS_SEAL", str(b.seal))
+    context = load_context(b.descriptor, repo=b.fixture["workspace"])
+
+    def invoke(*, resume=False):
+        argv = ["--run-id", "semantic-host-private", "--sandbox", "bwrap", "--no-oracle", "--experiment", "realistic"]
+        if resume:
+            argv.append("--resume")
+        return PHASE1.run(
+            context,
+            parse_options(argv),
+            bundle_manifest=b.manifest,
+            bundle_id=b.manifest.parent.name,
+            oracle_timing=b.run / "unused-oracle-timing.json",
+        )
+
+    assert invoke() == 0
+    assert invoke(resume=True) == 0
+    assert [prepared.resuming for prepared in prepared_runs] == [False, True]
+    fresh = prepared_runs[0]
+    diagnostic = fresh.environment["semantic_search_diagnostic"]
+    assert diagnostic["status"] == "recorded"
+    assert "instruction_semantics_snapshot" not in fresh.environment["corpus_review"]
+    receipt = fresh.run_dir / "semantic_search_diagnostic.json"
+    assert receipt.stat().st_mode & 0o077 == 0
+    assert not BW.is_exposed(BW.base_argv(fresh.workspace, fresh.bundle, repo=b.fixture["workspace"]), receipt)
+    assert not BW.is_exposed(
+        BW.base_argv(fresh.workspace, fresh.bundle, repo=b.fixture["workspace"]), Path(b.model_snapshot)
     )
 
 
@@ -410,7 +493,10 @@ def test_reviewed_derivation_formal_freeze_and_phase2_admission_share_exact_byte
     lifecycle_helper = importlib.util.module_from_spec(lifecycle_spec)
     lifecycle_spec.loader.exec_module(lifecycle_helper)
     lifecycle = lifecycle_helper.build_lifecycle(
-        tmp_path / "phase2", monkeypatch, functional_run=frozen, target_name=bridge.target.target,
+        tmp_path / "phase2",
+        monkeypatch,
+        functional_run=frozen,
+        target_name=bridge.target.target,
         published_compiler_root=relocated,
     )
     result_path = lifecycle.run()

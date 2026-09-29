@@ -193,6 +193,48 @@ def test_real_prepare_retains_views_and_post_staging_tool_observation(project, m
     assert not storage_lifecycle.blockers(observed[0].workspace.parent, require_terminal=True)
 
 
+def test_reviewed_semantic_diagnostic_is_private_and_resume_bound(project, monkeypatch):
+    _external_substitutes(monkeypatch)
+    from merlin_experiments.corpus import release
+
+    from merlin.targetgen import capsule_runner
+
+    monkeypatch.setattr(capsule_runner, "qa_loop_adapters", lambda *_args, **_kwargs: {"L0": object()})
+    monkeypatch.setattr(capsule_runner, "oracle_adapters", lambda *_args, **_kwargs: {"L0": object()})
+
+    # Substitute only the reviewed release boundary. The run still uses its
+    # actual frozen public corpus and Phase 1 admission/resume machinery.
+    model = project / "private-instruction-semantics.json"
+    model.write_text(json.dumps({"schema": "merlin.instruction_semantics.v1", "status": "UNKNOWN"}))
+
+    def reviewed_snapshot(*_args, **_kwargs):
+        return {
+            "release": str(project / "reviewed-release"),
+            "review_digest": "fixture-review",
+            "payload_sha256": "fixture-payload",
+            "whole_workload_phase1": {"required": False, "status": "not_established"},
+            "instruction_semantics_snapshot": str(model),
+        }
+
+    monkeypatch.setattr(release, "verify_snapshot", reviewed_snapshot)
+    monkeypatch.setenv("MERLIN_CORPUS_SEAL", str(project / "reviewed-release/private/seal.json"))
+    request = dataclasses.replace(_request(project), treatment=Treatment())
+
+    def continuation(prepared):
+        assert "instruction_semantics_snapshot" not in prepared.environment["corpus_review"]
+        assert prepared.environment["semantic_search_diagnostic"]["status"] == "recorded"
+        receipt = prepared.run_dir / "semantic_search_diagnostic.json"
+        assert receipt.stat().st_mode & 0o077 == 0
+        assert not BW.is_exposed(BW.base_argv(prepared.workspace, prepared.bundle, repo=project), receipt)
+        return 0
+
+    assert _run(request, continuation) == 0
+    assert _run(dataclasses.replace(_request(project, resume=True), treatment=Treatment()), continuation) == 0
+    model.write_text(json.dumps({"schema": "merlin.instruction_semantics.v1", "status": "described"}))
+    with pytest.raises(RuntimeError, match="semantic-search instruction model changed"):
+        _run(dataclasses.replace(_request(project, resume=True), treatment=Treatment()), continuation)
+
+
 def test_treatment_gets_authored_bundle_and_resumes_without_restaging(project, monkeypatch):
     _external_substitutes(monkeypatch)
     request = _request(project)

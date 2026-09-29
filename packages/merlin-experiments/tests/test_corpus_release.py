@@ -8,6 +8,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -18,6 +19,59 @@ from merlin_experiments.corpus.coverage import _public_category_roots
 from merlin_experiments.corpus.preparation import assemble
 from merlin_experiments.runner import fingerprint
 from merlin_experiments.spec import SpecError
+
+
+def test_selected_instruction_model_is_private_and_bound_to_release(monkeypatch, tmp_path):
+    from merlin_experiments.phase0 import evidence
+
+    bundle = tmp_path / "selected-evidence"
+    member = bundle / "software/instruction-semantics.json"
+    member.parent.mkdir(parents=True)
+    member.write_text('{"schema":"merlin.instruction_semantics.v1","target":"fixture-device","status":"UNKNOWN"}\n')
+    (bundle / "evidence-manifest.json").write_text('{"schema":"phase0_evidence_v1"}\n')
+    monkeypatch.setattr(
+        evidence,
+        "load_exported_evidence",
+        lambda _path: SimpleNamespace(
+            target="fixture-device",
+            archived_artifacts=(
+                ("software/instruction-semantics.json", member.read_bytes()),
+                ("evidence-manifest.json", (bundle / "evidence-manifest.json").read_bytes()),
+            ),
+        ),
+    )
+    root = tmp_path / "release"
+    private = root / "private"
+    private.mkdir(parents=True)
+    (root / "payload").mkdir()
+    (root / "payload/source.txt").write_text("frozen corpus\n")
+    commitment = corpus_release._stage_instruction_model(
+        {"phase0_evidence_bundle": str(bundle), "target": "fixture-device"}, private
+    )
+    copied = private / "instruction-semantics.json"
+    assert copied.read_bytes() == member.read_bytes()
+    assert copied.stat().st_mode & 0o077 == 0
+    prepared = {"payload_sha256": fingerprint(root / "payload"), "instruction_semantics": commitment}
+    corpus_release._content(root, prepared)
+    prepared["instruction_semantics"] = {**commitment, "sha256": "0" * 64}
+    with pytest.raises(SpecError, match="private instruction model changed"):
+        corpus_release._content(root, prepared)
+    copied.chmod(0o644)
+    with pytest.raises(SpecError, match="owner-only"):
+        corpus_release._content(
+            root, {"payload_sha256": fingerprint(root / "payload"), "instruction_semantics": commitment}
+        )
+    monkeypatch.setattr(
+        evidence,
+        "load_exported_evidence",
+        lambda _path: SimpleNamespace(
+            target="fixture-device", archived_artifacts=(("software/instruction-semantics.json", b"changed"),)
+        ),
+    )
+    with pytest.raises(SpecError, match="changed after evidence verification"):
+        corpus_release._stage_instruction_model(
+            {"phase0_evidence_bundle": str(bundle), "target": "fixture-device"}, tmp_path / "other-private"
+        )
 
 
 def _member(root: Path, category: str, name: str, label: str) -> None:

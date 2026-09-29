@@ -339,6 +339,8 @@ def prepare(
     _hidden_dir = None
     _corpus_seal = os.environ.get("MERLIN_CORPUS_SEAL", "").strip()
     _corpus_review = None
+    _semantic_model_snapshot = None
+    _semantic_diagnostic = None
     if _corpus_seal and a.sandbox != "bwrap":
         raise RuntimeError("sealed corpus admission requires a verified native bwrap input snapshot")
     if a.sandbox == "bwrap":
@@ -351,6 +353,9 @@ def prepare(
             from merlin_experiments.corpus.release import verify_snapshot
 
             _corpus_review = verify_snapshot(Path(_corpus_seal), context.descriptor, ws, bundle, repo=context.repo)
+            # This private path is an ephemeral host input. Persisting it in
+            # corpus_review would mix snapshot routing into the release identity.
+            _semantic_model_snapshot = _corpus_review.pop("instruction_semantics_snapshot", None)
             _reviewed_corpus_roots = tuple(_te().graded_roots())
         _bundle_snapshot_record = _BWS.snapshot_record(ws)
         _corpus_view = CI.resolve(ws, bundle, _corpus_record, repo=context.repo, reviewed_roots=_reviewed_corpus_roots)
@@ -360,6 +365,27 @@ def prepare(
             require_complete(_corpus_view.workload_coverage or {})
         _public_root, _policy_root = _corpus_view.public, _corpus_view.policy
         _contract_root = _corpus_view.contract
+        if _corpus_seal:
+            from . import semantic_diagnostics as _SD
+
+            _model_path = Path(_semantic_model_snapshot) if _semantic_model_snapshot is not None else None
+            if _resuming:
+                # Old reviewed runs had no diagnostic. Do not mint a new
+                # receipt or change their admission identity on resume.
+                if "semantic_search_diagnostic" in _environment_record:
+                    _SD.verify(
+                        _environment_record["semantic_search_diagnostic"],
+                        run_dir,
+                        model_path=_model_path,
+                        public_root=_public_root,
+                    )
+            else:
+                _semantic_diagnostic = _SD.create(
+                    run_dir,
+                    model_path=_model_path,
+                    public_root=_public_root,
+                    contract_root=_contract_root,
+                )
         _te_setup = _te()
         if _te_setup.numeric_profile is not None:
             from merlin_experiments.corpus.numeric_policy import (
@@ -492,6 +518,7 @@ def prepare(
             "authored_bundle_manifest_sha256": _authored_bundle_sha256,
             "public_corpus_input": _corpus_record,
             "corpus_review": _corpus_review,
+            **({"semantic_search_diagnostic": _semantic_diagnostic} if _corpus_seal else {}),
             "hidden_capsule_snapshot": _hidden_snapshot_record,
             "model_host_lane_snapshot": _model_host_lane_snapshot,
             "repo_sha": repo_sha(repo=context.repo),

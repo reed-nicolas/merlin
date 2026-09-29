@@ -16,7 +16,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..spec import SpecError
-from .preparation import admission, assemble, ordinary_tree, private_json, scaffold, source_run
+from .preparation import admission, assemble, copy_input, ordinary_tree, private_json, scaffold, source_run
+
+_INSTRUCTION_MODEL = "instruction-semantics.json"
 
 
 def _read(path: Path) -> dict:
@@ -65,7 +67,52 @@ def _content(root: Path, prepared: dict) -> dict:
     observed = fingerprint(root / "payload")
     if prepared.get("payload_sha256") != observed:
         raise SpecError("prepared corpus payload changed; prepare a new release")
+    model = prepared.get("instruction_semantics")
+    member = root / "private" / _INSTRUCTION_MODEL
+    if model is None:
+        if member.exists() or member.is_symlink():
+            raise SpecError("unrecorded private instruction model in corpus release")
+    else:
+        if not isinstance(model, dict) or not isinstance(model.get("sha256"), str):
+            raise SpecError("invalid private instruction model commitment")
+        ordinary_tree(member)
+        if not member.is_file() or member.stat().st_mode & 0o077:
+            raise SpecError("private instruction model must be an owner-only ordinary file")
+        if fingerprint(member) != model["sha256"]:
+            raise SpecError("private instruction model changed; prepare a new release")
     return {"preparation_sha256": _digest(prepared), "payload_sha256": observed}
+
+
+def _stage_instruction_model(plan: dict, private: Path) -> dict | None:
+    """Copy only a selected Phase 0 consumer model into host-private release input."""
+    from ..runner import fingerprint
+
+    location = plan.get("phase0_evidence_bundle")
+    if location is None:
+        return None
+    if not isinstance(location, str) or not location:
+        raise SpecError("selected Phase 0 evidence bundle path is invalid")
+    from ..phase0.evidence import load_exported_evidence
+
+    bundle = Path(location).expanduser().absolute()
+    selected = load_exported_evidence(bundle)
+    if selected.target != plan["target"]:
+        raise SpecError("selected instruction model target differs from corpus release")
+    member = bundle / "software" / "instruction-semantics.json"
+    if member.is_symlink() or not member.is_file():
+        raise SpecError("selected Phase 0 instruction model is missing or symlinked")
+    destination = private / _INSTRUCTION_MODEL
+    digest = copy_input(member, destination, private=True)
+    archived = dict(selected.archived_artifacts)
+    selected_bytes = archived.get("software/instruction-semantics.json")
+    if selected_bytes is None or digest != hashlib.sha256(selected_bytes).hexdigest():
+        raise SpecError("selected Phase 0 instruction model changed after evidence verification")
+    manifest_bytes = archived.get("evidence-manifest.json")
+    manifest_sha = fingerprint(bundle / "evidence-manifest.json")
+    if manifest_bytes is None or manifest_sha != hashlib.sha256(manifest_bytes).hexdigest():
+        raise SpecError("selected Phase 0 evidence manifest changed after verification")
+    destination.chmod(0o400)
+    return {"sha256": digest, "source_evidence_sha256": manifest_sha}
 
 
 def _freeze_payload(root: Path) -> None:
@@ -158,6 +205,7 @@ def prepare(
             scaffolding = scaffold(te, payload / "corpus", payload / "experiment", private=root / "private")
             descriptor = payload / "experiment" / "target_experiment.yaml"
             checked = admission(descriptor, coverage_output=root / "private" / "workload-coverage.json")
+            instruction_semantics = _stage_instruction_model(plan, root / "private")
             source_run(source)  # derivation/input drift during preparation is not accepted
             private_json(
                 root / "private" / "preparation.json",
@@ -171,6 +219,7 @@ def prepare(
                     "assembly": assembly,
                     "scaffolding": scaffolding,
                     "admission": checked,
+                    "instruction_semantics": instruction_semantics,
                     "payload_sha256": fingerprint(payload),
                     "prepared_at": datetime.now(UTC).isoformat(),
                 },
@@ -357,4 +406,19 @@ def verify_snapshot(seal_path: Path, descriptor: Path, ws: Path, bundle: dict, *
     # A change while the native snapshot was checked cannot borrow its seal.
     if verify(seal_path, descriptor) != identity:
         raise SpecError("corpus release changed while verifying its native snapshot")
-    return identity
+    result = dict(identity)
+    model = frozen_prepared.get("instruction_semantics")
+    if model is not None:
+        member = snapshots[-1] / _INSTRUCTION_MODEL
+        if (
+            not isinstance(model, dict)
+            or member.is_symlink()
+            or not member.is_file()
+            or member.stat().st_mode & 0o077
+            or fingerprint(member) != model.get("sha256")
+        ):
+            raise SpecError("frozen private instruction model differs from reviewed release")
+        # The session consumes and removes this host-only path before persisting
+        # its public review identity or constructing an agent-visible treatment.
+        result["instruction_semantics_snapshot"] = str(member)
+    return result

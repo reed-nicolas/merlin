@@ -168,6 +168,9 @@ def paths(
         ("rtl_checks", "merlin.targetgen.rtl_checks"),
         ("circt_gate", "merlin.targetgen.circt_gate"),
         ("software_spec", "merlin.targetgen.software_spec"),
+        ("semantic_search", "merlin.targetgen.semantic_search.search"),
+        ("linalg_inventory", "merlin.targetgen.contract.linalg_iface"),
+        ("instruction_semantics", "merlin.targetgen.instruction_semantics"),
     ):
         inputs[f"phase1:startup:{key}"] = str(_source(module).resolve())
     try:
