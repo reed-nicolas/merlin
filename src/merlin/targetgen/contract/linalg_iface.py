@@ -14,7 +14,9 @@ Two input grammars ship over the same ``capsule.interface.mlir`` slot:
 This reader is the front-door **parse** for that grammar: it returns a structural inventory of the
 workload (entry signature + one record per payload op, with provenance, operand/result shapes and
 dtypes, matmul extents, and — for ``linalg.generic``/``reduce`` — the inner arithmetic op names that
-name the elementwise/reduction semantics). It is the exact analogue of
+name the elementwise/reduction semantics). Generic/map/reduce records also carry parsed indexing
+maps, iterator types, a typed scalar SSA DAG, side-effect evidence, and source provenance. It is the
+exact analogue of
 :func:`.interface_emit.parse_interface_mlir`: a **reader**, not a lowering. A backend package walks
 this inventory and authors its own lowering to the target command buffer.
 
@@ -93,6 +95,17 @@ def _dtype(t) -> str:
     return str(t.element_type) if isinstance(t, TensorType) else str(t)
 
 
+def _op_name(op) -> str:
+    """The parsed mnemonic, including xDSL's generic unregistered-op wrapper."""
+    from xdsl.dialects.builtin import StringAttr
+
+    if op.name == "builtin.unregistered":
+        original = op.attributes.get("op_name__")
+        if isinstance(original, StringAttr):
+            return original.data
+    return op.name
+
+
 def _prov(op) -> dict[str, str]:
     from xdsl.dialects.builtin import StringAttr
 
@@ -133,6 +146,10 @@ def _ins_outs(op) -> tuple[list, list]:
     """
     ins = list(getattr(op, "inputs", []) or [])
     outs = list(getattr(op, "outputs", []) or [])
+    if _op_name(op) == "linalg.reduce" and not ins and not outs:
+        return [op.input], [op.init]
+    if _op_name(op) == "linalg.map" and not ins and not outs and op.operands:
+        return list(op.operands[:-1]), [op.operands[-1]]
     if not ins and not outs:
         ins = list(op.operands)
     return ins, outs
@@ -147,10 +164,141 @@ def _body_op_names(op) -> list[str]:
     for region in getattr(op, "regions", []) or []:
         for block in region.blocks:
             for inner in block.ops:
-                if inner.name in ("linalg.yield", "func.return"):
+                if _op_name(inner) in ("linalg.yield", "func.return"):
                     continue
-                names.append(inner.name)
+                names.append(_op_name(inner))
     return names
+
+
+def _semantic_attributes(op) -> dict[str, str]:
+    """Canonical MLIR attributes that can affect an operation's result.
+
+    ``prov.*`` is reported separately, while operand segment sizes encode the IRDL
+    storage layout rather than mathematical behavior. Attribute values come from
+    parsed xDSL objects, never from slicing source text.
+    """
+    attrs = {**op.attributes, **(getattr(op, "properties", {}) or {})}
+    return {
+        key: str(value)
+        for key, value in sorted(attrs.items())
+        if not key.startswith("prov.") and key not in ("operandSegmentSizes", "op_name__")
+    }
+
+
+def _iterator_types(op, ins: list) -> list[str]:
+    """Explicit iterator types, or the well-defined iterators of reduce/map."""
+    attrs = {**op.attributes, **(getattr(op, "properties", {}) or {})}
+    explicit = attrs.get("iterator_types")
+    if explicit is not None:
+        out: list[str] = []
+        for it in explicit:
+            data = getattr(it, "data", it)
+            out.append(data.value if hasattr(data, "value") else data if isinstance(data, str) else str(it))
+        return out
+    if _op_name(op) == "linalg.map" and ins:
+        return ["parallel"] * len(_shape(ins[0].type))
+    if _op_name(op) == "linalg.reduce" and ins:
+        rank = len(_shape(ins[0].type))
+        reduction = set(_reduction_dims(op))
+        return ["reduction" if i in reduction else "parallel" for i in range(rank)]
+    return []
+
+
+def _indexing_maps(op, ins: list, outs: list) -> list[str] | None:
+    """Exact maps in linalg operand order, including defined named-op maps."""
+    from xdsl.dialects.builtin import AffineMapAttr
+    from xdsl.ir.affine import AffineDimExpr, AffineMap
+
+    attrs = {**op.attributes, **(getattr(op, "properties", {}) or {})}
+    maps = attrs.get("indexing_maps")
+    if maps is not None:
+        return [str(affine_map) for affine_map in maps]
+
+    opname = _op_name(op)
+    if opname not in ("linalg.reduce", "linalg.map") or not ins:
+        return None
+    rank = len(_shape(ins[0].type))
+    if opname == "linalg.map" and any(len(_shape(value.type)) != rank for value in (*ins, *outs)):
+        return None
+    reduced = set(_reduction_dims(op)) if opname == "linalg.reduce" else set()
+    if any(dim < 0 or dim >= rank for dim in reduced):
+        return None
+
+    def affine(dimensions: tuple[int, ...]) -> str:
+        return str(AffineMapAttr(AffineMap(rank, 0, tuple(AffineDimExpr(i) for i in dimensions))))
+
+    identity = tuple(range(rank))
+    output = tuple(i for i in identity if i not in reduced)
+    return [affine(identity) for _ in ins] + [affine(output) for _ in outs]
+
+
+def _effects(op) -> list[str] | None:
+    """Known xDSL memory effects; ``None`` means the interface cannot establish them."""
+    from xdsl.traits import get_effects
+
+    effects = get_effects(op)
+    if effects is None:
+        return None
+    return sorted({effect.kind.name.lower() for effect in effects})
+
+
+def _scalar_body(op, operand_rec) -> dict[str, Any] | None:
+    """Typed SSA DAG for a linalg scalar region, including ordered yield edges.
+
+    Body argument ``arg:i`` corresponds to linalg input/output scalar operand i.
+    An operation result is ``op:i:k`` (operation index, result index). These IDs
+    remain stable across textual SSA renaming and disambiguate multi-result ops.
+    """
+    regions = list(getattr(op, "regions", []) or [])
+    if not regions:
+        return None
+    if len(regions) != 1 or len(regions[0].blocks) != 1:
+        raise ValueError(f"{_op_name(op)} scalar body requires exactly one region and one block")
+    block = regions[0].blocks[0]
+    args = list(block.args)
+    inner_ops = list(block.ops)
+    if not inner_ops or _op_name(inner_ops[-1]) != "linalg.yield":
+        raise ValueError(f"{_op_name(op)} scalar body has no linalg.yield terminator")
+    operations = inner_ops[:-1]
+    result_owner = {value: (i, k) for i, inner in enumerate(operations) for k, value in enumerate(inner.results)}
+    captures: list[dict[str, Any]] = []
+    capture_index: dict[Any, int] = {}
+
+    def ref(value) -> str:
+        if value in args:
+            return f"arg:{args.index(value)}"
+        if value in result_owner:
+            i, k = result_owner[value]
+            return f"op:{i}:{k}"
+        if value not in capture_index:
+            capture_index[value] = len(captures)
+            captures.append(operand_rec(value))
+        return f"capture:{capture_index[value]}"
+
+    body_ops = [
+        {
+            "op": _op_name(inner),
+            "operands": [ref(value) for value in inner.operands],
+            "results": [str(value.type) for value in inner.results],
+            "attributes": _semantic_attributes(inner),
+            "effects": _effects(inner),
+            "regions": len(inner.regions),
+        }
+        for inner in operations
+    ]
+    known = [item["effects"] for item in body_ops]
+    effects = (
+        None
+        if any(item is None or op_rec["regions"] for item, op_rec in zip(known, body_ops))
+        else sorted({kind for item in known for kind in item})
+    )
+    return {
+        "arguments": [str(value.type) for value in args],
+        "captures": captures,
+        "operations": body_ops,
+        "yields": [ref(value) for value in inner_ops[-1].operands],
+        "effects": effects,
+    }
 
 
 def _reduction_dims(op) -> list[int]:
@@ -450,7 +598,7 @@ def _underlying_reason(exc) -> str:
     return f"{type(exc).__name__}: {reason}" if reason else type(exc).__name__
 
 
-def _parse_diagnostic(text: str, exc) -> "LinalgParseError":
+def _parse_diagnostic(text: str, exc) -> LinalgParseError:
     """Turn an xDSL parse failure into a diagnostic that names the op, not the next line.
 
     The offset comes from the exception's own ``span`` (structural), never from its message text.
@@ -538,6 +686,9 @@ def parse_linalg_mlir(text: str, *, ctx=None) -> dict[str, Any]:
     An ``("op", j)`` edge additionally carries ``result_index``: WHICH of op ``j``'s results it reads.
     Multi-result ops are real (an arg-reduce ``linalg.generic`` yields value AND index together), and
     for them the op id alone does not identify the value.
+
+    ``scalar_body`` exposes body arguments, captures from the enclosing function, ordered
+    operations and exact yield edges. ``effects=None`` means purity was not established by xDSL.
     """
     from xdsl.ir import BlockArgument
 
@@ -558,9 +709,13 @@ def parse_linalg_mlir(text: str, *, ctx=None) -> dict[str, Any]:
             raise _parse_diagnostic(text, exc) from exc
 
     fns = [op for op in module.walk() if op.name == "func.func"]
-    if not fns:
-        raise ValueError("linalg-on-tensors interface has no func.func entry")
-    fn = fns[0]
+    definitions = [op for op in fns if op.body.blocks]
+    if not definitions:
+        raise ValueError("linalg-on-tensors interface has no func.func definition with a body")
+    forward = [op for op in definitions if _fn_name(op) == "forward"]
+    if len(forward) > 1 or (not forward and len(definitions) > 1):
+        raise ValueError("linalg-on-tensors interface has no unique @forward definition")
+    fn = forward[0] if forward else definitions[0]
     entry = _fn_name(fn)
     block = fn.body.blocks[0]
     func_args = list(block.args)
@@ -587,7 +742,7 @@ def parse_linalg_mlir(text: str, *, ctx=None) -> dict[str, Any]:
         if isinstance(value, BlockArgument):
             return ("arg", func_args.index(value)) if value in func_args else ("arg", None)
         owner = value.owner
-        oname = getattr(owner, "name", "")
+        oname = _op_name(owner) if owner is not None else ""
         if value in result_owner:
             return ("op", result_owner[value][0])
         if oname in ("tensor.empty", "linalg.fill", "tensor.splat"):
@@ -611,20 +766,36 @@ def parse_linalg_mlir(text: str, *, ctx=None) -> dict[str, Any]:
     for i, op in enumerate(payload):
         ins, outs = _ins_outs(op)
         prov = _prov(op)
+        loc = str(op.location)
+        opname = _op_name(op)
         rec: dict[str, Any] = {
             "id": i,
-            "kind": op.name,
-            "op": prov.get("op", op.name.split(".")[-1]),
+            "kind": opname,
+            "operation": opname,
+            "op": prov.get("op", opname.split(".")[-1]),
             "family": prov.get("family", ""),
             "prov": prov,
+            "source_provenance": {
+                "entry": entry,
+                "payload_index": i,
+                "tags": prov,
+                "location": None if loc == "loc(unknown)" else loc,
+            },
             "ins": [_operand_rec(v) for v in ins],
             "outs": [_operand_rec(v) for v in outs],
             "results": [{"shape": _shape(r.type), "dtype": _dtype(r.type)} for r in op.results],
+            "attributes": _semantic_attributes(op),
+            "indexing_maps": _indexing_maps(op, ins, outs),
+            "indexing_maps_explicit": "indexing_maps" in op.attributes or "indexing_maps" in op.properties,
+            "iterator_types": _iterator_types(op, ins),
+            "scalar_body": _scalar_body(op, _operand_rec)
+            if opname in ("linalg.generic", "linalg.reduce", "linalg.map")
+            else None,
             "body_ops": _body_op_names(op),
             "reduction_dims": _reduction_dims(op),
         }
         ext = {}
-        if op.name in _MATMUL_KINDS or prov.get("family") == "contraction":
+        if opname in _MATMUL_KINDS or prov.get("family") == "contraction":
             ext = _matmul_extents(ins, outs)
         if ext:
             rec["extents"] = ext
