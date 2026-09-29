@@ -321,7 +321,9 @@ policy passed 2 cases. The 96-package installed environment passed dependency
 compatibility after resolving its NumPy and OpenTelemetry dependencies. These checks
 do not establish live worker-loss cleanup on the current pin:
 the opt-in Ray test requires a loopback-only network namespace, unavailable in
-this release host. AET remains pinned independently to official main `903d4def`,
+this release host. That test exercises cooperative cancellation; a separate
+real-Ray worker `SIGKILL` check is required for a worker-loss claim. AET remains
+pinned independently to official main `903d4def`,
 also confirmed as upstream `main` on 2026-09-27. Merlin uses the public profiler
 module's collector lifecycle, directly constructs its public `MetricsBackend` subclass, and
 resolves batches through ordered public scalar `get` calls under one timeout budget.
