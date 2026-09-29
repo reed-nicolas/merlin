@@ -8,6 +8,7 @@ related: [phase0_specification, model2mlir, reproducibility]
 code_refs:
   - packages/merlin-experiments/src/merlin_experiments/phase0/capture_execution_attestation.py
   - packages/merlin-experiments/src/merlin_experiments/capture_execution/sealed_static.py
+  - packages/merlin-experiments/src/merlin_experiments/capture_execution/sealed_m2m.py
   - packages/merlin-experiments/src/merlin_experiments/capture_execution/sealed_python.py
   - packages/merlin-experiments/src/merlin_experiments/capture_execution/python_preflight.py
   - src/merlin/targetgen/application_inventory.py
@@ -128,3 +129,16 @@ adapter. Those entries appear as `selected_checkout_sources` with observed and
 current hashes, separately from `selected_m2m_sources`. They are not silently
 absorbed into the receipt's direct-owner list, and a matching hash still does not
 prove a complete import or checkpoint-data closure.
+
+The bounded `sealed_m2m` CPU runner has a separate v2 policy for either FP32
+without a recipe or static int8 with an explicitly selected, content-validated
+`quant_recipe_v1` whose numerical engine is `integer_reference`. Its plan names
+the dtype and recipe bytes, selected Model2MLIR revision, workload, Merlin worker
+package and Python runtime. Issuance copies those inputs into a private
+empty-root process. Replay reconstructs the selected command and checks the
+recipe against the capture's quantization metadata and independent integer
+reference agreement. Historical FP32 v1 receipts retain their original replay
+policy. Neither version is an authenticated historical-execution attestation or
+Phase 0 admission; the result explicitly says `phase0_admission: not_granted`.
+Loaders that read ambient environment values or require checkpoints outside the
+selected trees remain unsupported by this bounded policy.
