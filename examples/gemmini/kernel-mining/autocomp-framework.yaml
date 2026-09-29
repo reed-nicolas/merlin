@@ -1,4 +1,4 @@
-# Caller-side assumptions for Autocomp-generated Gemmini C kernels.
+# Authored caller-side assumptions for Autocomp-generated Gemmini C kernels.
 framework: autocomp
 isa: gemmini
 layout:

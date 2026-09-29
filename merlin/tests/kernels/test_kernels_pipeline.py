@@ -15,7 +15,7 @@ DATA = str(merlin_dir() / "tests" / "data" / "kernels")
 def _rec(name, source, target, op, dtype):
     nk = list(ingest_generic(os.path.join(DATA, name), source=source, target=target, op=op, dtype=dtype))[0]
     if target == "gemmini":
-        with use_feature_contract(repo_root() / "examples/gemmini/target/feature-extraction.yaml"):
+        with use_feature_contract(repo_root() / "examples/gemmini/kernel-mining/feature-extraction.yaml"):
             return emit_kernel_record(nk)
     return emit_kernel_record(nk)
 

@@ -98,7 +98,7 @@ _STALE_LITERAL_ALLOW = {
     # These probes package an external ModeLIR checkout, whose own cache lives at
     # <modelir>/runs/ (not at Merlin's retired generated-artifact root).
     'examples/atlas/target/probe_native_program.py:args.modelir / "runs/circt-arc/',  # target-ok: target example path
-    'examples/gemmini/target/probe_native_dma.py:support / "runs/circt-arc/',  # target-ok: target example path
+    'examples/gemmini/verification/probe_native_dma.py:support / "runs/circt-arc/',  # target-ok: target example path
 }
 
 

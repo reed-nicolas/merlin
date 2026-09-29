@@ -12,7 +12,7 @@ from merlin.common.paths import repo_root
 
 
 def _attester():
-    path = repo_root() / "examples/gemmini/target/attest_native_simulator.py"
+    path = repo_root() / "examples/gemmini/verification/attest_native_simulator.py"
     spec = importlib.util.spec_from_file_location("gemmini_native_attester", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)

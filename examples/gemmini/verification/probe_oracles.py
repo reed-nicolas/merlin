@@ -13,9 +13,9 @@ Env (all optional; defaults target /path/to/chipyard):
   MERLIN_GEMMINI_HARNESS_DIR gemmini-rocc-tests root (includes + benchmarks/common)
 
 Usage:
-  python examples/gemmini/target/probe_oracles.py                 # status only
-  python examples/gemmini/target/probe_oracles.py --run spike     # + run known-good on spike-gemmini
-  python examples/gemmini/target/probe_oracles.py --run verilator # + run known-good on Verilator RTL
+  python examples/gemmini/verification/probe_oracles.py                 # status only
+  python examples/gemmini/verification/probe_oracles.py --run spike     # + run known-good on spike-gemmini
+  python examples/gemmini/verification/probe_oracles.py --run verilator # + run known-good on Verilator RTL
 """
 
 from __future__ import annotations

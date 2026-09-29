@@ -12,7 +12,7 @@ from merlin.common.paths import repo_root
 
 
 def test_native_probe_rejects_stale_generation(tmp_path, monkeypatch):
-    monkeypatch.syspath_prepend(str(repo_root() / "examples/gemmini/target"))
+    monkeypatch.syspath_prepend(str(repo_root() / "examples/gemmini/verification"))
     from probe_headline_kernel import _verified_generation
 
     projection = {"source": {"model_mlir_sha256": "source"}, "projection": {"geometry": {"M": 1}}}
@@ -54,7 +54,7 @@ def test_native_probe_rejects_stale_generation(tmp_path, monkeypatch):
 
 
 def test_scaled_readout_uses_fp32_rne_and_saturation(monkeypatch):
-    monkeypatch.syspath_prepend(str(repo_root() / "examples/gemmini/target"))
+    monkeypatch.syspath_prepend(str(repo_root() / "examples/gemmini/verification"))
     from probe_headline_kernel import _scaled_i8_reference
 
     assert _scaled_i8_reference([[-255, -3, -1, 1, 3, 255]], 0.5) == [

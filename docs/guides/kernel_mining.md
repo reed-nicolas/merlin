@@ -66,7 +66,7 @@ XNNPACK RVV / OpenBLAS RVV / Autocomp (Gemmini) / Exo (compiled C + schedule .py
   with `source="triton_cpu"` for the CPU fork.
 - `markers.py` — loads generic ISA-class marker tables from core. Target-specific opcode,
   reuse, and marker declarations are selected explicitly from the target owner; for example,
-  `examples/gemmini/target/feature-extraction.yaml`. The selected file's SHA-256 is recorded
+  `examples/gemmini/kernel-mining/feature-extraction.yaml`. The selected file's SHA-256 is recorded
   in the index, and extraction/audit requires the same bytes. Expert-corpus locations come
   from `merlin/contract/corpora.yaml`.
 - `features/` — pure `extract_*` functions, incl. `shape_regime.py` (working-set bytes,
@@ -101,9 +101,9 @@ kernel-audit   --inputs "out/artifacts/kernel-index/*_index.json" [--motif M] [-
                --out audit_samples.md
 ```
 
-For Gemmini, pass `--feature-contract examples/gemmini/target/feature-extraction.yaml`
+For Gemmini, pass `--feature-contract examples/gemmini/kernel-mining/feature-extraction.yaml`
 to all three tools. For Autocomp indexing, also pass `--framework-contract
-examples/gemmini/target/autocomp-framework.yaml` or an explicit `--target`. Without
+examples/gemmini/kernel-mining/autocomp-framework.yaml` or an explicit `--target`. Without
 the feature file, Gemmini-specific dispatch counts and reuse markers are absent; core
 does not infer them from the target name or checkout. An index that records selected
 feature bytes refuses extraction/audit with a missing or different selection.

@@ -1,4 +1,4 @@
-// Authored property reference for the source-selected MacUnit only.
+// Authored verification reference for the source-selected MacUnit only.
 // Treat each input as a signed 8-bit integer; multiply in 20 bits, add the
 // low 20 bits of the accumulator, and return the 20-bit modular result.
 hw.module @MacUnitReference(in %io_in_a: i8, in %io_in_b: i8,

@@ -11,7 +11,7 @@ from merlin.common.paths import repo_root
 
 
 def load_probe():
-    source = repo_root() / "examples/gemmini/target/probe_oracles.py"
+    source = repo_root() / "examples/gemmini/verification/probe_oracles.py"
     spec = importlib.util.spec_from_file_location("gemmini_probe_example", source)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

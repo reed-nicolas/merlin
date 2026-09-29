@@ -8,7 +8,7 @@ related: [verification, phase0_specification, simulator_selection]
 code_refs:
   - packages/merlin-experiments/src/merlin_experiments/phase0/hardware_validation.py
   - packages/merlin-experiments/src/merlin_experiments/phase0/cell_probe.py
-  - examples/gemmini/target/mac_unit_reference.mlir
+  - examples/gemmini/verification/mac_unit_reference.mlir
 ---
 
 # Verify selected hardware properties
@@ -25,7 +25,7 @@ in Phase 0 and when using Phase 0 tests in Phase 2.
 
 Author a target-specific HW/Comb reference that implements one numerical or
 interface property. Review its arithmetic semantics independently of the RTL.
-For a selected integer cell, [this reference](../../examples/gemmini/target/mac_unit_reference.mlir)
+For a selected integer cell, [this reference](../../examples/gemmini/verification/mac_unit_reference.mlir)
 specifies signed 8-bit multiply and 20-bit modular accumulation. Its proof is
 about the cell's input/output function, including every value of the 32-bit
 accumulator input. It does not prove a whole matrix multiplication, DMA command,
@@ -43,7 +43,7 @@ from merlin_experiments.phase0.hardware_validation import (
 receipt = prove_combinational_property(
     hw_source="/selected/core.hw.mlir",
     module="MacUnit",
-    reference="examples/gemmini/target/mac_unit_reference.mlir",
+    reference="examples/gemmini/verification/mac_unit_reference.mlir",
     reference_module="MacUnitReference",
     circt_opt="/selected/circt/bin/circt-opt",
     z3="/selected/bin/z3",
