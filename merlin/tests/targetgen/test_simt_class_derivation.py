@@ -92,3 +92,38 @@ class TestTierHonesty:
         # `+c` -- satisfied, contract-declared. Never `+f`, which would read as RTL-grounded.
         assert "+c" in table
         assert "+f" not in table
+
+
+class TestEndpointEvidence:
+    def test_observed_decode_field_does_not_invent_a_transport(self):
+        facts = {"facts": {"interfaces": [{
+            "name": "funct_decode_table",
+            "legal_funct": [7, 9943],
+            "scope": "observed_decode_field",
+            "complete_isa": False,
+        }]}}
+        residual = {"compute_units": [{"name": "pe", "kind": "systolic"}]}
+        endpoint, tier, evidence = P._endpoint_kind(_sources(facts=facts, residual=residual))
+        assert endpoint is None
+        assert tier == P.TIER_NONE
+        assert "observed" in evidence
+
+    def test_required_simt_facts_do_not_fall_through_to_a_family_endpoint(self):
+        residual = {"facts_source": "simt", "compute_units": [{"name": "lane", "kind": "simt"}]}
+        endpoint, tier, evidence = P._endpoint_kind(_sources(residual=residual))
+        assert endpoint is None
+        assert tier == P.TIER_NONE
+        assert "missing" in evidence
+
+    def test_rocc_transport_is_fact_tier_without_claiming_complete_legality(self):
+        facts = {"facts": {"interfaces": [
+            {"name": "rocc_cmd"},
+            {"name": "funct_decode_table", "custom_opcode": 0x7B,
+             "scope": "observed_decode_field", "complete_isa": False,
+             "legal_funct": [0, 3]},
+        ]}}
+        endpoint, tier, evidence = P._endpoint_kind(_sources(facts=facts))
+        assert endpoint == "inline_asm_insn"
+        assert tier == P.TIER_FACTS
+        assert "transport" in evidence
+        assert "legal" not in evidence

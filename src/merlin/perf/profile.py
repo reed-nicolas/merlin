@@ -20,8 +20,9 @@ Exactly the three that :func:`merlin.targetgen.capability_manifests.derive_manif
 same precedence, because a profile that disagreed with the capability manifest about what a target IS
 would be a second, competing description of the same machine:
 
-1. **RTL facts** (``merlin.targetgen.rtl.facts.load_facts``) -- geometry, memories, datapaths, the
-   decode table, the per-module ``timing`` walk. GROUNDED: extracted from the target's own RTL.
+1. **RTL facts** (``merlin.targetgen.rtl.facts.load_facts``) -- geometry, memories, datapaths,
+   observed decode fields, the per-module ``timing`` walk. GROUNDED: extracted from the target's own RTL,
+   but a field-local observation alone does not establish an executable interface.
 2. **Family defaults** (``merlin.targetgen.families.family_profile``, keyed by compute-unit KIND) --
    what a machine of this kind does by default when nothing else says.
 3. **The residual** (``<target_base>/contracts/residual.yaml``) -- the human intent and ABI prose the
@@ -565,27 +566,27 @@ class Archetype:
 def _endpoint_kind(sources: Sources) -> tuple[str | None, str, str]:
     """``(endpoint_kind, tier, evidence)`` -- how the target's work is delivered.
 
-    The facts-derived classification is the one in
-    :func:`merlin.targetgen.capability_manifests._endpoint_from_facts`: a decode table whose legal
-    opcodes all fit the host co-processor's funct field is a host-decoded co-processor; any wider
-    opcode means the device decodes its own stream. That derivation is reused rather than restated
-    so the funct-width constant lives in exactly one place.
+    Reuse the capability-manifest interface classifier. An observed decoder
+    field does not prove a host transport or a self-hosted instruction stream;
+    without independent interface evidence the endpoint remains unestablished.
     """
     from merlin.targetgen import capability_manifests as _cm
 
     derived = _cm._endpoint_from_facts(sources.body)
     if derived:
-        itf = sources.interfaces().get(_IFACE_DECODE, {})
-        legal = list(itf.get("legal_funct") or [])
         detail = (
-            f"{len(legal)} legal opcodes, widest 0x{max(legal):x}"
-            if legal
-            else f"a {_IFACE_SELF_HOSTED} interface declaring its own encoding"
+            "RoCC command transport and selected custom opcode"
+            if derived == "inline_asm_insn" else "self-hosted instruction interface"
         )
         return derived, TIER_FACTS, f"facts.interfaces: {detail} -> endpoint {derived}"
     declared = sources.residual.get("endpoint_kind")
     if declared:
         return str(declared), TIER_RESIDUAL, f"residual declares endpoint_kind={declared!r}"
+    interfaces = sources.interfaces()
+    if _IFACE_DECODE in interfaces or _IFACE_SELF_HOSTED in interfaces:
+        return None, TIER_NONE, "observed decoder/interface facts do not establish an executable endpoint"
+    if sources.residual.get("facts_source") in {"rtl", "simt"}:
+        return None, TIER_NONE, "required executable-interface facts are missing"
     kinds = sources.unit_kinds()
     if kinds:
         try:
