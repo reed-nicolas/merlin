@@ -171,7 +171,8 @@ def test_core_cli_uses_explicit_filecheck_or_path_never_chipyard(tmp_path, monke
     monkeypatch.setattr(paths, "ext_path", forbidden)
     monkeypatch.setattr(paths, "repo_root", forbidden)
     monkeypatch.setattr(rtlchecks.RUN, "load_facts", lambda target: {})
-    monkeypatch.setattr(rtlchecks.RUN, "capsule_corpus_roots", lambda: [])
+    monkeypatch.setattr(rtlchecks.RUN, "graded_capsule_roots", lambda target: [tmp_path])
+    monkeypatch.setattr(rtlchecks.RUN, "perf_capsule_roots", lambda target: [])
     monkeypatch.setattr(rtlchecks.RUN, "iter_run_dirs", lambda root: [])
     path_queries = []
     monkeypatch.setattr(rtlchecks.RUN.shutil, "which", lambda name: path_queries.append(name) or "PATH/FileCheck")
