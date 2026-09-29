@@ -13,6 +13,7 @@ from merlin.common.paths import repo_root
 from merlin.runtime.simulator import simulate
 from merlin.targetgen.contract.interface_emit import parse_interface_mlir
 from merlin.targetgen.contract.model_kernel_outline import outline_integer_matmuls
+from merlin.targetgen.contract.model_stitching import stitching_inventory
 from merlin.targetgen.source_kernel_probe import derive_kernel_window
 
 pytestmark = pytest.mark.target("gemmini", "atlas")
@@ -114,6 +115,27 @@ def test_exact_integer_model_body_outlines_a_compilable_interface_kernel(tmp_pat
         candidate["operation_id"] + ":result:0"
     )
     assert stitching["functions"][0]["unlowered_host_operations"]
+    plan = stitching["composition_plan"]
+    assert plan["model_sha256"] == manifest["model_sha256"]
+    assert plan["status"] == "unlowered" and plan["executable"] is False
+    assert plan["functions"][0]["order"] == "single_block_lexical"
+    steps = plan["functions"][0]["steps"]
+    assert [step["kind"] for step in steps] == [
+        "host", "host", "transfer", "transfer", "kernel", "transfer", "return"
+    ]
+    kernel = next(step for step in steps if step["kind"] == "kernel")
+    assert kernel["interface_sha256"] == candidate["interface_sha256"]
+    assert kernel["compiler_support"] == "not_evaluated"
+    assert kernel["software_admission"]["status"] == "unknown"
+    assert kernel["operand_value_ids"] == [edge["source_value_id"] for edge in stitching["candidate_boundary_crossings"][:2]]
+    assert [step["edge_id"] for step in steps if step["kind"] == "transfer"] == [
+        edge["edge_id"] for edge in stitching["candidate_boundary_crossings"]
+    ]
+    assert {obligation["kind"] for obligation in plan["obligations"]} >= {
+        "host_operation_lowering", "memory_placement_and_typed_transfers",
+        "kernel_dispatch_and_pointer_abi", "kernel_compilation_and_admission",
+        "whole_model_numerical_equivalence",
+    }
     interface = (output / candidate["interface_file"]).read_text()
     assert hashlib.sha256(interface.encode()).hexdigest() == candidate["interface_sha256"]
     parsed = parse_interface_mlir(interface)
@@ -157,6 +179,30 @@ def test_model_stitching_keeps_host_producer_and_consumer_edges_explicit():
     assert producer["source_value_id"] == result["candidates"][0]["operand_bindings"][0]["source_value_id"]
     assert producer["producer_operation_id"] in stitching["functions"][0]["unlowered_host_operations"]
     assert stitching["candidate_boundary_crossings"][-1]["consumer_operation"] == "func.return"
+    plan = stitching["composition_plan"]
+    steps = plan["functions"][0]["steps"]
+    host = next(step for step in steps if step.get("operation_id") == producer["producer_operation_id"])
+    incoming = next(step for step in steps if step.get("edge_id") == producer["edge_id"])
+    kernel = next(step for step in steps if step["kind"] == "kernel")
+    assert steps.index(host) < steps.index(incoming) < steps.index(kernel)
+
+
+def test_composition_refuses_to_linearize_multiple_blocks():
+    from merlin.common import mlir_query as query
+
+    model = """builtin.module {
+      func.func @forward(%a: tensor<2xi8>) -> tensor<2xi8> {
+        cf.br ^next(%a : tensor<2xi8>)
+      ^next(%b: tensor<2xi8>):
+        func.return %b : tensor<2xi8>
+      }
+    }"""
+    plan = stitching_inventory(query.parse(model), "0" * 64, [])["composition_plan"]
+    assert plan["executable"] is False
+    assert plan["functions"][0]["order"] == "unestablished"
+    assert plan["functions"][0]["steps"] == []
+    assert plan["functions"][0]["unplanned_operation_ids"]
+    assert any(obligation["kind"] == "control_flow_lowering" for obligation in plan["obligations"])
 
 
 def test_outline_requires_selected_same_target_resident_class_and_sw_declaration():
@@ -178,6 +224,8 @@ def test_outline_requires_selected_same_target_resident_class_and_sw_declaration
     unsupported = outline_integer_matmuls(model, target="atlas", software_spec=atlas_spec,
                                           capability_contract=atlas_contract)
     assert unsupported["candidates"] == []
+    assert unsupported["stitching"]["composition_plan"]["executable"] is False
+    assert not any(step["kind"] == "kernel" for step in unsupported["stitching"]["composition_plan"]["functions"][0]["steps"])
     assert unsupported["interface_class"]["status"] == "unsupported"
     assert len(unsupported["refused"]) == 1
     assert "selected contract lacks" in unsupported["refused"][0]["reason"]

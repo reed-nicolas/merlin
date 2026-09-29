@@ -181,6 +181,6 @@ def outline_integer_matmuls(
         "stitching": stitching_inventory(module, digest, candidates),
         "qualification": (
             "diagnostic isolated integer kernels; SW admission may be unknown; "
-            "no target compilation, model stitching, or numerical proof"
+            "no target compilation, executable model stitching, or numerical proof"
         ),
     }
