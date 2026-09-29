@@ -762,6 +762,15 @@ def run_program_functional_oracle(
     }
     _t0 = time.monotonic()
     res = _run_func_helper(target, model_ext, req, Path(workdir), timeout)
+    unsupported = res.get("unsupported")
+    if not isinstance(unsupported, list):
+        raise OracleUnavailable(f"{target}: functional runner did not report instruction decode coverage")
+    if unsupported:
+        first = unsupported[0]
+        raise OracleUnavailable(
+            f"{target}: functional runner substituted {len(unsupported)} unsupported instruction(s); "
+            f"first: {first!r}"
+        )
     if not res.get("halted"):
         raise ProgramDidNotHalt(f"{target} program did not halt within {max_cycles} instructions (functional)")
 
@@ -939,6 +948,7 @@ def run_program_debug(
         "pc": res.get("pc"),
         "regs": res.get("regs"),
         "program_words": len(words),
+        "unsupported": res.get("unsupported"),
         "regions": regions,
         "rejected_regions": rejected,
         "on_chip": res.get("state_summary"),  # value-free populated-map (vmem/mrf/acc), or None
