@@ -125,9 +125,11 @@ The layout bridge also partitions rank-2 to rank-4 logical operands into
 bounded spatial windows and independent batches. A 64×32 by 32×64 functional
 contraction produced four 32×32 tiles with distinct BF16 expectations; all
 four tiles passed on source-built Spike for each format. Two independent
-rank-3 batch members likewise passed per format on Spike. These are serial
-bare-metal diagnostics, with no assembled output, RTL verdict, or Merlin
-capsule for the spatial and batch cases.
+rank-3 batch members likewise passed per format on Spike. The exact FP8
+two-batch ELF also exited zero on the selected RTL simulator, with both BF16
+matrices matching; FP6 and FP4 batches have Spike evidence only. These are
+serial bare-metal diagnostics, with no assembled spatial output, attention
+kernel, or Merlin capsule for the spatial and batch cases.
 An out-of-tree bridge now accepts model2MLIR's rank-2 Linear operand handoff
 without changing TorchAO or introducing target packing into model2MLIR. A
 reproducible integration test transforms one 32×32×32 Linear with TorchAO in
