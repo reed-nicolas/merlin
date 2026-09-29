@@ -76,7 +76,7 @@ def test_the_counterexample_writer_and_reader_share_explicit_path(tmp_path):
     write_profile(sidecar, [{"name": "CX_fixture", "value": 1}], provenance={"lattice_source": "fixture"})
     write_profile(sidecar, [{"name": "CX_fixture", "value": 2}], provenance={"lattice_source": "fixture"})
     loaded = GC.load_profile("fixture", recipe=recipe, performance_template=template, smt_profile=sidecar)
-    assert loaded["capsules"] == [{"name": "A0"}, {"name": "CX_fixture", "value": 2}]
+    assert loaded["capsules"] == [{"name": "A0", "label": "public"}, {"name": "CX_fixture", "value": 2}]
     assert yaml.safe_load(sidecar.read_text())["provenance"]["lattice_source"] == "fixture"
 
 
