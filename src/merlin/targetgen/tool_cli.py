@@ -7,6 +7,7 @@ their use independent of a Merlin checkout or any in-tree accelerator implementa
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -110,7 +111,53 @@ def _rtl_source_audit(args: argparse.Namespace) -> int:
     )
 
 
+def _semantic_search(args: argparse.Namespace) -> int:
+    """Inspect real linalg-on-tensors MLIR with a selected instruction model."""
+    from .contract.linalg_iface import parse_linalg_mlir
+    from .instruction_semantics import validate_normalized_instruction_model
+    from .semantic_search import SearchLimits, search_linalg_inventory
+
+    mlir_raw = Path(args.mlir).read_bytes()
+    model_raw = Path(args.instruction_model).read_bytes()
+    model = json.loads(model_raw)
+    if not isinstance(model, dict) or model.get("target") != args.target:
+        raise ValueError("selected instruction model target differs from --target")
+    if model.get("schema") != "merlin.instruction_semantics.v1":
+        raise ValueError("unsupported instruction model schema")
+    # Phase 0 emits an explicit diagnostic stub when no OOT description was
+    # selected. Only that non-selectable case may lack normalized source hashes.
+    if not (model.get("status") == "UNKNOWN" and model.get("instructions") == []):
+        model = validate_normalized_instruction_model(model, expected_target=args.target)
+    parsed = parse_linalg_mlir(mlir_raw.decode("utf-8"))
+    result = search_linalg_inventory(
+        parsed,
+        model,
+        limits=SearchLimits(max_candidates=args.max_candidates, timeout_ms=args.timeout_ms),
+    )
+    receipt = {
+        "schema": "merlin.semantic_search_invocation.v1",
+        "target": args.target,
+        "inputs": {
+            "mlir_sha256": hashlib.sha256(mlir_raw).hexdigest(),
+            "instruction_model_sha256": hashlib.sha256(model_raw).hexdigest(),
+        },
+        "result": result,
+        "qualification": "selection and modeled allocation only; no target code or execution proof",
+    }
+    destination = Path(args.out).absolute()
+    if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents):
+        raise ValueError("semantic-search output may not traverse a symlink")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("x", encoding="utf-8") as handle:
+        json.dump(receipt, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+    print(json.dumps({"out": str(destination), "regions": len(result["regions"])}, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
+    from .semantic_search import SearchLimits
+
     parser = argparse.ArgumentParser(prog="merlin-target-tools", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -154,6 +201,17 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--hardware-spec", required=True)
     audit.add_argument("--output", required=True)
     audit.set_defaults(func=_rtl_source_audit)
+
+    selection = sub.add_parser(
+        "semantic-search", help="inspect linalg-on-tensors kernels against selected OOT instruction semantics"
+    )
+    selection.add_argument("--target", required=True)
+    selection.add_argument("--mlir", required=True, help="exact model2MLIR/capsule linalg-on-tensors MLIR")
+    selection.add_argument("--instruction-model", required=True, help="frozen Phase 0 instruction-semantics JSON")
+    selection.add_argument("--out", required=True, help="fresh JSON receipt destination")
+    selection.add_argument("--max-candidates", type=int, default=SearchLimits().max_candidates)
+    selection.add_argument("--timeout-ms", type=int, default=SearchLimits().timeout_ms)
+    selection.set_defaults(func=_semantic_search)
     return parser
 
 

@@ -7,6 +7,8 @@ last_verified: 2026-09-27
 related: [phase0_specification, model_lowering, model2mlir, triton_kernels, target_resolution, llvm_integration, simulator_selection]
 code_refs:
   - src/merlin/targetgen/software_spec.py
+  - src/merlin/targetgen/instruction_semantics.py
+  - src/merlin/targetgen/semantic_search/search.py
   - src/merlin/targetgen/quant_recipe.py
   - src/merlin/targetgen/quant_layer_plan.py
   - src/merlin/targetgen/_recipe_quantizer.py
@@ -81,6 +83,43 @@ The staged kernel route is intentionally narrower than arbitrary whole-model MLI
 `lower_module` checks its supported function/block and matmul-family interface shape;
 do not force an unsupported graph through it or silently drop operations. A target may
 consume command buffers/runtime calls without introducing an LLVM backend at all.
+
+## Inspect semantic selection before writing a target lowering
+
+The diagnostic search path consumes actual model2MLIR/capsule
+`linalg-on-tensors` MLIR and the normalized instruction model frozen by Phase 0:
+
+```text
+PyTorch capture → typed linalg/arith MLIR → exact scalar/indexing inventory
+                                 + Phase 0 OOT instruction semantics
+                                 → bounded instruction candidates
+                                 → modeled local-memory allocation
+                                 → per-region selection/refusal receipt
+```
+
+Run it on a fresh output path, using the exact target and frozen model from one
+Phase 0 run:
+
+```sh
+merlin-target-tools semantic-search --target "$TARGET" \
+  --mlir "$CAPTURE_LINALG_MLIR" \
+  --instruction-model "$PHASE0/software/instruction-semantics.json" \
+  --out "$RUN/semantic-search.json"
+```
+
+The receipt binds the MLIR and model bytes and summarizes candidate/refusal counts
+by parsed operation kind. Currently the search accepts static,
+pure, exact typed `linalg.generic` bodies; its built-in equivalences are guarded
+integer commutation and modular-add reassociation, not arbitrary algebra. Allocation
+models declared memory capacity, alignment, value liveness and bank conflicts with
+a bounded solver.
+An unmatched or timed-out region remains unresolved; it is **not** automatically
+host-admitted. A selected row is only a candidate instruction graph with a modeled
+allocation. It does not emit target code, prove numerical equivalence, establish
+whole-model coverage, or certify the Phase 1 compiler. Target-specific encodings,
+transfers, runtime behavior and compiler passes remain OOT and need independent
+execution evidence. This initial implementation is a narrow semantic seam for
+growing verified rules, not unrestricted algebraic optimization.
 
 ## Phase 0: deterministic derivation, not an agent
 

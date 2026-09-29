@@ -72,6 +72,7 @@ module docstring. **Do not edit by hand** — run the generator (it's `--check`e
 | `merlin.targetgen.rocc` | The RoCC coprocessor interface: decoding a trace of it, and emitting one. |
 | `merlin.targetgen.rtl` | merlin-rtl-introspect: extract structure-only facts from elaborated RTL (CIRCT/FIRRTL). |
 | `merlin.targetgen.sandbox` | Shared, descriptor+manifest-driven agentic bwrap sandbox. |
+| `merlin.targetgen.semantic_search` | Bounded semantic instruction selection and scratchpad allocation. |
 | `merlin.targetgen.synthesize` | Synthesize the five plan artifacts from collected evidence. |
 | `merlin.targetgen.validate` | Validation layer: check synthesized plans + the generated repo, render a report. |
 | `merlin.triton` | Triton as a target-independent KERNEL FRONTEND to Merlin (not a per-target backend). |
