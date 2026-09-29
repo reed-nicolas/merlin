@@ -29,6 +29,7 @@ SCHEMA = "merlin.sealed_m2m_cpu.v2"
 # The only historical v1 issuer whose policy this verifier knows. New captures
 # use v2; an old unsigned receipt remains a diagnostic replay claim only.
 _V1_ISSUER_SHA256 = "f8ca017999a5cb40d44ed29bc9412bef842fe8f3edd8d85170879d1df15d1dd6"
+_HISTORICAL_V2_ISSUER_SHA256 = "36aa1528481a9630e2e31394f45fdde62a0bfea738b8e1855085029f9574344b"
 _V1_SCOPE = "isolated selected FP32 CPU M2M capture; no Phase 0 admission"
 _V2_SCOPE = "isolated selected CPU M2M capture; no Phase 0 admission"
 _MAX_SNAPSHOT_BYTES = 15_000_000_000
@@ -485,10 +486,17 @@ def _stage_source(plan: dict[str, Any], source: Path) -> None:
         shutil.copy2(plan["recipe"]["path"], selected_recipe)
 
 
-def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = None) -> Path:
+def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = None,
+          capture_selection_sha256: str | None = None) -> Path:
     """Make one private snapshot and capture; receipt remains pending replay."""
     if plan.get("schema") != SCHEMA or plan.get("status") != "plan_only":
         raise SealedM2MError("unsupported M2M plan")
+    if capture_selection_sha256 is not None and (
+        not isinstance(capture_selection_sha256, str)
+        or len(capture_selection_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in capture_selection_sha256)
+    ):
+        raise SealedM2MError("capture selection requires an exact SHA-256 identity")
     selected = prepare_plan(m2m_root=Path(plan["m2m_root"]), workload_root=Path(plan["workload_root"]),
                             worker=Path(plan["worker"]), venv=Path(plan["venv"]),
                             schemas_root=Path(plan["schemas_root"]),
@@ -506,7 +514,7 @@ def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = No
     if any(run_dir == path or run_dir.is_relative_to(path) or path.is_relative_to(run_dir) for path in inputs):
         raise SealedM2MError("run directory overlaps a selected input")
     bwrap = _bwrap_binary(bwrap_binary)
-    run_dir.mkdir(parents=False, exist_ok=False)
+    run_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
     source = run_dir / "snapshots/source"
     runtime = run_dir / "snapshots/guest-root"
     source.mkdir(parents=True)
@@ -572,6 +580,8 @@ def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = No
         "bwrap_sha256": _file_digest(bwrap),
         "scope": _V2_SCOPE,
     }
+    if capture_selection_sha256 is not None:
+        payload["capture_selection_sha256"] = capture_selection_sha256
     with receipt.open("xb") as stream:
         stream.write(_json(payload) + b"\n")
         stream.flush()
@@ -601,6 +611,13 @@ def replay_verify(run_dir: Path, *, bwrap_binary: Path | None = None) -> dict[st
         dtype, recipe = plan.get("dtype"), plan.get("recipe")
         if dtype not in {"fp32", "int8"} or (recipe is not None) != (dtype == "int8"):
             raise SealedM2MError("pending M2M receipt has an unsupported dtype or recipe selection")
+        selected_digest = doc.get("capture_selection_sha256")
+        if selected_digest is not None and (
+            not isinstance(selected_digest, str)
+            or len(selected_digest) != 64
+            or any(character not in "0123456789abcdef" for character in selected_digest)
+        ):
+            raise SealedM2MError("pending M2M receipt has a malformed capture selection identity")
         expected_issuer = _file_digest(Path(__file__))
         expected_template = _digest(_command_v2(Path("/capture-out"), dtype=dtype,
                                                 recipe=recipe is not None)[-1].encode())
@@ -608,8 +625,13 @@ def replay_verify(run_dir: Path, *, bwrap_binary: Path | None = None) -> dict[st
         expected_scope = _V2_SCOPE
     else:
         raise SealedM2MError("pending M2M receipt has an unsupported schema")
+    supported_issuer = (
+        {expected_issuer, _HISTORICAL_V2_ISSUER_SHA256}
+        if schema == SCHEMA and doc.get("capture_selection_sha256") is None
+        else {expected_issuer}
+    )
     if (doc.get("status") != "pending_replay"
-            or doc.get("issuer_sha256") != expected_issuer
+            or doc.get("issuer_sha256") not in supported_issuer
             or not isinstance(doc.get("nonce"), str) or len(doc["nonce"]) != 32
             or plan.get("schema") != schema or plan.get("status") != "plan_only"
             or plan.get("command_template_sha256") != expected_template
