@@ -31,6 +31,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2686,44 +2687,83 @@ def resolve_model_workload(entry: dict, m2m_dir: str | Path | None = None) -> "s
     declares no capture environment, and inventing one for it would be a fabricated fact.
     """
     root = (Path(m2m_dir) if m2m_dir else _m2m_dir()) / "workloads"
+    loader = resolve_model_loader(entry, m2m_dir)
     try:
-        rel = resolve_model_loader(entry, m2m_dir).resolve().relative_to(root.resolve())
-    except (ValueError, OSError):
+        loader.absolute().relative_to(root.absolute())
+    except ValueError:
         return None
+    try:
+        rel = loader.resolve().relative_to(root.resolve())
+    except (ValueError, OSError) as exc:
+        raise M2MUnavailable(f"selected Model2MLIR workload loader escapes its source tree: {loader}") from exc
     return rel.parts[0] if len(rel.parts) >= 2 else None
 
 
-def model_capture_env(workload: "str | None") -> dict:
-    """The loader environment ``workload`` DECLARES for its own capture (``{}`` when it declares none).
+def _model_capture_config(workload: str, m2m_dir: str | Path | None = None) -> dict:
+    """Read the selected workload declaration, never an ambient Model2MLIR checkout.
 
-    Delegated to :func:`merlin.baselines.bundle.loader_env`, which is where this repo already states
-    the policy per MODEL -- host locations replayed from the workload's own ``capture.toml``, plus the
-    curated full-fidelity knobs. One declaration, read by every arm that captures a model, so a capsule
-    and a baseline cannot end up capturing two different networks under one name.
+    The selected source tree is byte-bound by the frozen experiment. A missing declaration
+    means no settings were declared; an unreadable or malformed declaration is an error.
     """
-    if not workload:
+    if not workload or Path(workload).name != workload or workload in (".", ".."):
+        raise M2MUnavailable(f"invalid Model2MLIR workload name: {workload!r}")
+    root = Path(m2m_dir) if m2m_dir is not None else _m2m_dir()
+    directory = root / "workloads" / workload
+    loader = directory / "loader.py"
+    if directory.is_symlink() or not loader.is_file() or loader.is_symlink():
+        raise M2MUnavailable(f"selected Model2MLIR workload loader is missing or indirect: {loader}")
+    declaration = directory / "capture.toml"
+    if declaration.is_symlink():
+        raise M2MUnavailable(f"selected Model2MLIR capture declaration is indirect: {declaration}")
+    if not declaration.exists():
         return {}
     try:
-        from merlin.capture import bundle as _bundle
+        document = tomllib.loads(declaration.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise M2MUnavailable(f"cannot read selected Model2MLIR capture declaration: {declaration}") from exc
+    declared_env = document.get("env", {})
+    if not isinstance(declared_env, dict) or any(not isinstance(value, str) for value in declared_env.values()):
+        raise M2MUnavailable(f"selected Model2MLIR capture environment is invalid: {declaration}")
+    return document
 
-        return dict(_bundle.loader_env(workload))
-    except Exception:  # noqa: BLE001 -- an unreadable declaration is not a capture failure
+
+def model_capture_env(workload: "str | None", m2m_dir: str | Path | None = None) -> dict:
+    """Read selected host locations and historical full-fidelity settings for this workload."""
+    if not workload:
         return {}
+    from merlin.capture import bundle as _bundle
+
+    config = _model_capture_config(workload, m2m_dir)
+    locations = {
+        str(key): value
+        for key, value in config.get("env", {}).items()
+        if isinstance(value, str) and value and Path(value).is_dir()
+    }
+    return {**locations, **_bundle.full_env(workload)}
 
 
-def model_capture_python(workload: "str | None") -> "Path | None":
-    """The interpreter ``workload`` pins for its own capture, when it pins one that exists here."""
+def model_capture_python(workload: "str | None", m2m_dir: str | Path | None = None) -> "Path | None":
+    """The selected workload's pinned interpreter; reject a missing declared pin."""
     if not workload:
         return None
-    try:
-        from merlin.capture import bundle as _bundle
-
-        return _bundle.capture_python(workload)
-    except Exception:  # noqa: BLE001
+    config = _model_capture_config(workload, m2m_dir)
+    declared = config.get("venv")
+    if declared is None or declared == "":
         return None
+    if not isinstance(declared, str):
+        raise M2MUnavailable(f"selected Model2MLIR workload {workload!r} has an invalid venv declaration")
+    root = Path(m2m_dir) if m2m_dir is not None else _m2m_dir()
+    directory = root / "workloads" / workload
+    value = Path(declared)
+    python = (value if value.is_absolute() else directory / value) / "bin" / "python"
+    if not python.is_file() or not os.access(python, os.X_OK):
+        raise M2MUnavailable(f"selected Model2MLIR workload {workload!r} pins a missing Python: {python}")
+    return python
 
 
-def freeze_model_loader_dependencies(workload: "str | None", destination: Path, capture_meta: dict) -> "str | None":
+def freeze_model_loader_dependencies(
+    workload: "str | None", destination: Path, capture_meta: dict, m2m_dir: str | Path | None = None
+) -> "str | None":
     """Copy loader-imported source declared by the workload into a capsule-local Python tree.
 
     A frozen loader that imports an upstream module is not frozen if it still relies on an absolute
@@ -2737,15 +2777,12 @@ def freeze_model_loader_dependencies(workload: "str | None", destination: Path, 
 
     if not workload:
         return None
-    try:
-        from merlin.capture import bundle as _bundle
-
-        root_value = _bundle.capture_config(workload).get("upstream")
-    except Exception:  # noqa: BLE001 -- no declared dependency is a valid loader shape
+    root_value = _model_capture_config(workload, m2m_dir).get("upstream")
+    if not root_value:
         return None
-    root = Path(str(root_value or ""))
+    root = Path(str(root_value))
     if not root.is_dir():
-        return None
+        raise M2MUnavailable(f"selected Model2MLIR workload dependency root is missing: {root}")
     sources = []
     observed_hashes = {}
     for item in capture_meta.get("loader_dependency_sources") or []:
@@ -3203,7 +3240,7 @@ def write_model_capsule(
     # invent its inputs then raised, and the corpus recorded the model as one it could not build: a
     # fact about the invocation, published as a fact about the compiler's reach.
     workload = resolve_model_workload(entry, src.m2m_dir) if src is not None else None
-    capture_env = model_capture_env(workload) if src is not None else {}
+    capture_env = model_capture_env(workload, src.m2m_dir) if src is not None else {}
     capture_quantization = entry.get("capture_quantization")
     if capture_quantization not in (None, "already_materialized"):
         raise ValueError(f"unknown model capture_quantization {capture_quantization!r}")
@@ -3225,7 +3262,7 @@ def write_model_capsule(
             dtype,
             scheme=entry.get("quant_scheme"),
             env=capture_env,
-            python=model_capture_python(workload),
+            python=model_capture_python(workload, src.m2m_dir),
             recipe=(
                 None
                 if already_quantized
@@ -3288,7 +3325,9 @@ def write_model_capsule(
             declared = art.meta["materialized_artifact_identities"][original]
             if len(payload) != declared["bytes"] or hashlib.sha256(payload).hexdigest() != declared["sha256"]:
                 raise M2MUnavailable(f"materialized external payload changed during capsule copying: {original}")
-    loader_dependencies = freeze_model_loader_dependencies(workload, d, art.meta or {}) if artifact is None else []
+    loader_dependencies = (
+        freeze_model_loader_dependencies(workload, d, art.meta or {}, src.m2m_dir) if artifact is None else []
+    )
 
     # What this model owes the accelerator, derived from its own captured linalg and this target's role
     # census. Without it the capstone is vacuous: no required classes and no must_accelerate means a

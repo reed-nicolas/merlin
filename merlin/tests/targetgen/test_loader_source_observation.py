@@ -38,6 +38,11 @@ def test_worker_observes_top_level_and_input_builder_imports(tmp_path, monkeypat
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "m2m", ModuleType("m2m"))
     monkeypatch.setitem(sys.modules, "m2m.coverage", coverage)
+    monkeypatch.setattr(
+        worker,
+        "_capture_api_report",
+        lambda _m2m: {"same_conversion_missing": [], "frontend_trace_missing": [], "static_integerization_missing": []},
+    )
     collect = worker._loader_dependency_sources
 
     class Observed(Exception):
@@ -62,7 +67,6 @@ def test_worker_observes_top_level_and_input_builder_imports(tmp_path, monkeypat
 def test_loader_dependency_staging_checks_observed_bytes(tmp_path, monkeypatch, change):
     import shutil
 
-    from merlin.capture import bundle
     from merlin.targetgen import capsule_source
 
     upstream = tmp_path / "upstream"
@@ -70,7 +74,11 @@ def test_loader_dependency_staging_checks_observed_bytes(tmp_path, monkeypatch, 
     source = upstream / "dependency.py"
     source.write_text("original source\n")
     (upstream / "LICENSE").write_text("synthetic fixture license\n")
-    monkeypatch.setattr(bundle, "capture_config", lambda _: {"upstream": str(upstream)})
+    checkout = tmp_path / "model2MLIR"
+    workload = checkout / "workloads/fixture"
+    workload.mkdir(parents=True)
+    (workload / "loader.py").write_text("def get_model_and_inputs(): ...\n")
+    (workload / "capture.toml").write_text(f'upstream = "{upstream}"\n')
     meta = {
         "loader_dependency_sources": [
             {
@@ -94,11 +102,12 @@ def test_loader_dependency_staging_checks_observed_bytes(tmp_path, monkeypatch, 
         monkeypatch.setattr(shutil, "copyfile", changed_copy)
     destination = tmp_path / "capsule"
     if change == "none":
-        assert capsule_source.freeze_model_loader_dependencies("fixture", destination, meta) == "capsule.loader_deps"
+        staged = capsule_source.freeze_model_loader_dependencies("fixture", destination, meta, checkout)
+        assert staged == "capsule.loader_deps"
         assert (destination / "capsule.loader_deps/dependency.py").read_bytes() == source.read_bytes()
     else:
         with pytest.raises(capsule_source.M2MUnavailable, match="loader dependency changed"):
-            capsule_source.freeze_model_loader_dependencies("fixture", destination, meta)
+            capsule_source.freeze_model_loader_dependencies("fixture", destination, meta, checkout)
 
 
 @pytest.mark.parametrize("change", ["none", "modified", "missing", "legacy", "malformed"])
