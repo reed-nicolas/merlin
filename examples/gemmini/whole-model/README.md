@@ -32,11 +32,13 @@ not a whole-model compiler or correctness test.
 
 The available ResNet-50 and SmolVLA denoise-step captures expose the current
 gap. Requested `int8` routing identifies Gemmini-capable contractions, but
-the standard captures retain FP32/BF16 operands; the W8A8 ResNet capture
-still has 53 FP32 contractions. No target-native quantization bridge or
-general whole-model Gemmini binary is established by those routes. A separate
-historical ResNet program from an alternate capture is useful evidence for a
-tracer bullet, not certification of this generated Phase 1 compiler.
+some standard captures retain FP32/BF16 operands. A separately integerized
+W8A8 ResNet capture has exact `i8 × i8 → i32` candidates, but isolated kernel
+emission does not establish reviewed SW admission, host/device stitching or
+whole-model execution. No general whole-model Gemmini binary is established by
+those routes. A separate historical ResNet program from an alternate capture
+is useful evidence for a tracer bullet, not certification of this generated
+Phase 1 compiler.
 
 For an already-integerized capture, you can materialize the exact signed
 `i8 × i8 → i32` contraction kernels as standalone `merlin_iface` inputs:
@@ -72,6 +74,25 @@ not lower the intervening quantization, transpose, dequantization or host operat
 model, or establish numerical execution. The published Gemmini compiler still
 declines the *whole* upstream Linalg module; an isolated kernel command buffer
 does not change that verdict.
+To record what the selected OOT package emits for every candidate in the
+captured model, without hand-writing scripts in `out/`, run:
+
+```sh
+merlin-target-tools probe-int-mm-route --target gemmini \
+  --mlir /absolute/capture/model.mlir \
+  --software-spec /absolute/phase0-artifacts/software/software-spec.json \
+  --capability-contract /absolute/phase0-artifacts/software/contract.json \
+  --package /absolute/selected-oot-package \
+  --out /configured/out/artifacts/model-kernels/route-probe.json
+```
+
+The fresh receipt binds model/spec/contract/package bytes, source SSA operands,
+the OOT command buffer for each distinct interface, explicit declines, and a
+separate direct whole-model emission observation. Read `emission_counts`,
+`complete_model_direct_emission`, `stitching.obligations` and
+`whole_model_offload_verified` together. Successful isolated kernels do not
+imply that their inputs and outputs are connected back into a running model.
+
 The outline's focused test numerically checks its isolated signed `i8×i8→i32`
 interface on a non-square K-tail against scalar arithmetic. It does not execute
 the OOT compiler output, connect the host operations, or compare a model golden.
