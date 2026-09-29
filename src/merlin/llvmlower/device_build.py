@@ -47,13 +47,13 @@ class DeviceRouting:
     package_dir: str | Path
     operand_dtype: str
     accum_dtype: str
-    select: "Callable[[Any], bool] | None" = None
+    select: Callable[[Any], bool] | None = None
     numeric_policy: dict | None = None
     #: Exact Phase 0 operation/interface identities; mutually exclusive with a shape selector.
     exact_selection: Any | None = None
 
 
-def routing_for_placement(placement, device: str, package_dir: str | Path, *, numeric_policy=None) -> "DeviceRouting":
+def routing_for_placement(placement, device: str, package_dir: str | Path, *, numeric_policy=None) -> DeviceRouting:
     """The ``DeviceRouting`` a whole-model build needs, derived from a placement rather than declared.
 
     This is the step that made the fused single-ELF path unreachable in production. Every piece of it
@@ -306,7 +306,7 @@ def build_device_objects(
     accum_dtype: str,
     numeric_policy: dict | None = None,
     codegen_target: str = "riscv",
-    cflags: "Sequence[str] | None" = None,
+    cflags: Sequence[str] | None = None,
     timeout: int = 900,
     expected_interfaces: Mapping[str, Mapping[str, str]] | None = None,
     package_sha256: str | None = None,
@@ -320,9 +320,9 @@ def build_device_objects(
     declines should still build its other two and say what it lost, because the alternative is an
     all-or-nothing build whose failure names none of the shapes involved.
     """
+    from merlin.common.digest import sha256_text
     from merlin.targetgen import corpus_spec as CS
     from merlin.targetgen.oot_runner import load_package, run_entrypoint
-    from merlin.common.digest import sha256_text
 
     from .device_shim import emit_translation_unit, kernel_abi_for
     from .toolchain import clang, mlir_translate
@@ -411,14 +411,25 @@ def build_device_objects(
             parsed = parse_interface_mlir(iface)
             tensors = parsed["tensors"]
             commands = parsed["commands"]
-            if parsed["target"] != device or [
+            # The package's LLVM entry receives interface tensors in declaration
+            # order.  The shim passes resident weight, lhs, then output; matching
+            # shapes alone would let an A,B,Y interface compile and swap pointers.
+            if list(tensors) != ["B", "A"] or [
+                (tensors[name] or {}).get("role") for name in ("B", "A")
+            ] != ["input", "input"] or [
+                command.get("operands") for command in commands
+            ] != [
+                {"src": "B", "dst": "B_res"},
+                {"lhs": "A", "rhs": "B_res", "dst": "acc"},
+                {"src": "acc", "dst": "Y"},
+            ] or parsed["target"] != device or [
                 (tensors.get(name) or {}).get("shape") for name in ("A", "B")
             ] != [[m, k], [k, n]] or [
                 (tensors.get(name) or {}).get("dtype") for name in ("A", "B")
             ] != [dtypes[sym][0], dtypes[sym][1]] or [cmd["opcode"] for cmd in commands] != [
                 "RES_PACK", "MATMUL_RESIDENT", "COMMIT"
             ] or commands[-1].get("attributes", {}).get("output_dtype") != dtypes[sym][2]:
-                raise ValueError(f"{sym} selected interface disagrees with device, shape, or precision")
+                raise ValueError(f"{sym} selected interface disagrees with pointer ABI, device, shape, or precision")
         ifc = stem.with_suffix(".iface.mlir")
         ifc.write_text(iface, encoding="utf-8")
 
@@ -479,7 +490,7 @@ def build_device_objects(
     )
 
 
-def _flags(codegen_target: str, cflags: "Sequence[str] | None" = None) -> list[str]:
+def _flags(codegen_target: str, cflags: Sequence[str] | None = None) -> list[str]:
     """Compile flags for the device objects: the CALLER's when it supplied them.
 
     The defaults name an ISA (`-march=rv64gcv`), and a default ISA is an assumption about the

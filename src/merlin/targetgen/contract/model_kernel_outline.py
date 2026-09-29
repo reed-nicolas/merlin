@@ -116,8 +116,11 @@ def outline_integer_matmuls(
             "abi_version": "0.1",
             "target": target,
             "tensors": {
-                "A": {"shape": left, "dtype": "i8", "role": "input"},
+                # The resident-matmul pointer ABI is weight, lhs, output.  The
+                # OOT artifact takes external tensors in interface declaration
+                # order, so this order must agree with the host device shim.
                 "B": {"shape": right, "dtype": "i8", "role": "input"},
+                "A": {"shape": left, "dtype": "i8", "role": "input"},
             },
             "commands": [
                 {

@@ -128,8 +128,8 @@ def test_exact_model_build_hands_the_selected_interface_to_the_oot_package(tmp_p
     cb = {
         "abi_version": "0.1", "target": "gemmini",
         "tensors": {
-            "A": {"shape": [4, 19], "dtype": "i8", "role": "input"},
             "B": {"shape": [19, 8], "dtype": "i8", "role": "input"},
+            "A": {"shape": [4, 19], "dtype": "i8", "role": "input"},
         },
         "commands": [
             {"opcode": "RES_PACK", "operands": {"src": "B", "dst": "B_res"},
@@ -165,6 +165,17 @@ def test_exact_model_build_hands_the_selected_interface_to_the_oot_package(tmp_p
     )
     assert seen == [interface]
     assert not result.ok and "synthetic stop" in result.skipped[0][1]
+
+    cb["tensors"] = {"A": cb["tensors"]["A"], "B": cb["tensors"]["B"]}
+    swapped = emit_interface_mlir(cb)
+    with pytest.raises(ValueError, match="pointer ABI"):
+        build_device_objects(
+            "gemmini", {"selected": (4, 8, 19)}, {"selected": ("i8", "i8", "i32")},
+            package_dir=package, workdir=tmp_path / "bad", operand_dtype="int8", accum_dtype="i32",
+            expected_interfaces={"selected": {"mlir": swapped, "sha256": sha256_text(swapped)}},
+            package_sha256=hash_tree(package)["sha256"],
+        )
+    assert seen == [interface], "wrong pointer order must be refused before package invocation"
 
 
 def test_a_batched_signature_builds_the_same_kernel_as_its_unbatched_form(tmp_path):
