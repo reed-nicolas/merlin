@@ -51,3 +51,14 @@ def test_native_probe_rejects_stale_generation(tmp_path, monkeypatch):
     capsule_path.write_text(yaml.safe_dump(capsule), encoding="utf-8")
     with pytest.raises(ValueError, match="differ from their generated source binding"):
         _verified_generation(projection, tmp_path)
+
+
+def test_scaled_readout_uses_fp32_rne_and_saturation(monkeypatch):
+    monkeypatch.syspath_prepend(str(repo_root() / "examples/gemmini/target"))
+    from probe_headline_kernel import _scaled_i8_reference
+
+    assert _scaled_i8_reference([[-255, -3, -1, 1, 3, 255]], 0.5) == [
+        [-128, -2, 0, 0, 2, 127]
+    ]
+    with pytest.raises(ValueError, match="exactly representable FP32"):
+        _scaled_i8_reference([[1]], 0.1)
