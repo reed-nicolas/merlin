@@ -44,6 +44,11 @@ def build_phase0_handoff(tmp_path, *, copy_sources=True):
         shutil.copytree(python_source_dir() / "merlin", installed / "merlin", ignore=ignore)
         shutil.copytree(extension.parent / "merlin", installed / "merlin", dirs_exist_ok=True, ignore=ignore)
         shutil.copytree(extension, installed / "merlin_experiments", ignore=ignore)
+        # This fixture models an installed package, whose core wheel carries
+        # the corpus registry under merlin/_data rather than in the source tree.
+        registry = installed / "merlin/_data/contract/corpora.yaml"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(data_path("contract", "corpora.yaml"), registry)
     workspace = tmp_path / "external-workspace"
     workspace.mkdir()
     support = workspace / "explicit-target-resources"
