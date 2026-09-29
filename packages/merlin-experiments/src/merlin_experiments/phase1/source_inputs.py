@@ -16,11 +16,12 @@ from pathlib import Path
 from merlin.common.digest import sha256_file as _sha
 from merlin.common.source_membership import SourceMembershipError, python_members
 
+from .. import access_policy
 from ..adapters import _relative_entrypoint, phase0_startup_inputs
 from ..spec import SpecError
 
 PREFIXES = ("phase1:client:", "phase1:source:", "phase1:startup:", "phase1:native:")
-SCOPE = "phase1-package-public-clients-startup-and-retained-native-harness-python-v1"
+SCOPE = "phase1-package-public-clients-startup-and-retained-native-harness-access-policy-v2"
 
 
 def fingerprint(path: str | Path) -> str:
@@ -111,6 +112,7 @@ def paths(
     """Rediscover supported source ownership, including native executable aliases."""
     from merlin.targetgen.tool_registry import public_client_modules
 
+    access_policy.require_current_policy()
     inputs = {
         f"phase1:client:{module}": str(_source(module).resolve())
         for module in (*public_client_modules(), "merlin.targetgen.tool_registry")
@@ -128,6 +130,7 @@ def paths(
     inputs.update(members)
     startup = phase0_startup_inputs()
     inputs.update({f"phase1:startup:{name}": str(path) for name, path in startup.items()})
+    inputs["phase1:startup:legacy_target_access"] = str(access_policy.resource_path())
     corpus_members = _python_members(_source("merlin_experiments.corpus").parent, "phase1:startup:corpus:")
     for module in ("release", "preparation", "admission"):
         if str(_source(f"merlin_experiments.corpus.{module}").resolve()) not in corpus_members.values():
@@ -154,6 +157,7 @@ def paths(
         ("provider_loaded_ownership", "merlin.runtime.backends.base"),
         ("python_regex_scanner", "merlin.common.regex_scan"),
         ("shared_access_policy", "merlin.common.access"),
+        ("historical_target_access_policy", "merlin_experiments.access_policy"),
         ("answer_surface_policy", "merlin.targetgen.sandbox.answer_surfaces"),
         ("read_audit", "merlin.targetgen.sandbox.read_audit"),
         ("source_discovery", "merlin_experiments.adapters"),

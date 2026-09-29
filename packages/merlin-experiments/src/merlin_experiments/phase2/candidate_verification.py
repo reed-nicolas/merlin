@@ -18,6 +18,7 @@ from merlin.common.paths import module_source_path
 from merlin.targetgen.sandbox import bwrap as BW
 from merlin.targetgen.sandbox.answer_surfaces import answer_surfaces, audit_tokens
 from merlin.targetgen.target_experiment import TargetExperiment
+from merlin_experiments import access_policy as historical_target_access_policy
 
 from . import agent_workspace as AW
 from . import campaign as PC
@@ -134,7 +135,7 @@ def _verify_audit_requalification(
             frozen.resolve().relative_to(record_path.parent.resolve())
         except ValueError:
             raise StageGateError("audit policy snapshot escapes its requalification directory") from None
-        if requalification["schema_version"] == 4:
+        if requalification["schema_version"] in (4, 5):
             parent = frozen.parent
             while True:
                 if parent.is_symlink() or not parent.is_dir() or parent.stat().st_mode & 0o222:
@@ -169,11 +170,19 @@ def _verify_audit_requalification(
     discovery = next(row for row in snapshots if row["role"] == "python_source_membership")
     if _sha256_file(module_source_path("merlin.common.source_membership")) != discovery["sha256"]:
         raise StageGateError("live source membership implementation differs from requalification")
-    if requalification["schema_version"] == 4:
+    if requalification["schema_version"] in (4, 5):
         access_source = next(row for row in snapshots if row["role"] == "shared_access_policy")
         live_access = Path(inspect.getsourcefile(audit_token_in) or "").resolve()
         if _sha256_file(live_access) != access_source["sha256"]:
             raise StageGateError("live shared access policy differs from the requalification policy snapshot")
+    if requalification["schema_version"] == 5:
+        for role, live in (
+            ("historical_target_access_policy", module_source_path("merlin_experiments.access_policy")),
+            ("historical_target_access_data", historical_target_access_policy.resource_path()),
+        ):
+            source = next(row for row in snapshots if row["role"] == role)
+            if _sha256_file(live) != source["sha256"]:
+                raise StageGateError(f"live {role} differs from the requalification policy snapshot")
     combined, rounds = _recomputed_candidate_audits(
         document, target_experiment, audit_token_set=requalification["audit_token_set"]
     )
@@ -219,6 +228,8 @@ def requalify_audit_only_candidate(
         ("audit_implementation", Path(inspect.getsourcefile(audit_codex_transcript) or "").resolve()),
         ("answer_surface_policy", answer_policy_path),
         ("shared_access_policy", Path(inspect.getsourcefile(audit_token_in) or "").resolve()),
+        ("historical_target_access_policy", module_source_path("merlin_experiments.access_policy")),
+        ("historical_target_access_data", historical_target_access_policy.resource_path()),
         ("python_source_membership", module_source_path("merlin.common.source_membership")),
         *((f"phase2:{name}", path) for name, path in phase2_members.items()),
     )
@@ -266,7 +277,7 @@ def requalify_audit_only_candidate(
     for row, audit in zip(rewritten["agent"]["rounds"], rounds):
         row["audit"] = audit
     rewritten["audit_requalification"] = {
-        "schema_version": 4,
+        "schema_version": 5,
         "phase2_source_identity": phase2_identity,
         "kind": RECORD.AUDIT_REQUALIFICATION_KIND,
         "reason": RECORD.AUDIT_REQUALIFICATION_REASON,

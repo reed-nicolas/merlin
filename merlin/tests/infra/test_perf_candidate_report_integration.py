@@ -625,8 +625,16 @@ def test_real_one_round_producer_verifies_its_candidate(qualified_stage, monkeyp
     )
 
 
-@pytest.mark.parametrize("changed_role", ["audit_implementation", "phase2:candidate_verification.py"])
-def test_requalification_v4_pins_actual_owners_without_native_execution(tmp_path, monkeypatch, changed_role):
+@pytest.mark.parametrize(
+    "changed_role",
+    [
+        "audit_implementation",
+        "phase2:candidate_verification.py",
+        "historical_target_access_policy",
+        "historical_target_access_data",
+    ],
+)
+def test_requalification_v5_pins_actual_owners_without_native_execution(tmp_path, monkeypatch, changed_role):
     import copy
 
     from test_perf_agent_stage import _audit_only_refusal_record
@@ -653,11 +661,13 @@ def test_requalification_v4_pins_actual_owners_without_native_execution(tmp_path
     RECORD._validate_audit_requalification(document)
     VERIFY._verify_audit_requalification(output, document, object())
     qualification = document["audit_requalification"]
-    assert qualification["schema_version"] == 4
+    assert qualification["schema_version"] == 5
     assert {row["role"] for row in qualification["policy_snapshots"]} == {
         "audit_implementation",
         "answer_surface_policy",
         "shared_access_policy",
+        "historical_target_access_policy",
+        "historical_target_access_data",
         "python_source_membership",
         *("phase2:" + name for name in qualification["phase2_source_identity"]["members"]),
     }
@@ -691,6 +701,15 @@ def test_requalification_v4_pins_actual_owners_without_native_execution(tmp_path
     if changed_role.startswith("phase2:"):
         identity = copy.deepcopy(qualification["phase2_source_identity"])
         monkeypatch.setattr(VERIFY.TEL, "_package_source_record", lambda: identity)
+    elif changed_role == "historical_target_access_policy":
+        source_path = VERIFY.module_source_path
+        monkeypatch.setattr(
+            VERIFY,
+            "module_source_path",
+            lambda name: isolated if name == "merlin_experiments.access_policy" else source_path(name),
+        )
+    elif changed_role == "historical_target_access_data":
+        monkeypatch.setattr(VERIFY.historical_target_access_policy, "resource_path", lambda: isolated)
     else:
         monkeypatch.setattr(
             VERIFY.inspect,
@@ -727,7 +746,7 @@ def _assert_requalification_pins_shared_matcher(root, record, target, monkeypatc
     updated = VERIFY.requalify_audit_only_candidate(source, root / "requalified/candidate.json", target)
     qualified = VERIFY.verify_candidate_record(updated, target_experiment=target)
     attribution = qualified["audit_requalification"]
-    assert attribution["schema_version"] == 4
+    assert attribution["schema_version"] == 5
     assert "phase2:candidate_verification.py" in {row["role"] for row in attribution["policy_snapshots"]}
     assert record.read_bytes() == original_bytes and source.read_bytes() == source_bytes
 

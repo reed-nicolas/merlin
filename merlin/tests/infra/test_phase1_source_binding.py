@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from merlin_experiments import access_policy
 from merlin_experiments.phase1 import session as S
 from merlin_experiments.phase1 import source_inputs as SI
 from merlin_experiments.phase1 import treatments as T
@@ -144,9 +145,23 @@ def test_shared_inventory_and_fingerprint_have_one_owner(native_sources):
     assert record["inputs"]["phase1:startup:source_discovery_helper"]["path"] == str(
         module_source_path("merlin.common.source_membership")
     )
+    assert record["inputs"]["phase1:startup:legacy_target_access"]["path"] == str(access_policy.resource_path())
+    assert record["inputs"]["phase1:startup:historical_target_access_policy"]["path"] == str(
+        module_source_path("merlin_experiments.access_policy")
+    )
     assert "phase1:native:broker.py" in record["inputs"]
     assert "phase1:source:providers/bedrock_agent.py" in record["inputs"]
     SI.verify(record, **native_sources)
+
+
+def test_changed_packaged_access_policy_refuses_phase1_freeze(native_sources, tmp_path, monkeypatch):
+    document = json.loads(access_policy.resource_path().read_text())
+    document["modules"].pop()
+    changed = tmp_path / "changed-access.json"
+    changed.write_text(json.dumps(document))
+    monkeypatch.setattr(access_policy, "resource_path", lambda: changed)
+    with pytest.raises(access_policy.AccessPolicyUnavailable, match="changed after"):
+        SI.record(**native_sources)
 
 
 def test_prepared_prelaunch_binds_ownership_marker(native_sources, tmp_path):

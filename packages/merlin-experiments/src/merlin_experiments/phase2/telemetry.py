@@ -25,6 +25,7 @@ from merlin.targetgen.sandbox import bwrap as BW
 from merlin.targetgen.sandbox import toolchain as TC
 from merlin.targetgen.sandbox.answer_surfaces import answer_surfaces
 from merlin.targetgen.target_experiment import load_target_experiment
+from merlin_experiments import access_policy as historical_target_access_policy
 from merlin_experiments.phase2 import campaign as PC
 from merlin_experiments.phase2 import contracts
 from merlin_experiments.phase2 import gsim_gate as GATE
@@ -73,7 +74,7 @@ LEGACY_TREATMENT_SOURCES = frozenset(
 )
 
 
-SOURCE_POLICY_VERSION = 4
+SOURCE_POLICY_VERSION = 5
 ACCOUNTING_POLICY = "aet_explicit_price_snapshot_v1"
 PACKAGED_TREATMENT_SOURCES = LEGACY_TREATMENT_SOURCES | frozenset(
     {"performance_telemetry", "performance_contracts", "shared_digest"}
@@ -83,6 +84,9 @@ EXPLICIT_PRICE_TREATMENT_SOURCES = PACKAGED_TREATMENT_SOURCES | frozenset(
 )
 TREATMENT_SOURCES = EXPLICIT_PRICE_TREATMENT_SOURCES | frozenset(
     {"performance_package_sources", "python_source_membership"}
+)
+TARGET_ACCESS_TREATMENT_SOURCES = TREATMENT_SOURCES | frozenset(
+    {"historical_target_access_policy", "historical_target_access_data"}
 )
 
 
@@ -150,8 +154,10 @@ def treatment_identity(
         required = PACKAGED_TREATMENT_SOURCES
     elif type(version) is int and version == 3 and type(policy) is int and policy == 3:
         required = EXPLICIT_PRICE_TREATMENT_SOURCES
-    elif type(version) is int and version == 4 and type(policy) is int and policy == SOURCE_POLICY_VERSION:
+    elif type(version) is int and version == 4 and type(policy) is int and policy == 4:
         required = TREATMENT_SOURCES
+    elif type(version) is int and version == 5 and type(policy) is int and policy == SOURCE_POLICY_VERSION:
+        required = TARGET_ACCESS_TREATMENT_SOURCES
     else:
         raise StageGateError("unsupported performance telemetry source policy")
     sources = preflight.get("sources")
@@ -163,7 +169,7 @@ def treatment_identity(
         )
     ):
         raise StageGateError("performance telemetry treatment source identity is incomplete")
-    if version == 4:
+    if version in (4, 5):
         _validate_package_source_record(sources["performance_package_sources"])
     source_sha256 = {str(name): str(source["sha256"]) for name, source in sorted(sources.items())}
     resolution = preflight.get("model_resolution")
@@ -283,7 +289,7 @@ def read_preflight(path: Path) -> dict[str, Any]:
 
 def _verified_snapshot(preflight: Mapping[str, Any], model: str):
     identity = treatment_identity(preflight)
-    if preflight.get("accounting_policy") != ACCOUNTING_POLICY or preflight.get("schema_version") not in (3, 4):
+    if preflight.get("accounting_policy") != ACCOUNTING_POLICY or preflight.get("schema_version") not in (3, 4, 5):
         raise StageGateError(
             "new telemetry requires explicit price-snapshot qualification; preserve historical records"
         )
@@ -388,7 +394,7 @@ def verify_price_evidence(
         if preflight.get("schema_version") not in (1, 2):
             raise StageGateError("historical telemetry cannot omit current price evidence")
         return
-    if preflight.get("schema_version") not in (3, 4) or preflight.get("accounting_policy") != ACCOUNTING_POLICY:
+    if preflight.get("schema_version") not in (3, 4, 5) or preflight.get("accounting_policy") != ACCOUNTING_POLICY:
         raise StageGateError("telemetry price policy differs from preflight")
     declared = (preflight.get("price_table") or {}).get("snapshot") or {}
     price_sha = evidence["price_snapshot_sha256"]
@@ -548,7 +554,7 @@ def prepare(
     ):
         raise StageGateError("raw Codex/AET telemetry parser canary failed")
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "source_policy_version": SOURCE_POLICY_VERSION,
         "accounting_policy": ACCOUNTING_POLICY,
         "required": True,
@@ -600,6 +606,13 @@ def prepare(
             "shared_access_policy": _telemetry_source_record(
                 shared_access_policy, label="shared access and audit policy"
             ),
+            "historical_target_access_policy": _telemetry_source_record(
+                historical_target_access_policy, label="historical target access policy"
+            ),
+            "historical_target_access_data": {
+                "path": str(historical_target_access_policy.resource_path()),
+                "sha256": _sha256_file(historical_target_access_policy.resource_path()),
+            },
             "target_experiment_loader": _telemetry_source_record(
                 load_target_experiment, label="target experiment loader"
             ),
