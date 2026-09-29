@@ -61,6 +61,32 @@ Repeat with the other three loader names and distinct output directories.
 inputs/goldens and `capture_receipt.json` from the **same conversion and model
 instance**; it does not recapture an unrelated model. Inspect `frontend-trace.json`
 and `pytorch-opset.json` for source correspondence and build-specific operator scope.
+The direct worker command is a development capture, not a verified source-closure
+receipt. For a fresh, checkpoint-free capture whose source and runtime bytes must
+be selected *before* execution, use the explicit sealed diagnostic workflow:
+
+```sh
+merlin experiment corpus capture select \
+  --m2m-root "$MODEL2MLIR_ROOT" \
+  --workload-root examples/workloads/coverage_mlp \
+  --venv "$MODEL2MLIR_VENV" --dtype fp32 \
+  --run-dir "$CAPTURE_ROOT/sealed-coverage-mlp" \
+  --output "$CAPTURE_ROOT/selection-coverage-mlp"
+merlin experiment corpus capture issue \
+  --selection "$CAPTURE_ROOT/selection-coverage-mlp/capture-selection.json" \
+  --expected-sha256 "$SELECTION_SHA256"
+```
+
+Record the exact `sha256` returned by `select` as `SELECTION_SHA256`; both
+directories must be absent before selection. Inspect the owner-only
+`capture-selection.json`, `sealed_m2m_pending.json` and captured sidecars in
+the run directory. Repeat separately for each iteration workload. When deriving
+from those exact captures, pass a matching
+`--application-capture-selection "LABEL=PATH@SHA256"` for **every** roster label;
+mixing selected and legacy captures is refused. This establishes an auditable
+preselection and replay, but **does not grant Phase 0 admission**: the selection
+and receipt are owner-controlled, not an independent verified issuer. It also
+does not support external checkpoints yet.
 The worker anchors `--out` before Model2MLIR writes its weight reference, so a
 relative command-line output path still yields an absolute source reference.
 Phase 0 later copies the receipt-bound weights and rewrites that one reference
