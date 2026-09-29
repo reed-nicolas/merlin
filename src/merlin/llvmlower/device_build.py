@@ -402,33 +402,14 @@ def build_device_objects(
                 skipped.append((sym, f"interface capsule: {exc}"))
                 continue
         else:
-            from merlin.targetgen.contract.interface_emit import parse_interface_mlir
+            from merlin.targetgen.contract.resident_interface_abi import bind_single_resident_matmul
 
             chosen = expected_interfaces[sym]
             iface = chosen.get("mlir")
             if not isinstance(iface, str) or sha256_text(iface) != chosen.get("sha256"):
                 raise ValueError(f"{sym} no longer matches its selected interface bytes")
-            parsed = parse_interface_mlir(iface)
-            tensors = parsed["tensors"]
-            commands = parsed["commands"]
-            # The package's LLVM entry receives interface tensors in declaration
-            # order.  The shim passes resident weight, lhs, then output; matching
-            # shapes alone would let an A,B,Y interface compile and swap pointers.
-            if list(tensors) != ["B", "A"] or [
-                (tensors[name] or {}).get("role") for name in ("B", "A")
-            ] != ["input", "input"] or [
-                command.get("operands") for command in commands
-            ] != [
-                {"src": "B", "dst": "B_res"},
-                {"lhs": "A", "rhs": "B_res", "dst": "acc"},
-                {"src": "acc", "dst": "Y"},
-            ] or parsed["target"] != device or [
-                (tensors.get(name) or {}).get("shape") for name in ("A", "B")
-            ] != [[m, k], [k, n]] or [
-                (tensors.get(name) or {}).get("dtype") for name in ("A", "B")
-            ] != [dtypes[sym][0], dtypes[sym][1]] or [cmd["opcode"] for cmd in commands] != [
-                "RES_PACK", "MATMUL_RESIDENT", "COMMIT"
-            ] or commands[-1].get("attributes", {}).get("output_dtype") != dtypes[sym][2]:
+            resident = bind_single_resident_matmul(iface, target=device)
+            if (resident.m, resident.n, resident.k) != (m, n, k) or resident.dtypes != tuple(dtypes[sym]):
                 raise ValueError(f"{sym} selected interface disagrees with pointer ABI, device, shape, or precision")
         ifc = stem.with_suffix(".iface.mlir")
         ifc.write_text(iface, encoding="utf-8")

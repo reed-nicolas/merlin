@@ -230,6 +230,40 @@ def _probe_integer_model_route(args: argparse.Namespace) -> int:
     return 0
 
 
+def _stage_integer_model_admission(args: argparse.Namespace) -> int:
+    """Write an exact, fail-closed SW-admission development review artifact."""
+    from merlin.llvmlower.staged_admission import stage_integer_model_admission
+
+    selected = {}
+    inputs = [
+        ("mlir", args.mlir),
+        ("software-spec", args.software_spec),
+        ("capability-contract", args.capability_contract),
+    ]
+    if args.rtl_facts:
+        inputs.append(("rtl-facts", args.rtl_facts))
+    for label, argument in inputs:
+        path = Path(argument)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"--{label} must name a regular, non-symlink file")
+        selected[label] = path.read_bytes()
+    result = stage_integer_model_admission(
+        selected["mlir"], target=args.target, software_spec=selected["software-spec"],
+        capability_contract=selected["capability-contract"], package_dir=args.package,
+        operation_id=args.operation_id, rtl_facts=selected.get("rtl-facts"), timeout=args.timeout,
+    )
+    destination = Path(args.out).absolute()
+    if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents):
+        raise ValueError("admission-review output may not traverse a symlink")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("x", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+    print(json.dumps({"out": str(destination), "candidate_count": result["candidate_count"],
+                      "review_required": result["review_required"]}, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="merlin-target-tools", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -309,6 +343,20 @@ def build_parser() -> argparse.ArgumentParser:
     route.add_argument("--timeout", type=int, default=30, help="seconds per distinct kernel interface")
     route.add_argument("--out", required=True, help="fresh JSON diagnostic receipt destination")
     route.set_defaults(func=_probe_integer_model_route)
+
+    stage = sub.add_parser(
+        "stage-int-mm-admission", help="bind one integer model candidate to unreviewed compiler/shim evidence"
+    )
+    stage.add_argument("--target", required=True)
+    stage.add_argument("--mlir", required=True, help="exact captured model MLIR")
+    stage.add_argument("--software-spec", required=True, help="selected authored software spec")
+    stage.add_argument("--capability-contract", required=True, help="selected capability contract")
+    stage.add_argument("--package", required=True, help="selected OOT compiler package")
+    stage.add_argument("--operation-id", required=True, help="exact model SHA-bound operation ID")
+    stage.add_argument("--rtl-facts", help="selected same-target RTL facts for a reproducible shim tile edge")
+    stage.add_argument("--timeout", type=int, default=30, help="seconds per selected package entrypoint")
+    stage.add_argument("--out", required=True, help="fresh JSON review artifact destination")
+    stage.set_defaults(func=_stage_integer_model_admission)
     return parser
 
 

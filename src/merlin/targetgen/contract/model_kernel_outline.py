@@ -94,6 +94,13 @@ def outline_integer_matmuls(
                 {"operation_id": operation_id, "reason": "selected contract lacks " + ", ".join(class_missing)}
             )
             continue
+        # Ranked tensor SSA establishes logical value shape and dtype, not the
+        # bufferization result's strides, output overlap, or the target kernel's
+        # valid-window tail behavior.  Do not fill layouts/tails/aliasing with
+        # guesses here: those are separate Phase 1 compiler/shim obligations,
+        # and this Phase 0 SW screen must stay unknown until reviewed evidence
+        # closes them.  ``staged_admission`` records a development plan without
+        # changing this admission decision.
         admission = admit_operation(
             spec,
             "linalg.generic",

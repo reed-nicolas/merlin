@@ -14,10 +14,11 @@ import pytest
 
 from merlin.common.paths import repo_root
 from merlin.runtime.simulator import simulate
-from merlin.targetgen.contract.interface_emit import parse_interface_mlir
+from merlin.targetgen.contract.interface_emit import emit_interface_mlir, parse_interface_mlir
 from merlin.targetgen.contract.model_kernel_outline import outline_integer_matmuls
 from merlin.targetgen.contract.model_kernel_route import probe_integer_model_kernels
 from merlin.targetgen.contract.model_stitching import stitching_inventory
+from merlin.targetgen.contract.resident_interface_abi import bind_single_resident_matmul
 from merlin.targetgen.source_kernel_probe import derive_kernel_window
 
 pytestmark = pytest.mark.target("gemmini", "atlas")
@@ -110,6 +111,150 @@ def test_exact_model_route_probe_keeps_ssa_bindings_and_separates_kernel_from_mo
     }
     assert report["stitching"]["composition_status"] == "unlowered"
     assert report["whole_model_offload_verified"] is False
+
+
+def test_staged_admission_binds_development_evidence_without_promoting_unknown_sw(tmp_path, monkeypatch):
+    from merlin.llvmlower import staged_admission as staged
+    from merlin.llvmlower.exact_offload import ExactOffloadSelection
+
+    source = repo_root() / "examples/gemmini/target"
+    model = _INTEGER_BODY.encode()
+    spec = (source / "software-spec.yaml").read_bytes()
+    contract = (source / "contracts/target_contract.yaml").read_bytes()
+    outline = outline_integer_matmuls(model, target="gemmini", software_spec=spec, capability_contract=contract)
+    candidate = outline["candidates"][0]
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "manifest.yaml").write_text("target: gemmini\n", encoding="utf-8")
+    monkeypatch.setattr(staged.package_runtime, "load_package", lambda _path: SimpleNamespace(
+        target="gemmini", package_id="test-package", directory=package,
+    ))
+    monkeypatch.setattr(staged, "validate_facts", lambda _doc, *, target: [])
+    rtl_facts = json.dumps({"inputs": {"target": "gemmini"}, "facts": {
+        "arrays": [{"rows": 16, "cols": 16}],
+    }}).encode()
+    seen = []
+
+    def emit(_package, name, input_mlir, output_json=None, **_kw):
+        interface = input_mlir.read_text(encoding="utf-8")
+        seen.append((name, hashlib.sha256(interface.encode()).hexdigest()))
+        if name == "emit_command_buffer":
+            output_json.write_text(json.dumps(parse_interface_mlir(interface)), encoding="utf-8")
+            return CompletedProcess([], 0, "", "")
+        assert name == "emit_target_artifact"
+        return CompletedProcess([], 0, "module { llvm.func @gemmini_kernel(%arg0: !llvm.ptr) {} }", "")
+
+    monkeypatch.setattr(staged.package_runtime, "run_entrypoint", emit)
+    report = staged.stage_integer_model_admission(
+        model, target="gemmini", software_spec=spec, capability_contract=contract,
+        package_dir=package, operation_id=candidate["operation_id"], rtl_facts=rtl_facts,
+    )
+    binding = report["exact_binding"]
+    assert report["candidate_count"] == 1 and report["candidate_admission_counts"] == {"unknown": 1}
+    assert binding["model_sha256"] == hashlib.sha256(model).hexdigest()
+    assert binding["operation_id"] == candidate["operation_id"]
+    assert binding["interface_sha256"] == candidate["interface_sha256"]
+    assert hashlib.sha256(report["selected_interface_mlir"].encode()).hexdigest() == binding["interface_sha256"]
+    assert binding["rtl_facts_sha256"] == hashlib.sha256(rtl_facts).hexdigest()
+    assert seen == [("emit_command_buffer", binding["interface_sha256"]),
+                    ("emit_target_artifact", binding["interface_sha256"])]
+    assert report["source_facts"]["logical_shapes"] == {"A": [4, 19], "B": [19, 8], "Y": [4, 8]}
+    assert report["source_facts"]["physical_layout"] == "not_observed_in_tensor_ssa"
+    assert report["source_facts"]["physical_aliasing"] == "not_observed_in_tensor_ssa"
+    assert report["compiler_evidence"]["status"] == "emitted_unverified"
+    assert report["compiler_evidence"]["binding_sha256"] == binding["binding_sha256"]
+    assert report["shim_evidence"]["status"] == "generated_unexecuted"
+    assert report["shim_evidence"]["binding_sha256"] == binding["binding_sha256"]
+    assert report["shim_evidence"]["rtl_facts_provenance"]["status"] == "unverified"
+    assert report["shim_evidence"]["rtl_facts_provenance"]["reported_source_consistency"] == "not_reported"
+    assert set(report["codegen_obligations"]) == {"layouts", "tails", "aliasing"}
+    assert all(row["status"] == "requires_review" for row in report["codegen_obligations"].values())
+    assert report["software_admission"]["status"] == "unknown"
+    boundary = report["admission_boundary"]
+    assert boundary["phase0_semantic_screen"]["status"] == "diagnostic_observation_not_phase0_admission"
+    assert boundary["phase0_semantic_screen"]["unresolved_physical_constraints"] == [
+        "aliasing", "layouts", "tails"
+    ]
+    assert boundary["phase1_physical_plan"]["status"] == "generated_not_executed"
+    assert "cannot upgrade" in boundary["promotion_policy"]
+    assert report["review_required"] is True and report["whole_model_offload_verified"] is False
+    without_facts = staged.stage_integer_model_admission(
+        model, target="gemmini", software_spec=spec, capability_contract=contract,
+        package_dir=package, operation_id=candidate["operation_id"],
+    )
+    assert without_facts["shim_evidence"]["status"] == "declined"
+    assert without_facts["exact_binding"]["rtl_facts_sha256"] is None
+    assert without_facts["exact_binding"]["binding_sha256"] != binding["binding_sha256"]
+    wrong_facts = json.dumps({"inputs": {"target": "atlas"}, "facts": {
+        "arrays": [{"rows": 16, "cols": 16}],
+    }}).encode()
+    with pytest.raises(ValueError, match="exact candidate target"):
+        staged.stage_integer_model_admission(
+            model, target="gemmini", software_spec=spec, capability_contract=contract,
+            package_dir=package, operation_id=candidate["operation_id"], rtl_facts=wrong_facts,
+        )
+    rectangular_facts = json.dumps({"inputs": {"target": "gemmini"}, "facts": {
+        "arrays": [{"rows": 16, "cols": 32}],
+    }}).encode()
+    with pytest.raises(ValueError, match="non-square array"):
+        staged.stage_integer_model_admission(
+            model, target="gemmini", software_spec=spec, capability_contract=contract,
+            package_dir=package, operation_id=candidate["operation_id"], rtl_facts=rectangular_facts,
+        )
+    reported_verified_facts = json.dumps({"inputs": {"target": "gemmini"}, "facts": {
+        "arrays": [{"rows": 16, "cols": 16}],
+    }, "source_consistency": {"status": "verified"}}).encode()
+    verified_report = staged.stage_integer_model_admission(
+        model, target="gemmini", software_spec=spec, capability_contract=contract,
+        package_dir=package, operation_id=candidate["operation_id"], rtl_facts=reported_verified_facts,
+    )
+    assert verified_report["shim_evidence"]["rtl_facts_provenance"]["status"] == (
+        "reported_verified_not_rechecked"
+    )
+    with pytest.raises(ValueError, match="reviewed SW admission"):
+        ExactOffloadSelection.from_outline(
+            outline, model=model, target="gemmini", software_spec=spec, capability_contract=contract,
+            package_dir=package, operation_ids=(candidate["operation_id"],),
+        )
+    with pytest.raises(ValueError, match="not a candidate"):
+        staged.stage_integer_model_admission(
+            model + b"\n", target="gemmini", software_spec=spec, capability_contract=contract,
+            package_dir=package, operation_id=candidate["operation_id"], rtl_facts=rtl_facts,
+        )
+
+
+def test_resident_pointer_binding_uses_interface_dataflow_and_validates_contract_order():
+    import yaml
+
+    commands = [
+        {"opcode": "RES_PACK", "operands": {"src": "weights", "dst": "resident"},
+         "attributes": {"layout": "packed_rhs"}},
+        {"opcode": "MATMUL_RESIDENT", "operands": {"lhs": "activation", "rhs": "resident", "dst": "sum"}},
+        {"opcode": "COMMIT", "operands": {"src": "sum", "dst": "result"},
+         "attributes": {"output_dtype": "i32", "epilogue": []}},
+    ]
+    tensors = {
+        "weights": {"shape": [19, 8], "dtype": "i8", "role": "weight"},
+        "activation": {"shape": [4, 19], "dtype": "i8", "role": "input"},
+    }
+    cb = {"abi_version": "0.1", "target": "atlas", "tensors": tensors, "commands": commands}
+    interface = emit_interface_mlir(cb)
+    bound = bind_single_resident_matmul(interface, target="atlas")
+    assert bound.pointer_order == ("weights", "activation", "result")
+    assert (bound.m, bound.n, bound.k) == (4, 8, 19)
+    assert bound.kernel_symbol == "atlas_kernel"
+    wrong_order = emit_interface_mlir({**cb, "tensors": dict(reversed(list(tensors.items())))})
+    with pytest.raises(ValueError, match="pointer ABI"):
+        bind_single_resident_matmul(wrong_order, target="atlas")
+    wrong_result_type = interface.replace("tensor<4x8xi32>", "tensor<4x8xi8>")
+    with pytest.raises(ValueError, match="fully typed round trip"):
+        bind_single_resident_matmul(wrong_result_type, target="atlas")
+    contract = yaml.safe_load((repo_root() / "merlin/contract/mlir_oot_backend_contract.yaml").read_bytes())
+    rows = contract["kernel_abi"]["arg_order_by_command_shape"]
+    resident = next(row for row in rows if row["shape"] == "resident_matmul")
+    resident["order"] = list(reversed(resident["order"]))
+    with pytest.raises(ValueError, match="unsupported by the rank-2 shim"):
+        bind_single_resident_matmul(interface, target="atlas", abi_contract=yaml.safe_dump(contract).encode())
 
 
 def test_integerized_source_matrix_body_can_supply_a_bounded_window(tmp_path):
