@@ -237,6 +237,107 @@ def test_integer_golden_bound_uses_concrete_reduction_and_internal_width():
         _integer_reference_bound({"numerical_semantics": semantics}, capsule)
 
 
+def test_fused_integer_matmul_bias_cannot_bypass_internal_width_bound():
+    semantics = {
+        "internal_arithmetic": {
+            "full_operation_overflow_policy": "bounded_exact_requires_each_partial_sum",
+            "mac_result_bits": 20,
+            "signed_operand_bits": 8,
+        }
+    }
+    binding = CorpusBinding("fixture", 16, "int8", "i32", True, ["L0"], "exact_int")
+    entry = {
+        "name": "fused", "kind": "layer", "source_role": "derived_sweep", "source_reference": "fixture",
+        "op": "fused_matmul_bias", "M": 16, "K": 64, "N": 16,
+    }
+    capsule, _ = build(entry, binding)
+    capsule["stimulus_range"] = [127, 127]
+    with pytest.raises(ValueError, match="may_overflow"):
+        _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+    capsule["stimulus_range"] = [1, 1]
+    proof = _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+    assert proof["status"] == "proven_safe"
+    assert proof["reduction_extent"] == 64
+    assert proof["maximum_absolute_initial_addend"] == 1
+
+
+def test_resident_reuse_bounds_each_integer_matmul(monkeypatch):
+    from merlin.runtime.tensor import Tensor
+
+    semantics = {
+        "internal_arithmetic": {
+            "full_operation_overflow_policy": "bounded_exact_requires_each_partial_sum",
+            "mac_result_bits": 20,
+            "signed_operand_bits": 8,
+        }
+    }
+    binding = CorpusBinding("fixture", 16, "int8", "i32", True, ["L0"], "exact_int")
+    entry = {
+        "name": "reuse", "kind": "layer", "source_role": "derived_sweep", "source_reference": "fixture",
+        "op": "resident_reuse", "K": 64, "N": 16,
+        "matmuls": [{"lhs": "A0", "out": "Y0", "M": 16}, {"lhs": "A1", "out": "Y1", "M": 16}],
+    }
+    capsule, _ = build(entry, binding)
+    leaves = {
+        "W": Tensor((64, 16), [127] * (64 * 16), "i8"),
+        "A0": Tensor((16, 64), [0] * (16 * 64), "i8"),
+        "A1": Tensor((16, 64), [127] * (16 * 64), "i8"),
+    }
+    monkeypatch.setattr(writer.CG, "materialize_capsule_leaves", lambda _: leaves)
+    with pytest.raises(ValueError, match="may_overflow"):
+        _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+    leaves["A1"] = Tensor((16, 64), [1] * (16 * 64), "i8")
+    proof = _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+    assert proof["status"] == "proven_safe"
+    assert proof["bound"] == 64 * 127
+    assert [(member["lhs"], member["partial_sum_bound"]["reduction_extent"]) for member in proof["members"]] == [
+        ("A0", 64), ("A1", 64),
+    ]
+    capsule["operation"]["attributes"]["matmuls"][1]["lhs"] = "missing"
+    with pytest.raises(ValueError, match="requires concrete lhs"):
+        _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+
+
+@pytest.mark.parametrize("role,transform", [("island", "xor_low_bit"), ("no_island", "none")])
+def test_host_island_bounds_both_concrete_integer_contractions(role, transform):
+    semantics = {
+        "internal_arithmetic": {
+            "full_operation_overflow_policy": "bounded_exact_requires_each_partial_sum",
+            "mac_result_bits": 20,
+            "signed_operand_bits": 8,
+        }
+    }
+    binding = CorpusBinding("fixture", 16, "int8", "i32", True, ["L0"], "exact_int")
+    entry = {
+        "name": "seam", "kind": "model_slice", "source_role": "derived_sweep", "source_reference": "fixture",
+        "op": "host_island_seam", "M": 1, "K": 1, "H": 16, "N": 1,
+        "comparison_role": role, "host_transform": transform, "xor_mask": 1,
+    }
+    capsule, _ = build(entry, binding)
+    capsule["stimulus_range"] = [127, 127]
+    proof = _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+    assert proof["status"] == "proven_safe"
+    assert [member["region"] for member in proof["members"]] == ["contraction_0", "contraction_1"]
+    assert proof["members"][0]["partial_sum_bound"]["bound"] == 127 * 127
+    assert proof["members"][1]["partial_sum_bound"]["bound"] == 16 * (126 if role == "island" else 127) * 127
+    with pytest.raises(ValueError, match="selected internal-width bound policy"):
+        _integer_reference_bound({}, capsule)
+
+    # Only the derived second input is dangerous; the first contraction remains within i20.
+    wider, _ = build({**entry, "H": 64}, binding)
+    wider["stimulus_range"] = [127, 127]
+    with pytest.raises(ValueError, match="may_overflow"):
+        _integer_reference_bound({"numerical_semantics": semantics}, wider)
+
+    capsule["operation"]["attributes"]["shared_accelerator_epilogue"] = "unknown"
+    with pytest.raises(ValueError, match="declared two-contraction i8 seam"):
+        _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+    capsule["operation"]["attributes"]["shared_accelerator_epilogue"] = "saturating_i32_to_i8"
+    capsule["inputs"][2]["shape"] = [17, 1]
+    with pytest.raises(ValueError, match="operand ABI differs"):
+        _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+
+
 def test_rectangular_attention_score_uses_the_selected_internal_width():
     semantics = {
         "internal_arithmetic": {

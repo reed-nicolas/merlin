@@ -66,13 +66,26 @@ def _integer_reference_bound(entry: dict, cap: dict) -> dict:
     from merlin.targetgen.operation_numerics import integer_partial_sum_bound
 
     semantics = entry.get("numerical_semantics") or {}
-    policy = (semantics.get("internal_arithmetic") or {}).get("full_operation_overflow_policy")
-    if policy != "bounded_exact_requires_each_partial_sum":
-        return {"status": "unknown", "reason": "no selected full-operation internal-width bound policy"}
     operation = cap["operation"]
     op, attrs = operation["op"], operation.get("attributes") or {}
-    if op not in {"matmul", "linear", "matmul_bias", "residual_seam", "conv2d", "scope_chain", "attention_qk"}:
-        return {"status": "not_applicable", "reason": "this writer path is not a single integer contraction"}
+    policy = (semantics.get("internal_arithmetic") or {}).get("full_operation_overflow_policy")
+    if policy != "bounded_exact_requires_each_partial_sum":
+        if op == "host_island_seam":
+            raise ValueError("host-island integer contractions require a selected internal-width bound policy")
+        return {"status": "unknown", "reason": "no selected full-operation internal-width bound policy"}
+    if op not in {
+        "matmul",
+        "linear",
+        "matmul_bias",
+        "fused_matmul_bias",
+        "resident_reuse",
+        "host_island_seam",
+        "residual_seam",
+        "conv2d",
+        "scope_chain",
+        "attention_qk",
+    }:
+        return {"status": "not_applicable", "reason": "this writer path has no modeled integer contraction"}
     if op == "scope_chain":
         families = attrs.get("scope_families")
         if (
@@ -84,6 +97,116 @@ def _integer_reference_bound(entry: dict, cap: dict) -> dict:
             raise ValueError("integer scope chain needs one selected contraction and only post-contraction maps")
     leaves = CG.materialize_capsule_leaves(cap)
 
+    def bounded_matmul(lhs_name: str, rhs_name: str, *, initial_values=()) -> dict:
+        if lhs_name not in leaves or rhs_name not in leaves:
+            raise ValueError("integer contraction bound requires concrete lhs and weight operands")
+        lhs, rhs = leaves[lhs_name], leaves[rhs_name]
+        if len(lhs.shape) != 2 or len(rhs.shape) != 2 or lhs.shape[1] != rhs.shape[0]:
+            raise ValueError("integer matmul bound requires matching rank-2 reduction extents")
+        result = integer_partial_sum_bound(
+            semantics,
+            reduction_extent=lhs.shape[1],
+            lhs_values=[int(v) for v in lhs.data],
+            rhs_values=[int(v) for v in rhs.data],
+            initial_values=initial_values,
+        )
+        if result["status"] != "proven_safe":
+            raise ValueError(f"integer mathematical golden cannot qualify selected internal MAC width: {result}")
+        return result
+
+    if op == "resident_reuse":
+        weight_name, matmuls = attrs.get("weight"), attrs.get("matmuls")
+        if not isinstance(weight_name, str) or not isinstance(matmuls, list) or not matmuls:
+            raise ValueError("resident reuse bound requires a weight and nonempty matmul roster")
+        members = []
+        for member in matmuls:
+            if (
+                not isinstance(member, dict)
+                or not isinstance(member.get("lhs"), str)
+                or not isinstance(member.get("out"), str)
+            ):
+                raise ValueError("resident reuse bound has a malformed matmul member")
+            members.append(
+                {
+                    "lhs": member["lhs"],
+                    "out": member["out"],
+                    "partial_sum_bound": bounded_matmul(member["lhs"], weight_name),
+                }
+            )
+        bounds = [member["partial_sum_bound"] for member in members]
+        return {
+            "status": "proven_safe",
+            "scope": "each listed resident-weight contraction; not full-kernel execution",
+            "bound": max(bound["bound"] for bound in bounds),
+            "signed_positive_limit": bounds[0]["signed_positive_limit"],
+            "mac_result_bits": bounds[0]["mac_result_bits"],
+            "members": members,
+        }
+
+    if op == "host_island_seam":
+        from merlin.runtime.tensor import Tensor
+
+        role, transform = attrs.get("comparison_role"), attrs.get("host_transform")
+        if (
+            role not in {"island", "no_island"}
+            or {"island": "xor_low_bit", "no_island": "none"}[role] != transform
+            or attrs.get("accelerator_contractions") != 2
+            or attrs.get("shared_accelerator_epilogue") != "saturating_i32_to_i8"
+            or (semantics.get("internal_arithmetic") or {}).get("signed_operand_bits") != 8
+        ):
+            raise ValueError("host-island bound requires the declared two-contraction i8 seam")
+        lhs_name, first_weight_name, second_weight_name = (
+            attrs.get("lhs"), attrs.get("weight0"), attrs.get("weight1")
+        )
+        if not all(isinstance(name, str) for name in (lhs_name, first_weight_name, second_weight_name)) or set(
+            leaves
+        ) != {lhs_name, first_weight_name, second_weight_name} or len(leaves) != 3:
+            raise ValueError("host-island bound requires exactly its three concrete input tensors")
+        lhs, first_weight, second_weight = (
+            leaves[lhs_name], leaves[first_weight_name], leaves[second_weight_name]
+        )
+        dimensions = tuple(attrs.get(key) for key in ("M", "K", "H", "N"))
+        if (
+            any(type(value) is not int or value < 1 for value in dimensions)
+            or lhs.shape != dimensions[:2]
+            or first_weight.shape != dimensions[1:3]
+            or second_weight.shape != dimensions[2:]
+            or any(tensor.dtype != "i8" for tensor in (lhs, first_weight, second_weight))
+        ):
+            raise ValueError("host-island bound operand ABI differs from its declared contractions")
+        first = bounded_matmul(lhs_name, first_weight_name)
+        # The first sum is proven inside the selected MAC width above. Its
+        # saturating narrow and optional bitwise map therefore give the exact
+        # signed i8 operand bytes consumed by the second contraction.
+        middle = lhs.matmul(first_weight).to_i8()
+        if transform == "xor_low_bit":
+            mask = attrs.get("xor_mask")
+            if type(mask) is not int or not 0 < mask < 128:
+                raise ValueError("host-island bound has an invalid low-bit XOR mask")
+            middle = Tensor(middle.shape, [value ^ mask for value in middle.data], "i8")
+        second = integer_partial_sum_bound(
+            semantics,
+            reduction_extent=dimensions[2],
+            lhs_values=middle.data,
+            rhs_values=second_weight.data,
+        )
+        if second["status"] != "proven_safe":
+            raise ValueError(f"integer mathematical golden cannot qualify selected internal MAC width: {second}")
+        return {
+            "status": "proven_safe",
+            "scope": (
+                "both host-island contractions on the concrete input and derived middle tensor; "
+                "not full-kernel execution"
+            ),
+            "bound": max(first["bound"], second["bound"]),
+            "signed_positive_limit": first["signed_positive_limit"],
+            "mac_result_bits": first["mac_result_bits"],
+            "members": [
+                {"region": "contraction_0", "partial_sum_bound": first},
+                {"region": "contraction_1", "partial_sum_bound": second},
+            ],
+        }
+
     def name(role, declared):
         return attrs.get(declared) or next((row["name"] for row in cap["inputs"] if row.get("role") == role), None)
 
@@ -94,6 +217,11 @@ def _integer_reference_bound(entry: dict, cap: dict) -> dict:
     if lhs_name not in leaves or rhs_name not in leaves:
         raise ValueError("integer contraction bound requires concrete lhs and weight operands")
     lhs, rhs = leaves[lhs_name], leaves[rhs_name]
+    if op in {"matmul", "linear", "matmul_bias", "fused_matmul_bias"}:
+        initial = [
+            int(value) for key, tensor in leaves.items() if key not in {lhs_name, rhs_name} for value in tensor.data
+        ]
+        return bounded_matmul(lhs_name, rhs_name, initial_values=initial)
     if op == "attention_qk" and rhs.shape[-1] != lhs.shape[-1]:
         raise ValueError("attention score reduction extents differ between query and key")
     if op == "scope_chain" and rhs.shape[-1] != lhs.shape[-1]:
