@@ -29,7 +29,7 @@ def _selected(tmp_path: Path, *, status: str = "UNKNOWN") -> tuple[StageE2ESenti
             {"name": "whole", "kind": "model", "label": "public", "interface_mlir": "capsule.interface.mlir"}
         )
     )
-    (capsule / "capsule.interface.mlir").write_text("module {}\n")
+    (capsule / "capsule.interface.mlir").write_text('module attributes {prov.level = "linalg-on-tensors"} {}\n')
     model = {
         "schema": "merlin.instruction_semantics.v1",
         "target": "fixture",
@@ -104,7 +104,7 @@ def test_described_model_reaches_search_with_selected_bytes(tmp_path: Path, monk
 
     def parse(raw):
         calls.append(("mlir", raw))
-        return {"ops": []}
+        return {"ops": [{"operation": "linalg.generic"}]}
 
     def search(parsed, model, *, limits):
         calls.append(("model", model["target"]))
@@ -117,6 +117,23 @@ def test_described_model_reaches_search_with_selected_bytes(tmp_path: Path, monk
     assert row["status"] == "diagnostic"
     assert calls == [("mlir", (capsule / "capsule.interface.mlir").read_text()), ("model", "fixture")]
     assert row["phase0"]["instruction_model_sha256"] == _digest(model_path.read_bytes())
+
+
+def test_non_linalg_source_cannot_appear_as_a_searched_model(tmp_path: Path, monkeypatch) -> None:
+    selected, _, capsule = _selected(tmp_path, status="described")
+    (capsule / "capsule.interface.mlir").write_text("module {}\n")
+    selected = StageE2ESentinel(
+        selected.capsule,
+        selected.capsule_path,
+        selected.frozen_source_path,
+        exact_tree_record(capsule)["sha256"],
+        selected.required_lanes,
+        selected.required_tiers,
+    )
+    monkeypatch.setattr(SD, "validate_normalized_instruction_model", lambda model, expected_target: model)
+    row = SD.inspect_member(selected, target="fixture", capsule_linked=True, frozen_grants=(capsule.parents[1],))
+    assert row["status"] == "unavailable"
+    assert "not linalg-on-tensors" in row["reason"]
 
 
 def test_adjacent_evidence_outside_exact_frozen_grant_refuses(tmp_path: Path) -> None:

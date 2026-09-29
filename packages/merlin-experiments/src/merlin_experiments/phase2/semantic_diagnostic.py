@@ -15,7 +15,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from merlin.targetgen.contract.linalg_iface import parse_linalg_mlir
+from merlin.targetgen.contract.linalg_iface import is_linalg_on_tensors, parse_linalg_mlir
 from merlin.targetgen.instruction_semantics import validate_normalized_instruction_model
 from merlin.targetgen.semantic_search import SearchLimits, search_linalg_inventory
 
@@ -147,10 +147,17 @@ def inspect_member(
             row.update(status="unknown", reason="Phase 0 selected no described instruction semantics")
             return row
         model = validate_normalized_instruction_model(model, expected_target=target)
-        parsed = parse_linalg_mlir(mlir_raw.decode("utf-8"))
+        mlir_text = mlir_raw.decode("utf-8")
+        if not is_linalg_on_tensors(mlir_text):
+            row.update(status="unavailable", reason="selected source is not linalg-on-tensors MLIR")
+            return row
+        parsed = parse_linalg_mlir(mlir_text)
         operations = parsed.get("ops")
         if not isinstance(operations, list) or len(operations) > _MAX_PAYLOAD_OPERATIONS:
             row.update(status="unavailable", reason="source MLIR exceeds host diagnostic operation bound")
+            return row
+        if not any(str(operation.get("operation", "")).startswith("linalg.") for operation in operations):
+            row.update(status="unavailable", reason="source MLIR has no linalg payload operation")
             return row
         row.update(status="diagnostic", result=search_linalg_inventory(parsed, model, limits=_LIMITS))
     except ImportError as exc:
