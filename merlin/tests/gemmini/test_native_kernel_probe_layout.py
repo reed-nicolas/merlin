@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,3 +40,12 @@ def test_legacy_manifest_remains_selectable_but_ambiguous_inputs_fail(tmp_path):
     current.write_text("{}")
     with pytest.raises(ValueError, match="ambiguous"):
         probe.phase0_manifest_path(corpus)
+
+
+def test_two_engine_receipt_refuses_missing_rtl():
+    probe = _probe()
+    backend = SimpleNamespace(available=lambda simulator: simulator == "spike")
+    with pytest.raises(RuntimeError, match="verilator unavailable"):
+        probe.require_two_engine_backend(backend)
+    backend.available = lambda _simulator: True
+    probe.require_two_engine_backend(backend)

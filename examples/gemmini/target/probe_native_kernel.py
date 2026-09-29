@@ -208,6 +208,13 @@ def checked_declared_inputs(phase0_manifest: dict, software_spec: Path, support_
     return binding
 
 
+def require_two_engine_backend(backend) -> None:
+    """A successful receipt must represent functional and RTL execution."""
+    for simulator in ("spike", "verilator"):
+        if not backend.available(simulator):
+            raise RuntimeError(f"selected native Gemmini {simulator} unavailable; two-engine qualification not run")
+
+
 def run(
     *,
     corpus: Path,
@@ -230,8 +237,7 @@ def run(
     support = Path(os.environ["MERLIN_TARGET_PATH"]).resolve()
     chipyard = Path(os.environ["MERLIN_CHIPYARD"]).resolve()
     backend = get_backend("gemmini")
-    if not backend.available("spike"):
-        raise RuntimeError("selected native Gemmini Spike unavailable")
+    require_two_engine_backend(backend)
     manifest_path = phase0_manifest_path(corpus)
     phase0_manifest = json.loads(manifest_path.read_text())
     selected_source = checked_source_binding(phase0_manifest, source_evidence, facts_evidence)
@@ -336,7 +342,7 @@ def run(
         (case / "spike_console.log").write_text(spike["console"], encoding="utf-8")
         c_path = spike_dir / "main.c"
         elf = Path(spike["elf"])
-        if name == NAMES[0] and backend.available("verilator"):
+        if name == NAMES[0]:
             common["cycle_limit_probe"] = rejected_cycle_limit_flags(backend, elf)
         a, w, scalar, a_padded, w_padded = inputs_and_scalar(c_path.read_text(), m, k, n)
         expected = phase0_golden["outputs"]["Y0"]
@@ -381,39 +387,38 @@ def run(
             "spike_oracle": spike["oracle"],
             "phase0_software_screen": capsule["software_screen"]["status"],
         }
-        if backend.available("verilator"):
-            # Crucially, execute the SAME already-hashed ELF on both engines.
-            # A separate Verilator rebuild could silently change the program.
-            prior_case = ((previous or {}).get("cases") or {}).get(name, {})
-            prior_rtl = prior_case.get("verilator") or {}
-            reused = bool(
-                audit_existing
-                and prior_rtl.get("status") == "passed"
-                and prior_rtl.get("same_elf_sha256") == sha(elf)
-                and (case / "verilator_console.log").is_file()
-                and prior_rtl.get("console_sha256") == sha(case / "verilator_console.log")
-            )
-            rtl_console = (
-                (case / "verilator_console.log").read_text(encoding="utf-8")
-                if reused
-                else backend.run_elf(elf, simulator="verilator", timeout=ORACLE_WALL_S)
-            )
-            (case / "verilator_console.log").write_text(rtl_console, encoding="utf-8")
-            rtl_outputs, rtl_metrics = backend.parse_output(rtl_console)
-            if rtl_outputs.get("Y0") != scalar:
-                raise AssertionError(f"Verilator/independent scalar mismatch for {name}")
-            results[name]["compared"].append("same-ELF Gemmini Verilator output")
-            results[name]["verilator"] = {
-                "status": "passed",
-                "engine": "rtl_verilator",
-                "reused_prior_console_for_identical_elf": reused,
-                "cycle_limit": "unavailable",
-                "wall_timeout_seconds": ORACLE_WALL_S,
-                "same_elf_sha256": sha(elf),
-                "console_sha256": sha(case / "verilator_console.log"),
-                "output_i32_le_sha256": digest(i32_bytes(rtl_outputs["Y0"])),
-                "cycles": rtl_metrics.get("cycles"),
-            }
+        # Crucially, execute the SAME already-hashed ELF on both engines.
+        # A separate Verilator rebuild could silently change the program.
+        prior_case = ((previous or {}).get("cases") or {}).get(name, {})
+        prior_rtl = prior_case.get("verilator") or {}
+        reused = bool(
+            audit_existing
+            and prior_rtl.get("status") == "passed"
+            and prior_rtl.get("same_elf_sha256") == sha(elf)
+            and (case / "verilator_console.log").is_file()
+            and prior_rtl.get("console_sha256") == sha(case / "verilator_console.log")
+        )
+        rtl_console = (
+            (case / "verilator_console.log").read_text(encoding="utf-8")
+            if reused
+            else backend.run_elf(elf, simulator="verilator", timeout=ORACLE_WALL_S)
+        )
+        (case / "verilator_console.log").write_text(rtl_console, encoding="utf-8")
+        rtl_outputs, rtl_metrics = backend.parse_output(rtl_console)
+        if rtl_outputs.get("Y0") != scalar:
+            raise AssertionError(f"Verilator/independent scalar mismatch for {name}")
+        results[name]["compared"].append("same-ELF Gemmini Verilator output")
+        results[name]["verilator"] = {
+            "status": "passed",
+            "engine": "rtl_verilator",
+            "reused_prior_console_for_identical_elf": reused,
+            "cycle_limit": "unavailable",
+            "wall_timeout_seconds": ORACLE_WALL_S,
+            "same_elf_sha256": sha(elf),
+            "console_sha256": sha(case / "verilator_console.log"),
+            "output_i32_le_sha256": digest(i32_bytes(rtl_outputs["Y0"])),
+            "cycles": rtl_metrics.get("cycles"),
+        }
     common["cases"] = results
     common["summary"] = {
         "cases": len(results),
