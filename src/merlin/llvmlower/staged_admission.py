@@ -25,7 +25,7 @@ from merlin.targetgen.contract.model_kernel_route import _emit
 from merlin.targetgen.contract.resident_interface_abi import bind_single_resident_matmul
 from merlin.targetgen.rtl.facts import validate_facts
 
-from .device_build import _objcopy, build_device_objects
+from .device_build import _nm, _objcopy, build_device_objects, verify_object_symbol_binding
 from .device_shim import emit_translation_unit, kernel_abi_for
 from .exact_offload import _package_sha256
 
@@ -36,7 +36,7 @@ def _build_toolchain_sha256() -> dict[str, str]:
     """Content identities, without embedding machine-local checkout paths in a receipt."""
     from .toolchain import clang, mlir_translate
 
-    tools = {"clang": clang(), "mlir_translate": mlir_translate(), "objcopy": _objcopy()}
+    tools = {"clang": clang(), "mlir_translate": mlir_translate(), "objcopy": _objcopy(), "nm": _nm()}
     identities = {}
     for name, executable in tools.items():
         resolved = None if executable is None else shutil.which(str(executable))
@@ -385,7 +385,13 @@ def build_staged_candidate(
         expected_interfaces={symbol: {"mlir": interface, "sha256": binding["interface_sha256"]}},
         package_sha256=binding["package_sha256"], tile_edge=edge,
     )
-    if not built.ok or built.skipped or set(built.kernels) != {symbol} or len(built.objects) != 2:
+    kernel_object = work / f"{symbol}.o"
+    shim_object = work / "device_shim.o"
+    if (
+        not built.ok or built.skipped or set(built.kernels) != {symbol}
+        or set(built.objects) != {kernel_object, shim_object}
+        or built.shim_object != shim_object
+    ):
         raise ValueError(f"staged exact kernel or guarded shim did not build: {built.skipped}")
     if (
         _package_sha256(Path(package_dir)) != binding["package_sha256"]
@@ -409,6 +415,11 @@ def build_staged_candidate(
             raise ValueError(f"staged candidate build did not retain {name}")
         raw = path.read_bytes()
         codegen[name] = {"sha256": sha256_bytes(raw), "bytes": len(raw)}
+    symbol_binding = verify_object_symbol_binding(
+        kernel_object, shim_object,
+        entry_symbol=symbol, kernel_symbol=built.kernels[symbol],
+        original_kernel_symbol=abi.symbol, timeout=timeout,
+    )
     return {
         "status": "built_unverified",
         "exact_binding": binding,
@@ -418,6 +429,7 @@ def build_staged_candidate(
         "cflags": list(cflags or ()),
         "toolchain_sha256": toolchain_sha256,
         "codegen": codegen,
+        "symbol_binding": symbol_binding,
         "objects": objects,
         "artifact_bytes": sum(obj["bytes"] for obj in objects),
         "runtime_descriptor_guards": "compiled_not_executed",
