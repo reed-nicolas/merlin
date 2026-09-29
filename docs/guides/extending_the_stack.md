@@ -3,7 +3,7 @@ title: Extending the compiler stack
 kind: guide
 status: current
 owner: compiler
-last_verified: 2026-09-28
+last_verified: 2026-09-29
 related: [phase0_specification, model_lowering, model2mlir, triton_kernels, target_resolution, llvm_integration, simulator_selection]
 code_refs:
   - src/merlin/targetgen/software_spec.py
@@ -97,8 +97,8 @@ PyTorch capture → typed linalg/arith MLIR → exact scalar/indexing inventory
                                  → per-region selection/refusal receipt
 ```
 
-Run it on a fresh output path, using the exact target and frozen model from one
-Phase 0 run:
+An operator may run this diagnostic outside the Phase 1 agent sandbox on a fresh
+output path, using the exact target and frozen model from one Phase 0 run:
 
 ```sh
 python -m pip install '.[semantic-search]'  # from a Merlin source checkout
