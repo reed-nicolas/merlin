@@ -104,7 +104,39 @@ def test_registered_corpus_is_never_an_output_even_for_another_descriptor(tmp_pa
 
     retained = tmp_path / "retained"
     retained.mkdir()
-    monkeypatch.setattr(corpora, "capsule_corpus_roots", lambda: [retained])
+    monkeypatch.setattr(corpora, "capsule_corpus_roots", lambda **_kwargs: [retained])
     te = SimpleNamespace(capsule_corpus=tmp_path / "unrelated" / "isa")
     with pytest.raises(ValueError, match="output_root .* overlaps source capsule corpus"):
         generation._require_distinct_corpus_destinations(te, output_root=retained / "isa", evidence_root=None)
+
+
+def test_external_workspace_without_registry_still_protects_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("MERLIN_REPO_ROOT", str(tmp_path / "external-workspace"))
+    source = tmp_path / "external" / "isa"
+    te = SimpleNamespace(capsule_corpus=source)
+    generation._require_distinct_corpus_destinations(te, output_root=tmp_path / "run" / "capsules", evidence_root=None)
+    with pytest.raises(ValueError, match="output_root .* overlaps source capsule corpus"):
+        generation._require_distinct_corpus_destinations(te, output_root=source, evidence_root=None)
+
+
+def test_malformed_legacy_registry_is_not_treated_as_absent(tmp_path, monkeypatch):
+    from merlin.targetgen import corpora
+
+    def malformed(**_kwargs):
+        raise ValueError("malformed")
+
+    monkeypatch.setattr(corpora, "capsule_corpus_roots", malformed)
+    with pytest.raises(ValueError, match="malformed"):
+        generation._require_distinct_corpus_destinations(
+            SimpleNamespace(capsule_corpus=tmp_path / "source"), output_root=tmp_path / "run", evidence_root=None
+        )
+
+
+def test_missing_selected_registry_is_not_treated_as_empty(tmp_path, monkeypatch):
+    from merlin.common import paths
+
+    monkeypatch.setattr(paths, "checkout_root", lambda: tmp_path / "missing-owner")
+    with pytest.raises(FileNotFoundError, match="corpora.yaml"):
+        generation._require_distinct_corpus_destinations(
+            SimpleNamespace(capsule_corpus=tmp_path / "source"), output_root=tmp_path / "run", evidence_root=None
+        )

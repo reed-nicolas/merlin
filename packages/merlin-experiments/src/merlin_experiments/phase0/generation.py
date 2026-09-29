@@ -84,9 +84,15 @@ def _require_distinct_corpus_destinations(te, *, output_root: str | Path, eviden
     caller explicitly supplied ``--output-root``. Resolve paths before comparing
     them so an alias cannot bypass this source-ownership check.
     """
+    from merlin.common.paths import checkout_root
     from merlin.targetgen.corpora import capsule_corpus_roots
 
-    sources = [*capsule_corpus_roots()]
+    # In source mode MERLIN_REPO_ROOT may select an external experiment
+    # workspace that has no copy of this checkout's historical registry. The
+    # implementation checkout still owns those retained paths; an installed
+    # wheel instead reads its bundled registry. Both modes keep malformed or
+    # missing selected metadata fail-closed.
+    sources = [*capsule_corpus_roots(owner_root=checkout_root())]
     selected = getattr(te, "capsule_corpus", None)
     if selected:
         sources.append(Path(selected))
