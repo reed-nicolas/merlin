@@ -557,7 +557,12 @@ def compile_rvv(
                 return out
             res = zm.run_on_verilator(b["elf"], board=board, timeout=timeout, references=refs or None)
         else:
-            res = zm.run_on_spike(b["elf"], harts=max(2, harts), mem_bytes=b["ram_bytes"], timeout=timeout)
+            from merlin.runtime.boards import board as _board_desc
+
+            res = zm.run_on_spike(
+                b["elf"], dram_base=_board_desc(board).dram_base,
+                harts=max(2, harts), mem_bytes=b["ram_bytes"], timeout=timeout,
+            )
             if refs:
                 res.update(zm._gate(res["prefix"], refs))
         out["status"] = "ran"

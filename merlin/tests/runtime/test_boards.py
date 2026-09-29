@@ -85,6 +85,58 @@ def test_zephyr_build_requires_board_before_creating_output(tmp_path):
     assert not work.exists()
 
 
+def test_external_memory_layout_uses_the_selected_board_not_a_fixed_address():
+    gib = 1 << 30
+    brd = _fixture_board(
+        "shifted", dram_base=0x90000000, dram_bytes=8 * gib,
+        zephyr_default_ram_bytes=256 << 20, zephyr_link_limit_bytes=1900 << 20,
+        zephyr_external_ram_bytes=gib, zephyr_external_tail_reserve_bytes=256 << 20,
+    )
+    layout = zm._memory_plan(brd, 2 * gib + 1, 3 * gib)
+    assert layout.external
+    assert layout.weights_base == brd.dram_base + gib
+    assert layout.ram_region_bytes == gib
+    assert layout.weights_region_bytes == 2 * gib + 4096
+    assert layout.spike_span_bytes == gib + layout.weights_region_bytes
+
+
+def test_large_model_without_board_layout_fails_before_linking():
+    brd = _fixture_board(
+        "no_external", dram_bytes=8 << 30,
+        zephyr_default_ram_bytes=256 << 20, zephyr_link_limit_bytes=1900 << 20,
+    )
+    with pytest.raises(zm.ZephyrModelError, match="declares no external-weights layout"):
+        zm._memory_plan(brd, 2 << 30, 3 << 30)
+    with pytest.raises(zm.ZephyrModelError, match="RAM override"):
+        zm._memory_plan(brd, 0, 0, override=3 << 30)
+
+
+def test_external_weights_cannot_overlap_reserved_dram_tail():
+    gib = 1 << 30
+    brd = _fixture_board(
+        "small_external", dram_bytes=4 * gib,
+        zephyr_default_ram_bytes=256 << 20, zephyr_link_limit_bytes=1900 << 20,
+        zephyr_external_ram_bytes=gib, zephyr_external_tail_reserve_bytes=256 << 20,
+    )
+    with pytest.raises(zm.ZephyrModelError, match="does not fit"):
+        zm._memory_plan(brd, 3 * gib, 4 * gib)
+
+
+def test_external_image_must_leave_room_for_its_activation_arena():
+    from merlin.runtime.elf_audit import Segment
+
+    gib = 1 << 30
+    brd = _fixture_board("arena", dram_bytes=8 * gib)
+    low = gib
+    image = Segment("LOAD", brd.dram_base, 200 << 20, 200 << 20, "RWE")
+    zm._require_external_arena(brd, low, [image], 500 << 20)
+    with pytest.raises(zm.ZephyrModelError, match="external-weights ELF leaves"):
+        zm._require_external_arena(brd, low, [image], 900 << 20)
+    spill = Segment("LOAD", brd.dram_base + low - 4096, 8192, 8192, "RWE")
+    with pytest.raises(zm.ZephyrModelError, match="crosses the declared low RAM"):
+        zm._require_external_arena(brd, low, [spill], 0)
+
+
 def test_cpu_overlay_uses_declared_dt_count_not_board_name():
     assert "cpu@2" in zm._cpu_disable_overlay(2, 4)
     with pytest.raises(zm.ZephyrModelError, match="only 2 CPU nodes"):
@@ -605,6 +657,7 @@ def test_the_board_table_is_the_registry_file_not_code(tmp_path):
     reg.write_text("schema_version: 1\nboards:\n  a_new_tapeout:\n    dram_bytes: 1 GiB\n    harts: 3\n"
                    "    dram_base: 0x80000000\n    console: uart\n    flow: zephyr\n"
                    "    loader: pyuartsi\n    loader_baud: 57600\n    ram_label: ram0\n"
+                   "    zephyr_default_ram_bytes: 256 MiB\n    zephyr_link_limit_bytes: 1900 MiB\n"
                    "    uart_label: uart0\n    fpu_sharing: false\n    zephyr_vector_ext: true\n"
                    "    vlen: 256\n    vector_hart_ids: [0, 2]\n", encoding="utf-8")
     b = boards.load_boards(reg)["a_new_tapeout"]
@@ -616,12 +669,14 @@ def test_the_board_table_is_the_registry_file_not_code(tmp_path):
 @pytest.mark.parametrize("missing_fact", [
     "dram_base", "console", "flow", "loader", "loader_baud",
     "ram_label", "uart_label", "fpu_sharing", "zephyr_vector_ext",
+    "zephyr_default_ram_bytes", "zephyr_link_limit_bytes",
 ])
 def test_catalog_rejects_missing_critical_facts(tmp_path, missing_fact):
     facts = {
         "dram_bytes": "1 GiB", "dram_base": 0x80000000, "harts": 2,
         "console": "uart", "flow": "zephyr", "loader": "pyuartsi",
         "loader_baud": 57600, "ram_label": "ram0", "uart_label": "uart0",
+        "zephyr_default_ram_bytes": "256 MiB", "zephyr_link_limit_bytes": "1900 MiB",
         "fpu_sharing": False, "zephyr_vector_ext": True, "vector_harts": 2,
     }
     facts.pop(missing_fact)

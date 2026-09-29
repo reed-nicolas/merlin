@@ -1,7 +1,7 @@
 """Audit a produced ELF against a board's memory map, BEFORE anyone loads it onto that board.
 
-Every "will it fit" decision in this repo is *predictive arithmetic* (``_ram_for_weights``,
-``LINK_LIMIT``, ``EXT_MAX_WEIGHTS``); nothing has ever looked at the artifact to confirm the prediction
+Every "will it fit" decision in this repo is *predictive arithmetic* (``_ram_for_weights``
+and the selected board's external-memory layout); nothing has ever looked at the artifact to confirm the prediction
 came true. That is tolerable when the person running the binary can attach a debugger. It is not
 tolerable when the binary is mailed to someone else's bench, because the failure modes are silent:
 

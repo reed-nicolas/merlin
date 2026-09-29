@@ -1,32 +1,15 @@
-"""Whole-model execution on **Zephyr** (SMP) — spike today, FireSim on the 2-tile board.
+"""Whole-model execution through a selected Zephyr RISC-V board port.
 
-This is the bring-up bridge from merlin's bare-metal spike path
-(:mod:`spike_model`) to a real RTOS image that runs on the FireSim
-``GemminiAndOPUShuttleConfig`` SoC (tile 0 = scalar/Gemmini, tile 1 = Saturn-OPU
-``rv64gcv`` vLen=128). NOTE: this whole-model Zephyr/FireSim SMP path deliberately
-uses the 2-tile gemmini+OPU SoC (it needs the Saturn vector tile); it is a distinct
-path from the Gemmini C0 RTL-certification oracle, which now runs the pure
-``GemminiRocketConfig`` (single-tile Rocket host, same 16x16 int8 Gemmini core). It reuses the *entire* data-driven C runtime
-(:mod:`merlin.llvmlower.c_runtime` + ``merlin/runtime/c/merlin_model.c`` +
-``merlin/runtime/abi/mlir_runtime.c``) and the single ``model.o`` lowered from
-``model.mlir``; only the harness changes: instead of ``crt.S``/``htif.c`` +
-absolute-addressed arena, it emits a **Zephyr application** with one worker thread
-**pinned to the RVV tile** (``k_thread_cpu_pin``) that calls ``merlin_run`` and dumps
-the output over the console (HTIF on spike, UART on FireSim).
+The model is lowered once to an object and linked with Merlin's data-driven C
+runtime into a Zephyr application. A worker is pinned to a declared compatible
+hart; on heterogeneous boards this prevents vector code from running on a scalar
+hart. The selected out-of-tree board catalog supplies the physical memory,
+Zephyr port, console and hart facts. The same image can be checked with Spike
+when its board protocol is simulator-compatible.
 
-Why a pinned worker and not ``main()``: on the FireSim board only tile 1 has the
-Saturn vector unit, so the ``rv64gcv`` ``model.o`` must execute on hart 1 — running
-it on the boot hart (tile 0, scalar) would trap an illegal vector instruction. On
-spike (``-p2``) every hart has V, so the same image runs there too.
-
-The Zephyr V recipe mirrors the verified ``samples/test_mt_rvv`` sample:
-eager per-thread V save/restore (``RISCV_ISA_EXT_V_LAZY=n`` + ``V_KERNEL_ONLY=y``),
-``SMP`` + ``SCHED_CPU_MASK_PIN_ONLY``. The model ``.o`` is built once with clang
-(``rv64gcv``) and linked as a static archive into the Zephyr image.
-
-Toolchain/env (see memory ``zephyr-multicore-rvv``): ``ZEPHYR_BASE``,
-``ZEPHYR_SDK_INSTALL_DIR`` (0.17.0), and the chipyard conda ``bin`` (west/cmake/ninja)
-on PATH. Resolved with sensible defaults, overridable via env.
+Toolchains are selected with ``ZEPHYR_BASE``, ``ZEPHYR_SDK_INSTALL_DIR`` and
+``MERLIN_CHIPYARD`` (for optional host tools). No target checkout or board map is
+assumed by importing this module.
 """
 
 from __future__ import annotations
@@ -54,18 +37,15 @@ from . import spike as _spike
 # clang flags for the model object. medany keeps it position-tolerant;
 # -ffreestanding/-fno-builtin so it needs only the symbols mlir_runtime.c + libc(picolibc)
 # provide (cosf/expf/.../memrefCopy/rsqrtf/malloc). Two backends:
-#   rvv    — vector tile (rv64gcv); runs on the Saturn tile (FireSim hart 1).
-#   scalar — no vector (rv64gc); runs on the scalar tile (FireSim hart 0). The portable
-#            FireSim-safe path: no V means no Saturn-V trap (the FPU_SHARING silent-retry
-#            hang the vector path is still being brought up against).
+#   rvv    — vector-capable harts (rv64gcv), selected by the board descriptor.
+#   scalar — no vector (rv64gc); may run on any declared hart.
 _CFLAGS_COMMON = ["-mabi=lp64d", "-mcmodel=medany", "-O2", "-ffreestanding", "-fno-builtin"]
 # RVV: the ONLY vector ops are the controlled fixed-width ones baked into the IR by the
 # transform schedule (linalg.matmul/batch_matmul -> vector<MxNxf32/i32> at e32,m1/m2). clang's
 # auto-vectorizer is DISABLED (-fno-vectorize -fno-slp-vectorize): left on, it emits
-# fractional-LMUL (mf2/mf4/mf8) and other configs the Saturn-OPU (vLen=128, tuned for LMUL=1)
-# wedges on — the documented RVV-on-FASED hang. With autovec off, the non-contraction generics
-# fall through convert-linalg-to-loops to scalar code (Saturn-safe), and only the transform
-# path's fixed-width contraction vectors reach the Saturn vector lanes.
+# fractional-LMUL (mf2/mf4/mf8) and other configs unsupported by some vector
+# ports. With autovec off, non-contraction generics fall through to scalar loops;
+# only the transform path's fixed-width contraction vectors reach vector lanes.
 RVV_CFLAGS = ["-march=rv64gcv", "-fno-vectorize", "-fno-slp-vectorize", *_CFLAGS_COMMON]
 SCALAR_CFLAGS = ["-march=rv64gc", *_CFLAGS_COMMON]
 
@@ -312,21 +292,70 @@ def perop_mr_cap() -> int:
 
 _PEROP_KC = 16
 
-DEFAULT_RAM_BYTES = 256 * 1024 * 1024  # spike/chipyard `ram0` default (0x10000000)
+_WEIGHTS_ALIGN_BYTES = 4096  # Zephyr memory-region alignment, not a board address
 
-# Above this, a weights blob linked into the image's .data overflows the medany ±2GB
-# PC-relative window (Zephyr's own .text<->.bss refs break). Past it we switch to
-# "external weights": the blob lives in its own DT memory-region at a fixed high absolute
-# address, referenced by integer-constant base (no far symbol), keeping ram0 compact.
-LINK_LIMIT = 1900 * 1024 * 1024
-EXT_RAM0_BYTES = 0x40000000  # 1 GB ram0 (code + activation arena) in ext mode
-EXT_WEIGHTS_BASE = 0xC0000000  # weights region origin (3 GB), right after ram0  # derived-ok: this backend's ext-mode layout origin, chosen together with DRAM_END below
-DRAM_END = 0x80000000 + 16 * 1024**3  # FireSim WithExtMemSize = 16 GB at 0x80000000
-# The WEIGHTS region uses a 2-cell DT container (#address/size-cells=2) so its reg can
-# express a 64-bit base+size — handling blobs > 4 GB (tiny 4.1 G, pi05 fp32 13 G), not just
-# the 1-cell <4 GB case. The only hard cap is physical DRAM: weights at EXT_WEIGHTS_BASE
-# must end before the 16 GB DRAM end (leave ram0 + margin).
-EXT_MAX_WEIGHTS = DRAM_END - EXT_WEIGHTS_BASE - (256 * 1024 * 1024)  # ~14.75 GB
+
+@dataclass(frozen=True)
+class _MemoryPlan:
+    external: bool
+    ram_region_bytes: int
+    spike_span_bytes: int
+    weights_base: int | None = None
+    weights_region_bytes: int = 0
+
+
+def _memory_plan(brd: Any, weights_bytes: int, linked_region: int, override: int | None = None) -> _MemoryPlan:
+    """Choose an in-DRAM layout using only the selected board's memory facts.
+
+    A missing external-weights layout is a refusal, not a guess at another board's
+    16 GiB map. The returned spike span covers every byte of the emitted ELF.
+    """
+    default = brd.zephyr_default_ram_bytes
+    limit = brd.zephyr_link_limit_bytes
+    if default is None or limit is None:
+        raise ZephyrModelError(f"{brd.name}: Zephyr memory facts are missing from the selected board")
+    if linked_region < 0 or weights_bytes < 0:
+        raise ZephyrModelError(f"{brd.name}: negative model memory requirement")
+    if brd.dram_base > 0xFFFFFFFF or default > 0xFFFFFFFF:
+        raise ZephyrModelError(f"{brd.name}: Zephyr RAM overlay requires one-cell DRAM address and size")
+    if override is not None:
+        if override < default or override < weights_bytes or override > limit or override > brd.dram_bytes:
+            raise ZephyrModelError(f"{brd.name}: RAM override cannot hold weights or exceeds board limits")
+        return _MemoryPlan(False, override, override)
+    if linked_region < default:
+        raise ZephyrModelError(f"{brd.name}: computed region is smaller than the port's default RAM region")
+    if linked_region <= limit:
+        if linked_region > brd.dram_bytes or linked_region > 0xFFFFFFFF:
+            raise ZephyrModelError(f"{brd.name}: linked region exceeds physical DRAM")
+        return _MemoryPlan(False, linked_region, linked_region)
+    low = brd.zephyr_external_ram_bytes
+    tail = brd.zephyr_external_tail_reserve_bytes
+    if low is None or tail is None:
+        raise ZephyrModelError(
+            f"{brd.name}: linked region exceeds the port's limit and the board declares no external-weights layout"
+        )
+    if low <= 0 or low > limit or low > 0xFFFFFFFF or tail < 0 or low + tail >= brd.dram_bytes:
+        raise ZephyrModelError(f"{brd.name}: invalid external-weights layout")
+    base = brd.dram_base + low
+    aligned = (weights_bytes + _WEIGHTS_ALIGN_BYTES - 1) & ~(_WEIGHTS_ALIGN_BYTES - 1)
+    if base % _WEIGHTS_ALIGN_BYTES or aligned + low + tail > brd.dram_bytes:
+        raise ZephyrModelError(f"{brd.name}: aligned weights blob does not fit the declared DRAM layout")
+    return _MemoryPlan(True, low, low + aligned, base, aligned)
+
+
+def _require_external_arena(brd: Any, ram_region_bytes: int, segments: list[Any], demand: int) -> None:
+    """Refuse an external image whose *linked* low-memory footprint crowds its arena."""
+    low_end = brd.dram_base + ram_region_bytes
+    low_segments = [sg for sg in segments if sg.vaddr < low_end]
+    if any(sg.vaddr < brd.dram_base or sg.end > low_end for sg in low_segments):
+        raise ZephyrModelError(f"{brd.name}: linked ELF crosses the declared low RAM region")
+    available = ram_region_bytes - sum(sg.memsz for sg in low_segments)
+    if available < demand:
+        raise ZephyrModelError(
+            f"{brd.name}: external-weights ELF leaves {available} bytes "
+            f"of low RAM for {demand} bytes of activation demand; declare a larger "
+            "external RAM region in the target-owned catalog"
+        )
 
 
 #: What one heap allocation looks like in the emitted LLVM IR. The lowered model reaches the C library
@@ -372,7 +401,8 @@ def allocation_bytes(ll_path: str | Path) -> tuple[int, int]:
 
 
 def _ram_for_weights(
-    weights_bytes: int, activation_bytes: int | None = None, allocation_bytes_total: int | None = None
+    weights_bytes: int, activation_bytes: int | None = None, allocation_bytes_total: int | None = None,
+    *, default_ram_bytes: int,
 ) -> int:
     """RAM-region size to hold the weights blob (linked into .data) plus an activation
     arena (the leftover, claimed by ARENA_SIZE=-1). Headroom scales with the model
@@ -416,7 +446,7 @@ def _ram_for_weights(
     total = weights_bytes + headroom
     align = 16 * 1024 * 1024
     total = ((total + align - 1) // align) * align
-    return max(DEFAULT_RAM_BYTES, total)
+    return max(default_ram_bytes, total)
 
 
 def _prepare_model_mlir(
@@ -1418,6 +1448,8 @@ def _debug_harness(debug: bool, dram_base: int, region_bytes: int, n_harts: int)
     """
     if not debug:
         return _DebugHarness()
+    if dram_base <= 0 or region_bytes <= 0:
+        raise ZephyrModelError("debug memory probe requires the selected board's DRAM base and region size")
     end = dram_base + region_bytes
     return _DebugHarness(
         decls=f"""
@@ -1518,7 +1550,7 @@ def _main_c(
     build_hash: str = "",
     console: str = "htif",
     debug: bool = False,
-    dram_base: int = 0x80000000,
+    dram_base: int = 0,
     region_bytes: int = 0,
 ) -> str:
     """Generate the Zephyr worker main: one COOP thread pinned to ``rvv_hart`` calls
@@ -2261,6 +2293,8 @@ def build_app(
     from ..boards import board as _board_desc
 
     brd = _board_desc(board, **({"vlen": vlen} if vlen is not None else {}))
+    if brd.flow != "zephyr" or brd.zephyr_default_ram_bytes is None or brd.zephyr_link_limit_bytes is None:
+        raise ZephyrModelError(f"{brd.name}: selected board lacks a Zephyr port and its memory facts")
     if matrix is not None:
         matrix.provider()  # Refuse unselected/incomplete support before build output or native tools.
     else:
@@ -2413,17 +2447,16 @@ def build_app(
     _h.update((work / "model.o").read_bytes())
     _h.update((cgen / "weights.bin").read_bytes())
 
-    # External-weights mode for blobs that would overflow medany linked into .data: rename
-    # the blob's section so Zephyr's default linker won't pull it into the image .data; a
-    # snippet diverts it to the WEIGHTS region at a fixed high address, and main.c addresses
-    # it by literal. Keeps ram0 compact (code + arena), so big fp32 models link.
+    # External-weights mode for blobs that would overflow the selected port's link
+    # window: keep the low code/arena region compact and place the blob at the
+    # board-declared contiguous DRAM address, referenced by an absolute pointer.
     # DECIDE ON THE LINKED FOOTPRINT, NOT THE BLOB SIZE. medany constrains the whole ram0 span
-    # (code + weights + activation arena), so a blob that fits LINK_LIMIT on its own can still push
+    # (code + weights + activation arena), so a blob that fits the limit on its own can still push
     # the region past the window once the arena is added -- and then linked mode is chosen for an
     # image that cannot work. MEASURED on gemma2_2b_int8_section12: 1462 MiB of weights sat under the
     # 1900 MiB threshold, linked mode was selected, the arena took ram0 to ~3.7 GiB, and the image
     # never reached its first op in 30 min (silent -- no fault, which is what made it expensive to
-    # find). The SAME bundle forced external, ram0 a compact 1 GiB and the blob at EXT_WEIGHTS_BASE,
+    # find). The SAME bundle forced external, with a compact low RAM region and a separate weights blob,
     # reaches op 0 in 8 minutes. Comparing the computed region is strictly safer than comparing the
     # blob: it can only move builds from linked to external, and external is the mode that works at
     # every size tested (1034 MiB and 2485 MiB regions both execute).
@@ -2432,33 +2465,23 @@ def build_app(
 
     peak = None  # measured only on the path that sizes the region from it
     linked_region = None
-    if ram_bytes_override is not None:
-        external = False
-    else:
+    if ram_bytes_override is None:
         # Same lock rationale as the sizing parse below: three concurrent build_app calls produced a
         # bogus ParseError on valid IR, which read as a broken build rather than a race.
         with IR_LOCK:
             peak = int(activation_peak_bytes(model_dir / "model.mlir") or 0) or None
-        linked_region = _ram_for_weights(weights_size, peak, alloc_total)
-        external = linked_region > LINK_LIMIT
-    weights_base = None
+        linked_region = _ram_for_weights(
+            weights_size, peak, alloc_total, default_ram_bytes=brd.zephyr_default_ram_bytes
+        )
+    layout = _memory_plan(brd, weights_size, linked_region or 0, ram_bytes_override)
+    external = layout.external
+    weights_base = layout.weights_base
     if external:
-        if weights_size > EXT_MAX_WEIGHTS:
-            raise ZephyrModelError(
-                f"weights blob {weights_size / 2**30:.1f} GB does not fit the 16 GB DRAM "
-                f"after ram0 (max ~{EXT_MAX_WEIGHTS / 2**30:.1f} GB) — out of envelope."
-            )
         _run([objcopy, "--rename-section", ".data=.merlin_weights", work / "weights_blob.o"])
-        weights_base = EXT_WEIGHTS_BASE
-        ram_bytes = (EXT_WEIGHTS_BASE - 0x80000000) + weights_size  # spike -m span
-    else:
-        # Size ram0 to the in-image weights blob + activation-arena headroom (default 256 MB
-        # is too small for multi-hundred-MB int8/fp8 blobs). ARENA_SIZE=-1 claims the
-        # leftover. Spike gets a matching -m; FireSim DRAM is fixed by the bitstream.
-        # `linked_region` was already computed above to MAKE the linked/external decision; reusing it
-        # is what keeps the decision and the sizing from disagreeing (recomputing invites a future
-        # edit to change one and not the other).
-        ram_bytes = ram_bytes_override if ram_bytes_override is not None else linked_region
+    # The region and simulator span differ in external mode: the linked arena only
+    # occupies the low region, while the simulator must map the weights as well.
+    ram_bytes = layout.spike_span_bytes
+    ram_region_bytes = layout.ram_region_bytes
 
     archive = work / "libmerlinmodel.a"
     archive.unlink(missing_ok=True)
@@ -2559,10 +2582,8 @@ def build_app(
 
     # Written below, once the identity it embeds is known.
     cmakelists_text = _cmake("")
-    # Board overlay. External mode: ram0 = 1 GB (code + arena) and a separate WEIGHTS
-    # memory-region holding the blob at EXT_WEIGHTS_BASE. Otherwise: grow ram0 only when
-    # the model needs > the stock 256 MB (small models keep the default that boots reliably
-    # on FireSim). Plus, for chipyard, the disable-cpu@2..7 overlay.
+    # Board overlay. External mode has a low code/arena region and a separate
+    # WEIGHTS region; their sizes and origin derive from the selected catalog.
     overlay = ""
     if console_facts is not None:
         # Point `chosen` at the chip's UART and state its address from the DERIVED fact rather than
@@ -2577,18 +2598,18 @@ def build_app(
             f"\tcurrent-speed = <{_DEFAULT_BAUD}>;\n}};\n\n"
         )
     if external:
-        wsz = (weights_size + 0xFFF) & ~0xFFF  # 4 KB align
+        wsz = layout.weights_region_bytes
         # The WEIGHTS region lives under a 2-cell (#address/size-cells=2) container so its
         # reg can express a 64-bit base+size — letting the blob exceed 4 GB (tiny, pi05).
         # The chipyard root is 1-cell, so we add a child bus with 2/2 cells. base & size are
         # emitted as <hi lo> pairs.
-        b_hi, b_lo = (EXT_WEIGHTS_BASE >> 32) & 0xFFFFFFFF, EXT_WEIGHTS_BASE & 0xFFFFFFFF
+        b_hi, b_lo = (weights_base >> 32) & 0xFFFFFFFF, weights_base & 0xFFFFFFFF
         s_hi, s_lo = (wsz >> 32) & 0xFFFFFFFF, wsz & 0xFFFFFFFF
         overlay += (
-            f"&ram0 {{\n\treg = <0x80000000 {hex(EXT_RAM0_BYTES)}>;\n}};\n\n"
+            f"&{brd.ram_label} {{\n\treg = <{hex(brd.dram_base)} {hex(ram_region_bytes)}>;\n}};\n\n"
             f"/ {{\n\tweights_bus {{\n"
             f"\t\t#address-cells = <2>;\n\t\t#size-cells = <2>;\n\t\tranges;\n"
-            f"\t\tweights0: memory@{EXT_WEIGHTS_BASE:x} {{\n"
+            f"\t\tweights0: memory@{weights_base:x} {{\n"
             f'\t\t\tcompatible = "zephyr,memory-region", "mmio-sram";\n'
             f"\t\t\treg = <{hex(b_hi)} {hex(b_lo)} {hex(s_hi)} {hex(s_lo)}>;\n"
             f'\t\t\tzephyr,memory-region = "WEIGHTS";\n\t\t}};\n\t}};\n}};\n'
@@ -2600,7 +2621,7 @@ def build_app(
         A function rather than a literal because the region may have to be CORRECTED after the link: the
         arena is the leftover after the image, and the image's size is not known until it exists.
         """
-        if size <= DEFAULT_RAM_BYTES:
+        if size <= brd.zephyr_default_ram_bytes:
             return ""
         # Never past what the chip HAS: a region larger than physical DRAM is a boot that dies before
         # main() with no console output at all.
@@ -2642,7 +2663,7 @@ def build_app(
             console=brd.console,
             debug=debug,
             dram_base=brd.dram_base,
-            region_bytes=ram_bytes,
+            region_bytes=ram_region_bytes,
         )
 
     _h.update(prj_conf_text.encode())
@@ -2704,6 +2725,11 @@ def build_app(
 
     build_hash = _emit_and_build()
     demand = alloc_total + 128 * 1024 * 1024
+    if external:
+        from ..elf_audit import read_elf as _read_elf
+
+        low_demand = (alloc_total or peak or 0) + 128 * 1024 * 1024
+        _require_external_arena(brd, ram_region_bytes, _read_elf(elf)[1], low_demand)
     if not external and alloc_total:
         from ..elf_audit import read_elf as _read_elf
 
@@ -2719,6 +2745,7 @@ def build_app(
                 flush=True,
             )
             ram_bytes = grown
+            ram_region_bytes = grown
             overlay = _overlay_for(ram_bytes)
             build_hash = _emit_and_build()
     out = {
@@ -2728,6 +2755,8 @@ def build_app(
         "board": brd.name,
         "backend": backend,
         "ram_bytes": ram_bytes,
+        "ram_region_bytes": ram_region_bytes,
+        "weights_base": weights_base,
         "build_hash": build_hash,
         **info,
     }
@@ -2778,18 +2807,20 @@ def spike_isa(vlen: int | None = None, base: str = DEFAULT_SPIKE_ISA) -> str:
 def run_on_spike(
     elf: str | Path,
     *,
+    dram_base: int,
+    mem_bytes: int,
     harts: int = 2,
     isa: str = DEFAULT_SPIKE_ISA,
     vlen: int | None = None,
-    mem_bytes: int = 1 << 31,
     timeout: int = 3600,
 ) -> dict[str, Any]:
     """Run the Zephyr ELF on spike ``-pN``; parse the OUT/ARGMAX/METRIC/DONE markers.
 
-    ``vlen`` pins the simulated vector length (via :func:`spike_isa`); None = spike's default 128.
+    ``dram_base`` and ``mem_bytes`` describe the selected board's mapped DRAM;
+    ``vlen`` pins the simulated vector length (via :func:`spike_isa`).
     """
     isa = spike_isa(vlen, isa) if vlen is not None else isa
-    cmd = [_spike.spike_path(), f"--isa={isa}", f"-p{harts}", f"-m{hex(0x80000000)}:{hex(mem_bytes)}", str(elf)]
+    cmd = [_spike.spike_path(), f"--isa={isa}", f"-p{harts}", f"-m{hex(dram_base)}:{hex(mem_bytes)}", str(elf)]
     proc = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, timeout=timeout)
     console = proc.stdout + proc.stderr
     return _parse_console(console, proc.returncode)
@@ -3367,9 +3398,14 @@ def build_and_run(
         # default 128); recorded so a result cannot be read as another VLEN's
         "vlen": vlen,
     }
-    if board != "spike_riscv64":
+    from ..boards import board as _board_desc
+
+    if board is None or _board_desc(board).simulator != "spike":
         return result  # FireSim path runs the elf separately (firesim_runner / queue)
-    run = run_on_spike(b["elf"], harts=harts, mem_bytes=b["ram_bytes"], timeout=timeout, vlen=vlen)
+    run = run_on_spike(
+        b["elf"], dram_base=_board_desc(board).dram_base, harts=harts,
+        mem_bytes=b["ram_bytes"], timeout=timeout, vlen=vlen,
+    )
     result.update(run)
     refs = references if references is not None else reference
     if refs is not None:

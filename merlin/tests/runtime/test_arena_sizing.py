@@ -12,6 +12,12 @@ from __future__ import annotations
 
 from merlin.runtime.backends import zephyr_model as zm
 
+_PORT_RAM_DEFAULT = 256 * 1024 * 1024
+
+
+def _sized(weights, peak=None, allocation=None):
+    return zm._ram_for_weights(weights, peak, allocation, default_ram_bytes=_PORT_RAM_DEFAULT)
+
 
 def _ll(tmp_path, body: str):
     f = tmp_path / "model.ll"
@@ -57,7 +63,7 @@ def test_the_region_covers_the_sum_of_allocations(tmp_path):
     """The whole point: a model whose buffers dwarf its weights gets a region sized to the buffers."""
     w = 16 * 1024 * 1024
     # Weights-scaled and peak-based sizing would both leave this model far short.
-    got = zm._ram_for_weights(w, 100 * 1024 * 1024, 900 * 1024 * 1024)
+    got = _sized(w, 100 * 1024 * 1024, 900 * 1024 * 1024)
     assert got >= w + 900 * 1024 * 1024
 
 
@@ -69,17 +75,17 @@ def test_the_measured_total_replaces_a_pessimistic_estimate():
     a model that fits in 3136 MB."""
     w = 1531545600
     estimate, measured = 2827 * 1024 * 1024, 1607049952
-    assert zm._ram_for_weights(w, estimate) // 2**20 == 4416
-    assert zm._ram_for_weights(w, estimate, measured) // 2**20 == 3136
+    assert _sized(w, estimate) // 2**20 == 4416
+    assert _sized(w, estimate, measured) // 2**20 == 3136
 
 
 def test_the_estimate_is_still_used_when_nothing_was_measured():
     """A caller with no emitted IR to read (an external-weights layout, an older path) must not silently
     fall back to the flat headroom that under-provisioned whisper_tiny."""
     w = 120 * 1024 * 1024
-    assert zm._ram_for_weights(w, 210 * 1024 * 1024) > zm._ram_for_weights(w, None)
+    assert _sized(w, 210 * 1024 * 1024) > _sized(w, None)
 
 
 def test_a_model_whose_buffers_are_small_is_unaffected():
     w = 1200 * 1024 * 1024
-    assert zm._ram_for_weights(w, 64 * 1024 * 1024, 8 * 1024 * 1024) == zm._ram_for_weights(w, None)
+    assert _sized(w, 64 * 1024 * 1024, 8 * 1024 * 1024) == _sized(w, None)

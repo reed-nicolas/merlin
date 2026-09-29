@@ -14,8 +14,16 @@ produced the most evidence it could have.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from merlin.runtime.backends import zephyr_model as zm
+
+_DEBUG_MEMORY = {"dram_base": 0x80000000, "region_bytes": 256 << 20}
+
+
+def test_debug_memory_probe_requires_selected_board_memory():
+    with pytest.raises(zm.ZephyrModelError, match="selected board's DRAM"):
+        zm._main_c(0, debug=True)
 
 
 def _at(src: str, marker: str) -> int:
@@ -25,7 +33,7 @@ def _at(src: str, marker: str) -> int:
 
 
 def test_the_epilogue_is_ordered_by_evidence_per_byte():
-    src = zm._main_c(0, debug=True)
+    src = zm._main_c(0, debug=True, **_DEBUG_MEMORY)
     order = [
         "METRIC cycles",
         'printk("ARGMAX %d',
@@ -44,7 +52,7 @@ def test_the_epilogue_is_ordered_by_evidence_per_byte():
 
 def test_compute_done_still_marks_the_end_of_compute():
     """The cheap stage marker stays put — it is what tells a stalled run from a slow one."""
-    src = zm._main_c(0, debug=True)
+    src = zm._main_c(0, debug=True, **_DEBUG_MEMORY)
     assert _at(src, 'merlin_stage("compute_done")') < _at(src, "METRIC cycles")
 
 
@@ -59,7 +67,7 @@ def test_a_delivery_image_carries_no_dump_at_all():
 
 def test_the_hash_the_harness_computes_is_the_one_the_host_checks():
     """FNV-1a over the output BYTES, in C and in numpy, must agree bit for bit."""
-    src = zm._main_c(0, debug=True)
+    src = zm._main_c(0, debug=True, **_DEBUG_MEMORY)
     assert "2166136261u" in src and "16777619u" in src, "not FNV-1a 32"
 
     def fnv1a32(b: bytes) -> int:

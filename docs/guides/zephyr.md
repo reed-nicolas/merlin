@@ -42,6 +42,20 @@ generic module-layout description below needs none):
   is for demonstrations; it is not bundled into the Merlin wheel. No board or
   unknown board fails before build output is created.
 
+For a Zephyr board, the catalog must also declare `zephyr_default_ram_bytes`
+(the selected port's unmodified device-tree region) and
+`zephyr_link_limit_bytes` (the model-object relocation window). If weights and
+arena would exceed that window, Merlin uses a separate weights region **only**
+when the board declares `zephyr_external_ram_bytes` and
+`zephyr_external_tail_reserve_bytes`. The weights base is computed as
+`dram_base + zephyr_external_ram_bytes`; the aligned blob and reserved tail
+must fit inside `dram_bytes`. No 16 GiB board, fixed `ram0` address, or Spike
+memory size is assumed by the runtime. A missing or impossible layout is an
+error before the Zephyr link; the build result records the low RAM region,
+simulator span, and weights base for inspection. Mark a simulator descriptor
+with `simulator: spike` if the certification runner should select it as its
+functional substrate.
+
 ## Generated module layout
 
 `merlin.targetgen.generate.zephyr_module` produces, from a `zephyr_plan.yaml`:

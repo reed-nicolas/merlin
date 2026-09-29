@@ -12,7 +12,9 @@
 # Value spellings:
 #   * byte sizes (`dram_bytes`, `code_reserve`) are an integer or "<n> KiB|MiB|GiB";
 #   * every entry explicitly states `dram_base`, `console`, `flow`, `loader`, and `loader_baud`;
-#   * Zephyr entries state `ram_label` (and UART entries also state `uart_label`);
+  #   * Zephyr entries state `ram_label` (and UART entries also state `uart_label`);
+  #   * Zephyr entries state their port's default RAM region and linked-region limit;
+  #     an external-weights layout also states its low region and reserved DRAM tail;
 #   * bare-metal entries state `code_reserve`;
 #   * `console` is htif | uart, `flow` is zephyr | baremetal, `loader` is uart_tsi | pyuartsi;
 #   * `vector_hart_ids` is a list of hart ids;
@@ -26,8 +28,11 @@ schema_version: 1
 boards:
   # The substrates we already validate on, described here so the same code path serves them.
   spike_riscv64:
+    simulator: spike
     dram_bytes: 2 GiB
     dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
     harts: 8
     vector_harts: 8
     vlen: 128
@@ -49,6 +54,8 @@ boards:
     dt_cpu_nodes: 8
     dram_bytes: 256 MiB
     dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
     harts: 4
     vector_harts: 4
     vlen: 256
@@ -65,7 +72,7 @@ boards:
 
   # The FPGA TARGET is its own board, not the DTS default. `chipyard_riscv64` keeps ram0's 256 MB because
   # that is what a Verilator/spike run of that config has; the FireSim dual-Saturn target has
-  # WithExtMemSize = 16 GB at 0x80000000 (see zephyr_model.DRAM_END, and the whole-model TinyLlama run
+  # WithExtMemSize = 16 GB at 0x80000000 (see the external-memory fields below and the whole-model TinyLlama run
   # whose 482 MB of weights could not otherwise have been linked). Conflating the two is what made
   # whisper_tiny -- 464 MB of region -- look like it did not fit on a 16 GB target.
   firesim_dual_saturn:
@@ -73,6 +80,10 @@ boards:
     dt_cpu_nodes: 8
     dram_bytes: 16 GiB
     dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
+    zephyr_external_ram_bytes: 1 GiB
+    zephyr_external_tail_reserve_bytes: 256 MiB
     harts: 2
     vector_harts: 2
     vlen: 256
@@ -104,6 +115,8 @@ boards:
     dt_cpu_nodes: 8
     dram_bytes: 512 MiB
     dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
     harts: 3
     vector_harts: 2
     vlen: 512
@@ -157,6 +170,8 @@ boards:
     dt_cpu_nodes: 8
     dram_bytes: 4 GiB
     dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
     harts: 2
     vector_harts: 2
     vlen: 512
@@ -191,6 +206,10 @@ boards:
     dt_cpu_nodes: 8
     dram_bytes: 16 GiB
     dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
+    zephyr_external_ram_bytes: 1 GiB
+    zephyr_external_tail_reserve_bytes: 256 MiB
     harts: 1
     vector_harts: 1
     vlen: 512
@@ -253,6 +272,8 @@ boards:
     dt_cpu_nodes: 8
     dram_bytes: 1 GiB
     dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
     harts: 2
     vector_harts: 2
     vlen: 256
@@ -293,6 +314,8 @@ boards:
     dt_cpu_nodes: 8
     dram_bytes: 1 GiB
     dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
     harts: 2
     vector_harts: 2
     vlen: 256

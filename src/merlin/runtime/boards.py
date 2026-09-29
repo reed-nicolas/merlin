@@ -91,6 +91,20 @@ class Board:
     rtl_sim_config: str | None = None
     #: FPGA bitstream identity for measurements, when applicable.
     bitstream: str | None = None
+    #: The selected Zephyr port's unmodified DT RAM-region size. A generated
+    #: overlay is needed only when the image needs more than this region.
+    zephyr_default_ram_bytes: int | None = None
+    #: Maximum linked code + weights + arena region supported by this port's
+    #: model-object relocation mode. Larger models require an external layout.
+    zephyr_link_limit_bytes: int | None = None
+    #: When the port supports separate weights, size of its low code/arena
+    #: region. Weights begin immediately after it within this board's DRAM.
+    zephyr_external_ram_bytes: int | None = None
+    #: Physical DRAM reserved after an external weights blob, if applicable.
+    zephyr_external_tail_reserve_bytes: int | None = None
+    #: Set only when this board descriptor represents the Spike simulator;
+    #: callers use this instead of inspecting a target-specific board name.
+    simulator: str | None = None
     notes: str = ""
 
     @property
@@ -146,9 +160,13 @@ _ENUMS: dict[str, tuple[str, ...]] = {
     "console": (CONSOLE_HTIF, CONSOLE_UART),
     "flow": (FLOW_ZEPHYR, FLOW_BAREMETAL),
     "loader": (LOADER_UART_TSI, LOADER_PYUARTSI),
+    "simulator": ("spike",),
 }
 #: Fields written as byte sizes, which the registry may spell "<n> KiB|MiB|GiB" for legibility.
-_SIZE_FIELDS = frozenset({"dram_bytes", "code_reserve"})
+_SIZE_FIELDS = frozenset({
+    "dram_bytes", "code_reserve", "zephyr_default_ram_bytes", "zephyr_link_limit_bytes",
+    "zephyr_external_ram_bytes", "zephyr_external_tail_reserve_bytes",
+})
 _SIZE_UNITS = {"KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
 
 
@@ -257,7 +275,10 @@ def load_boards(path: str | Path | None = None) -> dict[str, Board]:
             raise BoardRegistryError(f"{where}: missing required fact(s) {missing}")
         conditional = []
         if kwargs["flow"] == FLOW_ZEPHYR:
-            conditional.extend(("ram_label", "fpu_sharing", "zephyr_vector_ext"))
+            conditional.extend((
+                "ram_label", "fpu_sharing", "zephyr_vector_ext",
+                "zephyr_default_ram_bytes", "zephyr_link_limit_bytes",
+            ))
             if kwargs["console"] == CONSOLE_UART:
                 conditional.append("uart_label")
         if kwargs["flow"] == FLOW_BAREMETAL:
@@ -274,6 +295,21 @@ def load_boards(path: str | Path | None = None) -> dict[str, Board]:
             raise BoardRegistryError(f"{where}: dram_base must be nonnegative")
         if kwargs.get("code_reserve") is not None and kwargs["code_reserve"] <= 0:
             raise BoardRegistryError(f"{where}: code_reserve must be positive")
+        if kwargs["flow"] == FLOW_ZEPHYR:
+            default = kwargs["zephyr_default_ram_bytes"]
+            limit = kwargs["zephyr_link_limit_bytes"]
+            external = kwargs.get("zephyr_external_ram_bytes")
+            tail = kwargs.get("zephyr_external_tail_reserve_bytes")
+            if default <= 0 or default > kwargs["dram_bytes"]:
+                raise BoardRegistryError(f"{where}: zephyr_default_ram_bytes must fit physical DRAM")
+            if limit <= 0:
+                raise BoardRegistryError(f"{where}: zephyr_link_limit_bytes must be positive")
+            if (external is None) != (tail is None):
+                raise BoardRegistryError(f"{where}: external RAM and tail reserve must be declared together")
+            if external is not None and (external <= 0 or tail < 0 or external + tail >= kwargs["dram_bytes"]):
+                raise BoardRegistryError(f"{where}: external layout leaves no room for weights in DRAM")
+            if external is not None and external > limit:
+                raise BoardRegistryError(f"{where}: external RAM region exceeds the linked-region limit")
         out[name] = Board(name=name, **kwargs)
     return out
 
