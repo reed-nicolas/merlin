@@ -34,7 +34,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from . import circt_introspect as CI
+from . import port_geometry as PG
 from .facts import rtl_cache_dir
 
 GENERATOR_VERSION = "spatial-introspect-v1-opu"
@@ -119,12 +119,12 @@ def _first_bits(states: list[dict], predicate) -> int | None:
     return None
 
 
-# --------------------------------------------------------------- hw.mlir cross-checks (reuse CI parse)
+# --------------------------------------------------------------- hw.mlir cross-checks (shared port parser)
 def _cell_port_widths(hw_text: str) -> dict[str, int]:
     """Operand + accumulator widths from the ``@OuterProductCell`` port signature, parsed with the
-    shared :func:`circt_introspect._module_port_sig` / ``_int_width`` helpers (no re-invented parser).
+    shared :mod:`port_geometry` HW-port helpers (no re-invented parser).
     Returns ``{operand_bits, accumulator_bits, mrf_idx_bits}`` for the ports present."""
-    sig = CI._module_port_sig(hw_text, "OuterProductCell")
+    sig = PG._module_port_sig(hw_text, "OuterProductCell")
     out: dict[str, int] = {}
     if sig is None:
         return out
@@ -133,7 +133,7 @@ def _cell_port_widths(hw_text: str) -> dict[str, int]:
             continue
         lhs, typ = decl.rsplit(" : ", 1)
         name = lhs.split()[-1].lstrip("%")
-        w = CI._int_width(typ.strip())
+        w = PG._int_width(typ.strip())
         if w is None:
             continue
         if name == "io_in_l":
