@@ -17,7 +17,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..spec import SpecError
-from .preparation import admission, assemble, copy_input, ordinary_tree, private_json, scaffold, source_run
+from .preparation import (
+    admission,
+    assemble,
+    copy_input,
+    generation_lineage,
+    ordinary_tree,
+    private_json,
+    scaffold,
+    source_run,
+)
 
 _INSTRUCTION_MODEL = "instruction-semantics.json"
 
@@ -154,6 +163,9 @@ def inspect_release(path: Path) -> dict:
         "state": "sealed" if sealed else "awaiting_operator_review",
         "review_digest": _digest(identity),
         "payload_sha256": identity["payload_sha256"],
+        "generation_lineage_sha256": (
+            _digest(prepared["generation_lineage"]) if prepared.get("generation_lineage") is not None else None
+        ),
         "descriptor": str(root / "payload" / "experiment" / "target_experiment.yaml"),
         "counts": prepared["admission"],
         "engine_readiness": "not_executed",
@@ -184,6 +196,7 @@ def prepare(
     if not root.is_relative_to(generated_root / "artifacts"):
         raise SpecError("corpus releases must live below the configured artifact root")
     plan, attempt, generated = source_run(source)
+    lineage = generation_lineage(plan, generated)
     te = load_target_experiment(plan["phases"]["0"]["inputs"]["descriptor"])
     if private_baseline is not None:
         private_baseline = private_baseline.expanduser().absolute()
@@ -215,7 +228,9 @@ def prepare(
             descriptor = payload / "experiment" / "target_experiment.yaml"
             checked = admission(descriptor, coverage_output=root / "private" / "workload-coverage.json")
             instruction_semantics = _stage_instruction_model(plan, root / "private")
-            source_run(source)  # derivation/input drift during preparation is not accepted
+            checked_plan, _, checked_generated = source_run(source)
+            if generation_lineage(checked_plan, checked_generated) != lineage:
+                raise SpecError("Phase-0 generation lineage changed during corpus preparation")
             private_json(
                 root / "private" / "preparation.json",
                 {
@@ -225,6 +240,7 @@ def prepare(
                     "source_plan_sha256": fingerprint(source / "resolved-plan.json"),
                     "source_output_sha256": attempt["output_sha256"],
                     "source_descriptor_sha256": fingerprint(te.path),
+                    "generation_lineage": lineage,
                     "assembly": assembly,
                     "scaffolding": scaffolding,
                     "admission": checked,
@@ -269,7 +285,9 @@ def seal(path: Path, *, expected_digest: str, reviewed_by: str, review_note: str
         # input fingerprint before these selected bytes are interpreted.
         from ..runner import _phase0_synthesis_status
 
-        plan, _, _ = source_run(Path(prepared["source_run"]))
+        plan, _, generated = source_run(Path(prepared["source_run"]))
+        if generation_lineage(plan, generated) != prepared.get("generation_lineage"):
+            raise SpecError("Phase-0 generation lineage differs from the operator-reviewed preparation")
         phase = plan["phases"]["0"]
         if phase.get("phase0_evidence"):
             from ..phase0.evidence import load_exported_evidence
