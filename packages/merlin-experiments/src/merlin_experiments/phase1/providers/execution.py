@@ -115,7 +115,13 @@ def billing_mode(model: str, *, config: ProviderConfig) -> str:
 
 
 def sandbox_command(
-    inner: str, ws: Path, bundle: dict, extra_binds: list[str] | None = None, *, context: InvocationContext
+    inner: str,
+    ws: Path,
+    bundle: dict,
+    extra_binds: list[str] | None = None,
+    *,
+    context: InvocationContext,
+    private_run_dir: Path | None = None,
 ) -> str:
     """bwrap argv (deny-by-default) + claude runtime binds + TOOLCHAIN binds (the legit build+sim tools,
     bound back over the /scratch* masks) + the DERIVED answer-mask pass + toolchain env. The mask set now
@@ -145,6 +151,10 @@ def sandbox_command(
     parts = _BW.apply_final_answer_masks(
         parts, load_target_experiment(context.descriptor), ws, bundle, repo=context.repo
     )
+    if private_run_dir is not None:
+        from merlin_experiments.phase1.semantic_diagnostics import assert_private_mounts
+
+        assert_private_mounts(parts, private_run_dir)
     payload = f"{TC.sandbox_env(load_target_experiment(context.descriptor), ws)} {inner}"
     # Single-quote the whole payload for the OUTER `bash -c`, escaping any embedded single quotes (the
     # POSIX '\'' idiom). ``inner`` may itself be shlex-quoted by the caller (the opencode driver quotes
@@ -262,7 +272,7 @@ def launch(
                 subagent_model=config.provider.subagent_model,
                 background_model=config.provider.background_model,
                 effort=effort,
-                sandbox_command=partial(sandbox_command, context=config.context),
+                sandbox_command=partial(sandbox_command, context=config.context, private_run_dir=run_dir),
             )
         if drv == "codex":
             try:
@@ -288,7 +298,7 @@ def launch(
                 background_model=config.provider.background_model,
                 effort=effort,
                 continue_session=continuous,
-                sandbox_command=partial(sandbox_command, context=config.context),
+                sandbox_command=partial(sandbox_command, context=config.context, private_run_dir=run_dir),
             )
         # claudecode. The claude CLI speaks the Anthropic Messages API, so a NON-Anthropic model reaches
         # it only through the LiteLLM bridge (ANTHROPIC_BASE_URL -> our proxy -> Bedrock). This is what
@@ -309,7 +319,11 @@ def launch(
             # proxy) but not the environment.
             _exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in _bridge_env.items())
             inner = f"env {_exports} {inner}"
-        cmd = sandbox_command(inner, ws, bundle, context=config.context) if sandbox == "bwrap" else inner
+        cmd = (
+            sandbox_command(inner, ws, bundle, context=config.context, private_run_dir=run_dir)
+            if sandbox == "bwrap"
+            else inner
+        )
         tpath = run_dir / "rounds" / f"round_{rnd:02d}.transcript.jsonl"
         tpath.parent.mkdir(parents=True, exist_ok=True)
         epath = run_dir / "rounds" / f"round_{rnd:02d}.stderr.log"

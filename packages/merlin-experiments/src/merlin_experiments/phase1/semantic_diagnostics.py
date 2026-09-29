@@ -14,6 +14,7 @@ from pathlib import Path
 
 from merlin.targetgen.capsule_common import discover_capsules
 from merlin.targetgen.contract.linalg_iface import is_linalg_on_tensors, parse_linalg_mlir
+from merlin.targetgen.sandbox import bwrap as BW
 from merlin.targetgen.semantic_search import SearchLimits, search_linalg_inventory
 
 from .source_inputs import fingerprint
@@ -33,6 +34,49 @@ def _ordinary_bytes(path: Path) -> bytes:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _assert_host_private_location(run_dir: Path, *, workspace: Path, public_root: Path) -> None:
+    """Keep the owner receipt out of every directly bound agent input tree.
+
+    Mode 0600 is insufficient: the sandboxed agent runs under the operator's UID.
+    Resolve parent symlinks before testing both containment directions so a
+    configured run root cannot alias an agent-visible workspace or public view.
+    """
+    run = run_dir.resolve()
+    for label, root in (("workspace", workspace), ("public corpus", public_root)):
+        visible = root.resolve()
+        if run.is_relative_to(visible) or visible.is_relative_to(run):
+            raise RuntimeError(f"semantic-search host-private run directory overlaps the agent {label}")
+
+
+def assert_private_mounts(argv: list[str], run_dir: Path) -> None:
+    """Reject a final agent mount plan that exposes run metadata at any bind alias.
+
+    Call after *all* runtime/toolchain binds and answer masks have been composed,
+    immediately before launching an agent. A source bound at another destination
+    needs checking too; testing only the receipt's original path misses aliases.
+    """
+    private = [
+        path.resolve(strict=True)
+        for path in (run_dir, run_dir / "environment.yaml", run_dir / _RECEIPT)
+        if path.exists()
+    ]
+    if not private:
+        raise RuntimeError("semantic-search host-private run directory is missing before agent launch")
+    if any(BW.is_exposed(argv, path) for path in private):
+        raise RuntimeError("semantic-search host-private run metadata is visible in the agent sandbox")
+    for state, source, destination in BW._mounts(argv):
+        if state != "expose":
+            continue
+        source_path = Path(source).resolve()
+        for path in private:
+            if path.is_relative_to(source_path):
+                alias = Path(destination) / path.relative_to(source_path)
+                if BW.is_exposed(argv, alias):
+                    raise RuntimeError(
+                        "semantic-search host-private run metadata is visible through an agent bind alias"
+                    )
 
 
 def _public_linalg_files(public_root: Path, contract_root: Path) -> list[tuple[str, Path]]:
@@ -61,11 +105,13 @@ def _public_linalg_files(public_root: Path, contract_root: Path) -> list[tuple[s
 def create(
     run_dir: Path,
     *,
+    workspace: Path,
     model_path: Path | None,
     public_root: Path,
     contract_root: Path,
 ) -> dict:
     """Write an owner-only receipt when the reviewed release has a model."""
+    _assert_host_private_location(run_dir, workspace=workspace, public_root=public_root)
     if model_path is None:
         return {"schema": _SCHEMA, "status": "unavailable", "reason": "reviewed release has no instruction model"}
 
@@ -152,8 +198,9 @@ def create(
     }
 
 
-def verify(record: Mapping, run_dir: Path, *, model_path: Path | None, public_root: Path) -> None:
+def verify(record: Mapping, run_dir: Path, *, workspace: Path, model_path: Path | None, public_root: Path) -> None:
     """Refuse drift of a new run's optional model, public inputs, or receipt."""
+    _assert_host_private_location(run_dir, workspace=workspace, public_root=public_root)
     if not isinstance(record, Mapping) or record.get("schema") != _SCHEMA:
         raise RuntimeError("semantic-search diagnostic identity is missing or malformed")
     if record.get("status") == "unavailable":

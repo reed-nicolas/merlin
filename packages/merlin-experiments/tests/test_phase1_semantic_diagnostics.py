@@ -26,10 +26,11 @@ module attributes {prov.level = "linalg-on-tensors"} {
 
 def _inputs(tmp_path: Path, monkeypatch):
     run = tmp_path / "run"
+    workspace = tmp_path / "workspace"
     public = tmp_path / "frozen-public"
     private = tmp_path / "frozen-private"
     contract = tmp_path / "contract"
-    for directory in (run, public / "public-one", public / "dev-one", private, contract):
+    for directory in (run, workspace, public / "public-one", public / "dev-one", private, contract):
         directory.mkdir(parents=True)
     (public / "public-one/capsule.linalg.mlir").write_text(_LINALG)
     (public / "dev-one/capsule.linalg.mlir").write_text(_LINALG)
@@ -44,12 +45,12 @@ def _inputs(tmp_path: Path, monkeypatch):
         ]
 
     monkeypatch.setattr(SD, "discover_capsules", capsules)
-    return run, public, contract, model
+    return run, workspace, public, contract, model
 
 
 def test_private_receipt_uses_only_public_linalg_and_unknown_is_not_a_verdict(tmp_path, monkeypatch):
-    run, public, contract, model = _inputs(tmp_path, monkeypatch)
-    record = SD.create(run, model_path=model, public_root=public, contract_root=contract)
+    run, workspace, public, contract, model = _inputs(tmp_path, monkeypatch)
+    record = SD.create(run, workspace=workspace, model_path=model, public_root=public, contract_root=contract)
     receipt = run / "semantic_search_diagnostic.json"
     document = json.loads(receipt.read_text())
 
@@ -59,13 +60,13 @@ def test_private_receipt_uses_only_public_linalg_and_unknown_is_not_a_verdict(tm
     assert document["rows"][0]["capsule_linalg"] == "public-one/capsule.linalg.mlir"
     assert document["rows"][0]["inventory"]["regions"][0]["receipt"]["status"] == "unknown"
     assert "verdict" not in document
-    SD.verify(record, run, model_path=model, public_root=public)
+    SD.verify(record, run, workspace=workspace, model_path=model, public_root=public)
 
 
 def test_declared_input_without_linalg_provenance_is_diagnostic_error(tmp_path, monkeypatch):
-    run, public, contract, model = _inputs(tmp_path, monkeypatch)
+    run, workspace, public, contract, model = _inputs(tmp_path, monkeypatch)
     (public / "public-one/capsule.linalg.mlir").write_text("module {}\n")
-    SD.create(run, model_path=model, public_root=public, contract_root=contract)
+    SD.create(run, workspace=workspace, model_path=model, public_root=public, contract_root=contract)
     [row] = json.loads((run / "semantic_search_diagnostic.json").read_text())["rows"]
     assert row["status"] == "diagnostic_error"
     assert "linalg-on-tensors provenance" in row["reason"]
@@ -73,7 +74,7 @@ def test_declared_input_without_linalg_provenance_is_diagnostic_error(tmp_path, 
 
 
 def test_payload_budget_marks_file_unavailable_without_running_search(tmp_path, monkeypatch):
-    run, public, contract, model = _inputs(tmp_path, monkeypatch)
+    run, workspace, public, contract, model = _inputs(tmp_path, monkeypatch)
     monkeypatch.setattr(
         SD,
         "parse_linalg_mlir",
@@ -84,14 +85,14 @@ def test_payload_budget_marks_file_unavailable_without_running_search(tmp_path, 
         pytest.fail("search must not run after the host diagnostic cap")
 
     monkeypatch.setattr(SD, "search_linalg_inventory", forbidden)
-    SD.create(run, model_path=model, public_root=public, contract_root=contract)
+    SD.create(run, workspace=workspace, model_path=model, public_root=public, contract_root=contract)
     [row] = json.loads((run / "semantic_search_diagnostic.json").read_text())["rows"]
     assert row["status"] == "limit_reached"
     assert "inventory" not in row
 
 
 def test_escaping_capsule_declaration_is_only_a_diagnostic_refusal(tmp_path, monkeypatch):
-    run, public, contract, model = _inputs(tmp_path, monkeypatch)
+    run, workspace, public, contract, model = _inputs(tmp_path, monkeypatch)
     monkeypatch.setattr(
         SD,
         "discover_capsules",
@@ -99,7 +100,7 @@ def test_escaping_capsule_declaration_is_only_a_diagnostic_refusal(tmp_path, mon
             {"__dir__": str(public / "public-one"), "linalg_mlir": "../dev-one/capsule.linalg.mlir"}
         ],
     )
-    record = SD.create(run, model_path=model, public_root=public, contract_root=contract)
+    record = SD.create(run, workspace=workspace, model_path=model, public_root=public, contract_root=contract)
     document = json.loads((run / "semantic_search_diagnostic.json").read_text())
     assert record["status"] == "recorded"
     assert "escaping linalg input" in document["selection_error"]
@@ -107,13 +108,13 @@ def test_escaping_capsule_declaration_is_only_a_diagnostic_refusal(tmp_path, mon
 
 
 def test_missing_parser_dependency_is_only_a_diagnostic_row(tmp_path, monkeypatch):
-    run, public, contract, model = _inputs(tmp_path, monkeypatch)
+    run, workspace, public, contract, model = _inputs(tmp_path, monkeypatch)
 
     def missing(_text):
         raise ImportError("xdsl is not installed")
 
     monkeypatch.setattr(SD, "parse_linalg_mlir", missing)
-    SD.create(run, model_path=model, public_root=public, contract_root=contract)
+    SD.create(run, workspace=workspace, model_path=model, public_root=public, contract_root=contract)
     [row] = json.loads((run / "semantic_search_diagnostic.json").read_text())["rows"]
     assert row["status"] == "diagnostic_error"
     assert "ImportError" in row["reason"]
@@ -122,8 +123,8 @@ def test_missing_parser_dependency_is_only_a_diagnostic_row(tmp_path, monkeypatc
 
 @pytest.mark.parametrize("changed", ["model", "public", "receipt"])
 def test_resume_refuses_changed_diagnostic_inputs_or_receipt(tmp_path, monkeypatch, changed):
-    run, public, contract, model = _inputs(tmp_path, monkeypatch)
-    record = SD.create(run, model_path=model, public_root=public, contract_root=contract)
+    run, workspace, public, contract, model = _inputs(tmp_path, monkeypatch)
+    record = SD.create(run, workspace=workspace, model_path=model, public_root=public, contract_root=contract)
     path = {
         "model": model,
         "public": public / "public-one/capsule.linalg.mlir",
@@ -131,20 +132,75 @@ def test_resume_refuses_changed_diagnostic_inputs_or_receipt(tmp_path, monkeypat
     }[changed]
     path.write_bytes(path.read_bytes() + b"\n")
     with pytest.raises(RuntimeError, match="semantic-search"):
-        SD.verify(record, run, model_path=model, public_root=public)
+        SD.verify(record, run, workspace=workspace, model_path=model, public_root=public)
 
 
 def test_absent_model_is_bound_without_minting_a_receipt(tmp_path):
     run = tmp_path / "run"
+    workspace = tmp_path / "workspace"
     public = tmp_path / "public"
     contract = tmp_path / "contract"
-    for path in (run, public, contract):
+    for path in (run, workspace, public, contract):
         path.mkdir()
-    record = SD.create(run, model_path=None, public_root=public, contract_root=contract)
+    record = SD.create(run, workspace=workspace, model_path=None, public_root=public, contract_root=contract)
     assert record["status"] == "unavailable"
     assert not (run / "semantic_search_diagnostic.json").exists()
-    SD.verify(record, run, model_path=None, public_root=public)
+    SD.verify(record, run, workspace=workspace, model_path=None, public_root=public)
     model = tmp_path / "new-model.json"
     model.write_text("{}")
     with pytest.raises(RuntimeError, match="availability changed"):
-        SD.verify(record, run, model_path=model, public_root=public)
+        SD.verify(record, run, workspace=workspace, model_path=model, public_root=public)
+
+
+@pytest.mark.parametrize("exposed_root", ["workspace", "public"])
+@pytest.mark.parametrize("direction", ["inside", "ancestor", "symlink"])
+def test_receipt_refuses_agent_visible_placement(tmp_path, monkeypatch, exposed_root, direction):
+    run, workspace, public, contract, model = _inputs(tmp_path, monkeypatch)
+    exposed = {"workspace": workspace, "public": public}[exposed_root]
+    if direction == "inside":
+        unsafe_run = exposed / "run"
+        unsafe_run.mkdir()
+    elif direction == "ancestor":
+        unsafe_run = tmp_path
+    else:
+        unsafe_run = tmp_path / "alias"
+        unsafe_run.symlink_to(exposed, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="host-private"):
+        SD.create(unsafe_run, workspace=workspace, model_path=model, public_root=public, contract_root=contract)
+    assert not (unsafe_run / "semantic_search_diagnostic.json").exists()
+
+
+def test_resume_refuses_receipt_newly_exposed_to_workspace(tmp_path, monkeypatch):
+    run, workspace, public, contract, model = _inputs(tmp_path, monkeypatch)
+    record = SD.create(run, workspace=workspace, model_path=model, public_root=public, contract_root=contract)
+    exposed_workspace = tmp_path
+    with pytest.raises(RuntimeError, match="host-private"):
+        SD.verify(record, run, workspace=exposed_workspace, model_path=model, public_root=public)
+
+
+def test_final_mount_plan_rejects_direct_and_aliased_receipt_exposure(tmp_path, monkeypatch):
+    run, workspace, public, contract, model = _inputs(tmp_path, monkeypatch)
+    SD.create(run, workspace=workspace, model_path=model, public_root=public, contract_root=contract)
+    hidden = ["bwrap", "--tmpfs", str(tmp_path), "--bind", str(workspace), str(workspace)]
+    SD.assert_private_mounts(hidden, run)
+
+    direct = [*hidden, "--ro-bind", str(run), str(run)]
+    with pytest.raises(RuntimeError, match="host-private"):
+        SD.assert_private_mounts(direct, run)
+
+    alias = [*hidden, "--ro-bind", str(tmp_path), "/agent-visible"]
+    with pytest.raises(RuntimeError, match="bind alias"):
+        SD.assert_private_mounts(alias, run)
+
+    masked_alias = [*alias, "--ro-bind", "/dev/null", "/agent-visible/run/semantic_search_diagnostic.json"]
+    with pytest.raises(RuntimeError, match="bind alias"):
+        SD.assert_private_mounts(masked_alias, run)
+
+    hidden_alias = [*alias, "--tmpfs", "/agent-visible/run"]
+    SD.assert_private_mounts(hidden_alias, run)
+
+    environment = run / "environment.yaml"
+    environment.write_text("semantic_search_diagnostic: recorded\n")
+    environment_alias = [*hidden, "--ro-bind", str(environment), "/agent-visible/environment.yaml"]
+    with pytest.raises(RuntimeError, match="bind alias"):
+        SD.assert_private_mounts(environment_alias, run)

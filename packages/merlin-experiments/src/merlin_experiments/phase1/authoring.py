@@ -242,7 +242,11 @@ def finalize_report(
             f"--permission-mode bypassPermissions --add-dir {ws} "
             f"--output-format stream-json --verbose < {ws / 'FINALIZE.md'}"
         )
-        cmd = EX.sandbox_command(inner, ws, bundle, context=context) if sandbox == "bwrap" else inner
+        cmd = (
+            EX.sandbox_command(inner, ws, bundle, context=context, private_run_dir=run_dir)
+            if sandbox == "bwrap"
+            else inner
+        )
         try:
             rc = AS.stream_stamped(
                 ["bash", "-c", cmd],

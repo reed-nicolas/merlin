@@ -377,16 +377,10 @@ def prepare(
                     _SD.verify(
                         _environment_record["semantic_search_diagnostic"],
                         run_dir,
+                        workspace=ws,
                         model_path=_model_path,
                         public_root=_public_root,
                     )
-            else:
-                _semantic_diagnostic = _SD.create(
-                    run_dir,
-                    model_path=_model_path,
-                    public_root=_public_root,
-                    contract_root=_contract_root,
-                )
         _te_setup = _te()
         if _te_setup.numeric_profile is not None:
             from merlin_experiments.corpus.numeric_policy import (
@@ -494,6 +488,19 @@ def prepare(
     else:
         _treatment_snapshot = RI.treatment_snapshot_record(ws, run_dir, bundle_dir, _resolved_tool_ids)
     mask = transport.probe(ws, bundle, a.sandbox, context=context)
+    if _corpus_seal and not _resuming:
+        # The receipt is host-private. Mint it only after all prompt staging
+        # and the trusted workspace probe have finished, so neither receives
+        # a run directory that already contains search history.
+        from . import semantic_diagnostics as _SD
+
+        _semantic_diagnostic = _SD.create(
+            run_dir,
+            workspace=ws,
+            model_path=_semantic_model_snapshot,
+            public_root=_public_root,
+            contract_root=_contract_root,
+        )
     if not _resuming:
         _environment_record = {
             "run_id": a.run_id,

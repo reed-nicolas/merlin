@@ -141,7 +141,10 @@ def test_actual_dispatch_configuration_order_and_primary_cleanup(tmp_path, monke
         if driver != "converse":
             assert kw["effort"] == "high"
             assert kw["sandbox_command"].func is E.sandbox_command
-            assert kw["sandbox_command"].keywords == {"context": config.context}
+            assert kw["sandbox_command"].keywords == {
+                "context": config.context,
+                "private_run_dir": tmp_path,
+            }
         if driver == "codex":
             assert kw["continue_session"] is True
         if primary:
@@ -232,7 +235,10 @@ def test_sandbox_composition_preserves_original_order_and_payload(tmp_path, monk
     monkeypatch.setattr(toolchain, "sandbox_env", observe("environment", "export X=1;"))
     monkeypatch.setattr(bwrap, "compose_command", observe("compose", "composed"))
     assert (
-        E.sandbox_command("printf '%s' '(value)'", workspace, bundle, ["extra"], context=config.context) == "composed"
+        E.sandbox_command(
+            "printf '%s' '(value)'", workspace, bundle, ["extra"],
+            context=config.context, private_run_dir=None,
+        ) == "composed"
     )
     assert [event[0] for event in events] == [
         "base",
