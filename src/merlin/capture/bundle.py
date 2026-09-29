@@ -194,37 +194,10 @@ def _dirname(model: str, variant: str, suffix: str = "consistent") -> str:
     return f"{model}_{variant}_{suffix}"
 
 
-# K1-runnable set: models whose int8 footprint fits the 3.8 GB board (~3.4 GB usable). The three
-# 7B-class VLAs (openvla, molmoact, pi05) are RAM-infeasible for whole-model on-board runs even at int8
-# (fp32 embeddings dominate) — attempt+RAM-gap, never a false fit. From the full-fidelity recapture.
 #: Capture-directory suffixes, in the order `resolve` prefers them. `_full` is the real/native
 #: architecture and wins; `_consistent` is the older truncated capture; `_w8a8_consistent` is a
 #: separate activation-quantized capture family that no baseline arm could previously see at all.
 _BUNDLE_SUFFIXES: tuple[str, ...] = ("full", "consistent", "w8a8_consistent")
-
-K1_RUNNABLE: frozenset[str] = frozenset(
-    {"tiny_llama", "smolvla", "bitvla", "groot_n1d7", "rdt", "rdt2", "xr0", "small_llama"}
-)
-# resnet50_v1_5 is not here YET, and the reason has changed. The max-pool blocker is FIXED: its
-# `aten.max_pool2d.default` was captured as a linalg.generic whose map (d0,d1,d2*2+d4,d3*2+d5) leaves
-# d4/d5 unbound, so linalg's verifier rejected it as non-invertible IN THE READER, before any pass
-# ran. The window extent is not recoverable downstream (a 114-wide padded input at stride 2 giving 56
-# outputs fits both a 3- and a 4-tall window, which compute different maxima), so the repair is a
-# shape-only window operand emitted at capture, as upstream linalg.pooling_* does. The FP32 bundle
-# now lowers and gates clean: fp32_cos 1.0, rel 5.05e-07, argmax True.
-#
-# The int8 bundle's remaining blockers are also FIXED. Its W8A8 capture left
-# `torchao.choose_qparams_affine` / `torchao.quantize_affine` as opaque external calls (m2m has a
-# decomposition for `dequantize_affine` only), which nothing in merlin defined -- an undefined
-# reference at link and an OutlineError in the interpreter; `llvmlower.torchao_affine` now decomposes
-# both into linalg (bit-exact against torchao's own implementation) on both paths. And the FC weight
-# (`prov.quant_inner`-tagged empties the interpreter bound from `extra.npz` while the compiled path
-# left them uninitialized) is now lifted to `@forward` arguments by `llvmlower.qinner` and bound from
-# the same npz by the generated argument table. MEASURED on an x86 build of the same prepared IR:
-# the compiled output is BIT-IDENTICAL to the interpreter's (cos 1.0 / rel 1.38e-07 at
-# int8_compute=False, cos 0.99823 / rel 0.0471 at int8_compute=True). What has not been measured is
-# the board itself.
-K1_RAM_INFEASIBLE: frozenset[str] = frozenset({"openvla", "molmoact", "pi05"})
 
 # Full-fidelity capture env (the exact loader settings the recapture used to build the REAL/native
 # architecture, dropping the truncation defaults). A Phase-2 arm that live-loads the torch model via
@@ -243,7 +216,7 @@ FULL_FIDELITY_ENV: dict[str, dict[str, str]] = {
     # M2M_RESNET_RANDOM selects that synthetic seeded stream; weights stay PRETRAINED unless
     # M2M_RESNET_PRETRAINED=0. Without it the loader raises and the cell cannot be built at all.
     "resnet50_v1_5": {"M2M_RESNET_RANDOM": "1"},
-    "openvla": {},  # real Llama-2-7B+ViT config (RAM-infeasible on K1)
+    "openvla": {},  # real Llama-2-7B+ViT config
     "molmoact": {"M2M_MOLMOACT_LAYERS": "48", "M2M_MOLMOACT_VOCAB": "152064"},  # real 7B (RAM-infeasible)
     "pi05": {},  # full PaliGemma+expert 3.6B (RAM-infeasible)
 }

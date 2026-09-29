@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from merlin.baselines import BaselineResult, RegionProfile, ScalarFallback
-from merlin.baselines import aggregate, bundle, profile, rvv_audit
+from merlin.baselines import aggregate, bundle, k1_workload_policy, profile, rvv_audit
 
 
 # --- RVV coverage classifier ------------------------------------------------------------------
@@ -206,8 +206,12 @@ def test_bundle_resolve_paths():
 
 
 def test_k1_runnable_and_full_env():
-    assert "tiny_llama" in bundle.K1_RUNNABLE and "openvla" not in bundle.K1_RUNNABLE
-    assert bundle.K1_RUNNABLE.isdisjoint(bundle.K1_RAM_INFEASIBLE)
+    assert k1_workload_policy.K1_RUNNABLE == frozenset(
+        {"tiny_llama", "smolvla", "bitvla", "groot_n1d7", "rdt", "rdt2", "xr0", "small_llama"}
+    )
+    assert k1_workload_policy.K1_RAM_INFEASIBLE == frozenset({"openvla", "molmoact", "pi05"})
+    assert k1_workload_policy.K1_RUNNABLE.isdisjoint(k1_workload_policy.K1_RAM_INFEASIBLE)
+    assert not hasattr(bundle, "K1_RUNNABLE") and not hasattr(bundle, "K1_RAM_INFEASIBLE")
     assert bundle.full_env("bitvla") == {"BITVLA_LLM_LAYERS": "30"}
     assert bundle.full_env("tiny_llama") == {}
 

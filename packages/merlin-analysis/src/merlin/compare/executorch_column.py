@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 
 from merlin.baselines import aggregate as _agg
+from merlin.baselines import k1_workload_policy
 from merlin.capture import bundle as _bundle
 from merlin.common.paths import repo_root
 
@@ -114,7 +115,7 @@ def _result_caveats(model: str) -> str:
     on a RAM-infeasible or random-init model is an artifact of the run conditions, NOT evidence of an
     ExecuTorch kernel defect -- surfacing this stops a false 'ET is numerically wrong' read."""
     notes = []
-    if model in _bundle.K1_RAM_INFEASIBLE:
+    if model in k1_workload_policy.K1_RAM_INFEASIBLE:
         notes.append(
             "model is K1 RAM-infeasible whole-model (7B-class VLA vs the 3.8GB board), so any "
             "whole-model wall/cos is from a RAM-constrained or truncated run, not trustworthy"
@@ -154,7 +155,7 @@ def _not_measured_reason(model: str, variant: str, rows: list) -> str:
                 "evidence, not as parity."
             )
         return f"latest executorch {variant} = {r.status()}{detail}{_result_caveats(model)}"
-    if model in _bundle.K1_RAM_INFEASIBLE:
+    if model in k1_workload_policy.K1_RAM_INFEASIBLE:
         return (
             f"no executorch {variant} result; {model} is K1 RAM-infeasible whole-model (7B-class "
             "VLA exceeds the 3.8 GB board) -> honest not_run, never a false fit"

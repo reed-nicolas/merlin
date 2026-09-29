@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from merlin.baselines import bundle as _bundle
-from merlin.baselines import k1_exec, profile, rvv_audit
+from merlin.baselines import k1_exec, k1_workload_policy, profile, rvv_audit
 from merlin.baselines.contract import BaselineResult, RegionProfile, ScalarFallback
 from merlin.baselines.executorch_identity import (
     ExecuTorchIdentity,
@@ -1440,7 +1440,7 @@ def run_all(
 
 
 # All 11 m2m models: the 8 K1-runnable + the 3 RAM-infeasible VLAs (attempted, RAM-gapped).
-ALL_MODELS = tuple(sorted(_bundle.K1_RUNNABLE | _bundle.K1_RAM_INFEASIBLE))
+ALL_MODELS = tuple(sorted(k1_workload_policy.K1_RUNNABLE | k1_workload_policy.K1_RAM_INFEASIBLE))
 
 
 def run_all_int8(

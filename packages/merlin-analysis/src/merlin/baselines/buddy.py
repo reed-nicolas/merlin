@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from merlin.baselines import bundle as _bundle
-from merlin.baselines import k1_exec, profile, rvv_audit
+from merlin.baselines import k1_exec, k1_workload_policy, profile, rvv_audit
 from merlin.baselines.buddy_harness import (
     _buddy_model_call_c,
     _m2m_harness_c,
@@ -1037,7 +1037,7 @@ def run_model_native(
 
     Ingests the REAL torch model (buddy's own importer, full-fidelity ``bundle.full_env``) instead of
     m2m's linalg ``model.mlir`` — DIFFERENT IR that may bypass the m2m-path SIGSEGV. Records honest
-    gaps: RAM-infeasible 7B VLAs (``bundle.K1_RAM_INFEASIBLE``) are ``not_run`` (attempt build, never
+    gaps: RAM-infeasible 7B VLAs (``k1_workload_policy.K1_RAM_INFEASIBLE``) are ``not_run`` (attempt build, never
     a false fit); import/lower/link failures are ``not_built``.
     """
     import numpy as np
@@ -1123,7 +1123,7 @@ def run_model_native(
         return _finish(res, model, variant, write)
 
     # 4. RAM-infeasible 7B VLAs: attempt build (done) but never fit on the 3.8 GB board.
-    if model in _bundle.K1_RAM_INFEASIBLE:
+    if model in k1_workload_policy.K1_RAM_INFEASIBLE:
         res.gap_reason = (
             f"{model} is 7B-class — {param_elems * 4 / 1e9:.1f} GB params exceed the 3.8 GB "
             "K1 RAM even at int8 (built + RVV audited; on-board run RAM-infeasible)"
