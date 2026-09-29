@@ -19,7 +19,8 @@ def test_diagnostic_model_copy_binds_bytes_without_granting_admission(tmp_path):
     for name in names:
         (tmp_path / name).write_bytes(name.encode())
 
-    _diagnostic_model_copy(tmp_path, loader)
+    missing_api = {"same_conversion_missing": ["m2m/capture/provenance.py"]}
+    _diagnostic_model_copy(tmp_path, loader, capture_api=missing_api)
 
     receipt = json.loads((tmp_path / "diagnostic-capture.json").read_text())
     assert (tmp_path / "model.mlir").read_bytes() == (tmp_path / "linalg.mlir").read_bytes()
@@ -28,10 +29,11 @@ def test_diagnostic_model_copy_binds_bytes_without_granting_admission(tmp_path):
     assert receipt["phase0_admission"] == "not_granted"
     assert receipt["source_closure_verified"] is False
     assert receipt["materialized_abi"] is False
+    assert receipt["capture_api"] == missing_api
     assert set(receipt["artifacts"]) == {*names, "model.mlir"}
     for name, record in receipt["artifacts"].items():
         data = (tmp_path / name).read_bytes()
         assert record == {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
     with pytest.raises(ValueError, match="cannot reuse"):
-        _diagnostic_model_copy(tmp_path, loader)
+        _diagnostic_model_copy(tmp_path, loader, capture_api=missing_api)
