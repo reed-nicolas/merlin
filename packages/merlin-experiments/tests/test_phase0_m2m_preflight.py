@@ -77,9 +77,28 @@ def test_static_int8_model_accepts_selected_integerizer(monkeypatch, tmp_path):
     integerizer = upstream / "m2m/capture/pt2e_integerize.py"
     integerizer.parent.mkdir(parents=True)
     integerizer.write_text("def integerize_pt2e(*args): pass\n")
+    (integerizer.parent / "trace.py").write_text(
+        "def pt2e_conv_bn_fold_candidates(*args): return []\ndef attach_pt2e_conv_bn_folds(*args): pass\n"
+    )
 
     assert run() == []
     assert calls == ["static_model"]
+
+
+def test_static_int8_model_missing_selected_fold_trace_api_fails_before_all_writers(monkeypatch, tmp_path):
+    entries = [{"name": f"ordinary_{index}", "kind": "isa"} for index in range(84)]
+    entries.append({"name": "last_static_model", "kind": "model", "quant_scheme": "int8_static_act_int8_weight"})
+    run, calls, upstream = _generation_with_entries(monkeypatch, tmp_path, entries)
+    capture = upstream / "m2m/capture"
+    capture.mkdir(parents=True)
+    (capture / "pt2e_integerize.py").write_text("def integerize_pt2e(*args): pass\n")
+    (capture / "trace.py").write_text("def snapshot_exported_program(*args): pass\n")
+
+    with pytest.raises(ValueError, match="pt2e_conv_bn_fold_candidates") as error:
+        run()
+
+    assert str(upstream) in str(error.value)
+    assert calls == []
 
 
 def test_missing_capture_interpreter_keeps_optional_model_skip(monkeypatch, tmp_path):

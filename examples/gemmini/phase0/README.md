@@ -95,9 +95,11 @@ simulator, and set
 PyTorch-sourced capsules. The L3 performance members cannot execute if the
 simulator cannot be resolved; a missing exporter also leaves source capsules unwritten.
 Static-int8 source capsules additionally require
-`m2m/capture/pt2e_integerize.py` in that selected tree. Check the exact
-module and interpreter together before freezing; a different checkout with
-the same project name is not interchangeable.
+`m2m/capture/pt2e_integerize.py` and the
+`m2m.capture.trace` PT2E fold-provenance API
+(`pt2e_conv_bn_fold_candidates`, `attach_pt2e_conv_bn_folds`) in that selected
+tree. Check the exact modules and interpreter together before freezing; a
+different checkout with the same project name is not interchangeable.
 Record these dependencies in the frozen run rather than relying on a later
 resume to supply them.
 

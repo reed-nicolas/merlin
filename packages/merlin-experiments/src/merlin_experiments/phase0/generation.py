@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -194,6 +195,33 @@ def _prepare_model_capture_entry(
                 f"selected model2MLIR checkout {capture.m2m_dir} lacks {integerizer}; "
                 "static int8 model capture requires m2m.capture.pt2e_integerize"
             )
+        if capture.available():
+            # The PT2E quantizer imports these from the selected checkout only
+            # after source capsules start writing. Probe that exact interpreter
+            # and package now, so an absent lineage API cannot leave a partial
+            # cohort that looks like a completed Phase 0 materialization.
+            probe = subprocess.run(
+                [
+                    str(capture.python),
+                    "-B",
+                    "-c",
+                    "import sys; sys.path.insert(0, sys.argv[1]); "
+                    "from m2m.capture.trace import "
+                    "pt2e_conv_bn_fold_candidates, attach_pt2e_conv_bn_folds",
+                    str(capture.m2m_dir),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if probe.returncode:
+                raise ValueError(
+                    f"selected model2MLIR checkout {capture.m2m_dir} lacks the required "
+                    "m2m.capture.trace PT2E fold-provenance API "
+                    "(pt2e_conv_bn_fold_candidates, attach_pt2e_conv_bn_folds); "
+                    "select a compatible checkout and interpreter before generating capsules"
+                )
     return selected
 
 
