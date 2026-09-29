@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=70.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "merlin-firesim-modelblaster"
+version = "0.1.0"
+description = "Opt-in ModelBlaster FireSim runner for Merlin"
+requires-python = ">=3.12"
+dependencies = ["merlin"]
+
+[project.entry-points."merlin.firesim_runners"]
+modelblaster = "merlin_firesim_modelblaster:runner"
+
+[tool.setuptools.packages.find]
+where = ["src"]
