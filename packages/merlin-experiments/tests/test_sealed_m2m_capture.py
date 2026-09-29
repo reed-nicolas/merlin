@@ -2,9 +2,12 @@
 
 import json
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+from merlin.targetgen import application_inventory
 from merlin.targetgen.quant_recipe import digest as recipe_digest
 from merlin_experiments.capture_execution import sealed_m2m
 from merlin_experiments.capture_execution.sealed_m2m import (
@@ -67,6 +70,60 @@ def test_int8_command_binds_selected_recipe_and_never_uses_host_path(tmp_path):
         _command_v2(tmp_path / "capture", dtype="int8", recipe=False)
 
 
+def test_v2_guest_command_imports_worker_sibling_from_selected_package(tmp_path):
+    source = tmp_path / "source"
+    worker = source / "merlin-src/merlin/targetgen/_m2m_capture_worker.py"
+    worker.parent.mkdir(parents=True)
+    worker.write_text("from pathlib import Path\nimport sys\nsys.path.insert(0, str(Path(__file__).parent))\n"
+                      "import _recipe_quantizer\nprint(_recipe_quantizer.MARKER)\n")
+    (worker.parent / "_recipe_quantizer.py").write_text("MARKER = 'selected-sibling'\n")
+    stub = source / "m2m-src/structlog.py"
+    stub.parent.mkdir()
+    stub.write_text("class processors:\n"
+                    "    @staticmethod\n"
+                    "    def KeyValueRenderer(**kwargs): return object()\n"
+                    "def configure(**kwargs): pass\n")
+    command = _command_v2(Path("/capture-out"), dtype="int8", recipe=True)
+    program = command[-1].replace("/source", str(source))
+    observed = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", program],
+                              capture_output=True, text=True, timeout=10, check=False)
+    assert observed.returncode == 0, observed.stderr
+    assert observed.stdout.strip() == "selected-sibling"
+
+
+def test_v2_materialized_receipt_binds_the_executed_package_worker(tmp_path, monkeypatch):
+    source, output = tmp_path / "source", tmp_path / "capture"
+    worker_member = "merlin-src/merlin/targetgen/_m2m_capture_worker.py"
+    for member, content in ((worker_member, b"worker\n"), ("workload/loader.py", b"loader\n"),
+                            ("m2m-src/m2m/api.py", b"api\n")):
+        path = source / member
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    output.mkdir()
+    (output / "model.mlir").write_text(
+        "prov.weights_file = " + json.dumps(str(output / "weights.safetensors")) + "\n"
+    )
+    receipt = {
+        "source": {"path": "/source/workload/loader.py",
+                   "sha256": sealed_m2m._file_digest(source / "workload/loader.py")},
+        "tool": {"executed_entrypoint": {"path": "/source/" + worker_member,
+                                           "sha256": sealed_m2m._file_digest(source / worker_member)},
+                 "source_inventory_status": "complete",
+                 "source_sha256": {"m2m/api.py": sealed_m2m._file_digest(source / "m2m-src/m2m/api.py")}},
+    }
+    (output / "capture_receipt.json").write_text(json.dumps(receipt))
+    monkeypatch.setattr(application_inventory, "verify_capture_receipt", lambda *_: {
+        "status": "verified_materialized", "receipt_sha256": "bound"
+    })
+    assert sealed_m2m._materialized(output, source, output, worker_member=worker_member)["status"] == (
+        "verified_materialized"
+    )
+    receipt["tool"]["executed_entrypoint"]["path"] = "/source/worker.py"
+    (output / "capture_receipt.json").write_text(json.dumps(receipt))
+    with pytest.raises(SealedM2MError, match="snapshotted entrypoints"):
+        sealed_m2m._materialized(output, source, output, worker_member=worker_member)
+
+
 def test_int8_recipe_selection_is_explicit_and_content_bound(tmp_path):
     recipe = {
         "schema": "quant_recipe_v1", "status": "derived", "software_numerical_engine": "integer_reference",
@@ -97,7 +154,6 @@ def test_int8_materialization_refuses_recipe_or_integer_reference_mismatch(tmp_p
     (source / "merlin-src/merlin/targetgen").mkdir(parents=True)
     (source / "inputs").mkdir()
     output.mkdir()
-    (source / "worker.py").write_bytes(b"worker\n")
     (source / "merlin-src/merlin/targetgen/_m2m_capture_worker.py").write_bytes(b"worker\n")
     recipe = {"schema": "quant_recipe_v1", "status": "derived", "software_numerical_engine": "integer_reference",
               "activation": {"dtype": "int8", "mode": "static"}, "weight": {"dtype": "int8"}}
@@ -108,7 +164,7 @@ def test_int8_materialization_refuses_recipe_or_integer_reference_mismatch(tmp_p
         "quantization_stats": {"recipe_sha256": recipe["recipe_sha256"]},
         "integerization_receipt": {"golden_agreement": {"status": "passed", "reference": "pt2e_integer"}},
     }))
-    monkeypatch.setattr(sealed_m2m, "_materialized", lambda *_: {"status": "verified_materialized"})
+    monkeypatch.setattr(sealed_m2m, "_materialized", lambda *_, **__: {"status": "verified_materialized"})
     plan = {"dtype": "int8", "recipe": {"sha256": sealed_m2m._file_digest(source / "inputs/quant_recipe.json"),
                                       "bytes": (source / "inputs/quant_recipe.json").stat().st_size,
                                       "recipe_sha256": recipe["recipe_sha256"]}}
@@ -153,7 +209,7 @@ def test_cpu_receipts_replay_only_under_their_selected_policy(tmp_path, monkeypa
         "bwrap_sha256": "bwrap",
     }
     (run / "sealed_m2m_pending.json").write_text(json.dumps(receipt))
-    monkeypatch.setattr(sealed_m2m, "_validate_snapshots", lambda *_: None)
+    monkeypatch.setattr(sealed_m2m, "_validate_snapshots", lambda *_, **__: None)
     monkeypatch.setattr(sealed_m2m, "_snapshot_tree", lambda path: (
         input_identity if Path(path) in (source, runtime) else output_identity
     ))

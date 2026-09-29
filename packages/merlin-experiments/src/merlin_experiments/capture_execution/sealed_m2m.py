@@ -53,7 +53,8 @@ def _command(output_mount: Path) -> tuple[str, ...]:
 def _command_v2(output_mount: Path, *, dtype: str, recipe: bool) -> tuple[str, ...]:
     if (dtype, recipe) not in {("fp32", False), ("int8", True)}:
         raise SealedM2MError("CPU capture requires fp32 without a recipe or int8 with a selected recipe")
-    argv = ["/source/worker.py", "--m2m-dir", "/source/m2m-src", "--loader",
+    worker = "/source/merlin-src/merlin/targetgen/_m2m_capture_worker.py"
+    argv = [worker, "--m2m-dir", "/source/m2m-src", "--loader",
             "/source/workload/loader.py", "--dtype", dtype, "--seed", "0",
             "--materialize-bundle", "--out", str(output_mount)]
     if recipe:
@@ -64,7 +65,7 @@ def _command_v2(output_mount: Path, *, dtype: str, recipe: bool) -> tuple[str, .
         "'/opt/capture-venv/lib/python3.12/site-packages'];"
         "sys.argv=" + repr(argv) + ";import structlog;"
         "structlog.configure(processors=[structlog.processors.KeyValueRenderer(sort_keys=True)]);"
-        "runpy.run_path('/source/worker.py',run_name='__main__')"
+        "runpy.run_path(" + repr(worker) + ",run_name='__main__')"
     )
     return ("/opt/capture-venv/bin/python", "-I", "-S", "-B", "-c", program)
 
@@ -277,7 +278,7 @@ def prepare_plan(*, m2m_root: Path, workload_root: Path, worker: Path,
         "merlin": _source_tree(merlin_root),
     }
     estimate = sum(row["bytes"] for row in selected_trees.values())
-    estimate += worker.stat().st_size + sum(path.stat().st_size for path in libs)
+    estimate += sum(path.stat().st_size for path in libs)
     if selected_recipe is not None:
         estimate += selected_recipe["bytes"]
     if estimate > max_snapshot_bytes or estimate > shutil.disk_usage(venv).free:
@@ -298,7 +299,7 @@ def prepare_plan(*, m2m_root: Path, workload_root: Path, worker: Path,
     }
 
 
-def _validate_snapshots(source: Path, runtime: Path, output_mount: Path) -> None:
+def _validate_snapshots(source: Path, runtime: Path, output_mount: Path, *, schema: str = SCHEMA_V1) -> None:
     for name in ("source", "capture-out", "tmp", "dev"):
         path = runtime / name
         if path.is_symlink() or not path.is_dir() or any(path.iterdir()):
@@ -306,14 +307,17 @@ def _validate_snapshots(source: Path, runtime: Path, output_mount: Path) -> None
     executable = runtime / "opt/capture-venv/bin/python"
     if executable.is_symlink() or not executable.is_file() or executable.read_bytes()[:4] != b"\x7fELF":
         raise SealedM2MError("snapshotted interpreter is not a direct ELF")
-    if not (source / "worker.py").is_file() or not (source / "workload/loader.py").is_file():
+    worker = (source / "worker.py" if schema == SCHEMA_V1 else
+              source / "merlin-src/merlin/targetgen/_m2m_capture_worker.py")
+    if not worker.is_file() or not (source / "workload/loader.py").is_file():
         raise SealedM2MError("selected source entrypoints are absent")
     mounted = runtime / output_mount.relative_to("/")
     if mounted.is_symlink() or not mounted.is_dir() or any(mounted.iterdir()):
         raise SealedM2MError("host-resolvable guest output mount point is not empty")
 
 
-def _materialized(output: Path, source: Path, output_mount: Path) -> dict[str, Any]:
+def _materialized(output: Path, source: Path, output_mount: Path,
+                  *, worker_member: str = "worker.py") -> dict[str, Any]:
     from merlin.targetgen.application_inventory import verify_capture_receipt
 
     result = verify_capture_receipt(output / "model.mlir")
@@ -326,10 +330,11 @@ def _materialized(output: Path, source: Path, output_mount: Path) -> dict[str, A
     payload = json.loads((output / "capture_receipt.json").read_bytes())
     loader = payload.get("source") or {}
     entry = (payload.get("tool") or {}).get("executed_entrypoint") or {}
+    worker = source / worker_member
     if (loader.get("path") != "/source/workload/loader.py"
             or loader.get("sha256") != _file_digest(source / "workload/loader.py")
-            or entry.get("path") != "/source/worker.py"
-            or entry.get("sha256") != _file_digest(source / "worker.py")):
+            or entry.get("path") != "/source/" + worker_member
+            or entry.get("sha256") != _file_digest(worker)):
         raise SealedM2MError("M2M receipt does not bind the snapshotted entrypoints")
     sources = (payload.get("tool") or {}).get("source_sha256")
     if (
@@ -346,13 +351,8 @@ def _materialized(output: Path, source: Path, output_mount: Path) -> dict[str, A
 
 
 def _materialized_v2(output: Path, source: Path, output_mount: Path, plan: dict[str, Any]) -> dict[str, Any]:
-    result = _materialized(output, source, output_mount)
-    if not (source / "merlin-src/merlin/targetgen/_m2m_capture_worker.py").is_file():
-        raise SealedM2MError("selected Merlin worker package is absent from the snapshot")
-    if _file_digest(source / "worker.py") != _file_digest(
-        source / "merlin-src/merlin/targetgen/_m2m_capture_worker.py"
-    ):
-        raise SealedM2MError("executed worker differs from the selected Merlin package")
+    result = _materialized(output, source, output_mount,
+                           worker_member="merlin-src/merlin/targetgen/_m2m_capture_worker.py")
     metadata = json.loads((output / "meta.json").read_bytes())
     if not isinstance(metadata, dict) or metadata.get("dtype") != plan.get("dtype"):
         raise SealedM2MError("capture metadata does not identify the selected dtype")
@@ -408,7 +408,6 @@ def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = No
     runtime.mkdir()
     shutil.copytree(Path(plan["m2m_root"]) / "m2m", source / "m2m-src/m2m", symlinks=False)
     shutil.copytree(Path(plan["workload_root"]), source / "workload", symlinks=False)
-    shutil.copy2(plan["worker"], source / "worker.py")
     shutil.copytree(Path(plan["merlin_root"]), source / "merlin-src/merlin", symlinks=False)
     if plan.get("recipe"):
         selected_recipe = source / "inputs/quant_recipe.json"
@@ -431,7 +430,7 @@ def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = No
     for name in ("source", "capture-out", "tmp", "dev"):
         (runtime / name).mkdir()
     (runtime / output.relative_to("/")).mkdir(parents=True)
-    _validate_snapshots(source, runtime, output)
+    _validate_snapshots(source, runtime, output, schema=SCHEMA)
     # A copied runtime is direct files only; compare its selected large roots
     # to independently normalized source inventories before execution.
     if _snapshot_tree(venv_copy) != _source_tree(Path(plan["venv"]), skip_lib64=True):
@@ -444,7 +443,7 @@ def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = No
         raise SealedM2MError("workload snapshot differs from selected bytes")
     if _snapshot_tree(source / "merlin-src/merlin") != _source_tree(Path(plan["merlin_root"])):
         raise SealedM2MError("Merlin package snapshot differs from selected bytes")
-    if _file_digest(source / "worker.py") != _file_digest(Path(plan["worker"])):
+    if _file_digest(source / "merlin-src/merlin/targetgen/_m2m_capture_worker.py") != plan["worker_sha256"]:
         raise SealedM2MError("worker snapshot differs from selected bytes")
     if plan.get("recipe") and _file_digest(source / "inputs/quant_recipe.json") != plan["recipe"]["sha256"]:
         raise SealedM2MError("selected recipe snapshot differs from selected bytes")
@@ -517,7 +516,7 @@ def replay_verify(run_dir: Path, *, bwrap_binary: Path | None = None) -> dict[st
             or doc.get("scope") != expected_scope):
         raise SealedM2MError("pending M2M receipt has an unsupported policy")
     source, runtime, output = (run_dir / "snapshots/source", run_dir / "snapshots/guest-root", run_dir / "capture")
-    _validate_snapshots(source, runtime, output)
+    _validate_snapshots(source, runtime, output, schema=schema)
     if (_snapshot_tree(source), _snapshot_tree(runtime), _snapshot_tree(output)) != (
         doc.get("source"), doc.get("guest_root"), doc.get("output")
     ):
