@@ -263,8 +263,11 @@ def _accelerator_admission(row: dict, software: list[dict], hardware: dict, has_
     candidates = [decision for decision in software if decision["placement"] in {"accelerator", "fused_accelerator"}]
     accepted = [decision for decision in candidates if decision["status"] == "admitted"]
     status = "unknown"
-    if row["disposition"] in {"structural", "component"}:
+    non_compute = row["disposition"] in _NON_COMPUTE
+    if non_compute:
         status = "not_applicable"
+        candidates = []
+        accepted = []
     elif hardware["status"] == "admitted" and accepted:
         status = "admitted"
     elif hardware["status"] == "unsupported" or (
@@ -274,10 +277,14 @@ def _accelerator_admission(row: dict, software: list[dict], hardware: dict, has_
     return {
         "status": status,
         "reviewed": bool(accepted),
-        "review_status": "reviewed" if accepted else "unknown",
+        "review_status": "not_applicable" if non_compute else "reviewed" if accepted else "unknown",
         "hardware_admission": hardware,
         "software_admissions": candidates,
-        "reason": "independent selected accelerator declaration screen; placement and lowering remain unselected",
+        "reason": (
+            "not an independent accelerator compute demand; support lowering, when required, remains unverified"
+            if non_compute
+            else "independent selected accelerator declaration screen; placement and lowering remain unselected"
+        ),
     }
 
 

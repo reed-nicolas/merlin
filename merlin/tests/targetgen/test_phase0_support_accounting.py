@@ -327,10 +327,22 @@ class Phase0SupportAccounting(unittest.TestCase):
             assert graph["n_operations"] == 5
             assert len(completeness["operation_obligations"]) == 2
             assert all(row["role"] == "support_lowering" for row in completeness["operation_obligations"])
+            assert all(
+                row["accelerator_admission"]["status"] == "not_applicable"
+                for row in completeness["operation_obligations"]
+            )
+            assert all(
+                row["support_lowering_evidence"]["status"] == "not_available"
+                for row in completeness["operation_obligations"]
+            )
             assert completeness["transfer_obligations"] == []
             assert [edge["accounting"] for edge in graph["edges"] if edge["accounting"] == "support_dependency"] == [
                 "support_dependency"
             ]
+            summary = build_operation_accounting(inventory)["overall"]
+            assert summary["classification_counts"]["support_lowering_required"] == 2
+            assert summary["support_partition_counts"]["not_independent_compute"] == 5
+            assert summary["accelerator_admission_counts"] == {"not_applicable": 5}
 
     def test_joined_typed_partitions_and_conditional_transfer_are_honest(self):
         with tempfile.TemporaryDirectory() as directory:
