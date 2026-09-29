@@ -208,15 +208,17 @@ def test_reviewed_semantic_diagnostic_is_private_and_resume_bound(project, monke
     model.write_text(json.dumps({"schema": "merlin.instruction_semantics.v1", "status": "UNKNOWN"}))
 
     def reviewed_snapshot(*_args, **_kwargs):
-        return {
-            "release": str(project / "reviewed-release"),
-            "review_digest": "fixture-review",
-            "payload_sha256": "fixture-payload",
-            "whole_workload_phase1": {"required": False, "status": "not_established"},
-            "instruction_semantics_snapshot": str(model),
-        }
+        return release.VerifiedCorpusSnapshot(
+            {
+                "release": str(project / "reviewed-release"),
+                "review_digest": "fixture-review",
+                "payload_sha256": "fixture-payload",
+                "whole_workload_phase1": {"required": False, "status": "not_established"},
+            },
+            model,
+        )
 
-    monkeypatch.setattr(release, "verify_snapshot", reviewed_snapshot)
+    monkeypatch.setattr(release, "verify_snapshot_for_phase1", reviewed_snapshot)
     monkeypatch.setenv("MERLIN_CORPUS_SEAL", str(project / "reviewed-release/private/seal.json"))
     request = dataclasses.replace(_request(project), treatment=Treatment())
 

@@ -180,12 +180,16 @@ def bridge(tmp_path, monkeypatch, request):
     workspace.mkdir()
     BW.materialize_bundle_inputs(workspace, prepared.bundle, repo=fixture["workspace"])
     BW.require_snapshot_ownership(BW.verify_bundle_snapshot(workspace, prepared.bundle, repo=fixture["workspace"]))
-    snapshot_review = release.verify_snapshot(
+    snapshot = release.verify_snapshot_for_phase1(
         Path(sealed["seal"]), descriptor, workspace, prepared.bundle, repo=fixture["workspace"]
     )
-    model_snapshot = snapshot_review.pop("instruction_semantics_snapshot", None)
+    model_snapshot = snapshot.private_instruction_model
     assert (model_snapshot is not None) == synthetic_model
-    assert snapshot_review == identity
+    assert snapshot.review == identity
+    assert (
+        release.verify_snapshot(Path(sealed["seal"]), descriptor, workspace, prepared.bundle, repo=fixture["workspace"])
+        == identity
+    )
     view = CI.resolve(
         workspace,
         prepared.bundle,

@@ -986,7 +986,7 @@ def test_native_harness_binds_seal_before_any_agent_launch():
     session = ast.parse(module_source_path("merlin_experiments.phase1.session").read_text())
     admission = next(node for node in session.body if isinstance(node, ast.FunctionDef) and node.name == "prepare")
     calls = [node for node in ast.walk(admission) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
-    verification = [node.lineno for node in calls if node.func.id == "verify_snapshot"]
+    verification = [node.lineno for node in calls if node.func.id == "verify_snapshot_for_phase1"]
     assert not any(node.func.id == "_launch" for node in calls)
     launches = [
         node

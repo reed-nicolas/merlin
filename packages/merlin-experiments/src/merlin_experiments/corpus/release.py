@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,6 +20,14 @@ from ..spec import SpecError
 from .preparation import admission, assemble, copy_input, ordinary_tree, private_json, scaffold, source_run
 
 _INSTRUCTION_MODEL = "instruction-semantics.json"
+
+
+@dataclass(frozen=True)
+class VerifiedCorpusSnapshot:
+    """Separate the public review identity from an optional host-only input."""
+
+    review: dict
+    private_instruction_model: Path | None
 
 
 def _read(path: Path) -> dict:
@@ -370,8 +379,10 @@ def _verify_workload_coverage(root: Path, prepared: dict) -> dict:
     return summary
 
 
-def verify_snapshot(seal_path: Path, descriptor: Path, ws: Path, bundle: dict, *, repo: Path | None = None) -> dict:
-    """Native pre-agent gate: bind actual private snapshot bytes to reviewed source bytes."""
+def _verify_snapshot(
+    seal_path: Path, descriptor: Path, ws: Path, bundle: dict, *, repo: Path | None = None
+) -> VerifiedCorpusSnapshot:
+    """Bind actual private snapshot bytes to the operator-reviewed source bytes."""
     from merlin.targetgen.sandbox.bwrap import snapshot_input_paths
     from merlin.targetgen.target_experiment import load_target_experiment
 
@@ -406,8 +417,8 @@ def verify_snapshot(seal_path: Path, descriptor: Path, ws: Path, bundle: dict, *
     # A change while the native snapshot was checked cannot borrow its seal.
     if verify(seal_path, descriptor) != identity:
         raise SpecError("corpus release changed while verifying its native snapshot")
-    result = dict(identity)
     model = frozen_prepared.get("instruction_semantics")
+    private_model = None
     if model is not None:
         member = snapshots[-1] / _INSTRUCTION_MODEL
         if (
@@ -418,7 +429,17 @@ def verify_snapshot(seal_path: Path, descriptor: Path, ws: Path, bundle: dict, *
             or fingerprint(member) != model.get("sha256")
         ):
             raise SpecError("frozen private instruction model differs from reviewed release")
-        # The session consumes and removes this host-only path before persisting
-        # its public review identity or constructing an agent-visible treatment.
-        result["instruction_semantics_snapshot"] = str(member)
-    return result
+        private_model = member
+    return VerifiedCorpusSnapshot(dict(identity), private_model)
+
+
+def verify_snapshot(seal_path: Path, descriptor: Path, ws: Path, bundle: dict, *, repo: Path | None = None) -> dict:
+    """Native pre-agent gate returning only the reviewed corpus identity."""
+    return _verify_snapshot(seal_path, descriptor, ws, bundle, repo=repo).review
+
+
+def verify_snapshot_for_phase1(
+    seal_path: Path, descriptor: Path, ws: Path, bundle: dict, *, repo: Path | None = None
+) -> VerifiedCorpusSnapshot:
+    """Trusted Phase 1 host gate with an explicit, separately typed private input."""
+    return _verify_snapshot(seal_path, descriptor, ws, bundle, repo=repo)

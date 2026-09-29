@@ -350,12 +350,13 @@ def prepare(
         _BWS.require_snapshot_ownership(_BWS.verify_bundle_snapshot(ws, bundle, repo=context.repo))
         _snapshot_root = _BWS.bundle_snapshot_root(ws).resolve(strict=True)
         if _corpus_seal:
-            from merlin_experiments.corpus.release import verify_snapshot
+            from merlin_experiments.corpus.release import verify_snapshot_for_phase1
 
-            _corpus_review = verify_snapshot(Path(_corpus_seal), context.descriptor, ws, bundle, repo=context.repo)
-            # This private path is an ephemeral host input. Persisting it in
-            # corpus_review would mix snapshot routing into the release identity.
-            _semantic_model_snapshot = _corpus_review.pop("instruction_semantics_snapshot", None)
+            _reviewed = verify_snapshot_for_phase1(
+                Path(_corpus_seal), context.descriptor, ws, bundle, repo=context.repo
+            )
+            _corpus_review = _reviewed.review
+            _semantic_model_snapshot = _reviewed.private_instruction_model
             _reviewed_corpus_roots = tuple(_te().graded_roots())
         _bundle_snapshot_record = _BWS.snapshot_record(ws)
         _corpus_view = CI.resolve(ws, bundle, _corpus_record, repo=context.repo, reviewed_roots=_reviewed_corpus_roots)
@@ -368,7 +369,7 @@ def prepare(
         if _corpus_seal:
             from . import semantic_diagnostics as _SD
 
-            _model_path = Path(_semantic_model_snapshot) if _semantic_model_snapshot is not None else None
+            _model_path = _semantic_model_snapshot
             if _resuming:
                 # Old reviewed runs had no diagnostic. Do not mint a new
                 # receipt or change their admission identity on resume.
