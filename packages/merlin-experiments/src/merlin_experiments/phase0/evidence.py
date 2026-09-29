@@ -916,6 +916,24 @@ def _coverage_readme(accounting: dict, quantization: dict) -> bytes:
         "| --- | ---: |",
     ]
     lines += [f"| {cell(name)} | {count} |" for name, count in overall["classification_counts"].items()]
+    operation_breakdown: dict[tuple[str, str], int] = {}
+    for application in accounting["applications"].values():
+        for signature in application["signatures"]:
+            key = (signature["classification"], signature["observed_signature"]["mlir_operation"])
+            operation_breakdown[key] = operation_breakdown.get(key, 0) + signature["count"]
+    lines += [
+        "",
+        "## Normalized-IR operations by partition",
+        "",
+        "These are static occurrences from the same digest-bound accounting, not new support claims.",
+        "",
+        "| Partition | MLIR operation | Occurrences |",
+        "| --- | --- | ---: |",
+    ]
+    for (partition, operation), count in sorted(
+        operation_breakdown.items(), key=lambda item: (item[0][0], -item[1], item[0][1])
+    ):
+        lines.append(f"| {cell(partition)} | {cell(operation)} | {count} |")
     lines += [
         "",
         "## Selected hardware declaration screen",

@@ -260,6 +260,7 @@ def test_selected_application_accounting_is_digest_bound_and_replayed_without_fr
     assert "hardware/effective-views/isa-taxonomy.json" in manifest["consumers"]["corpus_binding"]
     coverage_readme = (output / "coverage/README.md").read_text()
     assert "unreviewed inputs remain unknown" in coverage_readme
+    assert "## Normalized-IR operations by partition" in coverage_readme
     assert "reviewed declaration screens" not in coverage_readme
     sidecar.write_text("{}")
     with pytest.raises(ValueError, match="inventory differs"):
