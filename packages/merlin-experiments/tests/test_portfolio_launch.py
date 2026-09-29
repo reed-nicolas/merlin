@@ -54,7 +54,11 @@ def case(tmp_path):
         target_name="synthetic",
         selected_provider=None,
         declared_inputs={"descriptor": tmp_path / "descriptor.yaml"},
-        inherited_environment={"SYNTHETIC_INHERITED": "kept", "PYTHONPATH": "/unselected"},
+        inherited_environment={
+            "SYNTHETIC_INHERITED": "kept",
+            "PYTHONPATH": "/unselected",
+            "MERLIN_BOARD_CATALOG": "/unsealed/board.yaml",
+        },
         worker_python_roots=("python", "helpers"),
     )
     return SimpleNamespace(root=tmp_path, invocation=invocation, deployment=deployment)

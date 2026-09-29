@@ -45,6 +45,7 @@ from merlin_experiments.phase2 import measurement_evidence as ME
 from merlin_experiments.phase2 import published_payload as PUBLISHED
 from merlin_experiments.phase2 import telemetry as TEL
 from merlin_experiments.phase2.chia_launch import PYTHON_SOURCE_ENVIRONMENT_KEYS
+from merlin_experiments.measured_launch import without_unsealed_board_catalog
 from merlin_experiments.phase2.contracts import PerformanceExperimentError as ExperimentError
 
 TRIALS = ("trial_00", "trial_01", "trial_02")
@@ -342,7 +343,7 @@ def child_environment(config: Config, certificate: GATE.CertificateRecord) -> di
     # Backend runtime selection may configure tools, not replace the admitted
     # interpreter's source selection. Bind absence as well as present values, and
     # retain a separate copy so a callback cannot mutate its own comparison base.
-    inherited = dict(os.environ)
+    inherited = without_unsealed_board_catalog(os.environ)
     configured = configure(binaries=binaries, gsim_max_cycles=config.gsim_max_cycles, environment=dict(inherited))
     if not isinstance(configured, Mapping) or any(
         not isinstance(k, str) or not isinstance(v, str) for k, v in configured.items()
@@ -350,6 +351,8 @@ def child_environment(config: Config, certificate: GATE.CertificateRecord) -> di
         raise ExperimentError("selected backend returned a malformed runtime environment")
     if any(configured.get(key) != inherited.get(key) for key in PYTHON_SOURCE_ENVIRONMENT_KEYS):
         raise ExperimentError("selected backend changed admitted Python source selection")
+    if "MERLIN_BOARD_CATALOG" in configured:
+        raise ExperimentError("selected backend supplied an unsealed board catalog")
     environment = {
         **configured,
         "MERLIN_TARGET_EXPERIMENT": str(config.descriptor.resolve()),

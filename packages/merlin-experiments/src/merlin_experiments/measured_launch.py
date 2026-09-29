@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from merlin.common.paths import module_source_path
@@ -22,6 +23,20 @@ OWNER = "merlin_experiments.phase2.chia_envelope"
 PREFIX = "phase2:installed:"
 ENVELOPE_FIELDS = {"managed_native_endpoint", "codex_slots", "gsim_slots"}
 FROZEN_PHASE0_ENV_POLICY = "merlin.phase0.selected_environment.v1"
+UNSEALED_BOARD_CATALOG_ENV = "MERLIN_BOARD_CATALOG"
+
+
+def without_unsealed_board_catalog(environment: Mapping[str, str]) -> dict[str, str]:
+    """Keep ambient board facts out of verified children until they have a frozen owner.
+
+    A path in the host environment is not a source receipt: it may alias another
+    location or change bytes between freeze and execution. This policy binds
+    absence; a later declared-input implementation can replace it with a sealed
+    catalog path, digest and alias check.
+    """
+    selected = dict(environment)
+    selected.pop(UNSEALED_BOARD_CATALOG_ENV, None)
+    return selected
 
 
 def _source(name: str) -> Path:
@@ -190,6 +205,8 @@ def source_inputs(command: dict) -> dict[str, str]:
 
 def execution_environment(command: dict) -> dict[str, str]:
     """Use the frozen installed roots even if the invoking ambient selection changed."""
+    if command.get("module") and UNSEALED_BOARD_CATALOG_ENV in command.get("env", {}):
+        raise SpecError("installed phase has an unsealed board catalog selection; freeze a declared input")
     if command.get("adapter") == "capsule_derivation" and command.get("source_snapshot"):
         if command.get("phase0_environment_policy") != FROZEN_PHASE0_ENV_POLICY:
             raise SpecError("frozen Phase 0 launch predates selected-only environment; freeze a new run")
@@ -208,6 +225,8 @@ def execution_environment(command: dict) -> dict[str, str]:
     if command.get("module") in {MODULE, "merlin_experiments.phase2.portfolio_cli"}:
         environment.pop("PYTHONHOME", None)
         environment.pop("PYTHONUSERBASE", None)
+    if command.get("module"):
+        environment = without_unsealed_board_catalog(environment)
     return environment
 
 

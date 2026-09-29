@@ -29,6 +29,7 @@ import yaml
 
 from merlin.common.digest import sha256_file
 from merlin.common.tree_hash import hash_tree
+from merlin_experiments.measured_launch import without_unsealed_board_catalog
 
 SCHEMA = "merlin.model_qualification.v1"
 MODULE = "merlin_experiments.model_qualification"
@@ -791,7 +792,7 @@ def qualify(
         "--worker",
         str(output),
     ]
-    environment = dict(os.environ)
+    environment = without_unsealed_board_catalog(os.environ)
     worker_tmp = output / "worker-tmp"
     worker_tmp.mkdir(mode=0o700)
     environment["TMPDIR"] = str(worker_tmp)
