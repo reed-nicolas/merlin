@@ -99,20 +99,30 @@ def test_sealed_m2m_assessment_binds_selected_model_and_receipt_without_admissio
     pending = run / "sealed_m2m_pending.json"
     pending.write_bytes(b"pending replay\n")
     model = capture / "model.mlir"
-    selected = {"model_sha256": _digest(model), "capture_receipt_sha256": _digest(capture / "capture_receipt.json")}
+    selected = {
+        "model_sha256": _digest(model),
+        "capture_receipt_sha256": _digest(capture / "capture_receipt.json"),
+        "sealed_receipt_sha256": _digest(pending),
+    }
     calls = []
 
     def replay(path, *, bwrap_binary=None):
         calls.append(path)
-        return {"schema": sealed_m2m.SCHEMA, "status": "verified_sandbox_replay",
-                "sealed_source_closure_replayed": True,
-                "phase0_admission": "not_granted", "receipt_sha256": _digest(pending), "capture_dtype": "fp32"}
+        return {
+            "schema": sealed_m2m.SCHEMA,
+            "status": "verified_sandbox_replay",
+            "sealed_source_closure_replayed": True,
+            "phase0_admission": "not_granted",
+            "receipt_sha256": _digest(pending),
+            "capture_dtype": "fp32",
+        }
 
     monkeypatch.setattr(sealed_m2m, "replay_verify", replay)
     assessment = assess_sealed_m2m_capture(run, model, **selected)
     assert assessment["status"] == "replay_verified_nonadmissible"
     assert assessment["phase0_admission"] == "not_granted"
     assert assessment["source_closure_verified"] is False
+    assert assessment["capture"]["sealed_receipt_sha256"] == _digest(pending)
     assert assessment["replay"]["receipt_sha256"] == _digest(pending)
     assert calls == [run]
     with pytest.raises(AttestationNotVerified):
@@ -121,6 +131,10 @@ def test_sealed_m2m_assessment_binds_selected_model_and_receipt_without_admissio
     mismatch = assess_sealed_m2m_capture(run, model, **{**selected, "model_sha256": "0" * 64})
     assert mismatch["status"] == "unverified"
     assert "differ" in mismatch["blockers"][0]
+    assert calls == [run]
+    changed_run = assess_sealed_m2m_capture(run, model, **{**selected, "sealed_receipt_sha256": "0" * 64})
+    assert changed_run["status"] == "unverified"
+    assert "sealed receipt bytes differ" in changed_run["blockers"][0]
     assert calls == [run]
     other = tmp_path / "other.mlir"
     other.write_bytes(model.read_bytes())
@@ -147,7 +161,11 @@ def test_sealed_m2m_assessment_rejects_failed_replay_and_changed_bytes(tmp_path,
     pending = run / "sealed_m2m_pending.json"
     pending.write_bytes(b"pending replay\n")
     model = capture / "model.mlir"
-    selected = {"model_sha256": _digest(model), "capture_receipt_sha256": _digest(capture / "capture_receipt.json")}
+    selected = {
+        "model_sha256": _digest(model),
+        "capture_receipt_sha256": _digest(capture / "capture_receipt.json"),
+        "sealed_receipt_sha256": _digest(pending),
+    }
 
     def failed(*_args, **_kwargs):
         raise sealed_m2m.SealedM2MError("source snapshot differs")
@@ -159,11 +177,32 @@ def test_sealed_m2m_assessment_rejects_failed_replay_and_changed_bytes(tmp_path,
 
     def changed(*_args, **_kwargs):
         model.write_bytes(b"changed\n")
-        return {"schema": sealed_m2m.SCHEMA, "status": "verified_sandbox_replay",
-                "sealed_source_closure_replayed": True,
-                "phase0_admission": "not_granted", "receipt_sha256": _digest(pending)}
+        return {
+            "schema": sealed_m2m.SCHEMA,
+            "status": "verified_sandbox_replay",
+            "sealed_source_closure_replayed": True,
+            "phase0_admission": "not_granted",
+            "receipt_sha256": _digest(pending),
+        }
 
     monkeypatch.setattr(sealed_m2m, "replay_verify", changed)
+    assessment = assess_sealed_m2m_capture(run, model, **selected)
+    assert "changed during assessment" in assessment["blockers"][0]
+    assert assessment["phase0_admission"] == "not_granted"
+
+    model.write_bytes(b"module {}\n")
+
+    def changed_pending(*_args, **_kwargs):
+        pending.write_bytes(b"different pending replay\n")
+        return {
+            "schema": sealed_m2m.SCHEMA,
+            "status": "verified_sandbox_replay",
+            "sealed_source_closure_replayed": True,
+            "phase0_admission": "not_granted",
+            "receipt_sha256": selected["sealed_receipt_sha256"],
+        }
+
+    monkeypatch.setattr(sealed_m2m, "replay_verify", changed_pending)
     assessment = assess_sealed_m2m_capture(run, model, **selected)
     assert "changed during assessment" in assessment["blockers"][0]
     assert assessment["phase0_admission"] == "not_granted"

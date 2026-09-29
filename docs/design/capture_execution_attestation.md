@@ -145,10 +145,16 @@ Loaders that read ambient environment values or require checkpoints outside the
 selected trees remain unsupported by this bounded policy.
 
 Phase 0's experiments-owned `assess_sealed_m2m_capture` accepts a selected
-`model.mlir` path and the caller's exact model and capture-receipt SHA-256 digests.
+`model.mlir` path and the caller's independently selected SHA-256 digests for
+the model, materialized capture receipt and `sealed_m2m_pending.json`.
 It requires that path to be the run's `capture/model.mlir`, verifies the adjacent
-materialized receipt, invokes the sealed v2 replay verifier, and rechecks the
-selected bytes afterward. V2 replay now compares the copied M2M package,
+materialized receipt, checks all three selected byte identities before and
+after replay, and invokes the sealed v2 replay verifier. The pending receipt
+commits to the issued command, selected input plan, sandbox policy, copied
+source/runtime snapshots, process result and output inventory. Selecting its
+digest independently prevents a different pending record from silently
+satisfying the same assessment. It does not authenticate who issued that
+record or which historical process ran. V2 replay compares the copied M2M package,
 workload, venv, base Python, and schemas against their selected tree digests,
 and checks the selected worker bytes. The Merlin package tree is compared when
 the schemas were selected within it; an external schema tree is injected into

@@ -20,7 +20,7 @@ from merlin.targetgen.application_inventory import verify_capture_receipt
 
 SCHEMA = "merlin.capture_execution_attestation.v1"
 _VERIFIED_ISSUERS: frozenset[str] = frozenset()
-SEALED_M2M_ASSESSMENT_SCHEMA = "merlin.phase0.sealed_m2m_assessment.v1"
+SEALED_M2M_ASSESSMENT_SCHEMA = "merlin.phase0.sealed_m2m_assessment.v2"
 _REQUIRED_CONTROLS = (
     "fresh_private_source_snapshot",
     "complete_runtime_and_checkpoint_snapshot",
@@ -192,13 +192,18 @@ def assess_sealed_m2m_capture(
     *,
     model_sha256: str,
     capture_receipt_sha256: str,
+    sealed_receipt_sha256: str,
     bwrap_binary: Path | None = None,
 ) -> dict[str, Any]:
     """Replay a selected CPU capture against independently selected Phase 0 bytes.
 
+    The sealed receipt commits to the actual command, selected source/runtime
+    snapshots, sandbox policy, and output. Require its independently selected
+    digest as well as the model/materialized-receipt digests: replaying a
+    different pending record cannot silently satisfy the same selection.
     This is a read-only assessment. The M2M receipt and its source/runtime plan
-    are unsigned, so even a passing replay cannot grant historical issuance or
-    Phase 0 source-closure admission.
+    remain unsigned, so even a passing replay cannot grant historical issuance
+    or Phase 0 source-closure admission.
     """
     from merlin_experiments.capture_execution.sealed_m2m import (
         SCHEMA as M2M_V2_SCHEMA,
@@ -214,7 +219,11 @@ def assess_sealed_m2m_capture(
         "phase0_admission": "not_granted",
         "source_closure_verified": False,
         "fresh_execution": False,
-        "capture": {"model_sha256": model_sha256, "receipt_sha256": capture_receipt_sha256},
+        "capture": {
+            "model_sha256": model_sha256,
+            "receipt_sha256": capture_receipt_sha256,
+            "sealed_receipt_sha256": sealed_receipt_sha256,
+        },
         "replay": None,
         "blockers": [],
     }
@@ -223,10 +232,13 @@ def assess_sealed_m2m_capture(
         result["blockers"].append(reason)
         return result
 
-    if any(not isinstance(value, str) or len(value) != 64
-           or any(character not in "0123456789abcdef" for character in value)
-           for value in (model_sha256, capture_receipt_sha256)):
-        return blocked("selected model and capture receipt require exact SHA-256 byte identities")
+    if any(
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in (model_sha256, capture_receipt_sha256, sealed_receipt_sha256)
+    ):
+        return blocked("selected model, capture receipt and sealed receipt require exact SHA-256 byte identities")
     try:
         run = _canonical_path(Path(run_dir), exists=True)
         model = _canonical_path(Path(model_path), exists=True)
@@ -237,13 +249,21 @@ def assess_sealed_m2m_capture(
     receipt_path = model.parent / "capture_receipt.json"
     if receipt_path.is_symlink() or not receipt_path.is_file():
         return blocked("selected M2M capture receipt is absent or indirect")
+    pending = run / "sealed_m2m_pending.json"
+    if pending.is_symlink() or not pending.is_file():
+        return blocked("selected M2M sealed receipt is absent or indirect")
     try:
         _, observed_model = _sha256(model)
         _, observed_receipt = _sha256(receipt_path)
+        _, observed_sealed = _sha256(pending)
     except (OSError, ValueError) as exc:
-        return blocked(f"selected M2M capture bytes cannot be read consistently: {exc}")
-    if (observed_model, observed_receipt) != (model_sha256, capture_receipt_sha256):
-        return blocked("selected model or capture receipt bytes differ from the Phase 0 selection")
+        return blocked(f"selected M2M evidence bytes cannot be read consistently: {exc}")
+    if (observed_model, observed_receipt, observed_sealed) != (
+        model_sha256,
+        capture_receipt_sha256,
+        sealed_receipt_sha256,
+    ):
+        return blocked("selected model, capture receipt or sealed receipt bytes differ from the Phase 0 selection")
     try:
         materialized = verify_capture_receipt(model)
     except (OSError, ValueError, TypeError, AttributeError) as exc:
@@ -254,25 +274,34 @@ def assess_sealed_m2m_capture(
         replay = replay_verify(run, bwrap_binary=bwrap_binary)
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
         return blocked(f"sealed M2M replay failed: {exc}")
-    if (not isinstance(replay, dict)
-            or replay.get("schema") != M2M_V2_SCHEMA
-            or replay.get("status") != "verified_sandbox_replay"
-            or replay.get("sealed_source_closure_replayed") is not True
-            or replay.get("phase0_admission") != "not_granted"):
+    if (
+        not isinstance(replay, dict)
+        or replay.get("schema") != M2M_V2_SCHEMA
+        or replay.get("status") != "verified_sandbox_replay"
+        or replay.get("sealed_source_closure_replayed") is not True
+        or replay.get("phase0_admission") != "not_granted"
+    ):
         return blocked("sealed M2M replay has no supported CPU v2 proof")
-    pending = run / "sealed_m2m_pending.json"
     try:
-        _, replay_receipt_sha256 = _sha256(pending)
+        _, final_sealed = _sha256(pending)
         _, final_model = _sha256(model)
         _, final_receipt = _sha256(receipt_path)
     except (OSError, ValueError) as exc:
         return blocked(f"sealed M2M evidence changed after replay: {exc}")
-    if (replay.get("receipt_sha256") != replay_receipt_sha256
-            or final_model != model_sha256 or final_receipt != capture_receipt_sha256):
+    if (
+        replay.get("receipt_sha256") != sealed_receipt_sha256
+        or final_sealed != sealed_receipt_sha256
+        or final_model != model_sha256
+        or final_receipt != capture_receipt_sha256
+    ):
         return blocked("sealed M2M replay or selected capture bytes changed during assessment")
     result["status"] = "replay_verified_nonadmissible"
-    result["replay"] = {"schema": replay["schema"], "status": replay["status"],
-                        "receipt_sha256": replay_receipt_sha256, "capture_dtype": replay.get("capture_dtype")}
+    result["replay"] = {
+        "schema": replay["schema"],
+        "status": replay["status"],
+        "receipt_sha256": sealed_receipt_sha256,
+        "capture_dtype": replay.get("capture_dtype"),
+    }
     result["blockers"] = [
         "unsigned M2M receipt cannot authenticate the original source/runtime selection or clean pinned revision",
         "selected Python runtime, framework dependencies and model data lack an independently verified closure pin",
