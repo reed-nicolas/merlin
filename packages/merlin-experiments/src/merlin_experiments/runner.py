@@ -827,6 +827,115 @@ def _verify_completed_phase1(command: dict, attempt: dict) -> None:
         raise SpecError("completed installed Phase 1 handoff bytes changed; create a new experiment run")
 
 
+def _installed_phase2_output(command: dict, attempt: dict) -> dict[str, dict[str, str]]:
+    """Bind terminal evidence without hashing mutable Phase 2 work areas."""
+    from merlin.benchharness import hash_tree
+
+    output = Path(attempt["engine_output"])
+    if output.is_symlink() or output.resolve() != output or not output.is_dir():
+        raise SpecError("completed installed Phase 2 output is absent, linked or moved")
+    expected = Path(command["engine_output"])
+    if command["resume_policy"] == "checkpoint_segment":
+        if output.parent != expected or not output.name.startswith("segment-"):
+            raise SpecError("completed portfolio segment is outside its frozen output root")
+    elif output != expected:
+        raise SpecError("completed installed Phase 2 output differs from its frozen selection")
+
+    def pin(name: str, path: Path, *, directory: bool = False) -> dict[str, str]:
+        if (
+            path.is_symlink()
+            or path.resolve() != path
+            or not path.is_relative_to(output)
+            or not (path.is_dir() if directory else path.is_file())
+        ):
+            raise SpecError(f"completed installed Phase 2 terminal member is absent or linked: {name}")
+        return {"path": str(path), "sha256": fingerprint(path)}
+
+    if command["adapter"] == "measured_claims":
+        from .phase2.checkpoint_admission import SCHEMA
+
+        finals = sorted(output.glob("experiment_manifest.*.json"))
+        if len(finals) != 1:
+            raise SpecError("completed measured Phase 2 run needs one final experiment manifest")
+        manifest = finals[0]
+        final = pin("experiment_manifest", manifest)
+        if (
+            manifest.name != f"experiment_manifest.{final['sha256']}.json"
+            or (document := _read_json(manifest)).get("schema") != SCHEMA
+            or document.get("status") != "GO"
+        ):
+            raise SpecError("completed measured Phase 2 final manifest is not a content-addressed GO record")
+        return {"experiment_manifest": final}
+
+    if command["adapter"] != "model_portfolio":
+        raise SpecError("unsupported installed Phase 2 terminal output")
+    records = output / "global_iterations"
+    result = {
+        "host_resource_telemetry": pin("host_resource_telemetry", output / "host_resource_telemetry.json"),
+        "launch": pin("launch", output / "launch.json"),
+        "agent_sequence": pin("agent_sequence", records / "agent_sequence.json"),
+    }
+    telemetry = _read_json(Path(result["host_resource_telemetry"]["path"]))
+    if telemetry.get("status") != "completed" or telemetry.get("worker_returncode") != 0:
+        raise SpecError("completed portfolio segment lacks a successful worker telemetry receipt")
+    sequence = _read_json(Path(result["agent_sequence"]["path"]))
+    selected = sequence.get("last_good_checkpoint") or {}
+    if (
+        sequence.get("schema") != "global_agent_sequence_v1"
+        or sequence.get("status") != "budget_complete"
+        or not isinstance(selected, dict)
+        or not isinstance(selected.get("path"), str)
+        or not isinstance(selected.get("candidate_sha256"), str)
+        or type(sequence.get("promotion_ready")) is not bool
+    ):
+        raise SpecError("completed portfolio segment lacks a selected terminal checkpoint")
+    checkpoint = Path(selected["path"])
+    if not checkpoint.is_relative_to(records):
+        raise SpecError("completed portfolio checkpoint escapes its segment")
+    result["selected_checkpoint"] = pin("selected_checkpoint", checkpoint)
+    if result["selected_checkpoint"]["sha256"] != selected.get("sha256"):
+        raise SpecError("completed portfolio checkpoint differs from the sequence receipt")
+    final_checkpoint = _read_json(checkpoint)
+    candidate = Path(str(final_checkpoint.get("candidate_path") or ""))
+    if not candidate.is_relative_to(records):
+        raise SpecError("completed portfolio candidate escapes its segment")
+    result["selected_candidate"] = pin("selected_candidate", candidate, directory=True)
+    if (
+        final_checkpoint.get("candidate_sha256") != selected["candidate_sha256"]
+        or hash_tree(candidate)["sha256"] != selected["candidate_sha256"]
+    ):
+        raise SpecError("completed portfolio candidate differs from its selected checkpoint")
+    # A recovered round can leave a ready checkpoint without a final review
+    # seal. The worker writes global_candidate only for failure-free sequences.
+    if sequence["promotion_ready"] and not sequence.get("failures"):
+        ready = records / "global_candidate.json"
+        result["global_candidate"] = pin("global_candidate", ready)
+        ready_record = _read_json(ready)
+        ready_candidate = Path(str(ready_record.get("candidate_path") or ""))
+        if not ready_candidate.is_relative_to(records):
+            raise SpecError("completed portfolio review candidate escapes its segment")
+        result["global_candidate_snapshot"] = pin("global_candidate_snapshot", ready_candidate, directory=True)
+        if (
+            ready_record.get("schema") != "global_perf_candidate_v1"
+            or ready_record.get("candidate_sha256") != selected["candidate_sha256"]
+            or hash_tree(ready_candidate)["sha256"] != selected["candidate_sha256"]
+        ):
+            raise SpecError("completed portfolio review candidate differs from its selected checkpoint")
+    return result
+
+
+def _verify_completed_phase2(command: dict, attempt: dict) -> None:
+    expected = attempt.get("terminal_outputs")
+    if not isinstance(expected, dict) or not expected:
+        raise SpecError("completed installed Phase 2 lacks output identity; create a new experiment run")
+    try:
+        observed = _installed_phase2_output(command, attempt)
+    except (OSError, SpecError) as exc:
+        raise SpecError(f"completed installed Phase 2 output changed: {exc}") from exc
+    if observed != expected:
+        raise SpecError("completed installed Phase 2 terminal bytes changed; create a new experiment run")
+
+
 def _process_active(pid: int | None) -> bool:
     if pid is None:
         return False
@@ -936,9 +1045,31 @@ def _execute(root: Path, plan: dict, record: dict, *, checkpoint: Path | None = 
             if attempt["state"] == "running" and _process_active(attempt.get("pid")):
                 raise SpecError(f"previous engine process {attempt['pid']} is still running")
         _verify_inputs(plan)
+        if checkpoint is not None and not any(
+            command["resume_policy"] == "checkpoint_segment" for command in plan["phases"].values()
+        ):
+            raise SpecError("--checkpoint requires a checkpoint-segment experiment")
+        if checkpoint is not None and not any(
+            plan["phases"][attempt["phase"]]["resume_policy"] == "checkpoint_segment" for attempt in record["attempts"]
+        ):
+            raise SpecError("--checkpoint requires a prior portfolio segment")
+        for attempt in record["attempts"]:
+            pin = attempt.get("resume_checkpoint")
+            if pin is not None and fingerprint(pin["path"]) != pin["sha256"]:
+                raise SpecError("previous portfolio resume checkpoint bytes changed")
+            command = plan["phases"][attempt["phase"]]
+            if (
+                attempt["state"] == "execution_succeeded"
+                and command["adapter"] in {"measured_claims", "model_portfolio"}
+                and command.get("module")
+            ):
+                _verify_completed_phase2(command, attempt)
         for number, command in plan["phases"].items():
             previous = [entry for entry in record["attempts"] if entry["phase"] == number]
-            if previous and previous[-1]["state"] == "execution_succeeded":
+            continue_segment = bool(
+                previous and command["resume_policy"] == "checkpoint_segment" and checkpoint is not None
+            )
+            if previous and previous[-1]["state"] == "execution_succeeded" and not continue_segment:
                 if command["adapter"] == "capsule_derivation":
                     expected = previous[-1].get("output_sha256")
                     try:
@@ -1040,6 +1171,22 @@ def _execute(root: Path, plan: dict, record: dict, *, checkpoint: Path | None = 
                         engine_returncode=0,
                         state="execution_failed",
                         error=f"phase1 handoff identity not established; engine evidence unchanged: {exc}",
+                    )
+                    returncode = 1
+            elif (
+                returncode == 0
+                and command["adapter"] in {"measured_claims", "model_portfolio"}
+                and command.get("module")
+            ):
+                try:
+                    _verify_inputs(plan)
+                    entry["terminal_outputs"] = _installed_phase2_output(command, entry)
+                except (OSError, SpecError) as exc:
+                    entry.update(
+                        returncode=1,
+                        engine_returncode=0,
+                        state="execution_failed",
+                        error=f"phase2 output identity not established; engine evidence unchanged: {exc}",
                     )
                     returncode = 1
             record["state"] = entry["state"]

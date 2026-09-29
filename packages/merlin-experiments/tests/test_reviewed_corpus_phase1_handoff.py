@@ -504,6 +504,15 @@ def test_reviewed_derivation_formal_freeze_and_phase2_admission_share_exact_byte
         published_compiler_root=relocated,
     )
     result_path = lifecycle.run()
+    # The outer installed orchestrator binds the run-owned Phase 2 tree after
+    # the native checkpoint engine has produced its final synthetic manifest.
+    from merlin_experiments.runner import _installed_phase2_output, _verify_completed_phase2
+
+    phase2_command = {"engine_output": str(lifecycle.config.root), "resume_policy": "native_chain"}
+    phase2_attempt = {"engine_output": str(lifecycle.config.root)}
+    phase2_command["adapter"] = "measured_claims"
+    phase2_attempt["terminal_outputs"] = _installed_phase2_output(phase2_command, phase2_attempt)
+    _verify_completed_phase2(phase2_command, phase2_attempt)
     projected = lifecycle.config.root / "published-functional-base"
     assert hash_tree(projected) == hash_tree(frozen.submission_dir)
     assert not (projected / ".merlin").exists()

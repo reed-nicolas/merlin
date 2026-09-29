@@ -83,6 +83,103 @@ def test_inspect_preflight_run_status_resume_processes(workflow, capsys):
     assert len(status(destination)["attempts"]) == 4
 
 
+def test_completed_portfolio_segment_can_resume_from_explicit_checkpoint(tmp_path, monkeypatch):
+    from merlin_experiments import portfolio_catalog
+
+    monkeypatch.setenv("MERLIN_REPO_ROOT", str(tmp_path))
+    monkeypatch.setenv("MERLIN_OUT_ROOT", str(tmp_path / "out"))
+    monkeypatch.setattr(portfolio_catalog, "verify_plan", lambda _plan: None)
+    engine = tmp_path / "segment_engine.py"
+    engine.write_text(
+        "import argparse, hashlib, json, pathlib\n"
+        "from merlin.benchharness import hash_tree\n"
+        "p=argparse.ArgumentParser(); p.add_argument('--output'); "
+        "p.add_argument('--resume-checkpoint')\n"
+        "a=p.parse_args(); out=pathlib.Path(a.output); out.mkdir(parents=True)\n"
+        "records=out/'global_iterations'; records.mkdir()\n"
+        "candidate=records/'blocked_submission'; candidate.mkdir()\n"
+        "(candidate/'compiler.py').write_text('synthetic compiler for '+out.name+'\\n')\n"
+        "candidate_sha=hash_tree(candidate)['sha256']\n"
+        "checkpoint=records/'round_0000_authoring.json'\n"
+        "raw=json.dumps({'schema':'global_authoring_checkpoint_v1',"
+        "'candidate_path':str(candidate),'candidate_sha256':candidate_sha}).encode()\n"
+        "checkpoint.write_bytes(raw)\n"
+        "sequence={'schema':'global_agent_sequence_v1','status':'budget_complete',"
+        "'promotion_ready':False,'last_good_checkpoint':{'path':str(checkpoint),"
+        "'sha256':hashlib.sha256(raw).hexdigest(),'candidate_sha256':candidate_sha}}\n"
+        "(records/'agent_sequence.json').write_text(json.dumps(sequence))\n"
+        "(out/'launch.json').write_text('{}')\n"
+        "(out/'host_resource_telemetry.json').write_text(json.dumps("
+        "{'status':'completed','worker_returncode':0}))\n"
+    )
+    destination = tmp_path / "run"
+    first = destination / "phase2/segment-0001"
+    monkeypatch.setitem(
+        ADAPTERS,
+        "fixture_segment",
+        Adapter(
+            "fixture_segment",
+            "2",
+            "segment_engine.py",
+            {"output": Option(required=True)},
+            resume="checkpoint_segment",
+        ),
+    )
+    definition = tmp_path / "definition.yaml"
+    definition.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "id": "segment-fixture",
+                "target": "synthetic",
+                "phases": {"2": {"adapter": "fixture_segment", "config": {"output": str(first)}}},
+            }
+        )
+    )
+    plan = resolve_plan(load_spec(definition), run_dir=destination)
+    plan["phases"]["2"].update(adapter="model_portfolio", module="synthetic.installed.segment")
+    assert run(plan) == 0
+    assert status(destination)["phases"]["2"]["engine_output"] == str(first)
+    assert resume(destination) == 0
+    assert len(status(destination)["attempts"]) == 1
+    # A selected checkpoint may be a separately retained copy; the native
+    # portfolio verifier owns its scientific/lineage admission.
+    checkpoint = tmp_path / "selected-checkpoint.json"
+    checkpoint.write_bytes((first / "global_iterations/round_0000_authoring.json").read_bytes())
+    assert resume(destination, checkpoint=checkpoint) == 0
+    second = destination / "phase2/segment-0002"
+    attempts = status(destination)["attempts"]
+    assert [entry["engine_output"] for entry in attempts] == [str(first), str(second)]
+    assert all("terminal_outputs" in entry for entry in attempts)
+    assert attempts[1]["resume_checkpoint"]["path"] == str(checkpoint)
+    assert resume(destination) == 0
+    # The native worker does not write a final review seal when a recovered
+    # round left failures, even if its last checkpoint is promotion-ready.
+    from merlin_experiments.runner import _installed_phase2_output
+
+    sequence_path = first / "global_iterations/agent_sequence.json"
+    sequence_bytes = sequence_path.read_bytes()
+    recovered = json.loads(sequence_bytes)
+    recovered.update(promotion_ready=True, failures=[{"recovery": "next_budgeted_round_from_consumed_checkpoint"}])
+    sequence_path.write_text(json.dumps(recovered))
+    assert "global_candidate" not in _installed_phase2_output(plan["phases"]["2"], attempts[0])
+    recovered["failures"] = []
+    sequence_path.write_text(json.dumps(recovered))
+    with pytest.raises(SpecError, match="global_candidate"):
+        _installed_phase2_output(plan["phases"]["2"], attempts[0])
+    sequence_path.write_bytes(sequence_bytes)
+    candidate = first / "global_iterations/blocked_submission/compiler.py"
+    original = candidate.read_bytes()
+    candidate.write_text("changed after segment 2\n")
+    with pytest.raises(SpecError, match="completed portfolio candidate differs|terminal bytes changed"):
+        resume(destination)
+    candidate.write_bytes(original)
+    checkpoint.write_text("changed checkpoint bytes\n")
+    with pytest.raises(SpecError, match="previous portfolio resume checkpoint bytes changed"):
+        resume(destination)
+    assert len(status(destination)["attempts"]) == 2
+
+
 @pytest.mark.parametrize("mutation", ["changed_input", "missing_input", "changed_script", "changed_definition"])
 def test_resume_rejects_drift(workflow, mutation):
     definition, destination, control, engine = workflow
