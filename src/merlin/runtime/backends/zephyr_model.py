@@ -153,18 +153,26 @@ def _tool_env() -> dict:
     return env
 
 
-def available() -> bool:
-    """True when the Zephyr build + spike toolchain are present."""
+def build_available() -> bool:
+    """Check Zephyr build prerequisites independently of any simulator."""
     try:
+        gcc = _spike.gcc_path()
         return (
             _zephyr_base().is_dir()
             and _sdk_dir().is_dir()
             and build_tool("cmake") is not None
             and build_tool("ninja") is not None
-            and _spike.available()
+            and toolchain.available()
+            and gcc.is_file()
+            and all(gcc.with_name(f"riscv64-unknown-elf-{name}").is_file() for name in ("ld", "ar", "objcopy"))
         )
     except Exception:  # noqa: BLE001
         return False
+
+
+def available() -> bool:
+    """True when Zephyr build tools and the Spike execution path are present."""
+    return build_available() and _spike.available()
 
 
 # Bounded wall clock for the build's clang/ld steps (this is the seam apply_rvv_package's spike/K1
@@ -2299,14 +2307,14 @@ def build_app(
         matrix.provider()  # Refuse unselected/incomplete support before build output or native tools.
     else:
         load_matrix_signatures(Path(work), None)
+    if not build_available():
+        raise ZephyrModelError("Zephyr build toolchain unavailable (see env in module doc)")
     model_dir, work = Path(model_dir).resolve(), Path(work).resolve()
     work.mkdir(parents=True, exist_ok=True)
     from ...llvmlower.weight_prepack import prepare_build_bundle
 
     model_dir = prepare_build_bundle(model_dir, work, features)
     inputs_npz = inputs_npz or (model_dir / "inputs.npz")
-    if not available():
-        raise ZephyrModelError("Zephyr/spike toolchain unavailable (see env in module doc)")
     # NOTE scalar multicore IS supported (see the lowering call below): the scalar path cannot use the
     # forall-under-the-RVV-schedule route, so it parallelizes at the linalg loop level instead. This is
     # the ONLY way to use a hart that has no vector unit -- a heterogeneous SoC may bring up more cores

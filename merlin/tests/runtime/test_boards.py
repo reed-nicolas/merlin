@@ -78,6 +78,49 @@ def test_catalog_selection_is_explicit(monkeypatch):
         boards.load_boards()
 
 
+def test_zephyr_image_build_does_not_require_spike(monkeypatch, tmp_path):
+    zephyr = tmp_path / "zephyr"
+    sdk = tmp_path / "sdk"
+    zephyr.mkdir()
+    sdk.mkdir()
+    gcc = tmp_path / "riscv64-unknown-elf-gcc"
+    for name in ("gcc", "ld", "ar", "objcopy"):
+        (tmp_path / f"riscv64-unknown-elf-{name}").write_text("tool\n")
+    monkeypatch.setattr(zm, "_zephyr_base", lambda: zephyr)
+    monkeypatch.setattr(zm, "_sdk_dir", lambda: sdk)
+    monkeypatch.setattr(zm, "build_tool", lambda _: tmp_path / "host-tool")
+    monkeypatch.setattr(zm.toolchain, "available", lambda: True)
+    monkeypatch.setattr(zm._spike, "gcc_path", lambda: gcc)
+    monkeypatch.setattr(zm._spike, "available", lambda: False)
+    assert zm.build_available()
+    assert not zm.available()
+
+
+def test_zephyr_build_reaches_bundle_preparation_without_spike(monkeypatch, tmp_path):
+    from merlin.llvmlower import weight_prepack
+
+    selected = _fixture_board(
+        "portable",
+        zephyr_default_ram_bytes=256 << 20,
+        zephyr_link_limit_bytes=1900 << 20,
+    )
+
+    class ReachedPreparation(Exception):
+        pass
+
+    monkeypatch.setattr(boards, "board", lambda *_args, **_kwargs: selected)
+    monkeypatch.setattr(zm, "load_matrix_signatures", lambda *_args: None)
+    monkeypatch.setattr(zm, "build_available", lambda: True)
+    monkeypatch.setattr(zm, "available", lambda: pytest.fail("Spike readiness must not gate a Zephyr image build"))
+
+    def prepare(*_args):
+        raise ReachedPreparation
+
+    monkeypatch.setattr(weight_prepack, "prepare_build_bundle", prepare)
+    with pytest.raises(ReachedPreparation):
+        zm.build_app(tmp_path / "model", tmp_path / "work", board="portable")
+
+
 def test_zephyr_build_requires_board_before_creating_output(tmp_path):
     work = tmp_path / "build"
     with pytest.raises(zm.ZephyrModelError, match="explicitly selected"):

@@ -26,14 +26,19 @@ runtime dialect
 ## Prerequisites
 
 **Shared base:** complete the base install + `.env` setup in [Getting started](getting_started.md)
-first, then `check_repro_env.py` to confirm the `zephyr_spike` capability is runnable here.
+first. `check_repro_env.py` checks the combined `zephyr_spike` capability when
+running an image on Spike; building an image does not require Spike.
 
 **Workflow-specific prerequisites** (only for building/running the whole-model `build_app` path; the
 generic module-layout description below needs none):
 
 - **Required — Zephyr SW workspace + SDK 0.17.0**: `MERLIN_ZEPHYR_SW` (workspace root), `ZEPHYR_BASE`
   (the zephyr tree), `ZEPHYR_SDK_INSTALL_DIR`.
-- **Required — spike** via `MERLIN_CHIPYARD` (or `MERLIN_SPIKE`) for the SMP RVV-on-Saturn run.
+- **Required — RISC-V cross compiler** via `MERLIN_RISCV_GCC` or `MERLIN_CHIPYARD`
+  for the image build. `zephyr_model.build_available()` checks build prerequisites.
+- **Spike only for a Spike run** via `MERLIN_CHIPYARD` or `MERLIN_SPIKE`.
+  `zephyr_model.available()` checks the combined build-and-Spike path;
+  `build_app` uses the build-only check.
 - **Optional — FireSim** (2-tile SMP) is board/FPGA-gated and **not fresh-machine reproducible** (see
   [Getting started §5](getting_started.md)); **spike substitutes** for the functional whole-model run.
 - **Required — board catalog and selection**: set `MERLIN_BOARD_CATALOG` to a
