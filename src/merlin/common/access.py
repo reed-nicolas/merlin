@@ -1,9 +1,9 @@
-"""Declared agent-access identities, independent of source layout and optional imports.
+"""Shared agent-access identities, independent of source layout and optional imports.
 
 This is policy data, not plugin discovery. A module keeps its withheld identity when its
-implementation moves or is not installed. Filesystem masks, transcript audits and candidate import
-checks consume the same declarations. Register a renamed module here *before* moving its source;
-neither a missing file nor an unavailable research package grants access.
+implementation moves or is not installed. The optional experiments sandbox extends these shared
+identities with its mandatory, packaged legacy-target registry. A missing extension means the
+sandbox itself is unavailable; it must never silently run with only this shared subset.
 """
 
 from __future__ import annotations
@@ -136,6 +136,9 @@ def _module(module: str, origin: str, *, directory: bool = False, aliases: tuple
     return ModuleAccess(module, origin, modules, directory)
 
 
+module_access = _module
+
+
 MODULE_ACCESS = (
     _module("merlin.perf.analysis_worker", "grader"),
     _module("merlin.perf.isolated_probe_provider", "grader"),
@@ -185,15 +188,6 @@ MODULE_ACCESS = (
         "oracle",
         aliases=("merlin.targetgen.program_values", "merlin.targetgen.program_engine_policy"),
     ),
-    _module("merlin.targetgen.muon_oracles", "oracle"),  # historical identity; now an OOT adapter
-    # Historical names remain denied after their Gemmini implementation moves OOT.
-    _module("merlin.targetgen.eval.gemmini_conformance", "grader"),
-    _module("merlin.targetgen.eval.gemmini_suite", "grader"),
-    _module("merlin.targetgen.eval.gemmini_dispatcher", "grader"),
-    _module("merlin.targetgen.agent.gemmini_kernel_slot", "grader"),
-    _module("gemmini_conformance", "grader", directory=True),
-    _module("merlin.targetgen.oracle_helpers.npu_emit", "oracle"),  # historical support identity
-    _module("atlas_program_emit", "oracle"),
     # The operator CLI is installed with the broadly bound Python toolchain, but this
     # search implementation belongs to the host-private diagnostic treatment. A CLI
     # subcommand is not an agent tool grant; mask its importable implementation too.
@@ -232,9 +226,9 @@ MODULE_ACCESS = (
 )
 
 
-def declared_modules(origin: str) -> tuple[str, ...]:
+def declared_modules(origin: str, *, items: tuple[ModuleAccess, ...] = MODULE_ACCESS) -> tuple[str, ...]:
     """Declared identity does not disappear when the corresponding optional source is absent."""
-    return tuple(dict.fromkeys(module for item in MODULE_ACCESS if item.origin == origin for module in item.modules))
+    return tuple(dict.fromkeys(module for item in items if item.origin == origin for module in item.modules))
 
 
 def module_paths(item: ModuleAccess) -> tuple[str, ...]:
@@ -348,21 +342,21 @@ def module_locations(root: Path, item: ModuleAccess) -> tuple[Path, ...]:
     return tuple(paths)
 
 
-def unresolved_modules(root: Path) -> tuple[ModuleAccess, ...]:
+def unresolved_modules(root: Path, *, items: tuple[ModuleAccess, ...] = MODULE_ACCESS) -> tuple[ModuleAccess, ...]:
     """Explicit migration diagnostics, not a claim that missing declarations are safe to read.
 
     Core-only installs and historically evicted OOT adapters legitimately lack some implementations.
     Callers validating a migration compare these identities before/after, rather than accepting an
     empty filesystem coverage result as evidence that everything was classified.
     """
-    return tuple(item for item in MODULE_ACCESS if not module_locations(root, item))
+    return tuple(item for item in items if not module_locations(root, item))
 
 
-def legacy_module_paths(origin: str) -> tuple[str, ...]:
+def legacy_module_paths(origin: str, *, items: tuple[ModuleAccess, ...] = MODULE_ACCESS) -> tuple[str, ...]:
     """Compatibility view for callers still persisting the legacy repo-relative grant format."""
     return tuple(
         "merlin/python/" + item.identity.replace(".", "/") + ("" if item.directory else ".py")
-        for item in MODULE_ACCESS
+        for item in items
         if item.origin == origin
     )
 

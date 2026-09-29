@@ -43,6 +43,13 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from merlin_experiments.access_policy import (
+    MODULE_ACCESS,
+    declared_modules,
+    legacy_module_paths,
+    require_current_policy,
+)
+
 from merlin.common.access import (
     AUDIT_ADVISORY_KINDS as AUDIT_ADVISORY_KINDS,
 )
@@ -54,10 +61,7 @@ from merlin.common.access import (
     KEY_FILENAME,
     KEY_TOPIC,
     KEY_TOPIC_FOLDED,
-    MODULE_ACCESS,
     contract_resource_roots,
-    declared_modules,
-    legacy_module_paths,
     module_locations,
 )
 from merlin.common.access import (
@@ -435,6 +439,7 @@ def answer_surfaces(te: TargetExperiment) -> list[AnswerSurface]:
     """The COMPLETE derived answer-surface set for one target — the single source the sandbox masks and
     the coverage guard checks. Only surfaces that actually exist on this host are returned (a masked
     non-existent path is a no-op); the coverage guard therefore checks a real, achievable set."""
+    require_current_policy()
     root = repo_root()
     out: list[AnswerSurface] = []
 

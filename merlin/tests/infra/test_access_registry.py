@@ -66,8 +66,8 @@ def test_moved_golden_exporter_is_masked_without_hiding_public_emitter(tmp_path,
     ],
 )
 def test_evicted_gemmini_owners_retain_historical_private_identity(tmp_path, isolated_policy, module):
-    assert module in A.declared_modules("grader")
-    assert "gemmini_conformance" in A.declared_modules("grader")
+    assert module in AS.declared_modules("grader")
+    assert "gemmini_conformance" in AS.declared_modules("grader")
     relative = "packages/merlin-experiments/src/" + module.replace(".", "/") + ".py"
     private = _write(tmp_path, relative)
     surfaces = AS.answer_surfaces(isolated_policy)
@@ -89,7 +89,7 @@ def test_relocated_evaluation_cohort_keeps_grader_mask(tmp_path, isolated_policy
 
 @pytest.mark.parametrize("module", ["merlin.targetgen.oracle_helpers.npu_emit", "atlas_program_emit"])
 def test_program_emitters_retain_private_identity(tmp_path, isolated_policy, monkeypatch, module):
-    assert module in A.declared_modules("oracle")
+    assert module in AS.declared_modules("oracle")
     if module == "atlas_program_emit":
         private = _write(tmp_path, "support/atlas_program_emit.py")
         monkeypatch.setattr(AS, "_support_package_dirs", lambda: [private.parent])

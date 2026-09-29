@@ -46,8 +46,11 @@ def _ok(name, cond, detail=""):
 
 def _source_masks(root: Path) -> dict[str, Path]:
     """Probe existing implementations, never count a missing historical path as masked."""
-    from merlin.common.access import MODULE_ACCESS, module_locations
+    from merlin_experiments.access_policy import MODULE_ACCESS, require_current_policy
 
+    from merlin.common.access import module_locations
+
+    require_current_policy()
     required = {"merlin.runtime.reference", "merlin.runtime.simulator", "merlin.targetgen.capsule_grade"}
     masks = {}
     for item in MODULE_ACCESS:

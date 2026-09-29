@@ -3,6 +3,8 @@
 ## Purpose
 
 Shared utilities: schemas, IO, source/resource paths, storage and access identities.
+The common access registry contains only target-neutral identities; the experiments
+sandbox extends it with mandatory packaged historical target denials before launch.
 `frozen_imports` provides stdlib-only, process-local source import isolation for
 trusted bootstraps. Callers own snapshot seals, invocation records and grading.
 `source_membership` inventories ordinary Python source files for existing run
