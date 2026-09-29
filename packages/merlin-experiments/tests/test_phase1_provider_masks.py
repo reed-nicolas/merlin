@@ -71,6 +71,25 @@ def test_agent_composer_keeps_host_run_private_even_through_a_bind_alias(prepare
         )
 
 
+def test_converse_tool_checks_the_same_final_mount_boundary(prepared, monkeypatch):
+    from merlin_experiments.phase1.providers import bedrock_agent
+
+    private_run = prepared.ws.parent.parent / "converse-host-run"
+    private_run.mkdir()
+    (private_run / "semantic_search_diagnostic.json").write_text("{}")
+
+    def exposed_wrap(te, ws, command, bundle, *, argv_guard):
+        argv_guard(["bwrap", "--tmpfs", str(private_run.parent), "--ro-bind", str(private_run), "/agent/run"])
+        pytest.fail("an exposed run directory must be refused before command execution")
+
+    monkeypatch.setattr(BW, "wrap", exposed_wrap)
+    with pytest.raises(RuntimeError, match="host-private"):
+        bedrock_agent._bash_in_sandbox(
+            prepared.target, prepared.ws, prepared.bundle, "true", "bwrap", 5,
+            private_run_dir=private_run,
+        )
+
+
 def test_candidate_cannot_inherit_or_reintroduce_frozen_host_context(prepared, monkeypatch):
     variable = "MERLIN_FROZEN_PYTHON_CONTEXT"
     monkeypatch.setenv(variable, "host-only-pinned-context")

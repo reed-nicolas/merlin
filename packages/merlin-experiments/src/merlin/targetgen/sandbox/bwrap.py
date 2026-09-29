@@ -22,7 +22,7 @@ import json
 import os
 import shutil
 import stat
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from merlin.common import content_store
@@ -1347,7 +1347,13 @@ _MAX_ARG_BYTES = 32 * 1024
 
 
 def wrap(
-    te: TargetExperiment, ws: Path, inner: str, bundle: dict | None = None, *, _policy_test_live_inputs: bool = False
+    te: TargetExperiment,
+    ws: Path,
+    inner: str,
+    bundle: dict | None = None,
+    *,
+    argv_guard: Callable[[list[str]], None] | None = None,
+    _policy_test_live_inputs: bool = False,
 ) -> str:
     """A ready-to-run ``bash -c`` string: full argv + the sandbox env exports + the inner command.
 
@@ -1365,6 +1371,8 @@ def wrap(
     from merlin.targetgen.sandbox import toolchain as TC
 
     argv = full_argv(te, ws, bundle, _policy_test_live_inputs=_policy_test_live_inputs)
+    if argv_guard is not None:
+        argv_guard(argv)
     return compose_command(argv, f" bash -c '{TC.sandbox_env(te, ws)} {inner}'", ws)
 
 
