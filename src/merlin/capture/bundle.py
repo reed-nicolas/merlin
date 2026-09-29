@@ -322,5 +322,5 @@ def available_models() -> list[str]:
 
 
 def known_models() -> list[str]:
-    """All base models in the registry (whether or not captured yet)."""
-    return sorted(_models.MODEL_ARCH.keys())
+    """All source-owned workload names, even with no captures on disk."""
+    return sorted(_models.workload_names())

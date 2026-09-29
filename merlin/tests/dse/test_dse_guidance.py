@@ -3809,6 +3809,10 @@ def test_every_declared_roster_model_resolves_to_an_architecture():
     from merlin.common.paths import repo_root
     from merlin.dse_guidance.models import MODEL_ARCH
 
+    from merlin.capture.models import workload_names
+
+    assert set(MODEL_ARCH) == set(workload_names())
+
     roots = repo_root() / "merlin/experiments/capsule_bench/targets"
     declared: set[str] = set()
     for d in sorted(p for p in roots.iterdir() if p.is_dir()):
