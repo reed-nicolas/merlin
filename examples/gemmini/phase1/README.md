@@ -20,6 +20,10 @@ Prepare and review a fresh corpus release through the
 before verified execution. Preparation copies these inputs into the release and
 removes the live source pointers. New bundles grant the declared task directory;
 old bundles or frozen runs are not rewritten to adopt this layout.
+Phase 1 startup rechecks the sealed `phase0_readiness` against the frozen corpus;
+the distinct `whole_workload_phase1` verdict remains incomplete until a compiler
+produces and executes the required typed routes. A diagnostic capture replay is
+not sufficient for the Phase 0 handoff.
 
 ## What the functional finish line must prove
 
@@ -31,6 +35,12 @@ operator inventory, an accounted route for every region (Gemmini or a declared
 host lane), a whole-model compile with no unsupported-op escape, executable
 artifacts, numerical comparison against an independent framework reference,
 and observed dispatch evidence that the admitted accelerator work actually ran.
+For fused stages, inspect `planned_outlined_alignment` beside the dynamic
+`dispatch_ledger`: a routing plan or group proposal alone does not prove the
+runtime emitted one accelerator dispatch, much less executed it. Missing alignment
+is incomplete; an eligible group split into host work is a functional placement
+failure. The current runtime does not yet execute grouped epilogues on its mesh
+path, so do not claim fused-stage coverage from a passing contraction counter.
 Keep the capture, quantization scheme, weights/manifest, compiler submission
 hash, intermediate MLIR and run receipts together; a storage dtype alone does
 not establish the arithmetic or accelerator placement. The

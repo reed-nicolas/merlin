@@ -290,11 +290,15 @@ selected capability contract, without consulting an ambient provider. Mixed
 host/device composition stays unmeasured until an emitted boundary is bound to
 that same selected source; a declared legal boundary is not an execution proof.
 
-Verified admission also requires reviewed software and host semantics, complete
-capture source closure, independent numerical and compiler checks, resolved
-operation/transfer obligations, and an operator-owned hidden cohort. These
-cannot be inferred from a diagnostic run or supplied by changing a status
-field. Review the generated model inventory and `grading.resource_bound` for
+The release records two separate verdicts: `phase0_readiness` for the deterministic
+corpus handoff, and `whole_workload_phase1` for compiler qualification. Phase 0
+readiness requires reviewed software and host semantics, verified capture-source
+closure, complete graph/source correspondence, witnessed functional capsules,
+selected hardware evidence, and an operator-owned hidden cohort. Artifact-backed
+support lowering, emitted host/device routes and transfers, numerical target
+checks, and executed composition remain explicit Phase 1 obligations; they are
+not silently counted as passed at release time. None of these claims follows
+from a diagnostic run or a changed status field. Review the generated model inventory and `grading.resource_bound` for
 the *selected* cohort; if policy changes, freeze a new run rather than editing
 an old receipt. With a separately selected private hidden category, prepare a
 candidate release using:
