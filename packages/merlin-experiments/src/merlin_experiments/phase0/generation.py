@@ -235,6 +235,7 @@ def generate_target(
     profiles_root: str | Path | None = None,
     recipe: str | Path | None = None,
     software_spec: str | Path | None = None,
+    capability_contract: str | Path | None = None,
     hardware_spec: str | Path | None = None,
     rtl_facts: str | Path | None = None,
     evidence_root: str | Path | None = None,
@@ -309,6 +310,7 @@ def generate_target(
             evidence = select_evidence(
                 hardware_target,
                 descriptor=descriptor,
+                capability_contract_path=capability_contract,
                 facts_path=rtl_facts,
                 software_spec=software_spec or profile.get("_software_spec_path"),
                 hardware_spec=hardware_spec,

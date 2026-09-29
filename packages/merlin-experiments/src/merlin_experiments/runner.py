@@ -183,6 +183,7 @@ _PHASE0_OPTIONAL_INPUTS = frozenset(
         "smt_profile",
         "hidden_profile",
         "software_spec",
+        "capability_contract",
         "hardware_spec",
         "rtl_facts",
     }
@@ -401,6 +402,7 @@ def resolve_plan(
     corpus_seal: Path | None = None,
     bundle_manifest: Path | None = None,
     phase0_conformance_spec: Path | None = None,
+    phase0_capability_contract: Path | None = None,
     phase0_synth_profile: Path | None = None,
     phase0_hidden_profile: Path | None = None,
     phase0_rtl_facts: Path | None = None,
@@ -429,6 +431,7 @@ def resolve_plan(
             path is not None
             for path in (
                 phase0_conformance_spec,
+                phase0_capability_contract,
                 phase0_synth_profile,
                 phase0_hidden_profile,
                 phase0_rtl_facts,
@@ -443,6 +446,7 @@ def resolve_plan(
     phase0_selection = {}
     for name, path in (
         ("conformance_spec", phase0_conformance_spec),
+        ("capability_contract", phase0_capability_contract),
         ("synth_profile", phase0_synth_profile),
         ("hidden_profile", phase0_hidden_profile),
         ("rtl_facts", phase0_rtl_facts),

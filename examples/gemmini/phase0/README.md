@@ -14,7 +14,7 @@ Phase 1 develops the functional compiler; Phase 2 uses a separate performance co
 | [Host capabilities](../target/host-capabilities.yaml) | Separately pinned host compiler and reviewed operation/precision support |
 | [Recipe](recipe.yaml) | Derived-only policy, comparison tolerances and oracle tiers; no authored capsule list |
 | [Descriptor](../target/descriptor.yaml) | Independent iteration roster, held-out validation roster and experiment resources |
-| [Selected capability contract](../target/contracts/target_contract.yaml) | Example-specific command order and runner profile bound to the OOT support package |
+| [Selected capability contract](../target/contracts/target_contract.yaml) | Prototype command order and runner intent, explicitly frozen by the experiment; not an OOT support certificate |
 | Shared performance template | Phase 2 objectives and families, not additional functional capability |
 
 The selected configuration has signed 8-bit operands, a 20-bit MAC result and

@@ -11,6 +11,7 @@ Phase 1 develops the functional compiler; Phase 2 uses a separate performance co
 | --- | --- |
 | [Software spec](../target/software-spec.yaml) | Operation signatures, numerical semantics, placement/transfers and quantization eligibility |
 | [Hardware selection](../target/hardware.yaml) | Source-production requirements and direct RTL audit questions |
+| [Capability contract](../target/contracts/target_contract.yaml) | Prototype ISA/runner intent that RTL facts cannot supply; selected and frozen by the experiment, not a support certificate |
 | [Host capabilities](../target/host-capabilities.yaml) | Separately pinned host compiler and reviewed operation/precision support |
 | [Recipe](recipe.yaml) | Derived-only policy, comparison tolerances and oracle tiers; no authored capsule list |
 | [Descriptor](../target/descriptor.yaml) | Independent iteration roster, held-out validation roster and experiment resources |

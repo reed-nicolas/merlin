@@ -51,6 +51,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         child.add_argument("--phase0-rtl-facts", type=Path, help="select exact extracted facts for a new Phase 0 run")
         child.add_argument(
+            "--phase0-capability-contract",
+            type=Path,
+            help="select exact same-target capability contract for a new Phase 0 run",
+        )
+        child.add_argument(
             "--phase0-evidence-mode",
             choices=("diagnostic", "verified"),
             help="diagnostic preserves unknowns; verified refuses unresolved required evidence",
@@ -213,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                 corpus_seal=args.corpus_seal,
                 bundle_manifest=args.bundle_manifest,
                 phase0_conformance_spec=args.phase0_conformance_spec,
+                phase0_capability_contract=args.phase0_capability_contract,
                 phase0_synth_profile=args.phase0_synth_profile,
                 phase0_rtl_facts=args.phase0_rtl_facts,
                 phase0_evidence_mode=args.phase0_evidence_mode,

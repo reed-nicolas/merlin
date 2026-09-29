@@ -193,6 +193,7 @@ class Adapter:
                 "smt_profile",
                 "hidden_profile",
                 "software_spec",
+                "capability_contract",
                 "hardware_spec",
                 "rtl_facts",
                 "evidence_mode",
@@ -264,7 +265,10 @@ class Adapter:
                     "phase-0 orchestration requires explicit recipe inputs or an explicit profiles_root input"
                 )
             argv += ["--target", profile, "--output-root", str(run_dir / "phase0" / "capsules")]
-            if any(name in values for name in ("software_spec", "hardware_spec", "rtl_facts", "evidence_mode")):
+            if any(
+                name in values
+                for name in ("software_spec", "capability_contract", "hardware_spec", "rtl_facts", "evidence_mode")
+            ):
                 argv += ["--evidence-root", str(run_dir / "phase0")]
         elif self.name == "capsule_bench":
             env["MERLIN_TARGET_EXPERIMENT"] = values["descriptor"]
@@ -348,6 +352,7 @@ ADAPTERS = {
             "profiles_root": Option("input"),
             "recipe": Option("input"),
             "software_spec": Option("input"),
+            "capability_contract": Option("input"),
             "hardware_spec": Option("input"),
             "rtl_facts": Option("input"),
             "evidence_mode": Option(choices=("diagnostic", "verified")),

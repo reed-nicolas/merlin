@@ -41,6 +41,7 @@ def selection(command: dict, target: str):
     return select_evidence(
         target,
         descriptor=inputs["descriptor"],
+        capability_contract_path=inputs.get("capability_contract"),
         facts_path=inputs.get("rtl_facts"),
         hardware_spec=inputs.get("hardware_spec"),
         software_spec=inputs.get("software_spec"),

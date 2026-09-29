@@ -287,6 +287,7 @@ def select_evidence(
     target: str,
     *,
     descriptor=None,
+    capability_contract_path=None,
     facts_path=None,
     hardware_spec=None,
     software_spec=None,
@@ -446,7 +447,12 @@ def select_evidence(
     if "schema" in hardware_doc and hardware_doc["schema"] != "merlin.hardware_selection.v1":
         raise ValueError("unsupported hardware selection schema")
     software_doc = document(software_spec, "software-spec")
-    contract, residual, provider = {}, {}, None
+    contract = (
+        document(capability_contract_path, "target-contract", required=True)
+        if capability_contract_path is not None
+        else {}
+    )
+    residual, provider = {}, None
     try:
         provider = target_registry.resolve(target)
     except (KeyError, FileNotFoundError, ValueError) as exc:
@@ -455,9 +461,8 @@ def select_evidence(
         # Capability input selection is independent of executable support ownership.
         # The existing explicit contract selector must not be ignored merely because
         # support code was selected from an external provider.
-        contract = document(rtl_facts.target_contract_path(target), "target-contract", required=False)
-        if contract and contract.get("name") != target:
-            raise ValueError("selected backend capability contract differs from selected target")
+        if capability_contract_path is None:
+            contract = document(rtl_facts.target_contract_path(target), "target-contract", required=False)
         residual = document(provider.base / "contracts" / "residual.yaml", "residual", required=False)
         # Bind support code and its declarative/header dependencies before hooks
         # execute. This is an inventory, not a candidate grant or qualification.
@@ -468,6 +473,8 @@ def select_evidence(
                 and not excluded.intersection(path.relative_to(provider.base).parts)
             ):
                 observe(path, "support-source")
+    if contract and contract.get("name") != target:
+        raise ValueError("selected backend capability contract differs from selected target")
     datapath = {}
     if software_spec is not None:
         from merlin.targetgen.software_spec import (

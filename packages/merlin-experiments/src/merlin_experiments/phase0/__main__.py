@@ -23,6 +23,7 @@ def main(argv=None) -> int:
         "--software-spec", type=Path, help="selected software-visible semantics; overrides the recipe's path"
     )
     ap.add_argument("--hardware-spec", type=Path, help="selected hardware source and extraction declarations")
+    ap.add_argument("--capability-contract", type=Path, help="selected same-target backend capability declaration")
     ap.add_argument("--rtl-facts", type=Path, help="exact pre-extracted hardware facts; never silently regenerate")
     ap.add_argument("--evidence-root", type=Path, help="run-owned hardware/software evidence destination")
     ap.add_argument(
@@ -110,7 +111,14 @@ def main(argv=None) -> int:
         options.update(
             {
                 name: getattr(a, name)
-                for name in ("hardware_spec", "rtl_facts", "evidence_root", "evidence_input", "evidence_mode")
+                for name in (
+                    "hardware_spec",
+                    "capability_contract",
+                    "rtl_facts",
+                    "evidence_root",
+                    "evidence_input",
+                    "evidence_mode",
+                )
                 if getattr(a, name) is not None
             }
         )

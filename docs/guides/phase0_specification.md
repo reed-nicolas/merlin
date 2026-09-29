@@ -121,6 +121,7 @@ software-visible behavior. It is not a second handwritten hardware geometry tabl
 | Input | Define explicitly | Do not treat it as |
 | --- | --- | --- |
 | SW spec | Operation/signature constraints; layouts, tails, broadcasting, aliasing, placement, selected numeric behavior, quantization eligibility and transfer constraints | Automatically proven by an instruction name or storage width |
+| Selected capability contract | Target ISA/runner intent and extraction anchors that RTL facts cannot establish; explicit same-target Phase 0 input | Executable OOT support, extracted geometry or certification |
 | Selected OOT provider/backend config | Runtime implementation, ISA vocabulary/protocol ownership, extraction anchors and callable references | A second mandatory software spec to hand-maintain |
 | Hardware selection | Which evidence is required and which source/configuration is selected | A capability declaration or certificate |
 | Extracted RTL facts | Array and memory geometry, interfaces, observed decoder fields, datatype evidence and structural timing where established | Complete operation latency, numerical behavior, endpoint kind or software legality |
@@ -133,6 +134,13 @@ and executable typed constraints. Use semantic `families` for a shared class, or
 Numerical semantics select an independent model and its rounding/reduction policy,
 never a target-name default. Generated source audits, test counts, qualification hashes
 and long diagnostic reports belong in artifacts, not this YAML.
+
+When the SW spec is minimal, `experiment.yaml` must select its same-target
+`capability_contract` as a separate file. Installed Phase 0 freezes that file's
+exact bytes and refuses a changed contract on resume. For a new run, use
+`--phase0-capability-contract PATH` to select a reviewed replacement without
+editing the experiment definition. An authored prototype remains diagnostic
+until the required RTL and executable support evidence are separately qualified.
 
 ## Describe instruction semantics separately
 

@@ -66,6 +66,22 @@ def test_exact_raw_bytes_and_derived_hashes_are_distinct(monkeypatch, tmp_path):
     assert selected.loaded_facts["facts"]["arrays"][0]["rows"] == 4
 
 
+def test_explicit_capability_contract_does_not_require_executable_provider(monkeypatch, tmp_path):
+    contract = tmp_path / "selected-contract.yaml"
+    contract.write_text("name: fixture\ncompute_units: []\n")
+    monkeypatch.setattr(target_registry, "resolve", lambda target: (_ for _ in ()).throw(KeyError(target)))
+    monkeypatch.setattr(
+        facts, "find_facts", lambda target, explicit=None: (_ for _ in ()).throw(FileNotFoundError(target))
+    )
+    selected = evidence.select_evidence("fixture", capability_contract_path=contract)
+    assert selected.contract == {"name": "fixture", "compute_units": []}
+    assert any(source.path == contract and source.role == "target-contract" for source in selected.source_snapshots)
+
+    contract.write_text("name: other_target\ncompute_units: []\n")
+    with pytest.raises(ValueError, match="differs from selected target"):
+        evidence.select_evidence("fixture", capability_contract_path=contract)
+
+
 def test_selected_readout_scale_conflict_is_a_bound_diagnostic(monkeypatch, tmp_path):
     body = {
         "arrays": [{"rows": 4, "cols": 4}],
