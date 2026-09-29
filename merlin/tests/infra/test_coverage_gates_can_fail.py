@@ -140,6 +140,22 @@ def test_an_unauditable_target_contributes_no_debt():
     assert CC.uncovered_debt([rep], set()) == []
 
 
+def test_one_target_semantic_audit_does_not_claim_other_targets_debt_resolved(tmp_path, monkeypatch, capsys):
+    gate = _load("check_semantic_coverage")
+    debt = tmp_path / "debt.txt"
+    debt.write_text("gemmini:known:one\natlas:still_open:two\n")
+    monkeypatch.setattr(gate, "DEBT", debt)
+    monkeypatch.setattr(
+        gate,
+        "audit",
+        lambda _: [{"target": "gemmini", "kind": "known", "family": "one", "detail": "fixture"}],
+    )
+    monkeypatch.setattr("sys.argv", ["check_semantic_coverage.py", "--target", "gemmini"])
+
+    assert gate.main() == 0
+    assert "RESOLVED" not in capsys.readouterr().out
+
+
 # ------------------------------------------------------------------------ claim-set disjointness
 
 CS = _load("check_claim_set_disjointness")
