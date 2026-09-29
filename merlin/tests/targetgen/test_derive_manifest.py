@@ -1,12 +1,16 @@
 """Tests for the target-agnostic ``derive_manifest`` — a capability manifest reconstructed from CIRCT
 facts + family defaults + a small residual (intent/prose) side-input.
 
-The load-bearing proof: ``derive_manifest`` reproduces gemmini's tracked ``target_contract.yaml``
-field-by-field, filling the FACTS-derivable fields (mesh / capacities / datapath dtypes+accumulate /
-legal-funct codes) from ``facts.json`` while carrying every intent/prose field through the residual.
+The load-bearing proof: ``derive_manifest`` carries Gemmini intent and adds
+grounded geometry, capacity and datapath evidence without promoting an observed
+decoder field to complete instruction legality.
 Hermetic: facts are read from the committed pin via an explicit path (no mlc regeneration).
 """
 from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -71,11 +75,11 @@ def test_derive_reproduces_gemmini_facts_fields(gemmini_tracked, gemmini_facts):
     assert unit["accumulate"] == [{"in": "int8", "weight": "int8", "acc": dp_acc["dtype"]}]
     assert dp_in["dtype"] == "i8" and dp_acc["dtype"] == "i32"
 
-    # --- FACTS: encoding CODES from the funct_decode_table interface ---
+    # --- FACTS: transport selection, not complete ISA legality ---
     fdt = next(i for i in body["interfaces"] if i["name"] == "funct_decode_table")
     assert m["encoding"]["custom_opcode"] == fdt["custom_opcode"] == 123
     assert m["encoding"]["funct3"] == fdt["funct3"] == 3
-    assert m["encoding"]["legal_funct"] == fdt["legal_funct"]
+    assert "legal_funct" not in m["encoding"]
 
 
 def test_derive_carries_residual_intent_and_prose(gemmini_tracked, gemmini_facts):
@@ -88,10 +92,10 @@ def test_derive_carries_residual_intent_and_prose(gemmini_tracked, gemmini_facts
             continue
         assert m[key] == val, f"non-facts field {key!r} drifted"
 
-    # The encoding ABI sub-block (residual) is preserved; the codes (facts) are ADDED on top.
+    # The encoding ABI sub-block (residual) is preserved; selected transport fields are added.
     for k, v in gemmini_tracked["encoding"].items():
         assert m["encoding"][k] == v
-    assert set(m["encoding"]) - set(gemmini_tracked["encoding"]) == {"custom_opcode", "funct3", "legal_funct"}
+    assert set(m["encoding"]) - set(gemmini_tracked["encoding"]) == {"custom_opcode", "funct3"}
 
     # The compute-unit INTENT (name/kind/ops/scaling/requant) comes straight from the residual.
     tracked_u, derived_u = gemmini_tracked["compute_units"][0], m["compute_units"][0]
@@ -152,41 +156,48 @@ def test_existing_manifests_path_unchanged():
         assert load_capability_manifest(target).kind == "systolic"
 
 
-def test_endpoint_kind_is_derived_from_the_decode_opcode_width_not_hand_set():
-    """The codegen endpoint must fall out of the CIRCT decode facts, never a per-target hand-set field.
-    RoCC's funct field is 7 bits, so a decode table whose legal opcodes all fit ``<= 0x7f`` is a RoCC
-    co-processor (``inline_asm_insn``); one with any wider opcode is a standalone instruction decode — a
-    self-hosted ISA core (``external_backend``). This is the exact signal that separates gemmini (7-bit
-    ReservationStation funct7) from atlas (14-bit ScalarDecoder), with no target name in the logic."""
+def test_endpoint_kind_requires_complete_interface_not_decode_value_width():
+    """A decoder field's value width cannot distinguish a host command from a local ISA."""
     body = cm._facts_body
-    rocc = {"facts": {"interfaces": [{"name": "funct_decode_table", "legal_funct": [0, 64, 126]}]}}
-    wide = {"facts": {"interfaces": [{"name": "funct_decode_table", "legal_funct": [87, 4311, 9943]}]}}
-    assert cm._endpoint_from_facts(body(rocc)) == "inline_asm_insn"
-    assert cm._endpoint_from_facts(body(wide)) == "external_backend"
+    rocc = {"facts": {"interfaces": [{"name": "funct_decode_table", "legal_funct": [0, 64, 126],
+                                        "scope": "observed_decode_field"}]}}
+    wide = {"facts": {"interfaces": [{"name": "funct_decode_table", "legal_funct": [87, 4311, 9943],
+                                        "scope": "observed_decode_field"}]}}
+    assert cm._endpoint_from_facts(body(rocc)) is None
+    assert cm._endpoint_from_facts(body(wide)) is None
     assert cm._endpoint_from_facts(body({"facts": {"interfaces": []}})) is None  # -> family default
 
-    # End-to-end: the SAME systolic residual + descriptor derives DIFFERENT endpoints purely from the
-    # decode width — proving atlas's external_backend is not hand-set but a fact of its wide ISA.
+    # End-to-end: neither observed field is allowed to pick an executable endpoint.
     res = {"compute_units": [{"name": "mxu", "kind": "systolic", "ops": ["matmul"],
                               "dtypes": ["fp8_e4m3", "bf16"]}]}
     desc = {"target": "acme", "kind": "systolic"}
     m_rocc = cm.derive_manifest(desc, rocc, residual=res)
     m_wide = cm.derive_manifest(desc, wide, residual=res)
-    assert m_rocc["endpoint_kind"] == "inline_asm_insn"
-    assert m_wide["endpoint_kind"] == "external_backend"
+    assert m_rocc["endpoint_kind"] == m_wide["endpoint_kind"] == "unresolved"
 
 
-def test_atlas_manifest_derives_endpoint_and_mesh_from_facts_only_dtypes_residual():
-    """The atlas manifest builder is the derive path (facts + residual), not a hand-authored contract:
-    endpoint_kind + mesh + encoding codes come from the pinned CIRCT facts; only the datapath dtypes are
-    the (provenance-tagged, not-yet-grounded) residual. ``manifest_for`` loads atlas's residual (which
-    carries ``facts_source: rtl``) and grounds the facts — the same agnostic path every target uses."""
-    m = cm.validate(cm.manifest_for("atlas"))
-    assert m["endpoint_kind"] == "external_backend"              # DERIVED from the 14-bit decode
+def test_atlas_manifest_keeps_endpoint_unresolved_for_field_local_decode():
+    """An explicitly selected, source-verified Atlas fact bundle grounds its mesh only."""
+    selected = os.environ.get("MERLIN_ATLAS_SELECTED_FACTS")
+    if not selected:
+        pytest.skip("set MERLIN_ATLAS_SELECTED_FACTS to an explicit source-verified facts.json")
+    facts = json.loads(Path(selected).read_text(encoding="utf-8"))
+    assert facts["source_consistency"]["status"] == "verified"
+    assert (facts.get("inputs") or {}).get("target") == "atlas"
+    residual = cm._load_residual("atlas")
+    assert residual.pop("facts_source") == "rtl"
+    m = cm.validate(cm.derive_manifest({"target": "atlas", "facts_source": "rtl"}, facts, residual=residual))
+    assert m["endpoint_kind"] == "unresolved"  # field-local decode is insufficient
     assert m["capabilities"]["mesh"] == {"rows": 32, "cols": 32}  # DERIVED from the facts array
-    assert len(m["encoding"]["legal_funct"]) == 42               # DERIVED from the decode table
-    assert m["compute_units"][0]["dtypes"] == ["fp8_e4m3", "bf16"]  # residual intent
-    assert "not yet RTL-grounded" in m["provenance"].lower() or "not rtl-certified" in m["provenance"].lower()
+    decoder = next(i for i in facts["facts"]["interfaces"] if i["name"] == "funct_decode_table")
+    assert decoder["scope"] == "observed_decode_field" and decoder["complete_isa"] is False
+    assert "legal_funct" not in m.get("encoding", {})
+    assert m["compute_units"][0]["dtypes"] == ["fp8_e4m3"]  # residual operand format
+    assert m["compute_units"][0]["accumulate"] == [
+        {"in": "fp8_e4m3", "weight": "fp8_e4m3", "acc": "bf16"}
+    ]  # the accumulator format is not a second input dtype
+    assert m["provenance"] == residual["provenance"]
+    assert "not an executable backend" in m["provenance"].lower()
 
 
 def test_derive_manifest_maps_the_spatial_opu_fact_shape():

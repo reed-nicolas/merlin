@@ -5,9 +5,9 @@ generated as an ``out/`` artifact and plugged into the routing tooling — the s
 out-of-tree target repo ships. There are NO per-target manifest dicts baked into this core module:
 every manifest is reconstructed by :func:`derive_manifest` from three sources —
 
-  * **CIRCT FACTS** (``facts.json``): mesh / memory capacities / datapath dtypes / legal-funct codes,
+  * **CIRCT FACTS** (``facts.json``): mesh / memory capacities / datapath dtypes / observed decode fields,
   * **FAMILY defaults** (:func:`merlin.targetgen.families.family_profile`, keyed by compute-unit kind):
-    the codegen endpoint + runner fallback,
+    non-authorizing runner hints when no executable endpoint is established,
   * a small **RESIDUAL** side-input (intent + prose RTL cannot ground) that lives WITH the target
     package at ``<target_base>/contracts/residual.yaml`` — the discovered target dir, never a Python
     literal here.
@@ -16,10 +16,9 @@ Discovery (:func:`discovered_targets`) scans ``artifacts/targets/*/contracts/res
 ``manifest_for(name)`` runs the single agnostic derive path over each. A new accelerator brings itself
 up by dropping a descriptor + a residual and letting mlc extract facts — with zero edits to core.
 
-The shipped residuals: ``rvv`` (K1 vector unit — regular floats + int8, no low-bit datapath),
-``mx_gemmini`` (microscaling systolic PE — mxfp4/6/8 + int8/bf16), ``radiance`` (SIMT tensor core that
-composes the gemmini-mx PE), and ``atlas`` (self-hosted-ISA NPU MXU whose mesh/encoding/endpoint are
-DERIVED from RTL facts — ``facts_source: rtl``). All are provenance-tagged prototypes flagged
+The shipped residuals include ``rvv``, ``mx_gemmini``, ``radiance`` and ``atlas``.
+An observed Atlas decoder field does not by itself establish its encoding or endpoint.
+All are provenance-tagged prototypes flagged
 ``requires_human_review`` — NOT RTL-certified.
 """
 
@@ -123,7 +122,7 @@ def manifest_for(name: str) -> dict[str, Any]:
     elif facts_source == "simt":
         # A SIMT self-hosted core: its facts come from the SIMT RTL introspect (a standalone instruction
         # encoding, not a host RoCC decode table), adapted to the facts body shape so the SAME deriver
-        # grounds endpoint_kind from them. Empty {} when no introspect serves the target (family default).
+        # grounds endpoint_kind from them. Empty {} means the required interface is unresolved.
         from .rtl import mlc_bridge as _mb
 
         facts = _mb.simt_facts(facts_target)
@@ -140,7 +139,7 @@ def manifest_for(name: str) -> dict[str, Any]:
         from .rtl import spatial_introspect as _si
 
         facts = _si.build_fact_bundle(facts_target)
-    return derive_manifest({"target": name}, facts, residual=residual)
+    return derive_manifest({"target": name, "facts_source": facts_source}, facts, residual=residual)
 
 
 def __getattr__(attr: str):
@@ -273,45 +272,67 @@ def _datapaths_from_facts(body: dict[str, Any]) -> tuple[str | None, list[dict[s
 
 
 def _encoding_codes_from_facts(body: dict[str, Any]) -> dict[str, Any]:
-    """The RTL-grounded encoding CODES (``custom_opcode`` / ``funct3`` / ``legal_funct``) from the
-    ``funct_decode_table`` interface — the only encoding fields facts can ground (the ABI sub-block
-    lives in the residual)."""
+    """The observed RoCC funct field, never a standalone instruction encoding.
+
+    A generic equality fan-out can also find one field of a self-hosted ISA.
+    Only a selected RoCC custom slot supplies the transport context in which
+    these values are meaningful as funct codes. The observation is not an
+    exhaustive executable-ISA legality claim.
+    """
     for itf in body.get("interfaces") or []:
-        if itf.get("name") == "funct_decode_table":
-            return {k: itf[k] for k in ("custom_opcode", "funct3", "legal_funct") if k in itf}
+        if itf.get("name") == "funct_decode_table" and itf.get("custom_opcode") is not None:
+            fields = ("custom_opcode", "funct3")
+            if itf.get("scope") == "complete_rocc_funct7" and itf.get("complete_isa") is True:
+                fields += ("legal_funct",)
+            return {k: itf[k] for k in fields if k in itf}
     return {}
 
 
-# RoCC's funct field is architecturally 7 bits — a legal opcode above 0x7f cannot be a RoCC funct7, so a
-# decode table with wider opcodes is a standalone instruction decode (a self-hosted ISA core with its own
-# opcodes/PC/IMEM), not a RoCC co-processor. This is the load-bearing, RTL-grounded distinction between a
-# host-driven ``.insn`` endpoint and a device-kernel (``external_backend``) endpoint — never hand-set.
+# RoCC's funct field is architecturally 7 bits. This bound validates an
+# independently scoped RoCC interface; it does not classify an arbitrary field.
 _ROCC_FUNCT7_MAX = 0x7f  # derived-ok: standard RoCC ABI — funct7 is a 7-bit field, max 2^7-1 (not target-specific)  # fmt: skip
+_RISCV_CUSTOM_MAJOR_OPCODES = frozenset((0x0B, 0x2B, 0x5B, 0x7B))
 
 
 def _endpoint_from_facts(body: dict[str, Any]) -> str | None:
-    """Codegen ``endpoint_kind`` DERIVED from the CIRCT decode facts, never hand-set per target.
+    """Select an endpoint only from an explicit executable-interface fact.
 
-    A ``funct_decode_table`` whose legal opcodes ALL fit RoCC's 7-bit funct field (``<= 0x7f``) is a RoCC
-    co-processor decoded from the host pipeline -> ``inline_asm_insn`` (emit host ``.insn``). One with any
-    wider opcode (a standalone instruction decode — e.g. atlas's 14-bit ``ScalarDecoder``, values to
-    ``0x26d7``) is a self-hosted ISA core -> ``external_backend`` (emit a device ``kernel.S`` the target's
-    own assembler builds). No decode table -> ``None`` (caller falls back to the family default, e.g. a
-    spatial command-buffer target has one-hot op ports, not an opcode decode)."""
-    for itf in body.get("interfaces") or []:
-        if itf.get("name") == "funct_decode_table":
-            legal = itf.get("legal_funct") or []
-            if not legal:
-                return None
-            return "inline_asm_insn" if max(legal) <= _ROCC_FUNCT7_MAX else "external_backend"
-    # A self-hosted-ISA core carries its OWN instruction encoding (``encoding_bits``) + instruction
-    # classes, NOT a host-decoded RoCC funct — so it emits a device kernel the target's own toolchain
-    # builds -> ``external_backend``. This is the SIMT analog of "opcodes too wide for RoCC funct7": the
-    # signal is a standalone instruction encoding, surfaced as a ``self_hosted_isa`` interface (e.g. a
-    # 64-bit Muon/Vortex SIMT encoding), never a target-name test.
+    Equality comparisons over a field are not an ISA classification: a 5-bit
+    sub-op may belong to a 32-bit self-hosted instruction, and a 14-bit slice
+    does not prove the rest of that instruction's legality. Legacy tables with
+    no scope are equally non-authorizing. An observed RoCC command transport
+    with a selected custom major opcode, a scoped complete RoCC interface, or
+    an independently established self-hosted instruction interface can decide
+    the endpoint; decoder values alone return unknown.
+    """
     for itf in body.get("interfaces") or []:
         if itf.get("name") == "self_hosted_isa" and itf.get("encoding_bits"):
             return "external_backend"
+    # The host command transport plus its selected custom major opcode proves
+    # how instructions reach a RoCC device. It says nothing about which funct
+    # values are exhaustive or legal; those field observations remain scoped.
+    interfaces = [itf for itf in (body.get("interfaces") or []) if isinstance(itf, dict)]
+    has_rocc_command = any(itf.get("name") == "rocc_cmd" for itf in interfaces)
+    has_custom_slot = any(
+        itf.get("name") == "funct_decode_table"
+        and isinstance(itf.get("custom_opcode"), int)
+        and itf["custom_opcode"] in _RISCV_CUSTOM_MAJOR_OPCODES
+        for itf in interfaces
+    )
+    if has_rocc_command and has_custom_slot:
+        return "inline_asm_insn"
+    for itf in body.get("interfaces") or []:
+        if (
+            itf.get("name") == "funct_decode_table"
+            and itf.get("scope") == "complete_rocc_funct7"
+            and itf.get("complete_isa") is True
+            and itf.get("custom_opcode") is not None
+        ):
+            legal = itf.get("legal_funct") or []
+            if not legal:
+                return None
+            if all(isinstance(v, int) and 0 <= v <= _ROCC_FUNCT7_MAX for v in legal):
+                return "inline_asm_insn"
     return None
 
 
@@ -481,7 +502,8 @@ def derive_manifest(
       (memories), each compute unit's ``dtypes`` + ``accumulate`` matrix (datapaths), and the encoding
       CODES ``custom_opcode``/``funct3``/``legal_funct`` (funct_decode_table interface).
     - **FAMILY defaults** (:func:`merlin.targetgen.families.family_profile`, keyed by the primary
-      compute-unit ``kind``): the codegen ``endpoint_kind`` and the ``runner.suite`` fallback. The
+      compute-unit ``kind``): ``runner.suite`` and, only when no executable
+      facts source was requested, a provisional codegen ``endpoint_kind`` fallback. The
       remaining generation defaults (rtl_tiers/perf_fields/trace_gate) are filled at read time by
       :func:`merlin.targetgen.target_experiment.load_capability_manifest`, so they are not duplicated
       into the emitted contract.
@@ -556,12 +578,23 @@ def derive_manifest(
     # primary compute-unit kind -> family generation defaults (reuse the shared registry + resolver)
     kind = _primary_kind(_cu.compute_units(manifest))
     profile = _families.family_profile(kind)
-    # endpoint_kind: FACTS win (the decode-width signal) over the residual over the family default. A
-    # self-hosted-ISA systolic core (atlas: 14-bit ScalarDecoder) derives external_backend; a RoCC
-    # systolic co-processor (gemmini: 7-bit funct7) derives inline_asm_insn — neither hand-set.
+    # A field-local decode observation cannot choose an executable endpoint.
+    # Keep an explicitly authored endpoint, or a complete independent interface
+    # fact; otherwise mark a target with instruction observations unresolved.
     endpoint = _endpoint_from_facts(body)
     if endpoint:
         manifest["endpoint_kind"] = endpoint
+    elif manifest.get("endpoint_kind"):
+        pass  # reviewed target-owned interface declaration, not inferred from width
+    elif _descriptor_get(descriptor, "facts_source") in {"rtl", "simt"} or any(
+        itf.get("name") in {"funct_decode_table", "self_hosted_isa"}
+        for itf in (body.get("interfaces") or []) if isinstance(itf, dict)
+    ):
+        manifest["endpoint_kind"] = "unresolved"
+        manifest["endpoint_resolution"] = {
+            "status": "unverified",
+            "reason": "selected facts do not establish an executable endpoint",
+        }
     else:
         manifest.setdefault("endpoint_kind", profile.endpoint_kind_default)
 

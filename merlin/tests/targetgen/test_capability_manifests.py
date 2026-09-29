@@ -14,6 +14,7 @@ from merlin.targetgen import capability_manifests as cm
 from merlin.targetgen import compute_units as cu
 from merlin.targetgen import families as fam
 from merlin.targetgen import routing as rt
+from merlin.targetgen.rtl.facts import load_facts
 from merlin.targetgen.target_experiment import _primary_kind
 
 pytestmark = pytest.mark.target("radiance", "mx_gemmini", "atlas")
@@ -67,13 +68,11 @@ def test_prototype_manifests_reproduce_residual_plus_inert_family_defaults():
 
 
 def test_atlas_manifest_reproduced_from_residual_and_facts():
-    """OV1 regression for the facts-grounded target: atlas ships ``facts_source: rtl`` in its residual,
-    so ``manifest_for`` layers the RTL facts (mesh/encoding/endpoint) onto the intent+prose residual —
-    the same derive path, no hand-authored contract, no per-target builder."""
+    """Atlas intent survives fact derivation without promoting a decoder field to an ISA."""
     m = cm.manifest_for("atlas")
     residual = cm._load_residual("atlas")
     assert residual.pop("facts_source") == "rtl"
-    # residual intent/prose is preserved verbatim (facts only AUGMENT mesh/encoding/capacities)
+    # Residual intent/prose is preserved; observed decode values remain facts, not executable encoding.
     for key in ("name", "family", "features", "provenance"):
         assert m[key] == residual[key], f"atlas.{key} drifted from the residual"
     # compute_units is ADDITIVE rather than verbatim: the generator synthesizes a unit for each engine
@@ -89,20 +88,24 @@ def test_atlas_manifest_reproduced_from_residual_and_facts():
     # runner intent (model_ext/fourth_output_name) is preserved; only the inert suite default is added
     assert {k: m["runner"][k] for k in residual["runner"]} == residual["runner"]
     assert m["runner"]["suite"] == "atlas-capsule-bench"
-    # facts-grounded fields the residual deliberately omits
-    assert m["endpoint_kind"] == "external_backend"  # 14-bit decode -> self-hosted ISA
-    assert m["capabilities"]["mesh"] == {"rows": 32, "cols": 32}  # from the facts mesh array
-    assert len(m["encoding"]["legal_funct"]) == 42  # from the decode table
+    # The default selector may serve an older unverified cache that lacks mesh
+    # evidence. Assert exact projection of the selected facts, never a geometry
+    # borrowed from a different, explicitly selected source bundle.
+    selected = load_facts("atlas")
+    assert m["endpoint_kind"] == "unresolved"
+    assert m["capabilities"].get("mesh") == cm._mesh_from_facts(cm._facts_body(selected))
+    assert "legal_funct" not in m.get("encoding", {})
 
 
 def test_endpoint_from_facts_covers_rocc_and_self_hosted_isa():
-    """endpoint_kind derivation (pure/hermetic): a RoCC ``funct_decode_table`` grounds inline_asm_insn
-    (all funct <= 0x7f) vs external_backend (wider); a ``self_hosted_isa`` interface (own instruction
-    encoding, no RoCC funct) grounds external_backend — the SIMT analog. No signal -> None (family
-    default). No target-name test anywhere."""
+    """A field-local comparison set is not an endpoint; an explicit interface is."""
     ef = cm._endpoint_from_facts
-    assert ef({"interfaces": [{"name": "funct_decode_table", "legal_funct": [0, 3, 126]}]}) == "inline_asm_insn"
-    assert ef({"interfaces": [{"name": "funct_decode_table", "legal_funct": [0, 9943]}]}) == "external_backend"
+    assert ef({"interfaces": [{"name": "funct_decode_table", "legal_funct": [0, 3, 126]}]}) is None
+    assert ef({"interfaces": [{"name": "funct_decode_table", "legal_funct": [0, 9943]}]}) is None
+    assert ef({"interfaces": [{
+        "name": "funct_decode_table", "scope": "complete_rocc_funct7", "complete_isa": True,
+        "custom_opcode": 123, "legal_funct": [0, 3, 126],
+    }]}) == "inline_asm_insn"
     assert (
         ef({"interfaces": [{"name": "self_hosted_isa", "encoding_bits": 64, "instruction_classes": ["FMA", "TMC"]}]})
         == "external_backend"
@@ -112,27 +115,45 @@ def test_endpoint_from_facts_covers_rocc_and_self_hosted_isa():
     assert ef({"interfaces": []}) is None
 
 
-def test_radiance_and_mx_gemmini_endpoints_are_derived_not_defaulted():
-    """Both endpoints are DERIVED, not the family default (simt AND systolic both default to
-    inline_asm_insn): radiance -> external_backend from the SIMT self-hosted ISA (facts_source: simt);
-    mx_gemmini -> inline_asm_insn from gemmini's RoCC decode table (facts_source: rtl + facts_target:
-    gemmini), which also grounds mesh 16x16 while the MX dtypes stay put (not gemmini int8)."""
-    import pytest
+def test_rocc_endpoint_uses_command_transport_not_observed_funct_width():
+    observed = {"name": "funct_decode_table", "legal_funct": [87, 9943],
+                "scope": "observed_decode_field", "complete_isa": False,
+                "custom_opcode": 123}
+    assert cm._endpoint_from_facts({"interfaces": [observed]}) is None
+    assert cm._endpoint_from_facts({"interfaces": [{"name": "rocc_cmd"}, observed]}) == "inline_asm_insn"
 
-    try:
-        rad = cm.manifest_for("radiance")
-        mxg = cm.manifest_for("mx_gemmini")
-    except Exception as e:  # noqa: BLE001 — SIMT introspect / mlc facts unavailable in this env
-        pytest.skip(f"manifest derivation unavailable: {type(e).__name__}: {e}")
-    assert rad["endpoint_kind"] == "external_backend"  # SIMT self-hosted, NOT the simt default
-    assert mxg["endpoint_kind"] == "inline_asm_insn"  # RoCC decode, derived
-    assert mxg["capabilities"]["mesh"] == {"rows": 16, "cols": 16}  # from gemmini's facts mesh array
+
+def test_required_executable_facts_cannot_fall_back_to_family_endpoint():
+    residual = {"compute_units": [{"name": "core", "kind": "simt", "ops": ["matmul"], "dtypes": ["fp32"]}]}
+    unknown = cm.derive_manifest({"target": "unbound", "facts_source": "simt"}, {}, residual=residual)
+    assert unknown["endpoint_kind"] == "unresolved"
+    assert unknown["endpoint_resolution"]["status"] == "unverified"
+
+
+def test_radiance_and_mx_gemmini_endpoints_are_derived_not_defaulted():
+    """Use selected transport evidence; a missing SIMT provider cannot become RoCC by default."""
+    from merlin.targetgen.rtl import mlc_bridge
+
+    rad = cm.manifest_for("radiance")
+    mxg = cm.manifest_for("mx_gemmini")
+    gemmini_facts = cm._facts_body(load_facts("gemmini"))
+    interfaces = gemmini_facts.get("interfaces") or []
+    assert any(i.get("name") == "rocc_cmd" for i in interfaces)
+    assert any(i.get("name") == "funct_decode_table" and i.get("custom_opcode") == 123 for i in interfaces)
+    assert mxg["endpoint_kind"] == "inline_asm_insn"  # command transport + selected custom slot
+    assert mxg["capabilities"].get("mesh") == cm._mesh_from_facts(gemmini_facts)
     mxpe = next(u for u in mxg["compute_units"] if u["name"] == "mx_pe")
     assert {"mxfp4", "mxfp6", "mxfp8"} <= set(mxpe["dtypes"])  # MX dtypes preserved, not int8-only
-    # radiance SIMT geometry is DERIVED from the introspect (facts_source: simt), not a residual literal
-    assert rad["capabilities"]["simt"]["lanes_per_warp"] == 16
-    assert "lanes_per_warp" not in str(cm._load_residual("radiance").get("capabilities", {}).get("simt", {}))
-    assert rad["memory_model"].get("shared_memory_bytes") == 131072  # SMEM capacity derived (not base)
+    simt = mlc_bridge.simt_facts("radiance")
+    if simt:
+        assert cm._endpoint_from_facts(cm._facts_body(simt)) == "external_backend"
+        assert rad["endpoint_kind"] == "external_backend"
+        assert rad["capabilities"]["simt"]["lanes_per_warp"] == 16
+        assert rad["memory_model"].get("shared_memory_bytes") == 131072
+    else:
+        assert rad["endpoint_kind"] == "unresolved"
+        assert rad["endpoint_resolution"]["status"] == "unverified"
+        assert "simt" not in rad.get("capabilities", {})
 
 
 def _units(name):
@@ -193,32 +214,39 @@ def test_write_and_route_target(tmp_path):
         os.environ.pop("MERLIN_TARGET_PATH", None)
 
 
-def test_residual_target_materializes_contract_on_resolve(monkeypatch):
-    """A discovered residual-target (mx_gemmini ships only a contracts/residual.yaml) resolves with ZERO
-    env — no MERLIN_TARGET_PATH, no pre-committed contract: ``resolve`` materializes its contract from the
-    residual + mlc-derived RTL facts on demand ("drop a residual, let mlc derive"). Skips honestly when mlc
-    cannot ground the facts in this env (the fallback fails closed rather than fabricating a contract)."""
-    import os
-
+def test_target_resolution_is_read_only_and_materialization_is_explicit(tmp_path, monkeypatch):
+    """Resolution never derives or deletes a contract; generation needs a new, explicit destination."""
     from merlin.targetgen import target_registry as tr
 
+    name = "synth_materialize_boundary"
+    destination = tmp_path / "generated" / name
+    calls = []
+
+    def write_support_package(selected, root):
+        calls.append((selected, root))
+        contracts = root / "contracts"
+        contracts.mkdir(parents=True)
+        (contracts / "target_contract.yaml").write_text(f"name: {selected}\n", encoding="utf-8")
+        return root
+
     monkeypatch.delenv("MERLIN_TARGET_PATH", raising=False)
-    # Clear any already-materialized contract so this exercises the on-demand fallback, not a stale file.
-    contract = tr.target_contract_path("mx_gemmini")
-    if contract.is_file():
-        contract.unlink()
+    monkeypatch.delenv("MERLIN_TARGET_CONTRACT", raising=False)
+    monkeypatch.setenv("MERLIN_TARGETS_DIR", str(tmp_path / "references"))
+    monkeypatch.setenv("MERLIN_OUT_ROOT", str(tmp_path / "out"))
+    monkeypatch.setattr(cm, "write_oot_target", write_support_package)
 
-    info = tr.resolve("mx_gemmini")
-    if not info.contract_path.is_file():
-        import pytest
+    missing = tr.resolve(name)
+    assert not missing.contract_path.exists()
+    assert calls == []
 
-        pytest.skip("mlc could not derive mx_gemmini facts in this env (fallback failed closed)")
-
-    contract_doc = info.load_contract()
-    assert contract_doc["name"] == "mx_gemmini"
-    assert contract_doc["endpoint_kind"] == "inline_asm_insn"  # gemmini's RoCC decode, via facts
-    unit = contract_doc["compute_units"][0]
-    assert unit["name"] == "mx_pe" and "mxfp8" in unit["dtypes"]  # the MX datapath, from the residual
+    info = tr.materialize(name, destination=destination)
+    assert calls == [(name, destination)]
+    assert info.kind == "external"
+    assert info.contract_path == destination / "contracts" / "target_contract.yaml"
+    assert info.load_contract() == {"name": name}
+    with pytest.raises(FileExistsError, match="requires a new destination"):
+        tr.materialize(name, destination=destination)
+    assert calls == [(name, destination)]
 
 
 def test_radiance_composes_mx_gemmini():

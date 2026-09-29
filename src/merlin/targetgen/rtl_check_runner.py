@@ -89,26 +89,25 @@ def _parse_words(kernel_text: str) -> list[int]:
     return words
 
 
-def _legal_opcodes(facts_rec: dict) -> tuple[set[int], int] | None:
-    """(legal decode-value set, field width) DERIVED from the RTL/ISA decode facts, or None if the target
-    ships none. The width is inferred from the largest legal value (the extractor's icmp-eq field), so the
-    legality test compares the emitted instruction's low-``width`` bits — the field the hardware decoder
-    actually matches. No target literals: the set + width both come from the discovered facts."""
+def _observed_decode_values(facts_rec: dict) -> set[int]:
+    """One RTL-observed field's values, for diagnostics only.
+
+    Its bit positions are not necessarily contiguous or low-order: a decoder
+    may concatenate fields from distant positions in the instruction word.
+    Membership cannot establish whole-word legality.
+    """
     facts = facts_rec.get("facts", facts_rec)
     dt = _facts_interface(facts, "funct_decode_table")
-    vals = set((dt or {}).get("legal_funct") or [])
-    if not vals:
-        return None
-    width = max(vals).bit_length()
-    return vals, width
+    return set((dt or {}).get("legal_funct") or [])
 
 
 def render_kernel_decode(kernel_text: str, facts_rec: dict, taxonomy: dict | None = None) -> str:
     """Canonical text the KERNEL FileCheck lines are matched against — a decode of the emitted self-hosted
     kernel's `.word`/`.insn` instruction stream. Two layers, both fully DERIVED (no target literals):
 
-    * LEGALITY — each word's low-``width`` decode field vs the RTL-discovered legal-opcode set
-      (``ILLEGAL_OPCODE_COUNT`` = what the hardware decoder would reject).
+    * RECOGNITION — complete-word signatures can classify known words. Only a
+      taxonomy explicitly marked exhaustive may make a universal legality
+      claim; field-local RTL equality values are diagnostic evidence only.
     * CLASS DECODE — when a taxonomy is given, each word is classified into its SEMANTIC class using the
       per-op decode signatures (fixed_mask/fixed_value from the ISA def's own encoder). This exposes what a
       matmul kernel actually emitted (e.g. VADD instead of the MXU matmul), which legality alone misses —
@@ -119,9 +118,7 @@ def render_kernel_decode(kernel_text: str, facts_rec: dict, taxonomy: dict | Non
     from . import isa_taxonomy as IT
 
     words = _parse_words(kernel_text)
-    lo = _legal_opcodes(facts_rec)
-    legal, width = lo if lo else (set(), 0)
-    mask = (1 << width) - 1 if width else 0
+    observed = _observed_decode_values(facts_rec)
     n_illegal = 0
     lines = []
     present: list[str] = []
@@ -130,18 +127,12 @@ def render_kernel_decode(kernel_text: str, facts_rec: dict, taxonomy: dict | Non
     for idx, w in enumerate(words):
         matches = IT.classify(w, taxonomy) if taxonomy else []
         classes = [c for c, _m in matches]
-        # LEGALITY = "the decoder accepts this instruction". With the derived per-op decode signatures the
-        # authoritative test is that the word matches SOME op's opcode/funct bits (classify non-empty) —
-        # robust to operand values. Only when no taxonomy is available do we fall back to the coarse
-        # low-width membership in the discovered legal-value set.
-        if taxonomy:
+        # A taxonomy recognizes known instruction masks. Without an explicit
+        # completeness claim, legality remains unknown even for unmatched words.
+        if taxonomy and taxonomy.get("complete_isa") is True:
             ok = bool(matches)
-            field = w
-        else:
-            field = w & mask if mask else w
-            ok = (field in legal) if legal else True
-        if not ok:
-            n_illegal += 1
+            if not ok:
+                n_illegal += 1
         for c, fmask in matches:
             if c not in present:
                 present.append(c)
@@ -149,16 +140,16 @@ def render_kernel_decode(kernel_text: str, facts_rec: dict, taxonomy: dict | Non
             if (w & (~fmask & 0xFFFFFFFF)) == 0:  # operand payload (bits outside the fixed opcode/funct)
                 zeroops[c] = zeroops.get(c, 0) + 1
         cls_s = "|".join(classes) if classes else ("-" if taxonomy else "?")
-        lines.append(f"INSTR {idx} word=0x{w:08x} opcode={field} legal={'yes' if ok else 'no'} class={cls_s}")
-    # legality is determinable only with a taxonomy (per-op decode signatures) OR a discovered legal set;
-    # with neither, render '-' (unknown) instead of 0 so a target we could not ground is NOT vacuously
-    # passed — the compiler correspondingly omits the ILLEGAL_OPCODE_COUNT assertion (fail-closed).
-    determinable = bool(taxonomy) or bool(legal)
+        status = ("yes" if ok else "no") if taxonomy and taxonomy.get("complete_isa") is True else "?"
+        lines.append(f"INSTR {idx} word=0x{w:08x} opcode={w} legal={status} class={cls_s}")
+    # No complete taxonomy means no universal legality check, never a vacuous zero.
+    determinable = bool(taxonomy) and taxonomy.get("complete_isa") is True
     L = [
         f"# {CC.RENDER_SCHEMA}",
         f"EMPTY_KERNEL {'yes' if not words else 'no'}",
         f"INSTR_COUNT {len(words)}",
-        f"LEGAL_OPCODE_SET_SIZE {len(legal)}",
+        "LEGAL_OPCODE_SET_SIZE -",  # field-local observations do not define a whole-word opcode set
+        f"OBSERVED_DECODE_FIELD_VALUES {len(observed)}",
         f"ILLEGAL_OPCODE_COUNT {n_illegal if determinable else '-'}",
     ]
     L += [f"CLASS_PRESENT {c}" for c in present]
@@ -207,8 +198,9 @@ def screen_run(
 
     ``target`` selects the check family by DERIVED endpoint: a RoCC command-ISA target (endpoint
     ``inline_asm_insn``) gets the TRACE FileCheck over its decoded RoCC stream; a self-hosted-ISA target
-    (``external_backend``) gets the KERNEL opcode-legality FileCheck over its emitted instruction stream.
-    Both check the target's actual emitted commands; the Python numeric screen adds capacity bounds."""
+    (``external_backend``) gets KERNEL structural checks over its emitted instruction stream.
+    Universal legality is checked only with an explicitly complete ISA taxonomy;
+    the Python numeric screen adds capacity bounds."""
     gen = run_capsule_dir / "generated"
     trace_p = gen / "instruction_trace.json"
     kernel_p = gen / "kernel.S"
@@ -216,10 +208,9 @@ def screen_run(
     checks = RC.selected_checks(target) if CC._is_rocc_target(target, facts_rec) else None
     compiled = compiled_checks(facts_rec, capsule or {}, target, checks=checks)
 
-    # SELF-HOSTED-ISA (external_backend, e.g. atlas): no RoCC instruction_trace — the graded artifact is
-    # the emitted kernel.S. Run the kernel opcode-LEGALITY FileCheck (every emitted opcode ∈ the RTL/ISA
-    # legal set) over its rendered decode. This is the RTL-grounded, no-Verilog structural check for a
-    # self-hosted target, fully derived from facts_rec. Verdict rides this check.
+    # SELF-HOSTED-ISA: no RoCC instruction_trace — inspect the emitted kernel.S
+    # through the selected ISA taxonomy. Unknown legality stays unknown, and the
+    # check compiler emits only assertions supported by available evidence.
     if compiled.get("kernel") is not None:
         if not kernel_p.is_file():
             return None

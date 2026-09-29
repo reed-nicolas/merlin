@@ -4,7 +4,7 @@ RTL *needle* extraction (finding specific ISA facts in the HW-dialect op graph).
 ``mlc`` is an EXTERNAL dependency resolved via ``.env MERLIN_MLC_DIR`` (it will be upstreamed to its own
 open-source repo). Rather than re-implement the op-graph parser + decoder analysis, we reuse mlc's
 ``discover.irgraph`` (``circt-opt --mlir-print-op-generic`` -> xDSL ``HwGraph``) and ``discover.decode``
-(the legal opcode set from the decoder's ``comb.icmp eq`` fan-out), plus mlc's own prebuilt CIRCT
+(observed field values from the decoder's ``comb.icmp eq`` fan-out), plus mlc's own prebuilt CIRCT
 binaries. ``mlc`` is pip-installed editable into merlin's venv from ``MERLIN_MLC_DIR`` (see the dev
 setup docs), so its Python is a normal import. Imports are still function-local behind an availability
 guard (``chia_bridge`` style) so importing this module never hard-requires mlc, and a machine without
@@ -12,10 +12,9 @@ the mlc package installed degrades honestly rather than crashing. Its NON-python
 ``circt-opt`` binary, the cached ``runs/circt-arc/<target>`` arc outputs, schemas) still resolve by
 directory path via ``MERLIN_MLC_DIR``.
 
-Why this matters: an ISA *header* parse (hand table / ``val NAME = N.U``) is provably wrong vs the
-silicon — it lists command codes the decoder never matches and omits ones it does. The decoder-derived
-set here is the actual ISA the hardware implements, which is exactly what a functionally-correct compiler
-must target.
+Why this matters: a header parse and an RTL comparison set can disagree. Recording
+the selected decoder field exposes that discrepancy; neither alone proves an
+exhaustive executable ISA or authorizes a code-generation endpoint.
 
 TARGET-AGNOSTIC: every entry point here takes a ``target`` argument and holds no target name. mlc is
 target-parameterized (``artifact_paths(target)`` / ``discovered_memory_map(target)`` /
@@ -28,6 +27,7 @@ from __future__ import annotations
 import copy
 import shutil
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from merlin.integrations import modelir as _modelir
@@ -585,11 +585,84 @@ def compute_unit_dtypes(target: str) -> dict | None:
     return {u["unit"]: u["dtypes"] for u in detail.get("units", [])}
 
 
+@dataclass(frozen=True)
+class _EquivalentDecodeSignal:
+    module: str
+    width: int
+    values: tuple[int, ...]
+    fanout: int
+    cloned_expressions: int
+
+
+def _equivalent_decode_signals(graph) -> list[_EquivalentDecodeSignal]:
+    """Find equality fan-outs split by cloned, equivalent CIRCT expressions.
+
+    The upstream discovery groups comparisons by SSA value. CIRCT may duplicate
+    ``comb.extract`` and ``comb.concat`` for every comparison, although every
+    expression reads the same input bits. Canonicalize only those two pure ops;
+    everything else remains an opaque SSA leaf. Grouping stays within one HW
+    module, so a same-width subfield in another module cannot join this signal.
+    This is an integration repair, not an instruction-set completeness proof.
+    """
+    cache: dict[int, tuple] = {}
+
+    def expression(value) -> tuple:
+        key = id(value)
+        if key in cache:
+            return cache[key]
+        owner = graph.defining_op(value)
+        name = getattr(getattr(owner, "op_name", None), "data", None)
+        if name == "comb.extract" and len(owner.operands) == 1:
+            bit_range = graph.extract_range(owner)
+            result = (name, bit_range, str(value.type), expression(owner.operands[0])) if bit_range else ("ssa", key)
+        elif name == "comb.concat" and owner.operands:
+            result = (name, str(value.type), tuple(expression(operand) for operand in owner.operands))
+        else:
+            result = ("ssa", key)
+        cache[key] = result
+        return result
+
+    buckets: dict[tuple, dict[str, set[int]]] = {}
+    for module in graph.modules.values():
+        for compare in graph.ops("comb.icmp", within=module):
+            if graph.icmp_predicate(compare) != 0 or len(compare.operands) != 2:
+                continue
+            a, b = compare.operands
+            left, right = graph.defining_op(a), graph.defining_op(b)
+            left_const = left is not None and getattr(left.op_name, "data", None) == "hw.constant"
+            right_const = right is not None and getattr(right.op_name, "data", None) == "hw.constant"
+            if left_const == right_const:
+                continue
+            const, signal = (left, b) if left_const else (right, a)
+            value = graph.const_value(const)
+            typ = str(signal.type)
+            width = int(typ[1:]) if typ.startswith("i") and typ[1:].isdigit() else 0
+            if value is None or width == 0 or width > 16:
+                continue
+            expr = expression(signal)
+            if expr[0] == "ssa":
+                continue  # upstream already handles the identical-SSA case
+            bucket = buckets.setdefault((module.name, width, expr), {"values": set(), "signals": set()})
+            bucket["values"].add(value & ((1 << width) - 1))
+            bucket["signals"].add(id(signal))
+
+    out: list[_EquivalentDecodeSignal] = []
+    for (module, width, _expr), bucket in buckets.items():
+        values = bucket["values"]
+        if len(bucket["signals"]) < 2 or len(values) < 3 or len(values) >= 0.5 * (1 << width):
+            continue
+        out.append(
+            _EquivalentDecodeSignal(module, width, tuple(sorted(values)), len(values), len(bucket["signals"]))
+        )
+    return sorted(out, key=lambda item: (-item.fanout, -item.width, item.module, item.values))
+
+
 def discover_legal_opcodes(target: str, *, opcode_width: int | None = None) -> dict:
-    """Derive the legal command-opcode set the RTL DECODER matches, for ANY target — via mlc's
-    ``comb.icmp eq`` fan-out over the target's core HW dialect. The ISA the silicon implements, not a
-    hand table/header. Returns ``{legal_opcodes, width, fanout, module, hw_source, method, evidence}``
-    (``legal_opcodes=None`` if no decode signal is found / mlc or the HW dialect is unavailable)."""
+    """Observe one decoder comparison field in a target's core HW dialect.
+
+    ``legal_opcodes`` is a legacy key for observed field values, not a complete
+    instruction-set claim. Scope and completeness are returned explicitly.
+    """
     require_mlc()
     hw = core_hw_mlir(target)
     if hw is None:
@@ -601,6 +674,8 @@ def discover_legal_opcodes(target: str, *, opcode_width: int | None = None) -> d
             "hw_source": None,
             "method": "decoder_icmp_fanout(mlc)",
             "evidence": f"no core HW dialect for target {target!r} under mlc runs/circt-arc",
+            "scope": "observed_decode_field",
+            "complete_isa": False,
         }
     from mlc.discover import decode
 
@@ -608,6 +683,42 @@ def discover_legal_opcodes(target: str, *, opcode_width: int | None = None) -> d
 
     graph = load_hw_graph(hw, circt_opt=circt_opt_bin())
     sig = decode.discover_opcode_set(graph, expected_width=opcode_width)
+    recovered = [
+        candidate for candidate in _equivalent_decode_signals(graph)
+        if opcode_width is None or candidate.width == opcode_width
+    ]
+    if recovered and (sig is None or recovered[0].fanout > sig.fanout):
+        top = recovered[0]
+        # Equal-strength expressions with different values do not identify a
+        # unique decoder. Never union them just because their widths match.
+        tied = [candidate for candidate in recovered if candidate.fanout == top.fanout]
+        if any(candidate.values != top.values for candidate in tied[1:]):
+            return {
+                "legal_opcodes": None,
+                "width": top.width,
+                "fanout": top.fanout,
+                "module": None,
+                "hw_source": str(hw),
+                "method": "decoder_icmp_fanout(equivalent_expressions)",
+                "evidence": "ambiguous equal-strength equivalent-expression decode signals",
+                "scope": "observed_decode_field",
+                "complete_isa": False,
+            }
+        return {
+            "legal_opcodes": list(top.values),
+            "width": top.width,
+            "fanout": top.fanout,
+            "module": top.module,
+            "hw_source": str(hw),
+            "method": "decoder_icmp_fanout(equivalent_expressions)",
+            "evidence": (
+                f"comb.icmp-eq {top.width}-bit comparisons over {top.cloned_expressions} "
+                f"structurally equivalent comb.extract/concat expressions in module {top.module} "
+                f"-> {len(top.values)} field values; this is not a complete instruction-set proof"
+            ),
+            "scope": "observed_decode_field",
+            "complete_isa": False,
+        }
     if sig is None:
         return {
             "legal_opcodes": None,
@@ -617,6 +728,8 @@ def discover_legal_opcodes(target: str, *, opcode_width: int | None = None) -> d
             "hw_source": str(hw),
             "method": "decoder_icmp_fanout(mlc)",
             "evidence": f"no decode signal in {hw.name}",
+            "scope": "observed_decode_field",
+            "complete_isa": False,
         }
     legal = sorted(int(v) for v in sig.values)
     return {
@@ -627,7 +740,9 @@ def discover_legal_opcodes(target: str, *, opcode_width: int | None = None) -> d
         "hw_source": str(hw),
         "method": "decoder_icmp_fanout(mlc)",
         "evidence": f"union of comb.icmp-eq {sig.width}-bit decode signals in module {sig.module} "
-        f"({sig.fanout} comparisons) -> {len(legal)} legal opcodes",
+        f"({sig.fanout} comparisons) -> {len(legal)} observed field values; not a complete ISA proof",
+        "scope": "observed_decode_field",
+        "complete_isa": False,
     }
 
 

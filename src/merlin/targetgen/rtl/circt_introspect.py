@@ -429,10 +429,11 @@ def outside_block_names(isa_src: str, start_at: int = 0) -> dict[str, list[str]]
 
 # ------------------------------------------------------- decoder-derived funct set (the true ISA)
 def extract_funct_table_via_decoder(target: str) -> dict[str, Any] | None:
-    """The legal command-opcode set derived from the HW-dialect DECODER (mlc's comb.icmp-eq fan-out) —
-    the actual ISA the silicon implements. Target-parameterized (mlc resolves the target's core HW
-    dialect). Returns a table dict (same shape as :func:`extract_funct_table`), or None if mlc is
-    unavailable or the HW dialect cannot be parsed — an honest fallback, never a fake pass."""
+    """Observe one HW-dialect decoder comparison field via mlc's equality fan-out.
+
+    The legacy table shape records values and provenance, but is not a complete
+    ISA or endpoint proof. Returns None when that observation is unavailable.
+    """
     try:
         from . import mlc_bridge
 
@@ -449,18 +450,24 @@ def extract_funct_table_via_decoder(target: str) -> dict[str, Any] | None:
     return {
         "name": "funct_decode_table",
         "legal_funct": legal,
+        "width": res.get("width"),
+        "scope": res.get("scope", "observed_decode_field"),
+        "complete_isa": res.get("complete_isa") is True,
         "names": {},  # the decoder yields numeric codes; names are cross-referenced from the header below
         "hw_source": res.get("hw_source"),
+        "module": res.get("module"),
+        "fanout": res.get("fanout"),
         "method": res.get("method", "decoder_icmp_fanout(mlc)"),
         "evidence": res.get("evidence", "mlc decoder comb.icmp-eq fan-out"),
     }
 
 
 def _reconcile_funct(decoder: dict[str, Any] | None, header: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Choose the authoritative funct table. The decoder-derived set wins (it is the silicon); the
-    header parse is the fallback. When BOTH are present, record the discrepancy (functs the header
-    claims but the silicon never decodes, and vice-versa) + borrow the header's names for the codes the
-    silicon actually decodes — so the pin is both correct AND named."""
+    """Preserve observed decoder values and compare them with header declarations.
+
+    The two sets can differ without proving either complete; names remain useful
+    diagnostics, not an instruction-legality certificate.
+    """
     if decoder is None:
         if header is not None:
             header.setdefault("method", "scala_header_parse")
@@ -486,9 +493,9 @@ def _reconcile_funct(decoder: dict[str, Any] | None, header: dict[str, Any] | No
                 recovered[str(code)] = cands[0]
         if recovered:
             decoder["names_recovered_from_outside_block"] = recovered
-        decoder["header_only_functs"] = sorted(hs - ds)  # header claims, silicon never decodes (phantom)
-        decoder["decoder_only_functs"] = sorted(ds - hs)  # silicon decodes, header omits (missing)
-        decoder["evidence"] += f"; vs header: phantom={sorted(hs - ds)} missing={sorted(ds - hs)}"
+        decoder["header_only_functs"] = sorted(hs - ds)  # declared but not observed in this comparison family
+        decoder["decoder_only_functs"] = sorted(ds - hs)  # observed but not declared in the selected header span
+        decoder["evidence"] += f"; vs header: header_only={sorted(hs - ds)} observed_only={sorted(ds - hs)}"
     else:
         # No name vocabulary at all (target declares no ISA source) -> generic ``funct_<code>`` labels.
         # The CODES are the derived fact; the names are a convenience the target can supply later.
@@ -1153,8 +1160,8 @@ def _build_facts(
     sourced += _datapaths_from_cells(target, v1)
     sourced += _timing_from_discovery(target, v1)
 
-    # Funct decode table: PREFER the decoder-derived legal set (the ISA the silicon implements) over the
-    # name parse; fall back to the names when mlc / a version-matched HW dialect is unavailable. NAMES
+    # Decoder comparison field: preserve RTL-observed values over the weaker
+    # header parse, without treating either as an exhaustive legal set. NAMES
     # are sourced target-agnostically (Chisel ISA source > declared ISA headers > generic funct_<code>).
     header_funct = _funct_name_table(target, isa_path)
     decoder_funct = extract_funct_table_via_decoder(target)
@@ -1357,7 +1364,7 @@ def validate(
 
     if rocc_funct_class is not None:
         funct = _facts_interface(facts, "funct_decode_table")
-        if funct:
+        if funct and funct.get("scope") == "complete_rocc_funct7" and funct.get("complete_isa") is True:
             legal = set(funct["legal_funct"])
             classifier = set(int(k) for k in rocc_funct_class)
             extra = classifier - legal
@@ -1369,7 +1376,7 @@ def validate(
                     f"{funct['legal_funct'][0]}..{funct['legal_funct'][-1]}"
                 )
         else:
-            unknown.append("rocc_decode: RTL funct decode table unavailable")
+            unknown.append("rocc_decode: complete RTL RoCC funct legality unavailable; observed field is diagnostic")
     consistency = facts_rec.get("source_consistency") or {}
     if consistency.get("status") != "verified":
         unknown.append(f"source consistency: {consistency.get('reason', 'legacy evidence has no production receipt')}")

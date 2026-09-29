@@ -24,7 +24,7 @@ def _endpoint_kind_for(target: str, facts_rec: dict) -> str | None:
     so the FileCheck family routing matches the grader. Order: the residual+facts deriver
     (``manifest_for`` — works for every target that ships a residual, including the ones with no committed
     ``target_contract.yaml``), then the committed contract (``load_capability_manifest``), then straight
-    from this run's facts record (``_endpoint_from_facts`` over the funct7 width / self-hosted-ISA signal).
+    from this run's facts record (``_endpoint_from_facts`` over scoped executable-interface evidence).
     None only when nothing grounds it (caller then treats it as non-RoCC, honestly)."""
     from .capability_manifests import _endpoint_from_facts, _facts_body, manifest_for
 
@@ -34,12 +34,18 @@ def _endpoint_kind_for(target: str, facts_rec: dict) -> str | None:
             return ek
     except Exception:  # noqa: BLE001 — no residual/derivation for this target
         pass
+    body = _facts_body(facts_rec)
+    if any(
+        itf.get("name") in {"funct_decode_table", "self_hosted_isa"}
+        for itf in (body.get("interfaces") or []) if isinstance(itf, dict)
+    ) and _endpoint_from_facts(body) is None:
+        return "unresolved"  # do not let a family default promote this field-local observation
     try:
         from .target_experiment import load_capability_manifest
 
         return load_capability_manifest(target).endpoint_kind
     except Exception:  # noqa: BLE001 — no committed contract either
-        return _endpoint_from_facts(_facts_body(facts_rec))
+        return _endpoint_from_facts(body)
 
 
 def _is_rocc_target(target: str, facts_rec: dict) -> bool:
@@ -47,9 +53,7 @@ def _is_rocc_target(target: str, facts_rec: dict) -> bool:
     (external_backend, the KERNEL FileCheck) / other target? DERIVED, never a target-name test: routes on
     the DERIVED ``endpoint_kind`` (``inline_asm_insn`` == RoCC). We do NOT key on the presence of a
     ``funct_decode_table`` — the mlc icmp-fanout extractor synthesises one for ANY decoder (a self-hosted
-    ISA gets a table too), so that would false-positive; the endpoint deriver instead reads the funct7
-    WIDTH (<= 0x7f -> RoCC) / the self-hosted-ISA signal. When nothing grounds an endpoint, it is not
-    RoCC (the KERNEL family / honest non-routing)."""
+    ISA gets a table too). A field-local comparison set never establishes an endpoint."""
     return _endpoint_kind_for(target, facts_rec) == "inline_asm_insn"
 
 
@@ -83,9 +87,7 @@ def compile_trace_checks(
 
 
 def _decode_table(facts_rec: dict) -> dict | None:
-    """The mlc-derived RoCC decode interface (funct_decode_table), if the facts carry one. Its presence
-    is the DERIVED signal that this target speaks the RoCC command ISA the dialect/trace checks assume —
-    a SIMT/program-MMIO target has none, and those checks are dropped rather than emitted meaninglessly."""
+    """An observed decoder field, not proof of an executable endpoint or full ISA."""
     facts = facts_rec.get("facts", facts_rec)
     return _facts_interface(facts, "funct_decode_table")
 
@@ -104,8 +106,9 @@ def _provenance(facts_rec: dict, capsule: dict, target: str) -> dict[str, Any]:
         # legality + ABI + DIM come straight from the mlc decoder/geometry facts — derived when present.
         "isa_legality": {
             "source": dt.get("method", "funct_decode_table"),
-            "derived": bool(dt.get("legal_funct")),
+            "derived": dt.get("complete_isa") is True,
             "evidence": dt.get("evidence"),
+            "scope": dt.get("scope", "legacy_unverified"),
         },
         "abi_encoding": {
             "source": "funct_decode_table.custom_opcode/funct3",
@@ -127,23 +130,19 @@ def _provenance(facts_rec: dict, capsule: dict, target: str) -> dict[str, Any]:
 def compile_kernel_checks(
     capsule: dict, prefix: str = "KERNEL", facts_rec: dict | None = None, target: str | None = None
 ) -> str | None:
-    """FileCheck lines over a rendered decode of the emitted self-hosted-ISA kernel (external_backend,
-    e.g. atlas ``kernel.S`` → its `.word`/`.insn` instruction stream). The RTL-grounded insight — the kind
-    you would otherwise pay a Verilog run for and that spike/npu_model's functional output never gives —
-    is ISA LEGALITY: every emitted instruction's opcode must be one the target's decoder actually accepts
-    (the legal-opcode set discovered from the RTL / ISA definition). This catches a fabricated or
-    mis-encoded ISA (opcodes the hardware would reject) statically, before the cosim.
+    """FileCheck lines over a rendered self-hosted kernel instruction stream.
 
-    The check carries NO target literals: it asserts ``ILLEGAL_OPCODE_COUNT 0`` over the rendered decode;
-    the legal set + the decode itself are computed at run time in :func:`rtl_check_runner.render_kernel_decode`
-    from the DERIVED taxonomy. Returns None if the capsule declares no operation."""
+    Complete-word signatures can recognize known classes. Universal legality
+    requires an explicitly complete taxonomy; neither an RTL field observation
+    nor a partial taxonomy authorizes it. Returns None with no declared op.
+    """
     op = RC._declared_op(capsule)
     if op is None:
         return None
     required = list((capsule.get("expected") or {}).get("instruction_classes") or [])
-    # legality (ILLEGAL_OPCODE_COUNT 0) is assertable only when the runner can DETERMINE legality — a
-    # taxonomy (per-op decode signatures) OR a discovered legal-opcode set resolves. With neither, the
-    # render emits '-' and asserting "0" would be a vacuous pass, so we OMIT it (fail-closed).
+    # Only complete-word decode signatures can recognize emitted words. A
+    # field-local equality list cannot, even if every value in that field is
+    # known; with no taxonomy the render emits '-' and this assertion is omitted.
     tax = {}
     if target:
         try:
@@ -152,9 +151,9 @@ def compile_kernel_checks(
             tax = IT.taxonomy_for_target(target)
         except Exception:  # noqa: BLE001 — taxonomy unavailable -> skip these two, keep coverage/order
             tax = {}
-    legality_determinable = bool(tax) or bool((_decode_table(facts_rec or {}) or {}).get("legal_funct"))
+    legality_determinable = bool(tax) and tax.get("complete_isa") is True
     L = [
-        f"// RTL-derived kernel checks (op={op}) — legality + coverage + tiling + order + field-sanity",
+        f"// Kernel checks (op={op}) — class coverage + tiling + order + field-sanity",
         f"// {prefix}-DAG: EMPTY_KERNEL no",
     ]  # the kernel must actually emit instructions
     if legality_determinable:
@@ -199,19 +198,24 @@ def compile_checks(facts_rec: dict, capsule: dict, target: str, *, checks=None) 
     """Compile the check files for a capsule + a per-family PROVENANCE audit, ENDPOINT-aware and fully
     derived. A RoCC command-ISA target (endpoint ``inline_asm_insn``, e.g. gemmini) gets the trace
     FileCheck over its decoded RoCC stream; a self-hosted-ISA target (``external_backend``, e.g. atlas)
-    gets the kernel opcode-legality FileCheck over its emitted `.word` stream. The RoCC vs self-hosted
+    gets supported structural checks over its emitted `.word` stream. The RoCC vs self-hosted
     decision is the DERIVED ``endpoint_kind`` (never funct_decode_table presence — the mlc icmp-fanout
     extractor synthesises a table for a self-hosted decoder too, so that would mis-route). Both families
     check the target's actual emitted commands/instructions; neither depends on the agent's (per-run,
     un-derivable) dialect op mnemonics. We emit every check we can ground for the target's endpoint and
     drop the rest, never guessing."""
-    is_rocc = _is_rocc_target(target, facts_rec)
+    endpoint = _endpoint_kind_for(target, facts_rec)
+    is_rocc = endpoint == "inline_asm_insn"
     return {
         "schema": "rtl_checks_filecheck/v0",
         "capsule": capsule.get("name"),
         "target": target,
         "trace": compile_trace_checks(facts_rec, capsule, target=target, checks=checks) if is_rocc else None,
-        "kernel": None if is_rocc else compile_kernel_checks(capsule, facts_rec=facts_rec, target=target),
+        "kernel": (
+            compile_kernel_checks(capsule, facts_rec=facts_rec, target=target)
+            if endpoint == "external_backend" else None
+        ),
+        "endpoint_status": "resolved" if endpoint in {"inline_asm_insn", "external_backend"} else "unverified",
         "provenance": _provenance(facts_rec, capsule, target),
     }
 

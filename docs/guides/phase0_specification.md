@@ -96,7 +96,7 @@ software-visible behavior. It is not a second handwritten hardware geometry tabl
 | SW spec | Operation/signature constraints; layouts, tails, broadcasting, aliasing, placement, selected numeric behavior, quantization eligibility and transfer constraints | Automatically proven by an instruction name or storage width |
 | Selected OOT provider/backend config | Runtime implementation, ISA vocabulary/protocol ownership, extraction anchors and callable references | A second mandatory software spec to hand-maintain |
 | Hardware selection | Which evidence is required and which source/configuration is selected | A capability declaration or certificate |
-| Extracted RTL facts | Array and memory geometry, interfaces, command/register structure, datatype evidence and structural timing where established | Complete operation latency, numerical behavior or software legality |
+| Extracted RTL facts | Array and memory geometry, interfaces, observed decoder fields, datatype evidence and structural timing where established | Complete operation latency, numerical behavior, endpoint kind or software legality |
 | Recipe/workload policy | Application roster, semantic seeds, tolerances, oracle tiers, holdouts and performance objectives | Hardware facts or generated capsules |
 
 The authored spec holds `operations`, `numerical_semantics`, `quantization` and
@@ -137,6 +137,15 @@ granularity/zero points and ABI ordering before changing a spec's status. A widt
 does not identify a floating-point format. “Not extracted by the current reader” does not
 mean “impossible to infer from RTL”: first inspect the available elaboration and extraction
 coverage, then document the residual declaration and its independent evidence.
+
+The generated `funct_decode_table` is a historical field name, not a promise of a full
+instruction set. Its `scope: observed_decode_field` and `complete_isa: false` mean that
+the listed equalities apply only to the field the RTL compared. That field may concatenate
+nonadjacent instruction bits. Do not use its width or values to select RoCC versus a
+self-hosted endpoint, or to accept/reject complete instruction words. Keep the observation
+in `facts.json` for audit; use a separately established executable interface and a
+complete-word ISA definition for those decisions. Missing evidence leaves the generated
+endpoint unresolved rather than promoting a plausible architecture guess.
 
 TorchAO uses public extension points, not source patches. A selected accelerator format
 must also be legal for the operation receiving it. An int8 contraction does not establish
@@ -279,7 +288,10 @@ support lowering. A `tensor.empty`, reshape, slice, constant or copy-like node r
 in the node/SSA denominator, but is not an independent accelerator arithmetic demand:
 it needs a compiler-owned typed lowering and shape/value-preservation receipt. Until
 that receipt is verified, `support_lowering` and support-mediated SSA dependencies stay
-open. They are not assigned a host/device lane or counted as direct transfers merely
+open. The operation-accounting report marks their independent
+`accelerator_admission` as `not_applicable` while retaining every
+`support_lowering_required` obligation; this is not a successful lowering.
+They are not assigned a host/device lane or counted as direct transfers merely
 because their source signature appears in a capsule. This avoids adding every lowered
 helper operation to the target's SW spec or claiming a nonexistent host fallback.
 Historical v1 coverage reports remain inspectable, but verified admission requires a
