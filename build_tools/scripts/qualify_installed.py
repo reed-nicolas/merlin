@@ -216,6 +216,10 @@ SUITES = {
             "merlin_experiments.phase2.functional_inputs",
         ),
         "required_modules": ("xdsl",),
+        "required_entry_points": (
+            "merlin.exact_offload_release:reviewed_phase0="
+            "merlin_experiments.corpus.release:verify_exact_offload_binding",
+        ),
     },
     "phase1": {
         "tests": ("test_phase1_controller.py", "test_phase1_cli.py", "test_phase1_rtlchecks.py"),
@@ -625,6 +629,7 @@ def qualify(root, output, commit, suite, timeout, *, requested_ref=None, invocat
         "core_extras": list(SUITES[suite]["core_extras"]),
         "probe_modules": list(SUITES[suite]["probe_modules"]),
         "required_modules": list(SUITES[suite]["required_modules"]),
+        "required_entry_points": list(SUITES[suite].get("required_entry_points", ())),
         "test_process_policy": (
             "deny_processes_and_listeners" if SUITES[suite].get("guarded_tests") else "suite_defined"
         ),
@@ -715,6 +720,8 @@ def qualify(root, output, commit, suite, timeout, *, requested_ref=None, invocat
             probe_args.extend(("--module", module))
         for module in SUITES[suite]["required_modules"]:
             probe_args.extend(("--require-module", module))
+        for entry_point in SUITES[suite].get("required_entry_points", ()):
+            probe_args.extend(("--require-entry-point", entry_point))
         runner.run("payload-probe", [*probe_args, *wheels], external)
         runner.run("pytest-install", ["uv", "pip", "install", "--python", python, "pytest"], external)
         runner.run("freeze", ["uv", "pip", "freeze", "--python", python], external, stdout=output / "dependencies.txt")

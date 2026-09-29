@@ -13,6 +13,7 @@ import json
 import sys
 import sysconfig
 import zipfile
+from importlib.metadata import entry_points
 from pathlib import Path
 
 
@@ -55,7 +56,7 @@ def pytest_sessionfinish(session, exitstatus):
     assert_installed_origins()
 
 
-def probe(wheels, *, modules=(), required_modules=()):
+def probe(wheels, *, modules=(), required_modules=(), required_entry_points=()):
     site = Path(sysconfig.get_path("purelib")).resolve()
     count = 0
     for wheel in wheels:
@@ -70,6 +71,15 @@ def probe(wheels, *, modules=(), required_modules=()):
         importlib.import_module(module)
     for module in required_modules:
         assert importlib.util.find_spec(module) is not None, "suite requires module: " + module
+    for requirement in required_entry_points:
+        group_and_name, separator, value = requirement.partition("=")
+        group, name_separator, name = group_and_name.partition(":")
+        assert separator and name_separator and group and name and value, requirement
+        providers = tuple(entry_points(group=group))
+        assert len(providers) == 1, (group, providers)
+        provider = providers[0]
+        assert (provider.name, provider.value) == (name, value), (requirement, provider)
+        provider.load()
     return {"verified_payloads": count, "site": str(site), "installed_modules": assert_installed_origins()}
 
 
@@ -91,6 +101,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--module", action="append", default=[])
     parser.add_argument("--require-module", action="append", default=[])
+    parser.add_argument("--require-entry-point", action="append", default=[])
     parser.add_argument("wheels", nargs="+")
     args = parser.parse_args()
-    print(json.dumps(probe(args.wheels, modules=args.module, required_modules=args.require_module), indent=2))
+    print(
+        json.dumps(
+            probe(
+                args.wheels,
+                modules=args.module,
+                required_modules=args.require_module,
+                required_entry_points=args.require_entry_point,
+            ),
+            indent=2,
+        )
+    )
