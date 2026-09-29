@@ -95,6 +95,8 @@ def test_preselection_precedes_fresh_issue_and_refuses_tampered_bytes(tmp_path, 
     path.chmod(0o400)
     selected.issue(path, expected_sha256=identity["sha256"])
     assert calls[0][2]["capture_selection_sha256"] == identity["sha256"]
+    assert calls[0][2]["selected_system_libraries"] == document["system_libraries"]
+    assert calls[0][2]["selected_bwrap_sha256"] == document["bwrap"]["sha256"]
     with pytest.raises(ValueError, match="already exists"):
         selected.issue(path, expected_sha256=identity["sha256"])
 

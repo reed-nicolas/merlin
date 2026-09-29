@@ -486,8 +486,30 @@ def _stage_source(plan: dict[str, Any], source: Path) -> None:
         shutil.copy2(plan["recipe"]["path"], selected_recipe)
 
 
+def _verify_staged_selection(plan: dict[str, Any], source: Path, runtime: Path) -> dict[str, Any]:
+    """Reject bytes copied after selection changed, before executing any guest code."""
+    roots = {
+        "venv": runtime / "opt/capture-venv",
+        "base": runtime / Path(plan["base"]).relative_to("/"),
+        "m2m": source / "m2m-src/m2m",
+        "workload": source / "workload",
+        "schemas": source / "merlin-src/merlin/_data/schemas",
+    }
+    selected_trees = plan["selected_trees"]
+    for name, path in roots.items():
+        if _snapshot_tree(path) != selected_trees[name]:
+            raise SealedM2MError(f"staged {name} bytes differ from the pre-execution selection")
+    # External schemas are inserted after the original Merlin package snapshot.
+    if plan["schemas_root"] == str(Path(plan["merlin_root"]) / "_data/schemas"):
+        if _snapshot_tree(source / "merlin-src/merlin") != selected_trees["merlin"]:
+            raise SealedM2MError("staged Merlin bytes differ from the pre-execution selection")
+    return selected_trees["schemas"]
+
+
 def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = None,
-          capture_selection_sha256: str | None = None) -> Path:
+          capture_selection_sha256: str | None = None,
+          selected_system_libraries: list[dict[str, Any]] | None = None,
+          selected_bwrap_sha256: str | None = None) -> Path:
     """Make one private snapshot and capture; receipt remains pending replay."""
     if plan.get("schema") != SCHEMA or plan.get("status") != "plan_only":
         raise SealedM2MError("unsupported M2M plan")
@@ -497,6 +519,15 @@ def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = No
         or any(character not in "0123456789abcdef" for character in capture_selection_sha256)
     ):
         raise SealedM2MError("capture selection requires an exact SHA-256 identity")
+    if capture_selection_sha256 is not None and (
+        selected_system_libraries is None or selected_bwrap_sha256 is None
+    ):
+        raise SealedM2MError("selected capture requires antecedent system-library and bubblewrap bytes")
+    if selected_system_libraries is not None and (
+        not isinstance(selected_system_libraries, list)
+        or [row.get("path") for row in selected_system_libraries] != plan.get("system_libs")
+    ):
+        raise SealedM2MError("selected system-library roster differs from the plan")
     selected = prepare_plan(m2m_root=Path(plan["m2m_root"]), workload_root=Path(plan["workload_root"]),
                             worker=Path(plan["worker"]), venv=Path(plan["venv"]),
                             schemas_root=Path(plan["schemas_root"]),
@@ -514,6 +545,8 @@ def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = No
     if any(run_dir == path or run_dir.is_relative_to(path) or path.is_relative_to(run_dir) for path in inputs):
         raise SealedM2MError("run directory overlaps a selected input")
     bwrap = _bwrap_binary(bwrap_binary)
+    if selected_bwrap_sha256 is not None and _file_digest(bwrap) != selected_bwrap_sha256:
+        raise SealedM2MError("bubblewrap bytes differ from the pre-execution selection")
     run_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
     source = run_dir / "snapshots/source"
     runtime = run_dir / "snapshots/guest-root"
@@ -538,26 +571,20 @@ def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = No
         (runtime / name).mkdir()
     (runtime / output.relative_to("/")).mkdir(parents=True)
     _validate_snapshots(source, runtime, output, schema=SCHEMA)
-    # A copied runtime is direct files only; compare its selected large roots
-    # to independently normalized source inventories before execution.
-    if _snapshot_tree(venv_copy) != _source_tree(Path(plan["venv"]), skip_lib64=True):
-        raise SealedM2MError("venv snapshot differs from selected normalized bytes")
-    if _snapshot_tree(base_copy) != _source_tree(base.resolve()):
-        raise SealedM2MError("base CPython snapshot differs from selected bytes")
-    if _snapshot_tree(source / "m2m-src/m2m") != _source_tree(Path(plan["m2m_root"]) / "m2m"):
-        raise SealedM2MError("M2M package snapshot differs from selected bytes")
-    if _snapshot_tree(source / "workload") != _source_tree(Path(plan["workload_root"])):
-        raise SealedM2MError("workload snapshot differs from selected bytes")
-    selected_schemas = _snapshot_tree(source / "merlin-src/merlin/_data/schemas")
-    if (selected_schemas != plan["selected_trees"]["schemas"]
-            or selected_schemas != _source_tree(Path(plan["schemas_root"]))):
-        raise SealedM2MError("Merlin schema snapshot differs from selected bytes")
+    # Rehash the copied bytes against the antecedent selection, not mutable
+    # host paths: a source change after prepare_plan must never be executed.
+    selected_schemas = _verify_staged_selection(plan, source, runtime)
     if _file_digest(source / "merlin-src/merlin/targetgen/_m2m_capture_worker.py") != plan["worker_sha256"]:
         raise SealedM2MError("worker snapshot differs from selected bytes")
     if plan.get("recipe") and _file_digest(source / "inputs/quant_recipe.json") != plan["recipe"]["sha256"]:
         raise SealedM2MError("selected recipe snapshot differs from selected bytes")
-    for name in plan["system_libs"]:
-        if _file_digest(runtime / Path(name).relative_to("/")) != _file_digest(Path(name)):
+    for index, name in enumerate(plan["system_libs"]):
+        copied = runtime / Path(name).relative_to("/")
+        expected = selected_system_libraries[index] if selected_system_libraries is not None else None
+        if expected is not None:
+            if copied.stat().st_size != expected.get("bytes") or _file_digest(copied) != expected.get("sha256"):
+                raise SealedM2MError(f"system ELF snapshot differs from the pre-execution selection: {name}")
+        elif _file_digest(copied) != _file_digest(Path(name)):
             raise SealedM2MError(f"system ELF snapshot differs from selected bytes: {name}")
     source_digest = _snapshot_tree(source)
     runtime_digest = _snapshot_tree(runtime)
@@ -565,10 +592,14 @@ def issue(plan: dict[str, Any], run_dir: Path, *, bwrap_binary: Path | None = No
         raise SealedM2MError("actual snapshot bytes exceed selected cap")
     output.mkdir()
     command = _command_v2(output, dtype=plan["dtype"], recipe=plan.get("recipe") is not None)
+    if selected_bwrap_sha256 is not None and _file_digest(bwrap) != selected_bwrap_sha256:
+        raise SealedM2MError("bubblewrap bytes changed before sandbox execution")
     process = _execute(bwrap, runtime, source, output, command, output)
     materialized = _materialized_v2(output, source, output, plan)
     if (_snapshot_tree(source), _snapshot_tree(runtime)) != (source_digest, runtime_digest):
         raise SealedM2MError("sealed source or runtime changed during capture")
+    if selected_bwrap_sha256 is not None and _file_digest(bwrap) != selected_bwrap_sha256:
+        raise SealedM2MError("bubblewrap bytes changed during sandbox execution")
     receipt = run_dir / "sealed_m2m_pending.json"
     payload = {
         "schema": SCHEMA, "status": "pending_replay", "issuer_sha256": _file_digest(Path(__file__)),

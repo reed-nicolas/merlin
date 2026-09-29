@@ -119,6 +119,30 @@ def test_normalized_venv_inventory_matches_copied_bytes(tmp_path):
     assert _snapshot_tree(copied) != expected
 
 
+def test_staged_cpu_source_must_match_antecedent_selection_before_execution(tmp_path):
+    source, runtime = tmp_path / "source", tmp_path / "guest-root"
+    roots = {
+        "venv": runtime / "opt/capture-venv",
+        "base": runtime / "usr/local/base-python",
+        "m2m": source / "m2m-src/m2m",
+        "workload": source / "workload",
+        "merlin": source / "merlin-src/merlin",
+    }
+    roots["schemas"] = roots["merlin"] / "_data/schemas"
+    for path in roots.values():
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "selected.txt").write_text(path.name)
+    plan = {
+        "base": "/usr/local/base-python", "merlin_root": "/selected/merlin",
+        "schemas_root": "/selected/merlin/_data/schemas",
+        "selected_trees": {name: _snapshot_tree(path) for name, path in roots.items()},
+    }
+    assert sealed_m2m._verify_staged_selection(plan, source, runtime) == plan["selected_trees"]["schemas"]
+    (roots["workload"] / "selected.txt").write_text("changed after plan recheck")
+    with pytest.raises(SealedM2MError, match="staged workload bytes differ from the pre-execution selection"):
+        sealed_m2m._verify_staged_selection(plan, source, runtime)
+
+
 def test_other_directory_alias_is_rejected(tmp_path):
     selected = tmp_path / "selected"
     selected.mkdir()

@@ -175,7 +175,9 @@ def issue(path: Path, *, expected_sha256: str) -> Path:
     if _digest(Path(path).read_bytes()) != expected_sha256:
         raise ValueError("capture selection changed before execution")
     receipt = sealed_m2m.issue(
-        plan, run, bwrap_binary=bwrap, capture_selection_sha256=expected_sha256
+        plan, run, bwrap_binary=bwrap, capture_selection_sha256=expected_sha256,
+        selected_system_libraries=selected["system_libraries"],
+        selected_bwrap_sha256=selected["bwrap"]["sha256"],
     )
     if _digest(Path(path).read_bytes()) != expected_sha256:
         raise ValueError("capture selection changed during execution")
