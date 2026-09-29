@@ -68,3 +68,11 @@ def test_loaded_deny_set_cannot_outlive_a_changed_resource(tmp_path, monkeypatch
     monkeypatch.setattr(policy, "resource_path", lambda: source)
     with pytest.raises(policy.AccessPolicyUnavailable, match="changed after"):
         policy.require_current_policy()
+
+
+def test_packaged_policy_byte_drift_refuses_even_when_denials_are_unchanged(tmp_path, monkeypatch):
+    source = tmp_path / "same-denials.json"
+    source.write_bytes(policy.resource_path().read_bytes() + b"\n")
+    monkeypatch.setattr(policy, "resource_path", lambda: source)
+    with pytest.raises(policy.AccessPolicyUnavailable, match="changed after"):
+        policy.require_current_policy()

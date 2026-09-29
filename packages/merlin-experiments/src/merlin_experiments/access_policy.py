@@ -7,6 +7,7 @@ Keep their identities as packaged data, and refuse to start the sandbox if that 
 
 from __future__ import annotations
 
+import hashlib
 import json
 from importlib.resources import files
 from pathlib import Path
@@ -71,9 +72,19 @@ def load_legacy_access(path: Path | None = None) -> tuple[shared.ModuleAccess, .
 MODULE_ACCESS = (*shared.MODULE_ACCESS, *load_legacy_access())
 
 
+def _resource_digest() -> str:
+    try:
+        return hashlib.sha256(resource_path().read_bytes()).hexdigest()
+    except OSError as exc:
+        raise AccessPolicyUnavailable("required access policy cannot be read") from exc
+
+
+_RESOURCE_SHA256 = _resource_digest()
+
+
 def require_current_policy() -> None:
     """Refuse if packaged bytes changed after the deny set was loaded in this process."""
-    if load_legacy_access() != MODULE_ACCESS[len(shared.MODULE_ACCESS) :]:
+    if _resource_digest() != _RESOURCE_SHA256 or load_legacy_access() != MODULE_ACCESS[len(shared.MODULE_ACCESS) :]:
         raise AccessPolicyUnavailable("required access policy changed after sandbox initialization")
 
 
