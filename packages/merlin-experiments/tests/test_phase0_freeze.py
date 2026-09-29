@@ -334,6 +334,8 @@ def test_selected_m2m_runtime_is_explicit_and_rechecked_without_original_source(
     (venv / "site-module.py").write_text("VERSION = 1\n")
 
     selected = m2m_runtime.observe(source, venv / "bin/python", synth_profile=synth)
+    assert selected["same_conversion_capture_api"]["status"] == "incompatible"
+    assert "m2m/capture/provenance.py" in selected["same_conversion_capture_api"]["missing"]
     frozen = m2m_runtime.stage(selected, tmp_path / "run/m2m-source")
     shutil.rmtree(source)
     m2m_runtime.verify(frozen)

@@ -11,6 +11,7 @@ import pytest
 from merlin_experiments.capture_execution import sealed_m2m
 from merlin_experiments.capture_execution.sealed_m2m import (
     SealedM2MError,
+    _capture_api_missing,
     _command,
     _command_v2,
     _ldd_library_path,
@@ -25,6 +26,42 @@ from merlin_experiments.phase0.capture_execution_attestation import AttestationN
 from merlin.common.paths import module_source_path, schemas_dir
 from merlin.targetgen import application_inventory
 from merlin.targetgen.quant_recipe import digest as recipe_digest
+
+
+def test_selected_capture_api_refuses_second_conversion_before_runtime_snapshot(tmp_path, monkeypatch):
+    m2m = tmp_path / "selected-m2m"
+    capture = m2m / "m2m/capture"
+    capture.mkdir(parents=True)
+    (m2m / "m2m/api.py").write_text(
+        "def convert(model, inputs, *, backend, quantization, quantization_preapplied, "
+        "level, func_name, weights_path): pass\n"
+    )
+    (capture / "bundle.py").write_text(
+        "def write_bundle(model, inputs, out, *, quantization_preapplied=False): pass\n"
+    )
+    missing = _capture_api_missing(m2m)
+    assert missing == (
+        "m2m/capture/bundle.py:write_bundle(capture_trace)",
+        "m2m/capture/bundle.py:write_bundle(conversion_result)",
+        "m2m/capture/bundle.py:write_bundle(source_path)",
+        "m2m/capture/provenance.py",
+    )
+    workload = tmp_path / "workload"
+    workload.mkdir()
+    (workload / "loader.py").write_text("def get_model_and_inputs(): pass\n")
+    worker = module_source_path("merlin").parent / "targetgen/_m2m_capture_worker.py"
+    monkeypatch.setattr(sealed_m2m, "_venv_home", lambda *_: pytest.fail("runtime inventory must not start"))
+    with pytest.raises(SealedM2MError, match="same-conversion materialization/receipt API") as error:
+        prepare_plan(m2m_root=m2m, workload_root=workload, worker=worker,
+                     venv=tmp_path, schemas_root=schemas_dir())
+    assert "conversion_result" in str(error.value)
+    assert "m2m/capture/provenance.py" in str(error.value)
+
+    (capture / "bundle.py").write_text(
+        "def write_bundle(model, inputs, out, *, source_path, capture_trace, conversion_result): pass\n"
+    )
+    (capture / "provenance.py").write_text("def write_capture_receipt(out, *, source_path): pass\n")
+    assert _capture_api_missing(m2m) == ()
 
 
 def test_normalized_venv_inventory_matches_copied_bytes(tmp_path):

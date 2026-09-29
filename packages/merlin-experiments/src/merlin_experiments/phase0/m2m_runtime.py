@@ -16,7 +16,7 @@ from pathlib import Path
 
 import yaml
 
-from merlin_experiments.capture_execution.sealed_m2m import _source_tree, _venv_home
+from merlin_experiments.capture_execution.sealed_m2m import _capture_api_missing, _source_tree, _venv_home
 from merlin_experiments.capture_execution.sealed_static import _canonical_path, _file_digest
 
 SCHEMA = "merlin.phase0.selected_m2m_runtime.v1"
@@ -94,6 +94,7 @@ def observe(
     _check_workload_declarations(root, names, python)
     workloads = {name: _source_tree(root / "workloads" / name) for name in names}
     package_inventory = _source_tree(package)
+    missing_capture_api = _capture_api_missing(root)
     copy_bytes = package_inventory["bytes"] + sum(row["bytes"] for row in workloads.values())
     if copy_bytes > _MAX_SOURCE_COPY_BYTES:
         raise ValueError("selected Model2MLIR package and workload bytes exceed the 15 GB source-copy limit")
@@ -103,6 +104,11 @@ def observe(
         "root": str(root),
         "python": str(python),
         "package": package_inventory,
+        "same_conversion_capture_api": {
+            "status": "available_for_sealed_preflight" if not missing_capture_api else "incompatible",
+            "missing": list(missing_capture_api),
+            "phase0_admission": "not_granted",
+        },
         "workloads": workloads,
         "source_copy_bytes": copy_bytes,
         **_runtime(python),

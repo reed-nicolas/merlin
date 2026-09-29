@@ -9,6 +9,7 @@ must separately qualify the workload, framework numerics and Phase 0 policy.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import secrets
@@ -129,6 +130,44 @@ def _execute(bwrap: Path, runtime: Path, source: Path, output: Path,
 
 class SealedM2MError(ValueError):
     """The proposed capture or replay does not satisfy this narrow policy."""
+
+
+def _capture_api_missing(m2m_root: Path) -> tuple[str, ...]:
+    """Check the selected source API without importing its heavyweight runtime.
+
+    This is only a compatibility gate. The fresh sandbox execution and replay,
+    not source signatures, establish whether a selected implementation works.
+    """
+    required = {
+        "m2m/api.py": {
+            "convert": {"backend", "quantization", "quantization_preapplied", "level", "func_name", "weights_path"}
+        },
+        "m2m/capture/bundle.py": {
+            "write_bundle": {"source_path", "capture_trace", "conversion_result"}
+        },
+        "m2m/capture/provenance.py": {"write_capture_receipt": {"source_path"}},
+    }
+    missing: list[str] = []
+    for member, functions in required.items():
+        source = m2m_root / member
+        if not source.is_file() or source.is_symlink():
+            missing.append(member)
+            continue
+        try:
+            module = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        except (OSError, UnicodeError, SyntaxError):
+            missing.append(f"{member}: readable Python source")
+            continue
+        top_level = {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
+        for function, parameters in functions.items():
+            node = top_level.get(function)
+            if node is None:
+                missing.append(f"{member}:{function}")
+                continue
+            arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+            declared = {argument.arg for argument in arguments}
+            missing.extend(f"{member}:{function}({name})" for name in sorted(parameters - declared))
+    return tuple(missing)
 
 
 def _source_tree(root: Path, *, skip_lib64: bool = False) -> dict[str, Any]:
@@ -255,6 +294,12 @@ def prepare_plan(*, m2m_root: Path, workload_root: Path, worker: Path,
         raise SealedM2MError("selected Merlin schema tree lacks the quant-format registry and validator")
     if not (m2m_root / "m2m/api.py").is_file() or not (workload_root / "loader.py").is_file():
         raise SealedM2MError("M2M package or workload loader is absent")
+    missing_api = _capture_api_missing(m2m_root)
+    if missing_api:
+        raise SealedM2MError(
+            "selected Model2MLIR lacks same-conversion materialization/receipt API: "
+            + ", ".join(missing_api)
+        )
     if _loader_env_reads((workload_root / "loader.py").read_text()):
         raise SealedM2MError("this first sealed policy rejects environment-reading loaders")
     if not worker.is_file() or worker.suffix != ".py":
