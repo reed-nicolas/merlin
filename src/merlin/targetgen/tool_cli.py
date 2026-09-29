@@ -155,6 +155,32 @@ def _semantic_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _outline_integer_matmuls(args: argparse.Namespace) -> int:
+    """Materialize exact model-to-kernel slices for OOT compiler experiments."""
+    from .contract.model_kernel_outline import outline_integer_matmuls
+
+    source = Path(args.mlir)
+    if not source.is_file() or source.is_symlink():
+        raise ValueError("--mlir must name a regular, non-symlink model file")
+    result = outline_integer_matmuls(source.read_bytes(), target=args.target)
+    destination = Path(args.out).absolute()
+    if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents):
+        raise ValueError("outline output may not traverse a symlink")
+    destination.mkdir(parents=True, exist_ok=False)
+    for candidate in result["candidates"]:
+        name = f"kernel-{candidate['ordinal']:06d}.interface.mlir"
+        (destination / name).write_text(candidate.pop("interface_mlir"))
+        candidate["interface_file"] = name
+    (destination / "manifest.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    print(
+        json.dumps(
+            {"out": str(destination), "candidates": len(result["candidates"]), "refused": len(result["refused"])},
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     from .semantic_search import SearchLimits
 
@@ -212,6 +238,14 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--max-candidates", type=int, default=SearchLimits().max_candidates)
     selection.add_argument("--timeout-ms", type=int, default=SearchLimits().timeout_ms)
     selection.set_defaults(func=_semantic_search)
+
+    outline = sub.add_parser(
+        "outline-int-mm", help="materialize exact i8×i8→i32 contraction slices from model MLIR"
+    )
+    outline.add_argument("--target", required=True)
+    outline.add_argument("--mlir", required=True, help="captured linalg-on-tensors model MLIR")
+    outline.add_argument("--out", required=True, help="fresh directory for kernel interfaces and source bindings")
+    outline.set_defaults(func=_outline_integer_matmuls)
     return parser
 
 

@@ -38,6 +38,25 @@ general whole-model Gemmini binary is established by those routes. A separate
 historical ResNet program from an alternate capture is useful evidence for a
 tracer bullet, not certification of this generated Phase 1 compiler.
 
+For an already-integerized capture, you can materialize the exact signed
+`i8 × i8 → i32` contraction kernels as standalone `merlin_iface` inputs:
+
+```sh
+merlin-target-tools outline-int-mm --target gemmini \
+  --mlir /absolute/capture/model.mlir \
+  --out /configured/out/artifacts/model-kernels/int8-iteration-001
+```
+
+The fresh directory contains `manifest.json` plus one interface MLIR file per
+accepted contraction. The manifest binds each kernel to the model's SHA-256,
+the exact MLIR operation and its operand-producing SSA values; refusals stay
+explicit. Submit those interface files to the selected OOT compiler to check
+kernel code generation. This does not lower the intervening quantization,
+transpose, dequantization or host operations, connect the kernels back to the
+model, or establish numerical execution. The published Gemmini compiler still
+declines the *whole* upstream Linalg module; an isolated kernel command buffer
+does not change that verdict.
+
 For a capture that has the two named sidecars, run:
 
 ```sh

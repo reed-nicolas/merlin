@@ -7,6 +7,8 @@ import json
 
 import pytest
 
+from merlin.targetgen.contract.interface_emit import parse_interface_mlir
+from merlin.targetgen.contract.model_kernel_outline import outline_integer_matmuls
 from merlin.targetgen.source_kernel_probe import derive_kernel_window
 
 
@@ -61,6 +63,37 @@ def test_integerized_source_matrix_body_can_supply_a_bounded_window(tmp_path):
     assert projected["source"]["geometry"] == {"M": 4, "K": 19, "N": 8}
     assert projected["projection"]["geometry"] == {"M": 4, "K": 19, "N": 8}
     assert projected["projected_type_body_observed"] is True
+
+
+def test_exact_integer_model_body_outlines_a_compilable_interface_kernel(tmp_path):
+    from merlin.targetgen.tool_cli import main
+
+    model = _INTEGER_BODY.encode()
+    (tmp_path / "model.mlir").write_bytes(model)
+    output = tmp_path / "kernels"
+    assert main(
+        ["outline-int-mm", "--target", "example", "--mlir", str(tmp_path / "model.mlir"), "--out", str(output)]
+    ) == 0
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["model_sha256"] == hashlib.sha256(model).hexdigest()
+    assert len(manifest["candidates"]) == 1 and manifest["refused"] == []
+    candidate = manifest["candidates"][0]
+    assert candidate["operation_id"].startswith(f"mlir:{manifest['model_sha256']}:")
+    assert candidate["operand_bindings"] == [
+        {"source": "function_argument", "argument_index": 0},
+        {"source": "function_argument", "argument_index": 1},
+    ]
+    interface = (output / candidate["interface_file"]).read_text()
+    assert hashlib.sha256(interface.encode()).hexdigest() == candidate["interface_sha256"]
+    commands = parse_interface_mlir(interface)["commands"]
+    assert [command["opcode"] for command in commands] == ["RES_PACK", "MATMUL_RESIDENT", "COMMIT"]
+    assert commands[-1]["attributes"]["output_dtype"] == "i32"
+
+    # Neither same-typed wrong wiring nor a nonzero seed is a standalone matmul.
+    wrong_product = _INTEGER_BODY.replace('"arith.muli"(%lhs32, %rhs32)', '"arith.muli"(%lhs32, %lhs32)')
+    assert outline_integer_matmuls(wrong_product.encode(), target="example")["candidates"] == []
+    nonzero_init = _INTEGER_BODY.replace('value = 0 : i32', 'value = 1 : i32')
+    assert outline_integer_matmuls(nonzero_init.encode(), target="example")["candidates"] == []
 
 
 @pytest.mark.parametrize("changed", [
