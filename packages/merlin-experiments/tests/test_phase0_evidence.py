@@ -16,6 +16,25 @@ from merlin.targetgen import readout_facet, target_registry
 from merlin.targetgen.rtl import facts
 
 
+def test_specir_source_inventory_excludes_unrelated_generated_project_files(tmp_path):
+    package = tmp_path / "specir"
+    package.mkdir()
+    (package / "__init__.py").write_text("\n")
+    (package / "oracle.py").write_text("VALUE = 1\n")
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "generated.mlir").write_text("unrelated\n")
+    selected = evidence._reference_inventory_root(
+        "numerical_model", tmp_path, {"numerical_semantics": {"model": {"engine": "specir_fp_reduce"}}}
+    )
+    assert selected == package
+    assert sorted(path.name for path in selected.rglob("*.py")) == ["__init__.py", "oracle.py"]
+    (package / "__init__.py").unlink()
+    with pytest.raises(ValueError, match="SpecIR source package is absent"):
+        evidence._reference_inventory_root(
+            "numerical_model", tmp_path, {"numerical_semantics": {"model": {"engine": "specir_fp_reduce"}}}
+        )
+
+
 def _selection(monkeypatch, tmp_path, body=None):
     provider = tmp_path / "support"
     contract = provider / "contracts" / "target_contract.yaml"

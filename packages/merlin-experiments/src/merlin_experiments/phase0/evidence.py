@@ -29,6 +29,22 @@ def _canonical_digest(value: Any) -> str:
     return _digest(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode())
 
 
+def _reference_inventory_root(role: str, root: Path, software_doc: Mapping) -> Path:
+    """Select the source package used by a declared numerical engine.
+
+    The SpecIR adapter imports ``root/specir``. Snapshotting the entire project
+    would also bind unrelated targets, builds and generated ``out`` artifacts;
+    those are not inputs to its pure reduction model.
+    """
+    model = (software_doc.get("numerical_semantics") or {}).get("model") or {}
+    if role == "numerical_model" and model.get("engine") == "specir_fp_reduce":
+        package = root / "specir"
+        if not (package / "__init__.py").is_file():
+            raise ValueError(f"selected SpecIR source package is absent: {package}")
+        return package
+    return root
+
+
 def _native_baseline_observations(selections, applications, observe) -> dict:
     """Select exact generated host checks, never generalize them into host admission."""
     import numpy as np
@@ -290,7 +306,7 @@ def select_evidence(
 
     sources: dict[Path, EvidenceSource] = {}
     diagnostics: list[dict[str, Any]] = []
-    excluded = {".git", "__pycache__", "build", ".venv"}
+    excluded = {".git", "__pycache__", "build", ".venv", "out"}
     extensions = {".py", ".json", ".yaml", ".yml", ".mlir", ".h", ".hpp", ".cpp", ".c", ".inc", ".S"}
 
     def observe(path, role, *, required=False) -> bytes | None:
@@ -470,11 +486,12 @@ def select_evidence(
                 diagnostics.append({"component": "numerical-model", "status": "unknown", "reason": str(exc)})
             for role, path in references.items():
                 if path.is_dir():
-                    for leaf in sorted(path.rglob("*")):
+                    inventory_root = _reference_inventory_root(role, path, software_doc)
+                    for leaf in sorted(inventory_root.rglob("*")):
                         if (
                             leaf.is_file()
                             and leaf.suffix in extensions
-                            and not excluded.intersection(leaf.relative_to(path).parts)
+                            and not excluded.intersection(leaf.relative_to(inventory_root).parts)
                         ):
                             observe(leaf, f"software-reference:{role}")
                 else:

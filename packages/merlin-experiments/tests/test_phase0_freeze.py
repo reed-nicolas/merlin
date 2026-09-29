@@ -111,7 +111,16 @@ def _fixture(tmp_path, model_selector):
     facts = fixture["profiles"] / "facts.json"
     facts.write_text(json.dumps({"facts": {"arrays": [{"rows": 2, "cols": 2}], "memories": []}}))
     conformance = fixture["profiles"] / "conformance.yaml"
-    conformance.write_text("application_demands:\n  sidecar: demands.json\n")
+    contract_bytes = (json.dumps(contract, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    conformance.write_text(
+        yaml.safe_dump(
+            {
+                "target": "fixture-device",
+                "application_demands": {"sidecar": "demands.json"},
+                "derivation": {"phase0_execution": {"contract_sha256": hashlib.sha256(contract_bytes).hexdigest()}},
+            }
+        )
+    )
     (fixture["profiles"] / "demands.json").write_text(
         json.dumps(
             {
