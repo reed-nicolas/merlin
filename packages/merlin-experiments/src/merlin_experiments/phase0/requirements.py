@@ -168,12 +168,16 @@ def derive(
     software = selected_software_spec_path(
         declaration.recipe, spec.resolve(config["software_spec"]) if config.get("software_spec") else None
     )
+    capability_contract_path = (
+        spec.resolve(config["capability_contract"]) if config.get("capability_contract") else None
+    )
     hardware = spec.resolve(config["hardware_spec"]) if config.get("hardware_spec") else None
     if software is None:
         raise ValueError("deterministic derivation requires an explicit software spec in the recipe")
     selected = select_evidence(
         te.target,
         descriptor=declaration.descriptor,
+        capability_contract_path=capability_contract_path,
         software_spec=software,
         hardware_spec=hardware,
         facts_path=rtl_facts,
@@ -302,6 +306,7 @@ def derive(
     selected = select_evidence(
         te.target,
         descriptor=declaration.descriptor,
+        capability_contract_path=capability_contract_path,
         software_spec=software,
         hardware_spec=hardware,
         facts_path=rtl_facts,

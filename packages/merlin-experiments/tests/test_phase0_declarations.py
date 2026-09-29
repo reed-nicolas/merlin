@@ -92,3 +92,29 @@ def test_templates_skipped(tmp_path):
     document["kind"] = "template"
     path.write_text(yaml.safe_dump(document))
     assert D.all_declarations(catalog_path=catalog(tmp_path, path)) == ()
+
+
+def test_requirement_derivation_selects_authored_capability_contract(tmp_path, monkeypatch):
+    from merlin_experiments.phase0 import requirements
+
+    from merlin.common.paths import repo_root
+    from merlin.targetgen.target_experiment import load_target_experiment
+
+    definition = repo_root() / "examples/gemmini/experiment.yaml"
+    descriptor = repo_root() / "examples/gemmini/target/descriptor.yaml"
+    roster = load_target_experiment(descriptor).workload_spec["applications"]
+
+    class ContractObserved(Exception):
+        pass
+
+    def observe(target, **kwargs):
+        assert target == "gemmini"
+        assert kwargs["capability_contract_path"] == (
+            repo_root() / "examples/gemmini/target/contracts/target_contract.yaml"
+        )
+        raise ContractObserved
+
+    monkeypatch.setattr(requirements, "select_evidence", observe)
+    captures = {label: tmp_path / label / "model.mlir" for label in roster}
+    with pytest.raises(ContractObserved):
+        requirements.derive(definition, captures, rtl_facts=tmp_path / "facts.json", output_root=tmp_path / "derived")
