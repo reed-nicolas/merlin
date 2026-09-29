@@ -446,6 +446,10 @@ def compile_rvv(
                 # routing is deliberately separate: it cannot prove that a host island or mesh call ran.
                 "mesh_route_symbols": res.get("mesh_route_symbols"),
                 "dispatch_ledger": res.get("dispatch_ledger"),
+                # Static structure of THIS runtime outline, compared with the target-admitted
+                # groups on the same normalized module. The ledger above remains the independent
+                # evidence of dynamic execution; neither can substitute for the other.
+                "planned_outlined_alignment": res.get("planned_outlined_alignment"),
                 # Layers whose capacity_fit obligation the RUNTIME discharged for the backend; non-empty
                 # means this result is evidence about runtime+backend together, not about the backend
                 # alone. Each entry names the tiler that chose its extent (`tile_source`).

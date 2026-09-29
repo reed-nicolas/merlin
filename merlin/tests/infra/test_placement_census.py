@@ -204,6 +204,32 @@ def _module_census(target: str, **kwargs):
     return PC.census_of_module(_parse(_PRE_INTEGER_PREPARATION), target, **kwargs)
 
 
+def test_runtime_outline_must_preserve_a_planned_accelerator_group(monkeypatch) -> None:
+    """A matmul executing on a unit does not prove its attached elementwise work did too."""
+    from merlin.xdsl_dialects.lowering import compute_groups as CG
+    from merlin.xdsl_dialects.lowering.outline import outline_dispatches
+
+    module = _parse(_PRE_INTEGER_PREPARATION)
+    function = next(op for op in module.walk() if op.name == "func.func")
+    root, epilogue = [op for op in function.body.blocks[0].ops if op.name in {"linalg.matmul", "linalg.reduce"}]
+    group = CG.Group(
+        index=0,
+        placement="unit",
+        root=root,
+        members=[root, epilogue],
+        stages=[CG.classify(root).kind, CG.classify(epilogue).kind],
+    )
+    monkeypatch.setattr(CG, "form_groups", lambda *args, **kwargs: [group])
+
+    split = PC.planned_outlined_alignment(module, _TARGET, outline_dispatches(module))
+    assert split["status"] == "split"
+    assert split["split_stages"][0]["outlined_symbol"] != split["split_stages"][0]["root_symbol"]
+    # Passing the very same group to the outliner preserves it as one dispatch. This is the
+    # structural repair; dynamic execution is still a separate obligation.
+    kept = PC.planned_outlined_alignment(module, _TARGET, outline_dispatches(module, groups=[group]))
+    assert kept["status"] == "matched" and kept["n_planned_accelerator_stages"] == 1
+
+
 # --- THE MUTATION TESTS: BOTH DIRECTIONS ---------------------------------------------------------
 #
 # This instrument has been confidently wrong in BOTH directions, and a test pinning the number it

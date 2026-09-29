@@ -1400,6 +1400,24 @@ def run_model(
     _mesh_counts: dict = {}
     if kernel_backend is None and _os.environ.get("MERLIN_XNNPACK_HOST") == "1":
         kernel_backend = "xnnpack"
+    if kernel_backend == "mesh" and mesh_target:
+        # Compare the grouping the target admits with the outline THIS run will execute.  The
+        # whole-model runtime still outlines one linalg operation per kernel; a separate planning
+        # report built from the capture is not evidence that an epilogue stayed with its producer.
+        # Keep the result separate from the dynamic dispatch ledger: this proves only emitted
+        # structure, not where a completed call ran.
+        from ..perf import placement_census as _placement_census
+
+        try:
+            _mesh_counts["planned_outlined_alignment"] = _placement_census.planned_outlined_alignment(
+                module, mesh_target, outlined
+            )
+        except Exception as error:  # noqa: BLE001 -- an unavailable comparison cannot certify placement
+            _mesh_counts["planned_outlined_alignment"] = {
+                "schema": "planned_outlined_alignment_v1",
+                "status": "incomplete",
+                "reason": f"{type(error).__name__}: {error}",
+            }
     results = execute(
         outlined,
         args,
