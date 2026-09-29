@@ -2727,6 +2727,25 @@ def _model_capture_config(workload: str, m2m_dir: str | Path | None = None) -> d
     return document
 
 
+def model_capture_declaration_identity(workload: str | None, m2m_dir: str | Path | None = None) -> dict:
+    """Portable byte identity of the selected workload settings (never a host path)."""
+    if not workload:
+        return {"status": "not_a_model2mlir_workload"}
+    _model_capture_config(workload, m2m_dir)
+    root = Path(m2m_dir) if m2m_dir is not None else _m2m_dir()
+    relative = Path("workloads") / workload / "capture.toml"
+    declaration = root / relative
+    if not declaration.is_file():
+        return {"status": "absent", "path": relative.as_posix()}
+    raw = declaration.read_bytes()
+    return {
+        "status": "selected",
+        "path": relative.as_posix(),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
+    }
+
+
 def model_capture_env(workload: "str | None", m2m_dir: str | Path | None = None) -> dict:
     """Read selected host locations and historical full-fidelity settings for this workload."""
     if not workload:
@@ -2831,7 +2850,9 @@ _CORRECTNESS_ONLY_NOTE = (
 )
 
 
-def input_provenance_record(workload: "str | None", applied_env: dict, meta: dict) -> dict:
+def input_provenance_record(
+    workload: "str | None", applied_env: dict, meta: dict, capture_declaration: dict | None = None
+) -> dict:
     """What the capsule records about WHERE ITS INPUTS CAME FROM, from the loader's own declaration.
 
     A whole-model capsule can be captured on real, attributed dataset samples or on a seeded synthetic
@@ -2888,6 +2909,7 @@ def input_provenance_record(workload: "str | None", applied_env: dict, meta: dic
         # the capture was invoked, the second what the loader made of it, and a disagreement between
         # them is visible rather than averaged away.
         "loader_env": {str(k): str(v) for k, v in sorted((applied_env or {}).items())},
+        **({"capture_declaration": capture_declaration} if capture_declaration is not None else {}),
         "declared": declared,
         **({"declaration_error": meta["loader_provenance_error"]} if meta.get("loader_provenance_error") else {}),
     }
@@ -3240,6 +3262,7 @@ def write_model_capsule(
     # invent its inputs then raised, and the corpus recorded the model as one it could not build: a
     # fact about the invocation, published as a fact about the compiler's reach.
     workload = resolve_model_workload(entry, src.m2m_dir) if src is not None else None
+    capture_declaration = model_capture_declaration_identity(workload, src.m2m_dir) if src is not None else None
     capture_env = model_capture_env(workload, src.m2m_dir) if src is not None else {}
     capture_quantization = entry.get("capture_quantization")
     if capture_quantization not in (None, "already_materialized"):
@@ -3273,7 +3296,9 @@ def write_model_capsule(
         )
     )
     # WHERE THE INPUTS CAME FROM -- recorded unconditionally, tri-state, and never inferred here.
-    provenance = input_provenance_record(workload, capture_env, art.meta)
+    if src is not None and model_capture_declaration_identity(workload, src.m2m_dir) != capture_declaration:
+        raise M2MUnavailable("selected Model2MLIR capture declaration changed during model capture")
+    provenance = input_provenance_record(workload, capture_env, art.meta, capture_declaration)
 
     # Validate declared external payloads before touching a destination. A
     # missing source must not publish an ABI that names a nonexistent sidecar,

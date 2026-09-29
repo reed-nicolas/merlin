@@ -143,6 +143,14 @@ an agent to invent missing semantics, select favorable tests or repair a target 
 Phase 1 is the agentic functional compiler experiment. Phase 2 optimizes and measures an
 already functionally qualified compiler using a separate performance cohort.
 
+For a live model workload, capsule generation reads `workloads/<name>/capture.toml`
+from the selected model2MLIR source, not another checkout named by the host environment.
+A malformed declaration or missing pinned interpreter fails that capsule explicitly.
+The generated capsule's `input_provenance.capture_declaration` records the selected
+declaration's relative path, byte count and SHA-256 (or records its absence). This
+is inspectable input lineage, not proof of a sealed PyTorch runtime or Phase 0
+admission; those claims still require the separate capture-execution attestation.
+
 Authored inputs still have a role. The SW spec supplies behavior not yet established by
 extraction: operation legality, layouts and tails, numerical semantics, ABI ordering,
 quantization eligibility and host/accelerator transfer rules. Workload policy supplies

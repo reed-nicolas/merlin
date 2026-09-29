@@ -19,6 +19,7 @@ Target-agnostic: nothing here names a hardware target; the declarations are keye
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 
@@ -146,6 +147,13 @@ def test_declared_loader_env_reaches_the_capture_worker(tmp_path, monkeypatch):
     # a smoke-fidelity knob is NOT replayed (it would capture a smaller model than the golden)
     assert "ACME_LAYERS" not in seen["env"]
     assert d.is_dir()
+    declaration = (tmp_path / "model2MLIR/workloads/acme_net_v2/capture.toml").read_bytes()
+    assert _prov(d)["capture_declaration"] == {
+        "status": "selected",
+        "path": "workloads/acme_net_v2/capture.toml",
+        "sha256": hashlib.sha256(declaration).hexdigest(),
+        "bytes": len(declaration),
+    }
 
 
 def test_declared_interpreter_is_used_when_the_workload_pins_one(tmp_path, monkeypatch):
@@ -162,8 +170,11 @@ def test_declared_interpreter_is_used_when_the_workload_pins_one(tmp_path, monke
 
 
 def test_a_workload_that_pins_nothing_keeps_the_default_interpreter(tmp_path, monkeypatch):
-    _d, seen = _write(tmp_path, monkeypatch)
+    d, seen = _write(tmp_path, monkeypatch)
     assert seen["cmd"][0].endswith("model2MLIR/.venv/bin/python")
+    assert _prov(d)["capture_declaration"] == {
+        "status": "absent", "path": "workloads/acme_net_v2/capture.toml"
+    }
 
 
 def test_selected_checkout_owns_capture_declaration(tmp_path, monkeypatch):
