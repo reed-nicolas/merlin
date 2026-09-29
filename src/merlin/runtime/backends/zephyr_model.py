@@ -22,17 +22,17 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import numpy as np
 
 from merlin.common import proc as _proc
 from merlin.common.paths import runtime_dir
 
-from ...common.paths import repo_root
 from ...llvmlower import c_runtime, toolchain
 from ...llvmlower.lower import lower_model_file
 from . import spike as _spike
+from .firesim_runner import FireSimRunner, select_runner
 
 # clang flags for the model object. medany keeps it position-tolerant;
 # -ffreestanding/-fno-builtin so it needs only the symbols mlir_runtime.c + libc(picolibc)
@@ -1547,6 +1547,15 @@ static void merlin_report_stacks(void)
     )
 
 
+def _completion_metric_line(prefix: str | None) -> str:
+    if prefix is None:
+        return ""
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _=<>-:."
+    if not isinstance(prefix, str) or not prefix or any(char not in allowed for char in prefix):
+        raise ZephyrModelError("completion_metric_prefix contains unsupported C-string characters")
+    return f'  printk("{prefix} %llu\\n", (unsigned long long)(c1 - c0));\n'
+
+
 def _main_c(
     rvv_hart: int,
     dump_cap: int = 4096,
@@ -1560,6 +1569,7 @@ def _main_c(
     debug: bool = False,
     dram_base: int = 0,
     region_bytes: int = 0,
+    completion_metric_prefix: str | None = None,
 ) -> str:
     """Generate the Zephyr worker main: one COOP thread pinned to ``rvv_hart`` calls
     ``merlin_run`` and dumps the output with the same OUT/ARGMAX/METRIC/DONE protocol the
@@ -1573,7 +1583,11 @@ def _main_c(
     times against the same arena, one ``METRIC iter_cycles`` line per timed iteration, so the
     host can report steady-state min/median/p95 instead of a single cold sample. The final
     iteration's output is the one dumped, so every existing correctness gate is unchanged.
+
+    An optional runner may need a terminal cycle marker before ``DONE``. Its
+    prefix is supplied by that runner's build selection, never hardcoded here.
     """
+    marker_line = _completion_metric_line(completion_metric_prefix)
     # omp_threads decouples "threads the pool fans out to" from "harts the image was lowered
     # for". Same binary, fewer threads: the A/B that separates a threading bug from a codegen
     # bug (at 1 thread the parallel regions run serially on the master through the very same
@@ -1777,9 +1791,7 @@ static void merlin_worker(void *a, void *b, void *c) {{
    * `STAGE compute_done`, computed every one of its 11,160 ops, and was then killed by the run
    * cap 2,469 PROF lines into the dump -- eight hours spent, no logits printed, nothing gradeable.
    * The answer is the product; the profile is commentary. Print the product first. */
-{dbg.post_dump}  /* Terminal sentinel reused from the ModelBlaster FireSim runner: its
-   * run_firesim() waits for this marker to know the block is complete. */
-  printk("=== MODELBLASTER_WALL_CYCLES === %llu\\n", (unsigned long long)(c1 - c0));
+{dbg.post_dump}{marker_line}
   printk("DONE\\n");
   k_sem_give(&merlin_done);
 }}
@@ -2271,6 +2283,7 @@ def build_app(
     debug: bool = False,
     matrix: "MatrixRouting | None" = None,
     matrix_scalar_tile: bool = False,
+    completion_metric_prefix: str | None = None,
 ) -> dict:
     """Lower the model, generate the Zephyr app, and build ``zephyr.elf``.
 
@@ -2295,7 +2308,11 @@ def build_app(
     ``sdk_dir`` is the target's own SDK checkout, REQUIRED when the board declares a UART console:
     the UART address and the two clock rates its baud divisor depends on are derived from that SDK's
     headers (``runtime.sdk_facts``) rather than written down here.
+
+    ``completion_metric_prefix`` is an optional terminal cycle marker required
+    by some out-of-tree runners. It is folded into the image build hash.
     """
+    _completion_metric_line(completion_metric_prefix)
     if board is None:
         raise ZephyrModelError("a board from MERLIN_BOARD_CATALOG must be explicitly selected")
     from ..boards import board as _board_desc
@@ -2672,6 +2689,7 @@ def build_app(
             debug=debug,
             dram_base=brd.dram_base,
             region_bytes=ram_region_bytes,
+            completion_metric_prefix=completion_metric_prefix,
         )
 
     _h.update(prj_conf_text.encode())
@@ -3243,111 +3261,6 @@ def _gate(prefix: np.ndarray, references, *, max_rel: float | None = None, min_c
     return out
 
 
-def _check_firesim_workload(firesim_root: str, workload: str) -> None:
-    """Fail closed when the shared ``config_runtime.yaml`` names a different workload than the one we
-    stage into.
-
-    ``FIRESIM_WORKLOAD_NAME`` only tells the RUNNER where to put the ELF. What FireSim boots comes from
-    ``workload.workload_name`` in ``config_runtime.yaml``, and when the two disagree the simulator loads
-    whatever binary the other workload last left behind -- with no error anywhere, because from
-    FireSim's side nothing is wrong. That cost a 63-minute FPGA run whose uartlog turned out to be a
-    months-old image for a different accelerator, trapping on its first custom instruction.
-
-    The queue path is immune (the daemon is passed ``--workload`` and writes a per-job config), so this
-    is checked only where the shared file is actually consulted.
-    """
-    import yaml
-
-    cfg = Path(firesim_root) / "deploy" / "config_runtime.yaml"
-    if not cfg.is_file():
-        return
-    declared = ((yaml.safe_load(cfg.read_text()) or {}).get("workload", {}) or {}).get("workload_name")
-    want = f"{workload}.json"
-    if declared != want:
-        raise RuntimeError(
-            f"{cfg} declares workload_name={declared!r} but this run stages into {workload!r}. FireSim "
-            f"would boot the binary belonging to {declared!r}, not ours. Set workload_name to {want!r} "
-            f"(and restore it afterwards), or run through the queue, which manages its own config."
-        )
-
-
-class FireSimRunner(Protocol):
-    """Out-of-tree execution adapter; Merlin owns only console parsing and gating.
-
-    The adapter owns staging, queue submission, workload/project naming and any
-    simulator-specific imports. It returns the captured UART text, not a verdict.
-    """
-
-    def __call__(
-        self,
-        elf: str,
-        *,
-        firesim_root: str,
-        firesim_env: str,
-        timeout: int,
-        queue: bool,
-    ) -> str: ...
-
-
-def _legacy_modelblaster_firesim(
-    elf: str,
-    *,
-    firesim_root: str,
-    firesim_env: str,
-    timeout: int,
-    queue: bool,
-) -> str:
-    """Compatibility adapter for existing ModelBlaster-backed FireSim callers.
-
-    New target support supplies a runner explicitly instead of importing this
-    checkout-specific integration from Merlin's shared execution path.
-    """
-    import sys
-
-    # Resolve through paths.env (os.environ -> .env -> default), NOT os.environ alone: every
-    # other external dependency in the repo is configurable from the gitignored .env without
-    # exporting into the shell, and reading os.environ directly silently ignored a configured
-    # MERLIN_MODELBLASTER and failed with a bare ModuleNotFoundError for 'modelblaster'.
-    from ...common.paths import env as _env
-
-    mb = _env("MERLIN_MODELBLASTER", "/path/to/ModelBlaster")
-    for p in (f"{mb}/src", mb):
-        if p not in sys.path:
-            sys.path.insert(0, p)
-    # Run under OUR FireSim workload name, not ModelBlaster's. firesim_runner reads
-    # FIRESIM_WORKLOAD_NAME into a module constant AT IMPORT, so this must be set before
-    # the (lazy) import below. The workload def lives at deploy/workloads/merlin-oscar.json.
-    os.environ.setdefault("FIRESIM_WORKLOAD_NAME", "merlin-oscar")
-    # The firesim-queue records the SUBMITTER's env, and the daemon runs the job (incl.
-    # `firesim kill`, which SSHes to localhost) with it. If we submit from a session whose
-    # SSH_AUTH_SOCK points at a dead/empty agent (e.g. a VS Code agent), fabric can't
-    # authenticate and every run aborts at the kill step. Point at the FireSim agent (the
-    # one the daemon uses, holding the localhost key) when ours is missing/dead.
-    _fs_sock = os.environ.get("FIRESIM_SSH_AUTH_SOCK", "/tmp/firesim_ssh_agent.sock")
-    _cur = os.environ.get("SSH_AUTH_SOCK", "")
-    if os.path.exists(_fs_sock) and (not _cur or not os.path.exists(_cur)):
-        os.environ["SSH_AUTH_SOCK"] = _fs_sock
-    # Tag our jobs with a distinct project so they are unmistakably separable from other
-    # workflows on the shared queue (e.g. ModelBlaster's xpurt_demo runs) — and never
-    # confused for cancellation. firesim_runner reads FIRESIM_PROJECT (default modelblaster).
-    os.environ.setdefault("FIRESIM_PROJECT", "merlin-oscar")
-    if queue:
-        os.environ["FIRESIM_QUEUE"] = "1"
-        os.environ.setdefault("FIRESIM_QUEUE_TIMEOUT", str(timeout))
-    else:
-        # Without the queue the shared config_runtime.yaml is what FireSim reads, so it has to agree
-        # with where we stage. See _check_firesim_workload.
-        _check_firesim_workload(firesim_root, os.environ["FIRESIM_WORKLOAD_NAME"])
-    try:
-        from modelblaster.validation.firesim_runner import run_firesim  # type: ignore
-    except ModuleNotFoundError:
-        from validation.firesim_runner import run_firesim  # type: ignore
-
-    return run_firesim(
-        str(elf), models=None, firesim_root=firesim_root, firesim_env=firesim_env, timeout=float(timeout)
-    )
-
-
 def run_on_firesim(
     elf: str | Path,
     *,
@@ -3358,19 +3271,23 @@ def run_on_firesim(
     firesim_root: str | None = None,
     firesim_env: str | None = None,
     runner: FireSimRunner | None = None,
+    runner_name: str | None = None,
 ) -> dict[str, Any]:
     """Execute an ELF with a selected FireSim adapter, then parse and gate its UART.
 
     An out-of-tree adapter owns simulator staging, queue and environment policy.
-    Existing callers without one use the legacy ModelBlaster integration. That
-    default is compatibility only, not a target-independent execution claim.
+    An installed runner is selected by ``runner_name`` or
+    ``MERLIN_FIRESIM_RUNNER``. Direct ``runner=`` injection is for explicit
+    orchestration and tests. A checkout is never an implicit execution provider.
     """
     from ...common.paths import env as _env
 
     chipyard = _env("MERLIN_CHIPYARD", "/path/to/chipyard")
     root = firesim_root or _env("FIRESIM_ROOT", f"{chipyard}/sims/firesim")
     environment = firesim_env or _env("FIRESIM_ENV", f"{chipyard}/env.sh")
-    selected = runner if runner is not None else _legacy_modelblaster_firesim
+    if runner is not None and runner_name is not None:
+        raise ValueError("pass runner or runner_name, not both")
+    selected = runner if runner is not None else select_runner(runner_name)
     uart = selected(str(elf), firesim_root=root, firesim_env=environment, timeout=timeout, queue=queue)
     if not isinstance(uart, str):
         raise ZephyrModelError("FireSim runner must return captured UART text")
