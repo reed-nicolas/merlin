@@ -7,6 +7,7 @@ last_verified: 2026-09-27
 related: [generating_capsules, adding_a_target, integrations]
 code_refs:
   - src/merlin/targetgen/software_spec.py
+  - src/merlin/targetgen/instruction_semantics.py
   - src/merlin/targetgen/rtl/circt_introspect.py
   - packages/merlin-experiments/src/merlin_experiments/phase0/evidence.py
   - packages/merlin-experiments/src/merlin_experiments/phase0/generation.py
@@ -106,6 +107,34 @@ and executable typed constraints. Use semantic `families` for a shared class, or
 Numerical semantics select an independent model and its rounding/reduction policy,
 never a target-name default. Generated source audits, test counts, qualification hashes
 and long diagnostic reports belong in artifacts, not this YAML.
+
+## Describe instruction semantics separately
+
+The SW spec states which behavior software may rely on. It does not define an
+accelerator instruction set. When a target has an independently reviewed instruction
+description, keep it in its OOT support package and select its relative path with
+`instruction_semantics` in the target contract. Phase 0 validates its SW-operation
+links and binds it to the selected CIRCT facts, then freezes both the exact
+authored bytes (`software/instruction-semantics-authored.yaml`) and the normalized
+consumer model (`software/instruction-semantics.json`). The normalized model records
+the exact authored and selected-input byte hashes when file bytes were supplied;
+in-memory selected views carry canonical content hashes instead.
+Neither file belongs in Merlin core, and neither is a generated compiler.
+
+Each instruction description needs typed operands/results, a computation pattern
+(indexing maps, iterators and scalar SSA body), applicable SW operation, side effects,
+and any local-memory constraints. Unknown effects, missing SW links, or incomplete
+memory capacity remain explicit `UNKNOWN` entries. CIRCT facts can justify observed
+structure, but a decoder field alone cannot supply complete functional semantics.
+Do not copy an instruction from a related target or fill missing behavior by name.
+If no description is selected, Phase 0 emits an `UNKNOWN` model, not a guessed one.
+`described` means the checked declaration is internally complete, not that the
+instruction has been proved against RTL or executed on hardware.
+
+This extra input is intentionally separate from the minimal SW spec: an author writes
+software-visible behavior once, the OOT owner describes instruction behavior once,
+and Phase 0 binds both to exact hardware evidence. The schema is
+[`instruction_semantics.schema.yaml`](../../merlin/schemas/instruction_semantics.schema.yaml).
 
 The Atlas and Gemmini examples use directly named operations and transfers; authors
 do not need IDs, `signature` wrappers or duplicate copy endpoint constraints.

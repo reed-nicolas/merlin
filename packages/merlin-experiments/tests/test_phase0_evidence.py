@@ -115,8 +115,7 @@ def test_derivation_identity_binds_provider_bytes_but_not_checkout_location(monk
         relocated.raw_facts,
     )
     assert (
-        changed.derivation_identity["support_sources_sha256"]
-        != selected.derivation_identity["support_sources_sha256"]
+        changed.derivation_identity["support_sources_sha256"] != selected.derivation_identity["support_sources_sha256"]
     )
 
 
@@ -141,6 +140,52 @@ def test_export_and_reload_never_reopen_original_inputs(monkeypatch, tmp_path):
     assert manifest["raw_facts_sha256"] == selected.raw_facts_sha256
     assert (output / "hardware/circt/facts.json").read_bytes() == selected.raw_facts
     assert evidence.export_evidence(restored, output) == manifest
+
+
+def test_selected_instruction_semantics_are_frozen_with_the_phase0_inputs(monkeypatch, tmp_path):
+    selected, raw, code = _selection(monkeypatch, tmp_path)
+    from merlin.targetgen import instruction_semantics
+
+    contract = code.parent / "contracts/target_contract.yaml"
+    contract.write_text("name: fixture\ncompute_units: []\ninstruction_semantics: contracts/instructions.yaml\n")
+    authored = code.parent / "contracts/instructions.yaml"
+    authored.write_bytes(b"schema: merlin.instruction_semantics.v1\ntarget: fixture\ninstructions: []\n")
+    calls = []
+
+    def normalize(document, *, software_spec, rtl_facts, target, source_bytes, software_source_bytes, rtl_source_bytes):
+        calls.append(
+            (document, software_spec, rtl_facts, target, source_bytes, software_source_bytes, rtl_source_bytes)
+        )
+        return {
+            "schema": "merlin.instruction_semantics.v1",
+            "target": target,
+            "status": "UNKNOWN",
+            "instructions": [],
+            "unknowns": [{"reason": "no reviewed instruction semantics"}],
+        }
+
+    monkeypatch.setattr(instruction_semantics, "normalize_instruction_semantics", normalize)
+    selected = evidence.select_evidence("fixture", facts_path=raw)
+    assert calls[0][3] == "fixture"
+    assert calls[0][4] == authored.read_bytes()
+    assert calls[0][6] == raw.read_bytes()
+    output = tmp_path / "run-with-instructions"
+    manifest = evidence.export_evidence(selected, output)
+    assert (output / "software/instruction-semantics-authored.yaml").read_bytes() == authored.read_bytes()
+    assert "software/instruction-semantics.json" in manifest["consumers"]["instruction_selection"]
+    authored.unlink()
+    restored = evidence.load_exported_evidence(output)
+    assert restored.derivation_identity == selected.derivation_identity
+    assert evidence.export_evidence(restored, output) == manifest
+
+
+def test_selected_instruction_semantics_cannot_escape_provider(monkeypatch, tmp_path):
+    _, raw, code = _selection(monkeypatch, tmp_path)
+    contract = code.parent / "contracts/target_contract.yaml"
+    contract.write_text("name: fixture\ncompute_units: []\ninstruction_semantics: ../foreign.yaml\n")
+    (tmp_path / "foreign.yaml").write_text("target: foreign\n")
+    with pytest.raises(ValueError, match="escapes provider root|resource is not a file"):
+        evidence.select_evidence("fixture", facts_path=raw)
 
 
 def test_selected_application_accounting_is_digest_bound_and_replayed_without_framework_queries(monkeypatch, tmp_path):

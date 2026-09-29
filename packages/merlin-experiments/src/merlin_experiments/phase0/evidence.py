@@ -225,6 +225,7 @@ class EvidenceSelection:
     views_json: bytes
     raw_facts: bytes | None
     archived_artifacts: tuple[tuple[str, bytes], ...] = ()
+    instruction_semantics_source: bytes | None = None
 
     @property
     def source_paths(self) -> tuple[Path, ...]:
@@ -245,14 +246,16 @@ class EvidenceSelection:
         support = [source for source in self.source_snapshots if source.role == "support-source"]
         root = Path(os.path.commonpath([str(source.path.absolute().parent) for source in support])) if support else None
         support_rows = [
-            {"path": str(source.path.absolute().relative_to(root)), "sha256": source.sha256}
-            for source in support
+            {"path": str(source.path.absolute().relative_to(root)), "sha256": source.sha256} for source in support
         ]
         return {
             "contract_sha256": _digest(_json(self.contract)),
             "raw_facts_sha256": self.raw_facts_sha256,
             "readout_facets_sha256": _canonical_digest(self.readout_facets),
             "support_sources_sha256": _canonical_digest(sorted(support_rows, key=lambda row: row["path"])),
+            "instruction_semantics_sha256": (
+                _digest(self.instruction_semantics_source) if self.instruction_semantics_source is not None else None
+            ),
         }
 
     def __getattr__(self, name: str) -> Any:
@@ -288,7 +291,7 @@ def select_evidence(
     sources: dict[Path, EvidenceSource] = {}
     diagnostics: list[dict[str, Any]] = []
     excluded = {".git", "__pycache__", "build", ".venv"}
-    extensions = {".py", ".json", ".yaml", ".yml", ".h", ".hpp", ".cpp", ".c", ".inc", ".S"}
+    extensions = {".py", ".json", ".yaml", ".yml", ".mlir", ".h", ".hpp", ".cpp", ".c", ".inc", ".S"}
 
     def observe(path, role, *, required=False) -> bytes | None:
         path = Path(path).absolute()
@@ -494,6 +497,37 @@ def select_evidence(
         raise ValueError("selected RTL facts must contain a facts mapping")
     if not loaded_facts.get("facts"):
         diagnostics.append({"component": "facts", "status": "unknown", "reason": "no populated RTL facts selected"})
+    instruction_semantics_source = None
+    instruction_semantics = {
+        "schema": "merlin.instruction_semantics.v1",
+        "target": target,
+        "status": "UNKNOWN",
+        "unknowns": ["selected_target_contract_has_no_instruction_semantics_resource"],
+        "instructions": [],
+    }
+    instruction_resource = contract.get("instruction_semantics")
+    if instruction_resource is not None:
+        if provider is None or not isinstance(instruction_resource, str) or not instruction_resource.strip():
+            raise ValueError("instruction_semantics requires a selected support provider and relative resource")
+        from merlin.targetgen.instruction_semantics import normalize_instruction_semantics
+        from merlin.targetgen.providers import contained_resource
+
+        selected_instruction_path = contained_resource(provider.base, instruction_resource)
+        instruction_semantics_source = observe(selected_instruction_path, "instruction-semantics", required=True)
+        authored_instructions = yaml.safe_load(instruction_semantics_source)
+        instruction_semantics = normalize_instruction_semantics(
+            authored_instructions,
+            software_spec=software_doc,
+            rtl_facts=loaded_facts,
+            target=target,
+            source_bytes=instruction_semantics_source,
+            software_source_bytes=(
+                sources[Path(software_spec).absolute()].content
+                if software_spec is not None and not isinstance(software_spec, Mapping)
+                else None
+            ),
+            rtl_source_bytes=raw_facts,
+        )
     # Only explicit full paths identify actual RTL owners. Basenames and widths
     # are not enough to reconstruct provenance or declare numeric support.
     inputs = loaded_facts.get("inputs") or {}
@@ -776,6 +810,10 @@ def select_evidence(
         "descriptor": descriptor_doc,
         "hardware_spec": hardware_doc,
         "software_spec": software_doc,
+        "instruction_semantics": instruction_semantics,
+        "instruction_semantics_source_sha256": (
+            _digest(instruction_semantics_source) if instruction_semantics_source is not None else None
+        ),
         "datapath": datapath,
         "application_inventory": application_inventory,
         "application_inventory_identity": inventory_identity,
@@ -812,7 +850,13 @@ def select_evidence(
             ],
         },
     }
-    return EvidenceSelection(target, tuple(sources.values()), _json(views), raw_facts)
+    return EvidenceSelection(
+        target,
+        tuple(sources.values()),
+        _json(views),
+        raw_facts,
+        instruction_semantics_source=instruction_semantics_source,
+    )
 
 
 def _coverage_readme(accounting: dict, quantization: dict) -> bytes:
@@ -978,6 +1022,9 @@ def export_evidence(selection: EvidenceSelection, artifact_root: str | Path) -> 
         outputs[f"hardware/effective-views/{name}.json"] = _json(value)
     for name in ("contract", "residual", "hardware_spec", "software_spec", "datapath", "diagnostics"):
         outputs[f"software/{name.replace('_', '-')}.json"] = _json(getattr(selection, name))
+    outputs["software/instruction-semantics.json"] = _json(selection.instruction_semantics)
+    if selection.instruction_semantics_source is not None:
+        outputs["software/instruction-semantics-authored.yaml"] = selection.instruction_semantics_source
     from merlin.targetgen.operation_accounting import build_operation_accounting
     from merlin.targetgen.quantization_spec import build_quantization_contract, capture_recipe_candidates
 
@@ -1156,6 +1203,17 @@ def export_evidence(selection: EvidenceSelection, artifact_root: str | Path) -> 
                 *sorted(name for name in outputs if name.startswith("software/quantization-recipes/")),
                 "coverage/operation-accounting.json",
             ],
+            "instruction_selection": [
+                "software/software-spec.json",
+                "software/contract.json",
+                "software/instruction-semantics.json",
+                *(
+                    ["software/instruction-semantics-authored.yaml"]
+                    if selection.instruction_semantics_source is not None
+                    else []
+                ),
+                *(["hardware/circt/facts.json"] if selection.raw_facts is not None else []),
+            ],
         },
         "qualification": "byte snapshots and declared/derived views only; no compiler or hardware verdict",
     }
@@ -1226,6 +1284,7 @@ def load_exported_evidence(artifact_root: str | Path) -> EvidenceSelection:
         views,
         observed.get("hardware/circt/facts.json"),
         tuple(sorted({**observed, "evidence-manifest.json": manifest_raw}.items())),
+        observed.get("software/instruction-semantics-authored.yaml"),
     )
     if selection.raw_facts_sha256 != manifest.get("raw_facts_sha256"):
         raise ValueError("raw facts identity differs from evidence manifest")
