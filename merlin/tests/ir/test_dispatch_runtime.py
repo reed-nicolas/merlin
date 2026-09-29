@@ -67,6 +67,80 @@ builtin.module {
 """
 
 
+def test_grouped_epilogue_requires_complete_mesh_executor(tmp_path, monkeypatch):
+    """An admitted fused group must not silently execute on the host or drop its epilogue."""
+    from types import SimpleNamespace
+
+    from merlin.common import mlir_query as mq
+    from merlin.llvmlower import kernel_backend
+    from merlin.runtime import dispatch_runtime as runtime
+    from merlin.xdsl_dialects.lowering import compute_groups as CG
+    from merlin.xdsl_dialects.lowering.outline import outline_dispatches
+
+    module = mq.parse(
+        """builtin.module {
+  func.func @forward(%a: tensor<2x2xf32>, %b: tensor<2x2xf32>,
+                     %init: tensor<2x2xf32>, %out: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    %mm = linalg.matmul ins(%a, %b : tensor<2x2xf32>, tensor<2x2xf32>)
+          outs(%init : tensor<2x2xf32>) -> tensor<2x2xf32>
+    %relu = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                                              affine_map<(d0, d1) -> (d0, d1)>],
+                            iterator_types = ["parallel", "parallel"]}
+      ins(%mm : tensor<2x2xf32>) outs(%out : tensor<2x2xf32>) {
+      ^bb0(%x: f32, %old: f32):
+        %zero = arith.constant 0.000000e+00 : f32
+        %v = arith.maximumf %x, %zero : f32
+        linalg.yield %v : f32
+      } -> tensor<2x2xf32>
+    func.return %relu : tensor<2x2xf32>
+  }
+}"""
+    )
+    function = next(op for op in module.walk() if op.name == "func.func")
+    root, relu = [op for op in function.body.blocks[0].ops if op.name.startswith("linalg.")]
+    group = CG.Group(
+        index=0,
+        placement="unit",
+        root=root,
+        members=[root, relu],
+        stages=[CG.classify(root).kind, CG.classify(relu).kind],
+    )
+    outlined = outline_dispatches(module, groups=[group])
+    assert outlined.dispatches[0].stages == ["contraction", "relu"]
+
+    monkeypatch.setattr(
+        runtime,
+        "mesh_datapath",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            operand_dtype="int8", subnormal_operand_flush=False, integer=True, mlir_dtype=lambda _dtype: "i8"
+        ),
+    )
+
+    class HostKernel:
+        def __call__(self, _args):
+            pass  # host-group case below checks dispatch, not numerical compiler correctness
+
+    def unexpected_host_compile(*_args, **_kwargs):
+        pytest.fail("accelerator-placed group reached the host compiler")
+
+    monkeypatch.setattr(kernel_backend, "compile_host", unexpected_host_compile)
+    counters = {}
+    zeros = [np.zeros((2, 2), np.float32) for _ in range(4)]
+    with pytest.raises(runtime.DispatchRuntimeError, match="no complete mesh executor"):
+        runtime.execute(outlined, zeros, tmp_path, kernel_backend="mesh", mesh_target="synthetic", counters=counters)
+
+    # Explicit host placement remains legal and must not be promoted by the matmul classifier.
+    group.placement = "host"
+    outlined_host = outline_dispatches(module, groups=[group])
+    monkeypatch.setattr(kernel_backend, "compile_host", lambda *_args, **_kwargs: HostKernel())
+    host_counts = {}
+    runtime.execute(
+        outlined_host, zeros, tmp_path, kernel_backend="mesh", mesh_target="synthetic", counters=host_counts
+    )
+    assert host_counts["mesh_routed"] == 0
+    assert [entry["lane"] for entry in host_counts["dispatch_ledger"]] == ["native_cpu"]
+
+
 @pytest.mark.skipif(not _toolchain(), reason="m2m venv / clang-23 missing")
 def test_scalar_arg_kernel_is_passed_by_value(tmp_path):
     from merlin.frontends.linalg_mlir import parse_mlir_text

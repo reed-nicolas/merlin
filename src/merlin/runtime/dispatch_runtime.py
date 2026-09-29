@@ -773,6 +773,7 @@ def execute(
         if not mesh_target:
             raise DispatchRuntimeError("kernel_backend='mesh' requires mesh_target=<target>")
         mesh_dp = mesh_datapath(mesh_target, numeric_policy=numeric_policy)
+        grouped = {d.symbol: d for d in outline_result.dispatches if d.group is not None}
         # The host lane materializes f32; the mesh may also take its own format directly.
         _mesh_et = mesh_dp.mlir_dtype(mesh_dp.operand_dtype)
         _accept = ("f32", _mesh_et) if _mesh_et != "f32" else ("f32",)
@@ -780,10 +781,28 @@ def execute(
             op.sym_name.data: op for op in module.walk() if op.name == "func.func" and "$kernel_" in op.sym_name.data
         }
         for sym, kfn in kfns.items():
+            # An explicitly host-placed group must not be promoted merely because its body happens
+            # to match the standalone matmul classifier.
+            if sym in grouped and grouped[sym].placement == "host":
+                continue
             # a bare linalg.matmul, or the linalg.generic a quantization rewrite leaves behind
             route = _classify_mesh_matmul(kfn, _accept) or _classify_mesh_contraction(kfn, _accept)
             if route is not None:
                 mesh_routes[sym] = route
+        # The standalone mesh executor consumes two operands and returns their contraction. It has
+        # no binding for an outlined group's additional stages (bias, activation, readout, etc.).
+        # Never run an accelerator-placed group on the host by accident, or treat its contraction
+        # alone as execution of the whole group. Only a contraction-only group may use that route.
+        unsupported_groups = [
+            d.symbol
+            for d in grouped.values()
+            if d.placement != "host" and (d.symbol not in mesh_routes or d.stages != ["contraction"])
+        ]
+        if unsupported_groups:
+            raise DispatchRuntimeError(
+                "accelerator-placed outlined groups have no complete mesh executor: "
+                + ", ".join(sorted(unsupported_groups))
+            )
         # Matmul-family kernels the classifier REJECTED (bias-fused, transposed, batched-generic,
         # non-f32/i8, operand computed in-kernel). They never reach the mesh branch and so are invisible
         # to `mesh_fell_back`; counting them keeps the coverage claim honest.
