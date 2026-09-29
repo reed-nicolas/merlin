@@ -1,5 +1,7 @@
 """A projected kernel must remain tied to one exact captured MLIR body."""
 
+# ruff: noqa: E501 -- the multiline fixture preserves exact emitted MLIR lines.
+
 from __future__ import annotations
 
 import hashlib
@@ -10,7 +12,6 @@ import pytest
 from merlin.targetgen.contract.interface_emit import parse_interface_mlir
 from merlin.targetgen.contract.model_kernel_outline import outline_integer_matmuls
 from merlin.targetgen.source_kernel_probe import derive_kernel_window
-
 
 _INTEGER_BODY = """builtin.module {
   func.func @forward(%a: tensor<4x19xi8>, %b: tensor<19x8xi8>) -> tensor<4x8xi32> {

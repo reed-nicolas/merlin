@@ -103,7 +103,10 @@ def outline_integer_matmuls(model: bytes, *, target: str) -> dict:
         bindings = [source(value) for value in op.operands[:2]]
         if any(binding.get("source") == "unresolved" for binding in bindings):
             refused.append(
-                {"operation_id": operation_id, "reason": "operand source is not a direct SSA result or function argument"}
+                {
+                    "operation_id": operation_id,
+                    "reason": "operand source is not a direct SSA result or function argument",
+                }
             )
             continue
         candidates.append(
@@ -123,5 +126,8 @@ def outline_integer_matmuls(model: bytes, *, target: str) -> dict:
         "model_sha256": digest,
         "candidates": candidates,
         "refused": refused,
-        "qualification": "isolated exact integer kernels only; no target compilation, model stitching, or numerical proof",
+        "qualification": (
+            "isolated exact integer kernels only; "
+            "no target compilation, model stitching, or numerical proof"
+        ),
     }
