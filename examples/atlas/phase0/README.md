@@ -112,6 +112,10 @@ unset produces a diagnostic unknown and stops capsule materialization. Atlas is 
 self-hosted ISA target: do not add a command-ISA `corpus_issue_order` to bypass a
 missing model environment. Select and pin the model's Python environment, then
 rerun from a new artifact root; the failed frozen run remains diagnostic evidence.
+The frozen runner does not inherit an ambient Model2MLIR interpreter.
+PyTorch-sourced capsules requiring on-demand capture are reported as omissions
+until their tool/runtime has an explicit frozen selection; the four
+already-materialized iteration captures remain exact Phase 0 inputs.
 
 ```sh
 MERLIN_TARGET_PATH="$ATLAS_SUPPORT_ROOT" SPECIR_ROOT="$SPECIR_ROOT" \

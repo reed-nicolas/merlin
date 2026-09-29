@@ -93,10 +93,12 @@ The recipe declares stable performance oracle names (`spike` for L2 and
 to be installed; execution still verifies the selected engine and hardware
 revision. Before freezing a run that will execute those members, select
 `MERLIN_EXT_CHIPYARD` for the Chipyard tree containing the concrete Gemmini L3
-simulator, and set
-`MERLIN_M2M_DIR` to the selected Model2MLIR source tree and
-`MERLIN_M2M_PYTHON` to its pinned interpreter for generated
-PyTorch-sourced capsules. The L3 performance members cannot execute if the
+simulator. For separate capture/derivation, set `MERLIN_M2M_DIR` to the selected
+Model2MLIR source tree and `MERLIN_M2M_PYTHON` to its pinned interpreter.
+The frozen Phase 0 runner does not inherit those ambient variables: it binds
+already-materialized captures, while on-demand PyTorch-sourced capsules remain
+unwritten until their capture tool/runtime has an explicit frozen selection.
+The L3 performance members cannot execute if the
 simulator cannot be resolved; a missing exporter also leaves source capsules unwritten.
 Static-int8 source capsules require `m2m/capture/pt2e_integerize.py` in the
 selected tree. Captures that may fold Conv+BatchNorm also require the
@@ -219,14 +221,13 @@ from an older provider cannot be reused just because their MLIR parses.
 ## 5. Generate a fresh corpus and keep cohorts distinct
 
 Select the realized requirement/profile together for inspect, preflight and run:
-Pin the same Model2MLIR checkout and capture interpreter used to realize the
-iteration workloads. In particular, a sibling checkout may lack the selected
-recipe's integerization implementation; Phase 0 must fail instead of falling
-back to a different capture path.
+the selected materialized bundles already bind their Model2MLIR capture outputs.
+The frozen runner does not recapture from an ambient sibling checkout or
+inherit a live capture interpreter. Source capsules that still need one are
+reported as omissions, not as verified Phase 0 coverage.
 
 ```sh
-MERLIN_M2M_DIR="$MODEL2MLIR_ROOT" MERLIN_M2M_PYTHON="$CAPTURE_PYTHON" \
-  merlin experiment run gemmini-functional --phase 0 \
+merlin experiment run gemmini-functional --phase 0 \
   --phase0-rtl-facts "$RTL_ROOT/facts.json" \
   --phase0-conformance-spec "$REALIZED_DERIVATION_ROOT/requirements.yaml" \
   --phase0-synth-profile "$REALIZED_DERIVATION_ROOT/synthesis.yaml" \
