@@ -15,6 +15,7 @@ import yaml
 from merlin.common import mlir_query as mq
 from merlin.targetgen.application_inventory import exact_int_mm_generic_operation
 from merlin.targetgen.contract.interface_emit import emit_interface_mlir
+from merlin.targetgen.contract.model_stitching import stitching_inventory
 from merlin.targetgen.software_spec import admit_operation, validate_software_spec
 
 SCHEMA = "merlin.model_kernel_outline.v1"
@@ -177,6 +178,7 @@ def outline_integer_matmuls(
         },
         "candidates": candidates,
         "refused": refused,
+        "stitching": stitching_inventory(module, digest, candidates),
         "qualification": (
             "diagnostic isolated integer kernels; SW admission may be unknown; "
             "no target compilation, model stitching, or numerical proof"

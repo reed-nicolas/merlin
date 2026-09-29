@@ -56,7 +56,14 @@ contract must explicitly declare the resident-packed, accumulator-commit and
 command-buffer class.
 Missing, foreign or malformed selections refuse; an unsupported declaration emits
 no interface. The manifest binds the exact model, SW spec and capability-contract
-byte hashes, MLIR operation and operand-producing SSA values. Each candidate's
+byte hashes, MLIR operation and operand-producing SSA values. Its `stitching`
+inventory lists ordered source operations, function return bindings, and typed
+SSA crossings into or out of each contraction. These are *transfer requirements*,
+not generated DMA or a working dispatch. For the integerized `coverage_mlp`
+capture, both matmuls consume host-produced quantization/transpose results and
+feed further host math. Each crossing keeps the byte-bound source value and
+consumer identity so later placement and pointer order need not be guessed from
+tensor names. The inventory remains `diagnostic_unexecutable`. Each candidate's
 `software_admission` can still be `unknown` (the current unreviewed example is),
 and `compiler_support` remains `not_evaluated`; this is an inspectable diagnostic,
 not a Phase 0 provenance certificate or a claim that the target compiler supports the operation. Submit an interface
@@ -65,6 +72,9 @@ not lower the intervening quantization, transpose, dequantization or host operat
 model, or establish numerical execution. The published Gemmini compiler still
 declines the *whole* upstream Linalg module; an isolated kernel command buffer
 does not change that verdict.
+The outline's focused test numerically checks its isolated signed `i8×i8→i32`
+interface on a non-square K-tail against scalar arithmetic. It does not execute
+the OOT compiler output, connect the host operations, or compare a model golden.
 
 For a new numerical accelerator certificate, the compiler must emit
 `compiler_pointer_abi: {version: 1, arguments: [...]}` in its command buffer.

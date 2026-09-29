@@ -10,6 +10,7 @@ import json
 import pytest
 
 from merlin.common.paths import repo_root
+from merlin.runtime.simulator import simulate
 from merlin.targetgen.contract.interface_emit import parse_interface_mlir
 from merlin.targetgen.contract.model_kernel_outline import outline_integer_matmuls
 from merlin.targetgen.source_kernel_probe import derive_kernel_window
@@ -99,6 +100,20 @@ def test_exact_integer_model_body_outlines_a_compilable_interface_kernel(tmp_pat
         {"source": "function_argument", "argument_index": 0},
         {"source": "function_argument", "argument_index": 1},
     ]
+    stitching = manifest["stitching"]
+    assert stitching["model_sha256"] == manifest["model_sha256"]
+    assert stitching["candidate_operation_ids"] == [candidate["operation_id"]]
+    assert stitching["status"] == "diagnostic_unexecutable"
+    assert [edge["direction"] for edge in stitching["candidate_boundary_crossings"]] == [
+        "host_to_candidate", "host_to_candidate", "candidate_to_host"
+    ]
+    assert [edge["dtype"] for edge in stitching["candidate_boundary_crossings"]] == [
+        "i8", "i8", "i32"
+    ]
+    assert stitching["functions"][0]["return_values"][0]["value_id"] == (
+        candidate["operation_id"] + ":result:0"
+    )
+    assert stitching["functions"][0]["unlowered_host_operations"]
     interface = (output / candidate["interface_file"]).read_text()
     assert hashlib.sha256(interface.encode()).hexdigest() == candidate["interface_sha256"]
     parsed = parse_interface_mlir(interface)
@@ -107,6 +122,13 @@ def test_exact_integer_model_body_outlines_a_compilable_interface_kernel(tmp_pat
     assert [command["opcode"] for command in commands] == ["RES_PACK", "MATMUL_RESIDENT", "COMMIT"]
     assert commands[-1]["attributes"]["output_dtype"] == "i32"
 
+    # Numerically check this isolated interface's signed, untiled K-tail
+    # semantics against an independent scalar loop. This is not device code.
+    a = [[((i * 7 + k * 3) % 17) - 8 for k in range(19)] for i in range(4)]
+    b = [[((k * 5 + j * 11) % 23) - 11 for j in range(8)] for k in range(19)]
+    expected = [[sum(a[i][k] * b[k][j] for k in range(19)) for j in range(8)] for i in range(4)]
+    assert simulate(parsed, {"A": a, "B": b})["outputs"] == {"Y": expected}
+
     # Neither same-typed wrong wiring nor a nonzero seed is a standalone matmul.
     wrong_product = _INTEGER_BODY.replace('"arith.muli"(%lhs32, %rhs32)', '"arith.muli"(%lhs32, %lhs32)')
     selection = {"target": "gemmini", "software_spec": software_spec.read_bytes(),
@@ -114,6 +136,27 @@ def test_exact_integer_model_body_outlines_a_compilable_interface_kernel(tmp_pat
     assert outline_integer_matmuls(wrong_product.encode(), **selection)["candidates"] == []
     nonzero_init = _INTEGER_BODY.replace('value = 0 : i32', 'value = 1 : i32')
     assert outline_integer_matmuls(nonzero_init.encode(), **selection)["candidates"] == []
+
+
+def test_model_stitching_keeps_host_producer_and_consumer_edges_explicit():
+    root = repo_root() / "examples/gemmini/target"
+    model = _INTEGER_BODY.replace(
+        '    %result = "linalg.generic"(%a, %b, %init)',
+        '    %prepared = "tensor.cast"(%a) : (tensor<4x19xi8>) -> tensor<4x19xi8>\n'
+        '    %result = "linalg.generic"(%prepared, %b, %init)',
+    )
+    result = outline_integer_matmuls(
+        model.encode(), target="gemmini",
+        software_spec=(root / "software-spec.yaml").read_bytes(),
+        capability_contract=(root / "contracts/target_contract.yaml").read_bytes(),
+    )
+    assert len(result["candidates"]) == 1
+    stitching = result["stitching"]
+    producer = stitching["candidate_boundary_crossings"][0]
+    assert producer["direction"] == "host_to_candidate"
+    assert producer["source_value_id"] == result["candidates"][0]["operand_bindings"][0]["source_value_id"]
+    assert producer["producer_operation_id"] in stitching["functions"][0]["unlowered_host_operations"]
+    assert stitching["candidate_boundary_crossings"][-1]["consumer_operation"] == "func.return"
 
 
 def test_outline_requires_selected_same_target_resident_class_and_sw_declaration():
