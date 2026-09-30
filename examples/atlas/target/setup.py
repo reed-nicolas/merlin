@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
-"""Bring up the ATLAS NPU target's external dependencies for THIS clone — elegantly, without vendoring.
+"""Locate Atlas dependencies and report their revisions and availability.
 
-atlas is onboarded the same way gemmini is: everything derivable is discovered from atlas's RTL by
-mlc, and the two machine-specific external checkouts (the atlas-npu RTL repo + its npu_model functional
-simulator) are resolved by path via the `.env` registry (`merlin.common.paths.ext_path`), exactly like
-chipyard/merlin-iree. Users of this repo do NOT clone atlas-npu as a `third_party/` submodule — they
-point `.env` at wherever it already lives (typically the mlc sibling checkout, which pins it).
-
-This script:
-  1. RESOLVES the atlas-npu checkout + its embedded npu-model (from --atlas-npu / $MERLIN_EXT_ATLAS_NPU
-     / the mlc sibling default), and PINS them (reports the git sha).
-  2. REPORTS the mlc arc model's availability (`arc_available("atlas")`) and the npu_model
-     package directory's presence. Neither check establishes a successful oracle execution.
-  3. Optionally `--write-env` appends the two `MERLIN_EXT_*` keys to this clone's `.env`.
+Select external checkouts through CLI flags or the MERLIN_EXT_* environment keys.
+The whole-system simulator name follows the authored target descriptor. Reported
+revisions and file presence do not establish a successful oracle execution.
 
 It never clones, builds or materializes a package by default. `--sync-npu-model` runs `uv sync`
 in the npu-model dir; `--materialize-target-package` explicitly derives an OOT definition.
@@ -33,6 +24,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 from merlin.common.paths import repo_root
 
 ROOT = repo_root()
@@ -47,7 +40,7 @@ _MLC_DEFAULT = Path(os.environ.get("MERLIN_MLC_DIR") or _SIBLINGS / "mvp-lhwir" 
 _ATLAS_NPU_DEFAULT = _MLC_DEFAULT / "third_party" / "atlas-npu"
 # chipyard checkout with atlas wired in + a prebuilt whole-program Verilator sim (the L4 RTL tier).
 _CHIPYARD_ATLAS_DEFAULT = _SIBLINGS / "chipyard-atlas"
-_VERILATOR_SIM_REL = "sims/verilator/simulator-chipyard.harness-AtlasRocketConfig"
+_DESCRIPTOR = ROOT / "examples/atlas/target/descriptor.yaml"
 # Pinned shas we onboarded against (informational — a newer master is fine, we just record drift).
 _PIN_ATLAS_NPU = "569b7c3"
 _PIN_NPU_MODEL = "11598ec"
@@ -69,6 +62,13 @@ def _resolve_atlas_npu(cli: str | None) -> Path | None:
         if cand and Path(cand).is_dir():
             return Path(cand)
     return None
+
+
+def _simulator_relative_path(descriptor: Path) -> Path:
+    config = yaml.safe_load(descriptor.read_text())["rtl"]["elaboration"]["config"]
+    if not isinstance(config, str) or not config or not all(c.isalnum() or c == "_" for c in config):
+        raise ValueError("descriptor elaboration config must be a Scala class name")
+    return Path("sims/verilator") / f"simulator-chipyard.harness-{config}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -101,7 +101,10 @@ def main(argv: list[str] | None = None) -> int:
     if not atlas_npu:
         sys.stderr.write("atlas-npu checkout not found — pass --atlas-npu or set MERLIN_EXT_ATLAS_NPU.\n")
         return 2
-    npu_model = Path(a.npu_model) if a.npu_model else atlas_npu / "npu-model"
+    from merlin.common.paths import env
+
+    selected_model = a.npu_model or env("MERLIN_EXT_NPU_MODEL")
+    npu_model = Path(selected_model) if selected_model else atlas_npu / "npu-model"
     print(f"atlas-npu   : {atlas_npu}  (sha {_sha(atlas_npu) or '?'}; onboarded @{_PIN_ATLAS_NPU})")
     print(f"npu-model   : {npu_model}  (sha {_sha(npu_model) or '?'}; onboarded @{_PIN_NPU_MODEL})")
     if not npu_model.is_dir():
@@ -131,10 +134,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # L4 cycle-accurate RTL tier: the prebuilt chipyard whole-program Verilator sim (optional — the eval
     # can grade on arcilator L3 without it; verilator is the 2nd RTL tier + cross-check).
-    from merlin.common.paths import env as _env
-
-    chip = Path(a.chipyard_atlas or _env("MERLIN_EXT_CHIPYARD_ATLAS") or _CHIPYARD_ATLAS_DEFAULT)
-    sim = chip / _VERILATOR_SIM_REL
+    chip = Path(a.chipyard_atlas or env("MERLIN_EXT_CHIPYARD_ATLAS") or _CHIPYARD_ATLAS_DEFAULT)
+    sim = chip / _simulator_relative_path(_DESCRIPTOR)
     print(f"chipyard Verilator [L4 RTL]   : {'built' if sim.is_file() else 'not built'} ({sim})")
 
     # Materialize the OOT target-definition PACKAGE (contract + dialect_plan, derived from the CIRCT

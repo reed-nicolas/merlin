@@ -325,7 +325,7 @@ def main() -> int:
             case=case,
             selection=selection,
             build_commands=commands,
-            scope="selected AtlasRocketConfig AtlasCore inside AtlasTile; not AtlasTile/SoC or GSIM",
+            scope="source-selected AtlasCore inside AtlasTile; not AtlasTile/SoC or GSIM",
         )
     print(
         json.dumps(

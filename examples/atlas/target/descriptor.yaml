@@ -8,7 +8,7 @@ rtl:
   via: mlc            # ISA/memory/DIM DERIVED from atlas's RTL via mlc discovery
   elaboration:
     ext_root: chipyard_atlas
-    config: AtlasRocketConfig
+    config: EE290SimConfig
     generator: atlas
 
 hardware_spec:
