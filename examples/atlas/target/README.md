@@ -49,7 +49,16 @@ independently from that provider's compatibility declarations.
 
 [`descriptor.yaml`](descriptor.yaml) declares policy, workloads and external
 resources; [`tooling.env.example`](tooling.env.example) lists local tool locations
-without loading them automatically. Runtime implementation and named-program
+without loading them automatically. The authored elaboration selects
+[`EE290SimConfig` in bringup-chipyard](https://github.com/ucb-ee194-tapeout/bringup-chipyard/blob/main/generators/chipyard/src/main/scala/EE290Configs.scala#L13-L26),
+matching the configuration named by the current Atlas compiler timing profiles.
+The related upstream
+[`AtlasShuttleVectorConfig`](https://github.com/ucb-bar/atlas-npu/blob/2ae0bef209df6db78c3de18e8f651bb43855cce9/chipyard/config/AtlasConfigs.scala#L37-L44)
+is a separate Shuttle/vector configuration, not the identity of the selected
+whole system. Select and record the exact elaborated source and tools anew;
+changing the descriptor does not qualify cached RTL facts or simulator binaries.
+Historical source-selection and numerical receipts keep their original identities.
+Runtime implementation and named-program
 oracles belong to the OOT support package. Select that provider and ModelIR
 explicitly before extraction:
 
@@ -101,7 +110,7 @@ spec-generated hardware and Chipyard memory/hierarchy sources:
 
 ```sh
 python -m merlin.targetgen.rtl.source_selection \
-  --target atlas --generator atlas --config AtlasRocketConfig \
+  --target atlas --generator atlas --config EE290SimConfig \
   --core-root AtlasTile --firrtl /selected/elaboration/design.fir \
   --hierarchy /selected/elaboration/top_module_hierarchy.json \
   --firtool /selected/circt/bin/firtool --output /generated/atlas/source-1

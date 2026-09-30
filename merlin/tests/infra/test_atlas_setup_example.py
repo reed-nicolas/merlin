@@ -107,3 +107,33 @@ def test_failed_sync_prevents_requested_materialization(setup_example, monkeypat
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kw: SimpleNamespace(returncode=1))
     assert module.main(["--sync-npu-model", "--materialize-target-package"]) == 1
     assert calls == []
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_model_selection_honors_env_and_cli_precedence(setup_example, tmp_path, monkeypatch, capsys, explicit):
+    module, calls = setup_example
+    from merlin.common import paths
+
+    env_model = tmp_path / "env-model"
+    cli_model = tmp_path / "cli-model"
+    for model in (env_model, cli_model):
+        (model / "npu_model").mkdir(parents=True)
+    monkeypatch.setattr(paths, "env", lambda name: str(env_model) if name == "MERLIN_EXT_NPU_MODEL" else None)
+    args = ["--npu-model", str(cli_model)] if explicit else []
+    assert module.main(args) == 0
+    assert f"npu-model   : {cli_model if explicit else env_model}" in capsys.readouterr().out
+    assert calls == []
+
+
+def test_simulator_name_follows_selected_descriptor(setup_example, tmp_path):
+    module, _ = setup_example
+    descriptor = tmp_path / "descriptor.yaml"
+    descriptor.write_text("rtl:\n  elaboration:\n    config: DifferentSelectedConfig\n")
+    assert module._simulator_relative_path(descriptor).as_posix() == (
+        "sims/verilator/simulator-chipyard.harness-DifferentSelectedConfig"
+    )
+    authored = module._simulator_relative_path(module._DESCRIPTOR)
+    assert authored.name == "simulator-chipyard.harness-EE290SimConfig"
+    descriptor.write_text("rtl:\n  elaboration:\n    config: ../escape\n")
+    with pytest.raises(ValueError, match="Scala class name"):
+        module._simulator_relative_path(descriptor)

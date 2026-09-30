@@ -66,10 +66,10 @@ the original bundle members, and `hardware/scheduling/ingestion.json`.
 The shared selector accepts the target-neutral `merlin.scheduling_evidence.v1`
 envelope. It records hardware identity comparisons separately from qualification;
 imported scheduling evidence remains diagnostic and does not change operation
-admission or performance estimates. Current compiler profiles name `EE290SimConfig`,
-while this descriptor names `AtlasRocketConfig`. That mismatch stays visible.
-Even matching configuration names require source identity evidence; matching bytes
-alone do not establish a complete hardware build or a correct schedule.
+admission or performance estimates. Both the current compiler profiles and the
+descriptor select `EE290SimConfig`. Matching names still require source identity
+evidence; matching bytes alone do not establish a complete hardware build or a
+correct schedule. Historical receipts retain their original configuration.
 
 ## 3. Capture the independent iteration workloads
 
