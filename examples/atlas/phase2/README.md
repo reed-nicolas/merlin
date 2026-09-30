@@ -71,8 +71,33 @@ Static validation supplies no cycles. `--validation dynamic` reports the
 compiler scheduling simulator's before/after cycle cost when both checks pass.
 These engine-relative costs include approximate DMA estimates; they are not
 measured hardware cycles, whole-model latency or a roofline. The report keeps
-hardware timing `UNMEASURED`, numerical equivalence `UNKNOWN`, and functional
-qualification `NOT_ESTABLISHED`: the compiler's shared scheduling model does
-not evaluate tensor arithmetic. Numerical comparison requires separately
-selected runtime inputs and an independent execution observer. Neither mode
-changes the Phase 0 admission or frozen Phase 1 handoff requirements above.
+hardware timing `UNMEASURED` and functional qualification `NOT_ESTABLISHED`.
+Neither mode changes the Phase 0 admission or frozen Phase 1 handoff requirements.
+
+To also check arithmetic, supply `--model-root /absolute/tools/npu-model`,
+`--model-python /absolute/tools/model-venv/bin/python`, and
+`--model-fixture /absolute/inputs/fixture.json`. The independent
+[numerical observer](../target/rtlgraph_model.py) runs both native assembly
+streams in separate processes with identical initial inputs. Every selected
+output must match the supplied reference bytes and the other arm. With
+`--assembler`, model encodings must also match the selected baremetal assembler.
+A model with incorrect `DMA.CONFIG` or other encodings is rejected.
+Encoding agreement does not validate execution semantics: also check the selected
+model's VMEM address units and operand capture behavior against the hardware.
+The observer does not patch external tools.
+
+The fixture uses schema `merlin.atlas_model_fixture.v1`, with `dram_size`,
+`max_cycles`, `reference_provenance`, and `inputs`/`outputs` arrays. Inputs select
+a DRAM `base` and a relative raw-byte `path` with `sha256`. Outputs select a
+unique identifier `name`, either `space: dram` with `base`/`length` or
+`space: mrf_bf16` with `registers`, and a `reference` path/hash. MRF references
+concatenate each register's row-major BF16 bytes in the declared register order.
+Use independently computed references; the observer cannot establish their
+correctness from a hash. Fixture members, model sources, runtime, assembly,
+logs and outputs retain identities in the numerical report.
+
+Without a fixture, numerical equivalence remains `UNKNOWN`. With one, a
+mismatch, encoding disagreement, timeout or incomplete execution rejects the
+pair. Success establishes only that supplied numerical witness. Python-model
+ticks are reported separately from the compiler's estimated cycles and are
+not hardware measurements.

@@ -135,6 +135,22 @@ def test_baseline_mutation_during_optimization_refuses_pair(adapter, setup, monk
     assert report["candidate"] is None
 
 
+def test_candidate_removed_during_check_preserves_failure_report(adapter, setup):
+    args, calls, _, checker = setup
+    check = checker.check_schedule
+
+    def remove_candidate(**kwargs):
+        report = check(**kwargs)
+        if len(calls) == 2:
+            kwargs["source"].unlink()
+        return report
+
+    checker.check_schedule = remove_candidate
+    report = adapter.compare_schedules(**args)
+    assert report["status"] == "identity_error"
+    assert (args["output_dir"] / "report.json").is_file()
+
+
 @pytest.mark.parametrize("status,verified", [("error", True), ("passed", False)])
 def test_successful_process_cannot_override_invalidated_verdict(adapter, setup, monkeypatch, status, verified):
     args, _, _, checker = setup
@@ -164,3 +180,108 @@ def test_execution_failure_has_reviewable_report(adapter, setup, monkeypatch, ti
     assert report["optimization"]["returncode"] is None
     assert (args["output_dir"] / "report.json").is_file()
     assert report["candidate"] is None
+
+
+@pytest.fixture
+def numerical(adapter, setup, monkeypatch):
+    args, _, _, _ = setup
+    fixture = args["source"].with_name("fixture.json")
+    fixture.write_text("{}")
+    args.update(model_root=fixture.parent, model_python=fixture, model_fixture=fixture)
+    observations = []
+
+    def observe(**kwargs):
+        observations.append(kwargs)
+        report = {
+            "status": "passed", "numerical_equivalence": "PASSED_SUPPLIED_REFERENCE",
+            "model_ticks": {"before": 30, "after": 25, "after_minus_before": -5},
+            "identities": {key: adapter._identity(kwargs[key]) for key in ("before", "after", "fixture")},
+        }
+        kwargs["output_dir"].mkdir()
+        (kwargs["output_dir"] / "report.json").write_text(json.dumps(report))
+        return report
+
+    observer = SimpleNamespace(observe_pair=observe)
+    monkeypatch.setattr(adapter, "_observer", lambda: observer)
+    return observations, observer
+
+
+def test_independent_numerical_observation_keeps_timing_domains_separate(adapter, setup, numerical):
+    args, _, _, _ = setup
+    observations, _ = numerical
+    report = adapter.compare_schedules(**args, validation="dynamic")
+    assert report["status"] == "paired_checks_passed"
+    assert len(observations) == 1
+    assert observations[0]["before"] == args["output_dir"] / "baseline/native.S"
+    assert observations[0]["after"] == args["output_dir"] / "candidate.S"
+    assert report["numerical"]["equivalence"] == "PASSED_SUPPLIED_REFERENCE"
+    assert report["numerical"]["model_ticks"]["after_minus_before"] == -5
+    assert report["modeled_cost"]["after_minus_before_cycles"] == -8
+    assert report["hardware_timing"]["status"] == "UNMEASURED"
+    assert report["functional_qualification"] == "NOT_ESTABLISHED"
+
+
+@pytest.mark.parametrize("status,equivalence", [("error", "UNKNOWN"), ("passed", "UNKNOWN")])
+def test_numerical_failure_cannot_report_success(adapter, setup, numerical, status, equivalence):
+    args, _, _, _ = setup
+    _, observer = numerical
+    observe = observer.observe_pair
+
+    def failed(**kwargs):
+        return {**observe(**kwargs), "status": status, "numerical_equivalence": equivalence, "error": "wrong output"}
+
+    observer.observe_pair = failed
+    report = adapter.compare_schedules(**args)
+    assert report["status"] == "numerical_rejected"
+    assert report["numerical"]["error"] == "wrong output"
+
+
+def test_rejected_schedule_does_not_execute_numerical_observer(adapter, setup, numerical):
+    args, _, results, _ = setup
+    observations, _ = numerical
+    results[1] = 1
+    report = adapter.compare_schedules(**args)
+    assert report["status"] == "candidate_rejected"
+    assert not observations
+
+
+@pytest.mark.parametrize("drift", ["before", "after", "fixture"])
+def test_numerical_report_must_bind_checked_bytes(adapter, setup, numerical, drift):
+    args, _, _, _ = setup
+    _, observer = numerical
+    observe = observer.observe_pair
+
+    def wrong_identity(**kwargs):
+        report = observe(**kwargs)
+        report["identities"][drift]["sha256"] = "0" * 64
+        return report
+
+    observer.observe_pair = wrong_identity
+    report = adapter.compare_schedules(**args)
+    assert report["status"] == "numerical_rejected"
+    assert report["numerical"]["equivalence"] == "UNKNOWN"
+
+
+def test_fixture_mutation_during_scheduling_prevents_observation(adapter, setup, numerical, monkeypatch):
+    args, _, _, _ = setup
+    observations, _ = numerical
+    optimize = adapter.subprocess.run
+
+    def mutate(*arguments, **kwargs):
+        result = optimize(*arguments, **kwargs)
+        args["model_fixture"].write_text('{"changed":true}')
+        return result
+
+    monkeypatch.setattr(adapter.subprocess, "run", mutate)
+    report = adapter.compare_schedules(**args)
+    assert report["status"] == "numerical_rejected"
+    assert not observations
+
+
+@pytest.mark.parametrize("missing", ["model_root", "model_python", "model_fixture"])
+def test_numerical_selection_requires_all_inputs(adapter, setup, numerical, missing):
+    args, calls, _, _ = setup
+    args.pop(missing)
+    with pytest.raises(ValueError, match="supplied together"):
+        adapter.compare_schedules(**args)
+    assert not calls

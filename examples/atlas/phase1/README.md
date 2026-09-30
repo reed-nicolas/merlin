@@ -77,3 +77,14 @@ one modeled execution and retains its modeled cycle estimate; DMA completion
 still requires matching waits. Neither mode evaluates tensor arithmetic, replays
 RTL, measures hardware timing, or qualifies Phase 1 numerical correctness. The
 shared Phase 1 grading protocol does not automatically run this optional tool.
+
+Static checking requires fixed-latency work to drain at every CFG block boundary.
+A handwritten kernel can overlap work across a label and pass its finite dynamic
+execution while failing this conservative static rule. Such a rejection does
+not establish a numerical failure. To produce a candidate accepted by that rule,
+invoke the selected compiler with `--passes schedule --schedule-priority input
+--validation static --dma-timing robust` and the exact same profile arguments,
+then check the emitted candidate statically and dynamically. This preserves the
+checker guards and can add delays; retain the original verdict and report any
+modeled cost increase. Numerical equivalence requires a separate observation
+with explicit inputs and a numerical reference.
