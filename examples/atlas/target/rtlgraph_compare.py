@@ -10,12 +10,20 @@ import subprocess
 from pathlib import Path
 
 
-def _checker():
-    path = Path(__file__).with_name("rtlgraph_check.py")
-    spec = importlib.util.spec_from_file_location("atlas_pair_checker", path)
+def _module(filename):
+    path = Path(__file__).with_name(filename)
+    spec = importlib.util.spec_from_file_location(Path(filename).stem, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _checker():
+    return _module("rtlgraph_check.py")
+
+
+def _observer():
+    return _module("rtlgraph_model.py")
 
 
 def _identity(path):
@@ -33,6 +41,10 @@ def compare_schedules(
     assembler=None,
     validation="static",
     timeout=60,
+    model_root=None,
+    model_python=None,
+    model_fixture=None,
+    model_timeout=120,
 ):
     """Check a baseline, schedule it, then check the candidate with the same model.
 
@@ -43,6 +55,12 @@ def compare_schedules(
         raise ValueError("validation must be static or dynamic")
     if timeout <= 0:
         raise ValueError("timeout must be positive")
+    numerical_requested = any(value is not None for value in (model_root, model_python, model_fixture))
+    if numerical_requested and any(value is None for value in (model_root, model_python, model_fixture)):
+        raise ValueError("model_root, model_python and model_fixture must be supplied together")
+    if model_timeout <= 0:
+        raise ValueError("model_timeout must be positive")
+    fixture_identity = _identity(model_fixture) if numerical_requested else None
     checker = _checker()
     context = checker.prepare_selection(selection, compiler)
     output_dir = Path(output_dir).resolve()
@@ -68,8 +86,9 @@ def compare_schedules(
         "functional_qualification": "NOT_ESTABLISHED",
         "limitations": [
             *context["limitations"],
-            "Both arms share the compiler's scheduling model; arithmetic is not evaluated.",
-            "No runtime tensor inputs, numerical observer, or independent RTL execution were used.",
+            "Schedule checks share the compiler's scheduling model and do not evaluate tensor arithmetic.",
+            "Independent numerical observation is limited to the supplied fixture; no RTL was executed."
+            if numerical_requested else "No runtime tensor inputs, numerical observer, or RTL execution were used.",
         ],
     }
 
@@ -160,8 +179,13 @@ def compare_schedules(
         timeout=timeout,
     )
     report["candidate"] = checked
-    report["candidate_source"] = _identity(candidate)
     if not unchanged(baseline, checked):
+        return finish()
+    try:
+        report["candidate_source"] = _identity(candidate)
+    except OSError as error:
+        report["status"] = "identity_error"
+        report["error"] = str(error)
         return finish()
     if report["candidate_source"] != checked["identities"]["source"]:
         report["status"] = "identity_error"
@@ -176,6 +200,35 @@ def compare_schedules(
                 after_cycles=after_cycles,
                 after_minus_before_cycles=after_cycles - before_cycles,
             )
+    if report["status"] == "paired_checks_passed" and numerical_requested:
+        try:
+            if _identity(model_fixture) != fixture_identity:
+                raise ValueError("numerical fixture changed during scheduling")
+            observation = _observer().observe_pair(
+                before=before, after=candidate, fixture=model_fixture,
+                model_root=model_root, python=model_python, assembler=assembler,
+                output_dir=output_dir / "numerical", timeout=model_timeout,
+            )
+            report["numerical"] = {
+                "status": observation["status"],
+                "equivalence": observation["numerical_equivalence"],
+                "model_ticks": observation["model_ticks"],
+                "report": _identity(output_dir / "numerical/report.json"),
+            }
+            if observation["status"] != "passed" or observation["numerical_equivalence"] != "PASSED_SUPPLIED_REFERENCE":
+                report["status"] = "numerical_rejected"
+                report["numerical"]["error"] = observation.get("error", "numerical comparison failed")
+                return finish()
+            expected = {"before": _identity(before), "after": report["candidate_source"], "fixture": fixture_identity}
+            if any(observation["identities"].get(key) != value for key, value in expected.items()):
+                raise ValueError("numerical observation identities differ from checked pair")
+            if _identity(model_fixture) != fixture_identity:
+                raise ValueError("numerical fixture changed during observation")
+            if not unchanged(baseline, checked):
+                return finish()
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+            report["status"] = "numerical_rejected"
+            report["numerical"].update(status="error", equivalence="UNKNOWN", error=str(error))
     return finish()
 
 
@@ -189,6 +242,10 @@ def main():
     parser.add_argument("--assembler", type=Path)
     parser.add_argument("--validation", choices=["static", "dynamic"], default="static")
     parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--model-root", type=Path)
+    parser.add_argument("--model-python", type=Path)
+    parser.add_argument("--model-fixture", type=Path)
+    parser.add_argument("--model-timeout", type=float, default=120)
     args = parser.parse_args()
     report = compare_schedules(
         source=args.kernel,
@@ -199,6 +256,10 @@ def main():
         assembler=args.assembler,
         validation=args.validation,
         timeout=args.timeout,
+        model_root=args.model_root,
+        model_python=args.model_python,
+        model_fixture=args.model_fixture,
+        model_timeout=args.model_timeout,
     )
     print(json.dumps({"status": report["status"], "report": str(args.output / "report.json")}))
     return 0 if report["status"] == "paired_checks_passed" else 1
