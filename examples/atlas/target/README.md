@@ -6,6 +6,14 @@
 Neither an ISA name nor the host package's FP32 strategy certifies FP8/BF16
 operation support.
 
+The separate [hand-authored Atlas MLIR dialect](https://github.com/ucb-bar/atlas-mlir/tree/handwritten-implementation)
+shows typed machine operations and an LLVM/assembly handoff for fixed diagnostic
+tiles. Its [dialect reference](https://github.com/ucb-bar/atlas-mlir/blob/5485aa0aaeca222e1c158507460db06a621eeba4/docs/dialect-reference.md)
+documents the operation and pass contracts. This example's
+[`software-spec.yaml`](software-spec.yaml) remains the authored Merlin software
+declaration; the OOT reference does not replace it or qualify all its admitted
+semantics.
+
 [`contracts/target_contract.yaml`](contracts/target_contract.yaml) is the loadable
 prototype capability declaration. Its matching
 [`contracts/residual.yaml`](contracts/residual.yaml) feeds fact-backed derivation.

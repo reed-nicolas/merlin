@@ -6,6 +6,7 @@ target `atlas`; provider identity and hardware configuration are separate inputs
 
 - [Target descriptor](target/descriptor.yaml): target policy and declared external resources.
 - [Software spec](target/software-spec.yaml) and [hardware selection](target/hardware.yaml): separate authored semantics from selected structural evidence.
+- [Hand-authored Atlas MLIR reference](https://github.com/ucb-bar/atlas-mlir/tree/handwritten-implementation): the OOT machine dialect, passes, and [numbered MLP/attention handoff examples](https://github.com/ucb-bar/atlas-mlir/tree/5485aa0aaeca222e1c158507460db06a621eeba4/examples/handoff) from Atlas MLIR through LLVM MLIR, LLVM IR, assembly, and ELF.
 - [Phase 0 guide](phase0/README.md) and [public recipe](phase0/recipe.yaml): derive tests, then prepare and review the resulting corpus.
 - [Phase 1 guide](phase1/README.md): supplied compiler-authoring inputs and functional experiment requirements.
 - [Phase 2 handoff](phase2/README.md): select frozen compiler evidence and the existing optimization templates.
@@ -13,6 +14,12 @@ target `atlas`; provider identity and hardware configuration are separate inputs
 - [Artifact navigation](artifacts/README.md): raw CIRCT facts, actual consumer views, coverage and capsule lineage.
 
 [Target setup](target/README.md) describes explicit OOT support and local tooling prerequisites.
+The hand-authored reference is separate from Merlin's generated compiler and ACT
+comparison. Its examples are fixed 32×32 diagnostic tiles; their ELF words ran on
+the selected standalone AtlasCore through ModeLIR. They have not been run as
+complete programs in `npu_model` or as full MLP/attention layers. See the
+[dialect and pass reference](https://github.com/ucb-bar/atlas-mlir/blob/5485aa0aaeca222e1c158507460db06a621eeba4/docs/dialect-reference.md)
+for what each operation and pass currently checks.
 Phase 0 is explicitly diagnostic until source consistency, software semantics and
 coverage are qualified. Generated files remain outside the example.
 
