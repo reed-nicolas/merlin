@@ -109,6 +109,7 @@ def test_requirement_derivation_selects_authored_capability_contract(tmp_path, m
 
     def observe(target, **kwargs):
         assert target == "gemmini"
+        assert kwargs["scheduling_evidence"] == tmp_path / "scheduling-evidence.json"
         assert kwargs["capability_contract_path"] == (
             repo_root() / "examples/gemmini/target/contracts/target_contract.yaml"
         )
@@ -117,4 +118,10 @@ def test_requirement_derivation_selects_authored_capability_contract(tmp_path, m
     monkeypatch.setattr(requirements, "select_evidence", observe)
     captures = {label: tmp_path / label / "model.mlir" for label in roster}
     with pytest.raises(ContractObserved):
-        requirements.derive(definition, captures, rtl_facts=tmp_path / "facts.json", output_root=tmp_path / "derived")
+        requirements.derive(
+            definition,
+            captures,
+            rtl_facts=tmp_path / "facts.json",
+            output_root=tmp_path / "derived",
+            scheduling_evidence=tmp_path / "scheduling-evidence.json",
+        )

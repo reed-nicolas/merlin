@@ -40,6 +40,37 @@ Source consistency proves provenance, not operation legality or numerical agreem
 Manual RTL audit improves the deterministic extractor; it is not an agentic runtime
 step in Phase 0. Keep raw facts separate from the effective consumer views.
 
+### Optional instruction scheduling evidence
+
+The [Atlas compiler](https://github.com/Jeremy-Ryan-Mills/atlas-compiler/tree/feat/rtl-graph)
+exports partial operand/resource profiles and kernel-specific footprints in a
+[native contract bundle](https://github.com/Jeremy-Ryan-Mills/atlas-compiler/blob/feat/rtl-graph/docs/rtlgraph-contract.md).
+Convert an existing bundle into a portable evidence selection:
+
+```sh
+python examples/atlas/target/rtlgraph_evidence.py \
+  --contract "$ATLAS_CONTRACT/contract.json" --output "$SCHEDULING_ROOT"
+```
+
+The target-owned adapter checks profile/evidence agreement, artifact hashes, and
+completion conventions. It preserves the original bytes, including row accesses,
+resource holds, unknown addresses, and explicit DMA waits. It does not execute
+`atlas-opt`, reproduce footprints, or qualify numerical behavior.
+
+Add `--scheduling-evidence "$SCHEDULING_ROOT/scheduling-evidence.json"` to
+`merlin experiment corpus derive` below. For a new Phase 0 run, select the same
+manifest with `--phase0-scheduling-evidence`; the run freezes its members with the
+other selected inputs. Saved evidence includes `hardware/scheduling/manifest.json`,
+the original bundle members, and `hardware/scheduling/ingestion.json`.
+
+The shared selector accepts the target-neutral `merlin.scheduling_evidence.v1`
+envelope. It records hardware identity comparisons separately from qualification;
+imported scheduling evidence remains diagnostic and does not change operation
+admission or performance estimates. Current compiler profiles name `EE290SimConfig`,
+while this descriptor names `AtlasRocketConfig`. That mismatch stays visible.
+Even matching configuration names require source identity evidence; matching bytes
+alone do not establish a complete hardware build or a correct schedule.
+
 ## 3. Capture the independent iteration workloads
 
 Use [the four shared loaders](../../workloads/README.md): `coverage_mlp`,

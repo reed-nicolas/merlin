@@ -51,6 +51,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         child.add_argument("--phase0-rtl-facts", type=Path, help="select exact extracted facts for a new Phase 0 run")
         child.add_argument(
+            "--phase0-scheduling-evidence", type=Path, help="select diagnostic instruction scheduling evidence"
+        )
+        child.add_argument(
             "--phase0-capability-contract",
             type=Path,
             help="select exact same-target capability contract for a new Phase 0 run",
@@ -95,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         "--rtl-facts", type=Path, required=True, help="exact extraction artifact; never re-extract implicitly"
     )
     derive.add_argument("--output", type=Path, required=True, help="new immutable artifact root")
+    derive.add_argument("--scheduling-evidence", type=Path, help="selected diagnostic scheduling evidence manifest")
     capture = operations.add_parser("capture", help="preselect and issue one fresh sealed CPU capture")
     capture_ops = capture.add_subparsers(dest="capture_operation", required=True)
     select_capture = capture_ops.add_parser("select", help="freeze source/runtime/tool bytes before capture")
@@ -184,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                         _source(args.definition, args.catalog),
                         capture_selections(args.application_capture),
                         rtl_facts=args.rtl_facts,
+                        scheduling_evidence=args.scheduling_evidence,
                         output_root=args.output,
                         native_qualifications=capture_selections(args.native_qualification),
                         capture_preselections=capture_selection_specs(args.application_capture_selection),
@@ -266,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
                 phase0_capability_contract=args.phase0_capability_contract,
                 phase0_synth_profile=args.phase0_synth_profile,
                 phase0_rtl_facts=args.phase0_rtl_facts,
+                phase0_scheduling_evidence=args.phase0_scheduling_evidence,
                 phase0_evidence_mode=args.phase0_evidence_mode,
                 phase0_hidden_profile=args.phase0_hidden_profile,
                 phase0_m2m_root=args.phase0_m2m_root,

@@ -25,6 +25,7 @@ def main(argv=None) -> int:
     ap.add_argument("--hardware-spec", type=Path, help="selected hardware source and extraction declarations")
     ap.add_argument("--capability-contract", type=Path, help="selected same-target backend capability declaration")
     ap.add_argument("--rtl-facts", type=Path, help="exact pre-extracted hardware facts; never silently regenerate")
+    ap.add_argument("--scheduling-evidence", type=Path, help="selected diagnostic scheduling evidence manifest")
     ap.add_argument("--evidence-root", type=Path, help="run-owned hardware/software evidence destination")
     ap.add_argument(
         "--evidence-input", type=Path, help="previously frozen evidence bundle; do not reselect live evidence"
@@ -115,6 +116,7 @@ def main(argv=None) -> int:
                     "hardware_spec",
                     "capability_contract",
                     "rtl_facts",
+                    "scheduling_evidence",
                     "evidence_root",
                     "evidence_input",
                     "evidence_mode",

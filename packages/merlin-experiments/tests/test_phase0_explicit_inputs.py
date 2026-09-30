@@ -157,12 +157,27 @@ def test_cli_forwards_all_explicit_inputs_without_legacy_discovery(inputs, tmp_p
     monkeypatch.setattr(cli, "generate_target", lambda target, **kwargs: calls.append((target, kwargs)) or [])
     monkeypatch.setattr(cli, "profile_targets", lambda **kwargs: pytest.fail("explicit recipe enumerated targets"))
     descriptor, output = tmp_path / "target.yaml", tmp_path / "output"
+    scheduling = tmp_path / "scheduling-evidence.json"
     argv = ["--target", "fixture", "--descriptor", str(descriptor), "--output-root", str(output)]
+    argv.extend(["--scheduling-evidence", str(scheduling)])
     for name, path in inputs.items():
         argv.extend(["--" + name.replace("_", "-"), str(path)])
     assert cli.main(argv) == 0
-    assert calls == [("fixture", {"descriptor": descriptor, "output_root": output, **inputs})]
+    assert calls == [
+        ("fixture", {"descriptor": descriptor, "output_root": output, "scheduling_evidence": scheduling, **inputs})
+    ]
     assert not output.exists()
+
+
+def test_generation_rejects_live_scheduling_selection_with_frozen_evidence(tmp_path):
+    with pytest.raises(ValueError, match="cannot be combined with frozen"):
+        generation.generate_target(
+            "fixture",
+            output_root=tmp_path / "output",
+            evidence_input=tmp_path / "frozen",
+            scheduling_evidence=tmp_path / "scheduling-evidence.json",
+        )
+    assert not (tmp_path / "output").exists()
 
 
 def test_generation_forwards_paths_before_numerical_work(inputs, tmp_path, monkeypatch):

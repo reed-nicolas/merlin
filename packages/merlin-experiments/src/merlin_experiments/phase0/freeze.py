@@ -43,6 +43,7 @@ def selection(command: dict, target: str):
         descriptor=inputs["descriptor"],
         capability_contract_path=inputs.get("capability_contract"),
         facts_path=inputs.get("rtl_facts"),
+        scheduling_evidence=inputs.get("scheduling_evidence"),
         hardware_spec=inputs.get("hardware_spec"),
         software_spec=inputs.get("software_spec"),
         conformance_spec=inputs.get("conformance_spec"),
@@ -230,6 +231,9 @@ def stage(plan: dict) -> dict:
             staged = str(snapshot / source_snapshot.INPUT_ROOT / owner / Path(value).name)
             command["argv"] = [staged if arg == value else arg for arg in command["argv"]]
             command["inputs"][name] = staged
+    if "--scheduling-evidence" in command["argv"]:
+        index = command["argv"].index("--scheduling-evidence")
+        del command["argv"][index : index + 2]
     command["argv"] += ["--evidence-input", str(artifact_root)]
     command["entrypoint"] = path_map[command["entrypoint"]]
     command["cwd"] = str(snapshot)
