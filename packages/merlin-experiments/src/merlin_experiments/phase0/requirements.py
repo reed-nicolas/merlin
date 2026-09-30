@@ -250,6 +250,7 @@ def derive(
     *,
     rtl_facts: str | Path,
     output_root: str | Path,
+    scheduling_evidence: str | Path | None = None,
     native_qualifications: dict[str, Path] | None = None,
     capture_preselections: dict[str, tuple[Path, str]] | None = None,
     quantization_policies: dict[str, tuple[Path, str]] | None = None,
@@ -317,6 +318,7 @@ def derive(
         hardware_spec=hardware,
         facts_path=rtl_facts,
         prohibited_roles=spec.prohibited_instruction_roles,
+        scheduling_evidence=scheduling_evidence,
     )
     options = {
         "capability_contract": selected.contract,
@@ -540,6 +542,7 @@ def derive(
         software_spec=software,
         hardware_spec=hardware,
         facts_path=rtl_facts,
+        scheduling_evidence=scheduling_evidence,
         conformance_spec=root / "requirements.yaml",
         native_qualifications=native_qualifications,
         prohibited_roles=spec.prohibited_instruction_roles,

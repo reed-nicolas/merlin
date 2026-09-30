@@ -204,6 +204,7 @@ class Adapter:
                 "capability_contract",
                 "hardware_spec",
                 "rtl_facts",
+                "scheduling_evidence",
                 "evidence_mode",
                 "m2m_root",
                 "m2m_python",
@@ -217,6 +218,8 @@ class Adapter:
                     raise SpecError("explicit phase-0 recipe does not support comparison_manifest")
             if ("m2m_root" in config) != ("m2m_python" in config):
                 raise SpecError("select both m2m_root and m2m_python for a frozen capture runtime")
+            if "scheduling_evidence" in config and "software_spec" not in config:
+                raise SpecError("scheduling evidence requires explicit software_spec for frozen Phase 0 inputs")
 
     def resolve(self, spec, config: dict, root: Path, run_dir: Path) -> dict:
         """The frozen command for this phase, carrying the experiment's declared instruction policy."""
@@ -295,7 +298,14 @@ class Adapter:
             argv += ["--target", profile, "--output-root", str(run_dir / "phase0" / "capsules")]
             if any(
                 name in values
-                for name in ("software_spec", "capability_contract", "hardware_spec", "rtl_facts", "evidence_mode")
+                for name in (
+                    "software_spec",
+                    "capability_contract",
+                    "hardware_spec",
+                    "rtl_facts",
+                    "scheduling_evidence",
+                    "evidence_mode",
+                )
             ):
                 argv += ["--evidence-root", str(run_dir / "phase0")]
         elif self.name == "capsule_bench":
@@ -389,6 +399,7 @@ ADAPTERS = {
             "capability_contract": Option("input"),
             "hardware_spec": Option("input"),
             "rtl_facts": Option("input"),
+            "scheduling_evidence": Option("input"),
             "evidence_mode": Option(choices=("diagnostic", "verified")),
             "performance_template": Option("input"),
             "conformance_spec": Option("input"),

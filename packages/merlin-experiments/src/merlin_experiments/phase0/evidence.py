@@ -362,6 +362,7 @@ def select_evidence(
     inventory_path=None,
     native_qualifications=None,
     prohibited_roles=(),
+    scheduling_evidence=None,
 ) -> EvidenceSelection:
     """Observe selected source bytes once; never extract facts or modify a checkout.
 
@@ -980,6 +981,25 @@ def select_evidence(
         if native_qualifications
         else {}
     )
+    scheduling_view = None
+    if scheduling_evidence is not None:
+        from . import scheduling
+
+        observe(Path(scheduling.__file__), "scheduling-evidence-reader", required=True)
+        scheduling_view = scheduling.load_selection(
+            scheduling_evidence,
+            target=target,
+            descriptor=descriptor_doc,
+            source_consistency=consistency,
+            observe=observe,
+        )
+        diagnostics.append(
+            {
+                "component": "scheduling-evidence",
+                "status": scheduling_view["hardware_comparison"]["status"],
+                "reason": scheduling_view["hardware_comparison"]["reason"],
+            }
+        )
     for source in sources.values():
         if source.path.read_bytes() != source.content:
             raise ValueError(f"evidence source changed during selection: {source.path}")
@@ -1036,6 +1056,8 @@ def select_evidence(
             ],
         },
     }
+    if scheduling_view is not None:
+        views["scheduling_evidence"] = scheduling_view
     return EvidenceSelection(
         target,
         tuple(sources.values()),
@@ -1207,6 +1229,11 @@ def export_evidence(selection: EvidenceSelection, artifact_root: str | Path) -> 
         return manifest
     outputs: dict[str, bytes] = {}
     outputs["software/selection.json"] = selection.views_json
+    scheduling_view = getattr(selection, "scheduling_evidence", None)
+    if scheduling_view is not None:
+        from .scheduling import snapshot_outputs
+
+        outputs.update(snapshot_outputs(scheduling_view, selection.source_snapshots, target=selection.target))
     if selection.raw_facts is not None:
         outputs["hardware/circt/facts.json"] = selection.raw_facts
     hardware_views = {
@@ -1491,6 +1518,13 @@ def load_exported_evidence(artifact_root: str | Path) -> EvidenceSelection:
         tuple(sorted({**observed, "evidence-manifest.json": manifest_raw}.items())),
         observed.get("software/instruction-semantics-authored.yaml"),
     )
+    scheduling_view = getattr(selection, "scheduling_evidence", None)
+    if scheduling_view is not None:
+        from .scheduling import snapshot_outputs
+
+        expected = snapshot_outputs(scheduling_view, snapshots, target=selection.target)
+        if any(observed.get(name) != raw for name, raw in expected.items()):
+            raise ValueError("scheduling exported members differ from snapshots")
     if selection.raw_facts_sha256 != manifest.get("raw_facts_sha256"):
         raise ValueError("raw facts identity differs from evidence manifest")
     return selection

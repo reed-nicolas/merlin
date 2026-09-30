@@ -466,6 +466,7 @@ def resolve_plan(
     phase0_synth_profile: Path | None = None,
     phase0_hidden_profile: Path | None = None,
     phase0_rtl_facts: Path | None = None,
+    phase0_scheduling_evidence: Path | None = None,
     phase0_evidence_mode: str | None = None,
     phase0_m2m_root: Path | None = None,
     phase0_m2m_python: Path | None = None,
@@ -507,6 +508,7 @@ def resolve_plan(
                 phase0_synth_profile,
                 phase0_hidden_profile,
                 phase0_rtl_facts,
+                phase0_scheduling_evidence,
                 phase0_evidence_mode,
                 phase0_m2m_root,
                 phase0_m2m_python,
@@ -522,6 +524,7 @@ def resolve_plan(
         ("synth_profile", phase0_synth_profile),
         ("hidden_profile", phase0_hidden_profile),
         ("rtl_facts", phase0_rtl_facts),
+        ("scheduling_evidence", phase0_scheduling_evidence),
     ):
         if path is None:
             continue

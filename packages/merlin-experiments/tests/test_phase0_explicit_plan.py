@@ -159,6 +159,17 @@ def test_explicit_capability_contract_is_bound_and_rechecked(authored):
         runner.resolve_plan(load_spec(root / "experiment.yaml"), phase0_capability_contract=replacement)
 
 
+def test_scheduling_selection_requires_phase0_and_frozen_software_inputs(authored):
+    make, root, config = authored
+    make()
+    selected = root / "scheduling-evidence.json"
+    selected.write_text("{}\n")
+    with pytest.raises(SpecError, match="requires --phase 0"):
+        runner.resolve_plan(load_spec(root / "experiment.yaml"), phase0_scheduling_evidence=selected)
+    with pytest.raises(SpecError, match="requires explicit software_spec"):
+        make({**config, "scheduling_evidence": str(selected)})
+
+
 @pytest.mark.parametrize("changed", ["recipe", "conformance", "descriptor"])
 def test_preflight_rejects_stale_selected_synthesis(authored, changed):
     make, root, _ = authored

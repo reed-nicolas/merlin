@@ -288,6 +288,7 @@ def generate_target(
     capability_contract: str | Path | None = None,
     hardware_spec: str | Path | None = None,
     rtl_facts: str | Path | None = None,
+    scheduling_evidence: str | Path | None = None,
     evidence_root: str | Path | None = None,
     evidence_input: str | Path | None = None,
     evidence_mode: str | None = None,
@@ -302,6 +303,8 @@ def generate_target(
 
     if output_root is None:
         raise ValueError("Phase 0 requires an explicit output_root; generated capsules must not default to source data")
+    if scheduling_evidence is not None and evidence_input is not None:
+        raise ValueError("scheduling_evidence cannot be combined with frozen evidence_input")
     profile_inputs = dict(
         profiles_root=profiles_root,
         recipe=recipe,
@@ -363,7 +366,12 @@ def generate_target(
         raise ValueError("verified Phase 0 requires selected software and hardware evidence")
     evidence = None
     evidence_manifest = None
-    if evidence_input is not None or software_spec is not None or profile.get("_software_spec_path"):
+    if (
+        evidence_input is not None
+        or scheduling_evidence is not None
+        or software_spec is not None
+        or profile.get("_software_spec_path")
+    ):
         from .evidence import export_evidence, load_exported_evidence, select_evidence
 
         if evidence_input is not None:
@@ -379,6 +387,7 @@ def generate_target(
                 descriptor=descriptor,
                 capability_contract_path=capability_contract,
                 facts_path=rtl_facts,
+                scheduling_evidence=scheduling_evidence,
                 software_spec=software_spec or profile.get("_software_spec_path"),
                 hardware_spec=hardware_spec,
                 conformance_spec=conformance_spec,

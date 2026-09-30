@@ -186,6 +186,39 @@ def _fixture(tmp_path, model_selector):
         rtl_facts=str(facts),
         evidence_mode="diagnostic",
     )
+    if model_selector == "path":
+        scheduling = tmp_path / "scheduling-source"
+        scheduling.mkdir()
+        payload = b'{"unknown_address": null}\n'
+        (scheduling / "footprints.json").write_bytes(payload)
+        manifest = {
+            "schema": "merlin.scheduling_evidence.v1",
+            "target": "fixture-device",
+            "hardware": {"config": "FixtureConfig", "source_ir_sha256": "0" * 64},
+            "producer": {"name": "fixture-scheduler", "sha256": "1" * 64},
+            "semantics": {
+                "age_zero": "instruction-issue",
+                "hold_interval": "inclusive",
+                "dma_completion": "explicit-wait",
+            },
+            "profiles": [{"component": "vector", "fields": {"read_age": "0"}, "assumptions": [], "limitations": []}],
+            "artifacts": [
+                {"role": "footprints", "path": "footprints.json", "sha256": hashlib.sha256(payload).hexdigest()}
+            ],
+            "limitations": ["synthetic test"],
+            "verification": {
+                "artifact_bytes_verified": True,
+                "projection_evidence_agreement_verified": True,
+                "compiler_identity_verified": False,
+                "footprints_reproduced": False,
+                "schedule_legality_verified": False,
+                "rtl_replayed": False,
+            },
+        }
+        selected = scheduling / "scheduling-evidence.json"
+        selected.write_text(json.dumps(manifest))
+        config["scheduling_evidence"] = str(selected)
+        fixture["scheduling_source"] = scheduling
     # Installed qualification can reuse one actual producer-bound capture. Its
     # copied synthesis tree must remain executable after its original owner is
     # removed, without recapturing the framework model.
@@ -255,7 +288,7 @@ def test_actual_guarded_runner_executes_after_original_sources_are_deleted(tmp_p
         DELETE_ROOTS=json.dumps(
             [
                 str(fixture[key])
-                for key in ("installed", "support", "profiles", "model", "capture_source")
+                for key in ("installed", "support", "profiles", "model", "capture_source", "scheduling_source")
                 if key in fixture
             ]
             + [str(descriptor.parent)]
@@ -289,6 +322,11 @@ def test_actual_guarded_runner_executes_after_original_sources_are_deleted(tmp_p
     accounting = json.loads((fixture["run"] / "phase0/coverage/operation-accounting.json").read_text())
     assert accounting["status"] == "not_declared"
     assert (fixture["run"] / "phase0/software/quantization-contract.json").is_file()
+    if model_selector == "path":
+        saved = fixture["run"] / "phase0/hardware/scheduling"
+        assert (saved / "footprints.json").read_bytes() == b'{"unknown_address": null}\n'
+        assert json.loads((saved / "ingestion.json").read_bytes())["qualified_for_use"] is False
+        assert "--scheduling-evidence" not in command["argv"]
     if os.environ.get("MERLIN_TEST_MATERIALIZED_CAPTURE"):
         materialized = freeze._materialized_inputs(command)
         assert len(materialized) >= 8
