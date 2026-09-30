@@ -41,3 +41,38 @@ its original inputs; changed sources or evidence require new qualification.
 For model captures and intermediate IR, see [whole-model inspection](../whole-model/README.md).
 No target-specific end-to-end optimization or accelerator performance result is
 established by this guide.
+
+## Optional paired schedule feedback
+
+The target-owned [paired checker](../target/rtlgraph_compare.py) can compare one
+assembly fixture before and after Atlas scheduling using an imported
+`merlin.scheduling_evidence.v1` selection and the exact selected `atlas-opt`
+binary. This is a separate opt-in diagnostic, not a required stage or an Atlas
+performance experiment. Supply paths to your selected inputs and a fresh output
+directory beneath the configured artifact root:
+
+```sh
+python examples/atlas/target/rtlgraph_compare.py \
+  --kernel /absolute/inputs/kernel.S \
+  --selection /absolute/inputs/selection/scheduling-evidence.json \
+  --compiler /absolute/tools/atlas-opt \
+  --output /absolute/artifacts/paired-schedule \
+  --validation static
+```
+
+The baseline must pass before scheduling begins, and the candidate must pass a
+separate check with the same compiler and selected component projections.
+Both assembly streams, commands, diagnostics and their identities remain in
+the output directory. A rejected baseline or candidate produces no cost delta.
+The default assembly is `atlas-opt-native`; the Phase 1 checker documents
+explicit conversion prerequisites for Merlin native assembly.
+
+Static validation supplies no cycles. `--validation dynamic` reports the
+compiler scheduling simulator's before/after cycle cost when both checks pass.
+These engine-relative costs include approximate DMA estimates; they are not
+measured hardware cycles, whole-model latency or a roofline. The report keeps
+hardware timing `UNMEASURED`, numerical equivalence `UNKNOWN`, and functional
+qualification `NOT_ESTABLISHED`: the compiler's shared scheduling model does
+not evaluate tensor arithmetic. Numerical comparison requires separately
+selected runtime inputs and an independent execution observer. Neither mode
+changes the Phase 0 admission or frozen Phase 1 handoff requirements above.
