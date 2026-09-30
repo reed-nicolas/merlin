@@ -3,12 +3,25 @@ title: MX Gemmini Phase 0 contract
 kind: guide
 status: draft
 owner: core
-last_verified: 2026-09-29
+last_verified: 2026-09-30
 related: [phase0_specification, model2mlir, integrations]
 code_refs: [examples/mx_gemmini/target/software-spec.yaml, examples/mx_gemmini/phase0/recipe.yaml, build_tools/scripts/synth_capsule_corpus.py, src/merlin/targetgen/software_spec.py]
 ---
 
 # MX Gemmini Phase 0 contract
+
+The current [Phase 0 recipe](../../examples/mx_gemmini/phase0/recipe.yaml)
+selects the OOT `software-spec-2029218-candidate.yaml` at Gemmini
+`2029218197f771ce71416f859d975bea47b7aabc` and MxGen
+`56ef1c6810924e1cb0af07add09156b0e2f53576`. That file was authored in
+the OOT repository, not derived from `examples/mx_gemmini/`. Its source-check
+projection covers selected RTL/MxGen fields; host placement, shape bounds,
+transfer policy, and numerical behavior still need review. The operator picks
+model and input artifacts, then derives exact eligible sites and chooses a
+per-site FP8/FP6/FP4/host policy. The OOT
+`docs/iteration_roster_candidate.md` describes the frozen selection flow.
+The detailed evidence below concerns the older `f016...` source pin and is
+historical context. It does not certify the current candidate.
 
 ## Authority and scope
 
@@ -157,8 +170,11 @@ sequence. Ordering larger capacity-driven uploads and loops, preserving BF16
 state across them, and comparing their results with the selected RTL simulator
 remain open compiler qualifications.
 
-The active software spec is `contracts/software-spec.yaml` in the explicitly
-selected out-of-tree MX support provider. Its `unreviewed` status is intentional.
+The active MX Phase 0 recipe selects
+`mx_gemmini_support/contracts/software-spec-2029218-candidate.yaml` in the
+explicitly selected out-of-tree MX support provider. Its `unreviewed` status
+is intentional. The provider's default `contracts/software-spec.yaml`
+still names the older pin for other explicit consumers.
 The [in-tree snapshot](../../examples/mx_gemmini/target/software-spec.yaml)
 remains for historical tests and reproduction. The
 [Phase 0 recipe](../../examples/mx_gemmini/phase0/recipe.yaml) derives capsule

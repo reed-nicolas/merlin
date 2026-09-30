@@ -1,6 +1,8 @@
 # Declarative MX-Gemmini setup. The Phase 0 software contract selects
 # GemminiMxFPConfigs.standaloneMxFPConfig / GemminiMxFPStandaloneConfig at pinned
-# gemmini-mx-cleanup revision f0167390b56fb315deea90ac1fc3983772e92d82.
+# gemmini-mx-cleanup revision selected by the Phase 0 recipe. The current
+# candidate pins 2029218197f771ce71416f859d975bea47b7aabc; the older
+# f0167390b56fb315deea90ac1fc3983772e92d82 results remain historical.
 # That is the 16x16 standalone, weight-stationary, three-selected-format path
 # with a LUT and requantizer. The older defaultMxFPConfig has no LUT and does
 # not support this standalone transfer contract. The structural mlc selection
