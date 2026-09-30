@@ -16,6 +16,45 @@ from pathlib import Path
 ROLES = {"mxu0", "mxu1", "dma", "lsu", "xlu", "vpu"}
 METADATA = {"schema", "config", "source_ir_sha256", "evidence_sha256"}
 
+# Authored assembler mnemonics and the native report's instruction labels are
+# different vocabularies. Keep this translation at the target-owned edge.
+VPU_COMMANDS = {
+    "VADD_BF16": "add",
+    "VSUB_BF16": "sub",
+    "VMUL_BF16": "mul",
+    "VMINIMUM_BF16": "pairmin",
+    "VMAXIMUM_BF16": "pairmax",
+    "VMOV": "mov",
+    "VRECIP_BF16": "rcp",
+    "VEXP_BF16": "exp",
+    "VEXP2_BF16": "exp2",
+    "VPACK_BF16_FP8": "fp8pack",
+    "VUNPACK_FP8_BF16": "fp8unpack",
+    "VRELU_BF16": "relu",
+    "VSIN_BF16": "sin",
+    "VCOS_BF16": "cos",
+    "VTANH_BF16": "tanh",
+    "VLOG2_BF16": "log",
+    "VSQRT_BF16": "sqrt",
+    "VSQUARE_BF16": "square",
+    "VCUBE_BF16": "cube",
+    "VREDSUM_BF16": "csum",
+    "VREDMIN_BF16": "cmin",
+    "VREDMAX_BF16": "cmax",
+    "VREDSUM_ROW_BF16": "rsum",
+    "VREDMIN_ROW_BF16": "rmin",
+    "VREDMAX_ROW_BF16": "rmax",
+    "VLI_ALL": "vliAll",
+    "VLI_ROW": "vliRow",
+    "VLI_COL": "vliCol",
+    "VLI_ONE": "vliOne",
+}
+FREE_AGES = {
+    "VLOAD": ("lsu", "vload_first_free_age"),
+    "VSTORE": ("lsu", "vstore_first_free_age"),
+    "VTRPOSE_XLU": ("xlu", "first_free_age"),
+}
+
 
 def _require(condition, message):
     if not condition:
@@ -139,7 +178,161 @@ def _model_agreement(model, selected):
                 )
 
 
-def convert_contract(contract_path: Path, output_dir: Path) -> Path:
+def _schedule(raw):
+    import yaml
+
+    class UniqueLoader(yaml.SafeLoader):
+        pass
+
+    def mapping(loader, node):
+        result = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node)
+            _require(isinstance(key, str) and key not in result, "Invalid or duplicate schedule YAML key")
+            result[key] = loader.construct_object(value_node)
+        return result
+
+    UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
+    document = yaml.load(raw, Loader=UniqueLoader)
+    _require(
+        isinstance(document, dict) and type(document.get("version")) is int and document["version"] == 1,
+        "Unsupported authored schedule contract",
+    )
+    return document
+
+
+def compare_schedule_assumptions(schedule, profiles, reports, semantics):
+    """Compare scoped accepted-command spacing, never first-write age to latency.
+
+    Same-operation engine spacing is a diagnostic projection of a resource rule.
+    It cannot establish cross-operation acceptance, frontend assertions, operand
+    hazards, or the conditions under which instruction issue reaches the engine.
+    """
+    rows, coverage = [], []
+    _require(
+        semantics.get("age_zero") == "instruction-issue" and semantics.get("hold_interval") == "inclusive",
+        "Unsupported comparison age conventions",
+    )
+
+    def spacing(mnemonic):
+        if mnemonic in FREE_AGES:
+            component, field = FREE_AGES[mnemonic]
+            value = profiles.get(component, {}).get(field)
+            value = int(value) if isinstance(value, str) and value.isdecimal() else None
+            return component, field, value
+        if mnemonic in VPU_COMMANDS:
+            field = f"instructions.{VPU_COMMANDS[mnemonic]}.same_op_next_issue"
+            instructions = reports.get("vpu", {}).get("instructions", {})
+            _require(isinstance(instructions, dict), "Invalid VPU instruction timing observations")
+            command = instructions.get(VPU_COMMANDS[mnemonic], {})
+            _require(isinstance(command, dict), "Invalid VPU command timing observation")
+            value = command.get("same_op_next_issue")
+            if value is not None:
+                _require(type(value) is int and value >= 0, "Invalid accepted-command spacing")
+            return "vpu", field, value
+        return None, None, None
+
+    for kind in ("minimum_issue_gap", "register_dependency_gap"):
+        rules = schedule.get(kind, [])
+        _require(isinstance(rules, list), "Invalid authored schedule rules")
+        names = set()
+        for rule in rules:
+            _require(
+                isinstance(rule, dict) and isinstance(rule.get("name"), str) and rule["name"] not in names,
+                "Invalid or duplicate authored rule",
+            )
+            names.add(rule["name"])
+            producers, consumers = rule.get("producers"), rule.get("consumers")
+            _require(
+                isinstance(producers, list)
+                and producers
+                and isinstance(consumers, list)
+                and consumers
+                and all(isinstance(op, str) and op for op in [*producers, *consumers])
+                and len(set(producers)) == len(producers)
+                and len(set(consumers)) == len(consumers),
+                "Invalid authored instruction scope",
+            )
+            cycles = rule.get("cycles")
+            _require(type(cycles) is int and cycles >= 0, "Invalid authored issue gap")
+            compared = 0
+            for producer in producers:
+                row = {
+                    "kind": kind,
+                    "rule": rule["name"],
+                    "producer": producer,
+                    "consumer": producer if producer in consumers else None,
+                    "authored_cycles": cycles,
+                    "observed_cycles": None,
+                    "component": None,
+                    "evidence_field": None,
+                    "status": "unsupported",
+                }
+                if kind == "register_dependency_gap":
+                    row["reason"] = (
+                        "Row writes and engine occupancy do not establish register-sensitive visibility gaps."
+                    )
+                elif producer not in consumers:
+                    row["reason"] = "The rule contains no same-operation pair; cross-operation spacing is not compared."
+                else:
+                    component, field, value = spacing(producer)
+                    row.update(component=component, evidence_field=field, observed_cycles=value)
+                    if component is None:
+                        row["reason"] = (
+                            "No accepted-command spacing mapping; MXU first-write ages are not resource gaps."
+                        )
+                    elif value is None:
+                        row["status"] = "unknown"
+                        row["reason"] = "Selected evidence has no accepted-command spacing for this operation."
+                    else:
+                        compared += 1
+                        row["status"] = "matched" if value == cycles else "mismatch"
+                        row["relation"] = (
+                            "equal"
+                            if value == cycles
+                            else "authored_more_conservative"
+                            if cycles > value
+                            else "authored_below_observed_spacing"
+                        )
+                        row["reason"] = (
+                            "Conditional same-operation engine spacing; frontend acceptance "
+                            "and logical reservations remain obligations."
+                        )
+                rows.append(row)
+            total = len(producers) * len(consumers)
+            coverage.append(
+                {
+                    "kind": kind,
+                    "rule": rule["name"],
+                    "authored_pairs": total,
+                    "compared_same_operation_pairs": compared,
+                    "uncompared_pairs": total - compared,
+                    "complete": compared == total,
+                }
+            )
+    statuses = ("matched", "mismatch", "unknown", "unsupported")
+    return {
+        "schema": "atlas.scheduling_assumptions_comparison.v1",
+        "scope": "Conditional same-operation accepted-engine-command spacing versus authored issue-distance minima.",
+        "qualified_for_use": False,
+        "rows": rows,
+        "rule_coverage": coverage,
+        "summary": {status: sum(row["status"] == status for row in rows) for status in statuses},
+        "unsupported_scope": [
+            "Cross-operation pairs, whole-frontend acceptance and assertion legality.",
+            "Register dependencies, row visibility, physical-port conflicts and logical reservations.",
+            "MXU first-write ages are operand events, not resource release or completion bounds.",
+            "DMA explicit waits are completion policy, not fixed issue or completion latency.",
+            "Control flow and delay encoding; numerical correctness and performance predictions.",
+        ],
+        "action": (
+            "Review mismatches in a new authored contract after independent acceptance "
+            "and hazard checks; this report changes no rules."
+        ),
+    }
+
+
+def convert_contract(contract_path: Path, output_dir: Path, *, schedule_contract: Path | None = None) -> Path:
     """Validate and snapshot saved members without accessing the compiler binary."""
     contract_path = Path(contract_path).resolve(strict=True)
     root = contract_path.parent
@@ -178,7 +371,7 @@ def convert_contract(contract_path: Path, output_dir: Path) -> Path:
 
     member("source", contract.get("source"))
     footprints = _json(member("footprints", contract.get("footprints")))
-    profiles, selected = [], {}
+    profiles, selected, reports = [], {}, {}
     entries = contract.get("profiles")
     _require(isinstance(entries, list) and entries, "Missing selected profiles")
     for entry in entries:
@@ -190,6 +383,7 @@ def convert_contract(contract_path: Path, output_dir: Path) -> Path:
         )
         _require(fields["source_ir_sha256"] == hardware, "Mixed hardware identities")
         selected[role] = fields
+        reports[role] = report
         profiles.append(
             {
                 "component": role,
@@ -239,6 +433,26 @@ def convert_contract(contract_path: Path, output_dir: Path) -> Path:
         isinstance(limitations, list) and all(isinstance(value, str) for value in limitations),
         "Invalid contract limitations",
     )
+    if schedule_contract is not None:
+        schedule_raw = Path(schedule_contract).read_bytes()
+        comparison = compare_schedule_assumptions(_schedule(schedule_raw), selected, reports, semantics)
+        comparison["inputs"] = {
+            "native_contract_sha256": _hash(raw_contract),
+            "schedule_contract_sha256": _hash(schedule_raw),
+            "hardware": {"config": contract["config"], "source_ir_sha256": hardware},
+            "profile_evidence": [row for row in artifacts if row["role"].startswith("evidence:")],
+        }
+        for role, name, raw in (
+            ("authored-schedule-contract", "bundle/schedule_contract.yaml", schedule_raw),
+            (
+                "schedule-assumption-comparison",
+                "bundle/assumption-comparison.json",
+                (json.dumps(comparison, indent=2, allow_nan=False) + "\n").encode(),
+            ),
+        ):
+            _require(name not in members, "Comparison path collides with native bundle")
+            members[name] = raw
+            artifacts.append({"role": role, "path": name, "sha256": _hash(raw)})
     envelope = {
         "schema": "merlin.scheduling_evidence.v1",
         "target": "atlas",
@@ -276,8 +490,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contract", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--schedule-contract",
+        type=Path,
+        help="Snapshot authored schedule YAML and compare scoped assumptions (requires PyYAML)",
+    )
     args = parser.parse_args()
-    print(convert_contract(args.contract, args.output))
+    print(convert_contract(args.contract, args.output, schedule_contract=args.schedule_contract))
 
 
 if __name__ == "__main__":

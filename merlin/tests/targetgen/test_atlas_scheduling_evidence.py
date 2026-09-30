@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -294,3 +295,168 @@ def test_nonfinite_json_rejected(adapter, tmp_path, number):
     path.write_bytes(raw)
     with pytest.raises(ValueError, match="Nonfinite"):
         adapter.convert_contract(path, tmp_path / "output")
+
+
+def schedule_rule(name, producers, consumers, cycles):
+    return {"name": name, "producers": producers, "consumers": consumers, "cycles": cycles}
+
+
+def test_scoped_comparison_distinguishes_unlike_quantities(adapter):
+    schedule = {
+        "version": 1,
+        "minimum_issue_gap": [
+            schedule_rule("load", ["VLOAD", "VSTORE"], ["VLOAD", "VSTORE"], 34),
+            schedule_rule(
+                "simple",
+                ["VADD_BF16", "VUNPACK_FP8_BF16", "VSIN_BF16"],
+                ["VADD_BF16", "VUNPACK_FP8_BF16", "VSIN_BF16"],
+                66,
+            ),
+            schedule_rule("transpose", ["VTRPOSE_XLU"], ["VTRPOSE_XLU"], 66),
+            schedule_rule("matmul", ["VMATMUL_MXU1"], ["VMATMUL_MXU1"], 35),
+            schedule_rule("cross", ["VLOAD"], ["VADD_BF16"], 34),
+        ],
+        "register_dependency_gap": [schedule_rule("visibility", ["VADD_BF16"], ["VSTORE"], 66)],
+    }
+    profiles = {
+        "lsu": {"vload_first_free_age": "35", "vstore_first_free_age": "35"},
+        "xlu": {"first_free_age": "66", "write_age": "34"},
+        "mxu1": {"first_write_age": "35"},
+    }
+    reports = {
+        "vpu": {
+            "instructions": {
+                "add": {"same_op_next_issue": 65, "write_release": 65},
+                "fp8unpack": {"same_op_next_issue": 66},
+            }
+        }
+    }
+    report = adapter.compare_schedule_assumptions(
+        schedule, profiles, reports, {"age_zero": "instruction-issue", "hold_interval": "inclusive"}
+    )
+    rows = {
+        row["producer"]: row for row in report["rows"] if row["kind"] == "minimum_issue_gap" and row["rule"] != "cross"
+    }
+    assert rows["VLOAD"]["status"] == "mismatch"
+    assert rows["VLOAD"]["relation"] == "authored_below_observed_spacing"
+    assert rows["VADD_BF16"]["relation"] == "authored_more_conservative"
+    assert rows["VUNPACK_FP8_BF16"]["status"] == rows["VTRPOSE_XLU"]["status"] == "matched"
+    assert rows["VTRPOSE_XLU"]["observed_cycles"] == 66  # Not its first write age of 34.
+    assert rows["VSIN_BF16"]["status"] == "unknown"
+    assert rows["VMATMUL_MXU1"]["status"] == "unsupported"  # Equal first-write numbers prove no resource gap.
+    assert report["rows"][-1]["status"] == "unsupported"
+    assert report["rows"][-1]["observed_cycles"] is None
+    assert report["rows"][-2]["status"] == "unsupported"
+    load_coverage = report["rule_coverage"][0]
+    assert load_coverage == {
+        "kind": "minimum_issue_gap",
+        "rule": "load",
+        "authored_pairs": 4,
+        "compared_same_operation_pairs": 2,
+        "uncompared_pairs": 2,
+        "complete": False,
+    }
+    assert report["qualified_for_use"] is False
+
+
+def test_comparison_frozen_as_hash_bound_artifacts(adapter, tmp_path):
+    path, _, _ = bundle(tmp_path / "input")
+    schedule_raw = (
+        b"version: 1\nminimum_issue_gap:\n  - name: dma\n    producers: [DMA]\n    consumers: [DMA]\n    cycles: 9\n"
+    )
+    schedule_path = tmp_path / "schedule.yaml"
+    schedule_path.write_bytes(schedule_raw)
+    output = adapter.convert_contract(path, tmp_path / "output", schedule_contract=schedule_path)
+    envelope = json.loads(output.read_bytes())
+    records = {row["role"]: row for row in envelope["artifacts"]}
+    authored = records["authored-schedule-contract"]
+    compared = records["schedule-assumption-comparison"]
+    assert (output.parent / authored["path"]).read_bytes() == schedule_raw
+    comparison_raw = (output.parent / compared["path"]).read_bytes()
+    comparison = json.loads(comparison_raw)
+    assert digest(comparison_raw) == compared["sha256"]
+    assert comparison["inputs"]["schedule_contract_sha256"] == digest(schedule_raw)
+    assert comparison["inputs"]["native_contract_sha256"] == digest(path.read_bytes())
+    assert comparison["inputs"]["profile_evidence"] == [records["evidence:dma"]]
+    assert comparison["summary"] == {"matched": 0, "mismatch": 0, "unknown": 0, "unsupported": 1}
+    assert comparison["qualified_for_use"] is False
+    assert not envelope["verification"]["schedule_legality_verified"]
+
+
+def test_generic_ingestion_freezes_comparison_without_qualification(adapter, tmp_path):
+    scheduling = pytest.importorskip("merlin_experiments.phase0.scheduling")
+    path, contract, _ = bundle(tmp_path / "input")
+    authored = tmp_path / "schedule.yaml"
+    authored.write_text("version: 1\nminimum_issue_gap: []\n")
+    output = adapter.convert_contract(path, tmp_path / "output", schedule_contract=authored)
+    snapshots = []
+
+    def observe(member, role, *, required):
+        assert required
+        raw = member.read_bytes()
+        snapshots.append(SimpleNamespace(role=role, content=raw))
+        return raw
+
+    view = scheduling.load_selection(
+        output,
+        target="atlas",
+        descriptor={"rtl": {"elaboration": {"config": "EE290SimConfig"}}},
+        source_consistency={
+            "status": "verified",
+            "sources": [{"role": "core_hw", "sha256": contract["source_ir_sha256"]}],
+        },
+        observe=observe,
+    )
+    assert view["hardware_comparison"]["status"] == "matched"
+    assert view["qualified_for_use"] is False
+    frozen = scheduling.snapshot_outputs(view, snapshots, target="atlas")
+    assert frozen["hardware/scheduling/bundle/schedule_contract.yaml"] == authored.read_bytes()
+    compared = "hardware/scheduling/bundle/assumption-comparison.json"
+    assert frozen[compared] == (output.parent / "bundle/assumption-comparison.json").read_bytes()
+    saved_view = json.loads(frozen["hardware/scheduling/ingestion.json"])
+    assert saved_view["qualified_for_use"] is False
+    selected = next(item for item in snapshots if item.role.endswith("bundle/assumption-comparison.json"))
+    selected.content += b" "
+    with pytest.raises(ValueError, match="snapshot digest"):
+        scheduling.snapshot_outputs(view, snapshots, target="atlas")
+
+
+@pytest.mark.parametrize("change", ["cycles", "duplicate_rule", "empty_scope", "duplicate_scope", "rules"])
+def test_invalid_authored_rules_fail_closed(adapter, change):
+    rule = schedule_rule("load", ["VLOAD"], ["VLOAD"], 34)
+    schedule = {"version": 1, "minimum_issue_gap": [rule]}
+    if change == "cycles":
+        rule["cycles"] = True
+    elif change == "duplicate_rule":
+        schedule["minimum_issue_gap"].append(rule)
+    elif change == "empty_scope":
+        rule["producers"] = []
+    elif change == "duplicate_scope":
+        rule["consumers"] = ["VLOAD", "VLOAD"]
+    else:
+        schedule["minimum_issue_gap"] = {}
+    with pytest.raises(ValueError):
+        adapter.compare_schedule_assumptions(
+            schedule, {}, {}, {"age_zero": "instruction-issue", "hold_interval": "inclusive"}
+        )
+
+
+def test_duplicate_schedule_yaml_rejected_before_output(adapter, tmp_path):
+    path, _, _ = bundle(tmp_path / "input")
+    authored = tmp_path / "schedule.yaml"
+    authored.write_text("version: 1\nversion: 1\n")
+    with pytest.raises(ValueError, match="duplicate schedule"):
+        adapter.convert_contract(path, tmp_path / "output", schedule_contract=authored)
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("spacing", [True, -1, "65"])
+def test_invalid_spacing_is_not_treated_as_match(adapter, spacing):
+    schedule = {"minimum_issue_gap": [schedule_rule("simple", ["VADD_BF16"], ["VADD_BF16"], 65)]}
+    with pytest.raises(ValueError, match="accepted-command spacing"):
+        adapter.compare_schedule_assumptions(
+            schedule,
+            {},
+            {"vpu": {"instructions": {"add": {"same_op_next_issue": spacing}}}},
+            {"age_zero": "instruction-issue", "hold_interval": "inclusive"},
+        )

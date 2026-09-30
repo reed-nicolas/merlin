@@ -49,13 +49,27 @@ Convert an existing bundle into a portable evidence selection:
 
 ```sh
 python examples/atlas/target/rtlgraph_evidence.py \
-  --contract "$ATLAS_CONTRACT/contract.json" --output "$SCHEDULING_ROOT"
+  --contract "$ATLAS_CONTRACT/contract.json" --output "$SCHEDULING_ROOT" \
+  --schedule-contract examples/atlas/phase1/contracts/hwbringup_atlas_v0/schedule_contract.yaml
 ```
 
 The target-owned adapter checks profile/evidence agreement, artifact hashes, and
 completion conventions. It preserves the original bytes, including row accesses,
 resource holds, unknown addresses, and explicit DMA waits. It does not execute
 `atlas-opt`, reproduce footprints, or qualify numerical behavior.
+
+The optional `--schedule-contract` comparison requires PyYAML. It snapshots the
+authored YAML and `bundle/assumption-comparison.json` as hashed members of the
+selection. The comparison reports `matched`, `mismatch`, `unknown`, and
+`unsupported` for each scoped observation, with uncovered producer/consumer
+pairs listed in `rule_coverage`. A match applies to conditional same-operation
+engine spacing only. LSU/XLU first-free ages and VPU per-command next-issue ages
+can be compared to that scope of an authored resource rule. A larger authored
+gap is reported as a conservative mismatch; a smaller one needs review.
+MXU first-write ages, register visibility and cross-operation acceptance remain
+distinct obligations. DMA explicit waits supply no fixed latency bound.
+These observations neither rewrite the authored rules nor establish that a
+schedule satisfies frontend assertions, numerical checks or hardware execution.
 
 Add `--scheduling-evidence "$SCHEDULING_ROOT/scheduling-evidence.json"` to
 `merlin experiment corpus derive` below. For a new Phase 0 run, select the same
