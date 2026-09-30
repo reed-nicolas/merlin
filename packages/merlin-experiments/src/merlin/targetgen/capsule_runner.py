@@ -105,7 +105,6 @@ from .oot_runner import (
 )
 from .rocc import decode as RD
 
-SUITE = "gemmini-capsule-bench"
 CONTRACT_VERSION = "0.1"
 
 
@@ -2075,10 +2074,10 @@ def suite_for(target: str, *, dtype: str = "i8xi8_i32") -> str:
     """The suite path segment ``run_capsule`` writes results under for this target (``cfg.suite``).
 
     Any reader that re-globs the on-disk ``capsule_result.json`` MUST resolve the suite through this,
-    NOT the module-level ``SUITE`` literal ('gemmini-capsule-bench'): ``run_capsule`` lays results at
+    not a reference-target constant: ``run_capsule`` lays results at
     ``<runs_root>/runs/<cfg.suite>/<capsule>/`` where ``cfg.suite`` is the TARGET's own suite
-    (e.g. 'atlas-capsule-bench'). Using the gemmini literal made the atlas self-check glob an empty
-    gemmini dir and report ``n_capsules: 0`` on every call — the agent's feedback loop went blind while
+    (e.g. '<target>-capsule-bench'). Using a fixed reference suite made another target's self-check
+    glob an empty directory and report ``n_capsules: 0`` on every call — the feedback loop went blind while
     the in-memory grade was correct. Derived from the target's RunnerConfig, so it stays target-agnostic."""
     return _config_for_target(target, None, dtype).suite
 
@@ -3460,6 +3459,8 @@ def _grade_model_capsule_inline(
         result["routing_plan"] = out["routing_plan"]
     if out.get("coverage_certificate") is not None:  # ARR certificate (numerator×independent oracle)
         result["coverage_certificate"] = out["coverage_certificate"]
+    if out.get("placement_census") is not None:  # whole-module population, including unmatched operations
+        result["placement_census"] = out["placement_census"]
     # THE PLACEMENT SURFACE, carried into the verdict rather than left in the compile output. It runs in
     # SHADOW -- routing is the authority -- so this is reported, not gated. But two facts only it can
     # state were computed and read by nothing:
@@ -3780,6 +3781,55 @@ def _grade_model_capsule_inline(
         # declining a region would fail the thing it exists to prove.
         _cert = result.get("coverage_certificate") or {}
         _false_fb = _cert.get("false_fallback_count")
+        _census = result.get("placement_census")
+        if not isinstance(_census, dict):
+            result.update(
+                status="incomplete",
+                failure={
+                    "plane": "model",
+                    "category": "PLACEMENT_NOT_MEASURED",
+                    "detail": "the compile recorded no whole-module placement census; the routing plan "
+                    "cannot prove that every eligible source operation reached the accelerator",
+                },
+            )
+            return result
+        _census_status = _census.get("silent_fallbacks_status")
+        if _census_status != "offloaded":
+            result.update(
+                status="incomplete",
+                failure={
+                    "plane": "model",
+                    "category": "PLACEMENT_NOT_MEASURED",
+                    "detail": "the whole-module placement census did not establish a decided offload "
+                    f"population ({_census_status or 'missing status'}); missing or uncertain "
+                    "operations cannot be treated as successful accelerator placement",
+                },
+            )
+            return result
+        _silent = _census.get("silent_fallbacks")
+        if not isinstance(_silent, list):
+            result.update(
+                status="incomplete",
+                failure={
+                    "plane": "model",
+                    "category": "PLACEMENT_NOT_MEASURED",
+                    "detail": "the whole-module placement census has no silent-fallback ledger",
+                },
+            )
+            return result
+        if _silent:
+            result.update(
+                status="fail",
+                numeric=_numeric_when_not_accelerated(st, gate, _v, _cos, engine, measured_on="host_lane_fallback"),
+                failure={
+                    "plane": "model",
+                    "category": "FALLBACK_ON_ELIGIBLE_REGION",
+                    "detail": f"{len(_silent)} whole-module region(s) admitted by the independent "
+                    "eligibility oracle were left on the host without a hardware refusal; "
+                    f"first regions: {_silent[:8]}",
+                },
+            )
+            return result
         if isinstance(_false_fb, int) and _false_fb > 0:
             result.update(
                 status="fail",
@@ -4394,6 +4444,10 @@ def run_capsule(
         if cert is not None:
             paths.generated.mkdir(parents=True, exist_ok=True)
             (paths.generated / "coverage_certificate.json").write_text(json.dumps(cert, indent=2), encoding="utf-8")
+        census = result.get("placement_census")
+        if census is not None:
+            paths.generated.mkdir(parents=True, exist_ok=True)
+            (paths.generated / "placement_census.json").write_text(json.dumps(census, indent=2), encoding="utf-8")
         return result
 
     tiers: dict[str, TierResult] = {}

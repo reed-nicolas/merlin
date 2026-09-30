@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from merlin.common.paths import repo_root
 from merlin.llvmlower import weight_prepack as wp
 
 MLIR = """builtin.module attributes {prov.weights_file = "SRC/weights.safetensors", prov.level = "linalg-on-tensors"} {
@@ -235,6 +236,7 @@ def test_the_compiler_input_actually_changes(tmp_path):
 @pytest.mark.parametrize("enabled", [False, True])
 def test_build_entry_points_share_prepacked_ir_and_runtime_bundle(tmp_path, monkeypatch, backend, enabled):
     """Replay the actual build up to the ABI seam; only tool execution/lowering is substituted."""
+    from merlin.runtime import boards
     from merlin.runtime.backends import spike_model as sm
     from merlin.runtime.backends import zephyr_model as zm
 
@@ -242,7 +244,8 @@ def test_build_entry_points_share_prepacked_ir_and_runtime_bundle(tmp_path, monk
     monkeypatch.setattr(wp, "_default_cache_root", lambda: tmp_path / "cache")
     monkeypatch.setattr(sm._spike, "gcc_path", lambda: tmp_path / "riscv64-unknown-elf-gcc")
     monkeypatch.setattr(sm.toolchain, "clang", lambda: tmp_path / "clang")
-    monkeypatch.setattr(zm, "available", lambda: True)
+    monkeypatch.setenv(boards.BOARD_CATALOG_ENV, str(repo_root() / "examples/board-catalog.yaml"))
+    monkeypatch.setattr(zm, "build_available", lambda: True)
     monkeypatch.setattr(zm, "allocation_bytes", lambda _: (0, False))
     seen = {}
 
@@ -273,7 +276,10 @@ def test_build_entry_points_share_prepacked_ir_and_runtime_bundle(tmp_path, monk
     feature_set = frozenset({wp.FEATURE}) if enabled else frozenset()
     work = tmp_path / "work"
     with pytest.raises(ReachedABI):
-        (sm.build if backend == "baremetal" else zm.build_app)(src, work, features=feature_set, vlen=512)
+        if backend == "baremetal":
+            sm.build(src, work, features=feature_set, vlen=512)
+        else:
+            zm.build_app(src, work, board="chipyard_riscv64", features=feature_set, vlen=512)
     assert seen["lower"] == seen["abi"]
     assert seen["inputs"] == seen["abi"] / "inputs.npz"
     assert seen["prepared_dir"] == work

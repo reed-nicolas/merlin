@@ -12,6 +12,7 @@ import yaml
 
 from merlin.common.paths import checkout_root, module_source_path, python_import_roots
 from merlin_experiments import frozen_python, source_snapshot
+from merlin_experiments.measured_launch import FROZEN_PHASE0_ENV_POLICY
 from merlin_experiments.phase1.source_inputs import fingerprint
 
 from .evidence import export_evidence, select_evidence
@@ -40,6 +41,7 @@ def selection(command: dict, target: str):
     return select_evidence(
         target,
         descriptor=inputs["descriptor"],
+        capability_contract_path=inputs.get("capability_contract"),
         facts_path=inputs.get("rtl_facts"),
         hardware_spec=inputs.get("hardware_spec"),
         software_spec=inputs.get("software_spec"),
@@ -232,6 +234,7 @@ def stage(plan: dict) -> dict:
     command["entrypoint"] = path_map[command["entrypoint"]]
     command["cwd"] = str(snapshot)
     command["source_snapshot"] = str(snapshot)
+    command["phase0_environment_policy"] = FROZEN_PHASE0_ENV_POLICY
     command["env"].update(source_snapshot.provider_environment(snapshot, receipt))
     command["env"].update(
         MERLIN_REPO_ROOT=str(snapshot),
@@ -241,6 +244,21 @@ def stage(plan: dict) -> dict:
     )
     command["env"]["MERLIN_TARGET_EXPERIMENT"] = command["inputs"]["descriptor"]
     command["env"]["MERLIN_PHASE0_FROZEN_SOURCE_MAP"] = json.dumps(captured_paths, sort_keys=True)
+    if "--evidence-mode" in command["argv"]:
+        command["env"]["MERLIN_PHASE0_EVIDENCE_MODE"] = command["argv"][command["argv"].index("--evidence-mode") + 1]
+    selected_m2m = command.get("phase0_m2m_selection")
+    if selected_m2m is not None:
+        from . import m2m_runtime
+
+        selected_m2m = m2m_runtime.stage(selected_m2m, artifact_root / "private" / "m2m-source")
+        m2m_runtime.verify(selected_m2m)
+        command["phase0_m2m_selection"] = selected_m2m
+        command["env"].update(m2m_runtime.environment(selected_m2m))
+        m2m_receipt = artifact_root / "private" / "m2m-runtime.json"
+        with m2m_receipt.open("xb") as stream:
+            stream.write(m2m_runtime.receipt(selected_m2m))
+        frozen["phase0_m2m_runtime_receipt"] = str(m2m_receipt)
+        frozen["input_paths"]["phase0:m2m_runtime_receipt"] = str(m2m_receipt)
     model = (evidence.software_spec.get("numerical_semantics") or {}).get("model") or {}
     env_name = model.get("source_root_env")
     if env_name in {"HOME", "home", "CODEX_HOME"} or (env_name and env_name in command["env"]):
@@ -292,6 +310,8 @@ def verify(plan: dict) -> None:
     command = plan["phases"]["0"]
     if command.get("source_snapshot") != str(snapshot) or command.get("cwd") != str(snapshot):
         raise ValueError("frozen Phase 0 source selection changed")
+    if command.get("phase0_environment_policy") != FROZEN_PHASE0_ENV_POLICY:
+        raise ValueError("frozen Phase 0 launch predates selected-only environment; freeze a new run")
     if command["env"].get("MERLIN_REPO_ROOT") != str(snapshot):
         raise ValueError("frozen Phase 0 repository ownership changed")
     for key, value in source_snapshot.provider_environment(snapshot, receipt).items():
@@ -314,3 +334,16 @@ def verify(plan: dict) -> None:
     for key, value in plan["phase0_numerical_environment"].items():
         if command["env"].get(key) != value:
             raise ValueError("frozen Phase 0 numerical model routing changed")
+    selected_m2m = command.get("phase0_m2m_selection")
+    if selected_m2m is None:
+        if any(key in command["env"] for key in ("MERLIN_M2M_DIR", "MERLIN_MODEL2MLIR", "MERLIN_M2M_PYTHON")):
+            raise ValueError("unselected Model2MLIR runtime entered frozen Phase 0")
+    else:
+        from . import m2m_runtime
+
+        m2m_runtime.verify(selected_m2m)
+        if any(command["env"].get(key) != value for key, value in m2m_runtime.environment(selected_m2m).items()):
+            raise ValueError("frozen Phase 0 Model2MLIR runtime routing changed")
+        receipt_path = Path(plan["phase0_m2m_runtime_receipt"])
+        if receipt_path.read_bytes() != m2m_runtime.receipt(selected_m2m):
+            raise ValueError("frozen Phase 0 Model2MLIR runtime receipt changed")

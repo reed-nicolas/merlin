@@ -3,10 +3,12 @@ title: Extending the compiler stack
 kind: guide
 status: current
 owner: compiler
-last_verified: 2026-09-27
+last_verified: 2026-09-29
 related: [phase0_specification, model_lowering, model2mlir, triton_kernels, target_resolution, llvm_integration, simulator_selection]
 code_refs:
   - src/merlin/targetgen/software_spec.py
+  - src/merlin/targetgen/instruction_semantics.py
+  - src/merlin/targetgen/semantic_search/search.py
   - src/merlin/targetgen/quant_recipe.py
   - src/merlin/targetgen/quant_layer_plan.py
   - src/merlin/targetgen/_recipe_quantizer.py
@@ -82,6 +84,56 @@ The staged kernel route is intentionally narrower than arbitrary whole-model MLI
 do not force an unsupported graph through it or silently drop operations. A target may
 consume command buffers/runtime calls without introducing an LLVM backend at all.
 
+## Inspect semantic selection before writing a target lowering
+
+The diagnostic search path consumes actual model2MLIR/capsule
+`linalg-on-tensors` MLIR and the normalized instruction model frozen by Phase 0:
+
+```text
+PyTorch capture → typed linalg/arith MLIR → exact scalar/indexing inventory
+                                 + Phase 0 OOT instruction semantics
+                                 → bounded instruction candidates
+                                 → modeled local-memory allocation
+                                 → per-region selection/refusal receipt
+```
+
+An operator may run this diagnostic outside the Phase 1 agent sandbox on a fresh
+output path, using the exact target and frozen model from one Phase 0 run:
+
+```sh
+python -m pip install '.[semantic-search]'  # from a Merlin source checkout
+merlin-target-tools semantic-search --target "$TARGET" \
+  --mlir "$CAPTURE_LINALG_MLIR" \
+  --instruction-model "$PHASE0/software/instruction-semantics.json" \
+  --out "$RUN/semantic-search.json"
+```
+
+The receipt binds the MLIR and model bytes and summarizes candidate/refusal counts
+by parsed operation kind. Currently the search accepts static,
+pure, exact typed `linalg.generic` bodies; its built-in equivalences are guarded
+integer commutation and modular-add reassociation, not arbitrary algebra. Allocation
+models declared memory capacity, alignment, value liveness and bank conflicts with
+a bounded solver.
+An unmatched or timed-out region remains unresolved; it is **not** automatically
+host-admitted. A selected row is only a candidate instruction graph with a modeled
+allocation. It does not emit target code, prove numerical equivalence, establish
+whole-model coverage, or certify the Phase 1 compiler. Target-specific encodings,
+transfers, runtime behavior and compiler passes remain OOT and need independent
+execution evidence. This initial implementation is a narrow semantic seam for
+growing verified rules, not unrestricted algebraic optimization.
+
+When a reviewed experiment selects a Phase 0 evidence bundle, its
+`software/instruction-semantics.json` is copied into the sealed corpus release
+as an owner-only input. Phase 1 records
+`semantic_search_diagnostic.json` beside the host run record from the frozen
+public Linalg capsules; it is not served to the agent or used by the grader.
+Phase 2 may record `_host_semantic_diagnostics/semantic_search.json` inside a
+fresh optimization stage, using its frozen model capsule and matching Phase 0
+evidence when that link exists. Missing or unknown instruction semantics remain
+explicitly unavailable; neither receipt grants target support or changes timing or
+qualification. To make search an agent-visible tool, define and evaluate a
+separate experiment treatment rather than changing an existing run in place.
+
 ## Phase 0: deterministic derivation, not an agent
 
 Phase 0 must be a deterministic transformation of selected input bytes, explicit policy
@@ -90,6 +142,14 @@ and transfer obligations, and generates capsules and independent goldens. It doe
 an agent to invent missing semantics, select favorable tests or repair a target compiler.
 Phase 1 is the agentic functional compiler experiment. Phase 2 optimizes and measures an
 already functionally qualified compiler using a separate performance cohort.
+
+For a live model workload, capsule generation reads `workloads/<name>/capture.toml`
+from the selected model2MLIR source, not another checkout named by the host environment.
+A malformed declaration or missing pinned interpreter fails that capsule explicitly.
+The generated capsule's `input_provenance.capture_declaration` records the selected
+declaration's relative path, byte count and SHA-256 (or records its absence). This
+is inspectable input lineage, not proof of a sealed PyTorch runtime or Phase 0
+admission; those claims still require the separate capture-execution attestation.
 
 Authored inputs still have a role. The SW spec supplies behavior not yet established by
 extraction: operation legality, layouts and tails, numerical semantics, ABI ordering,

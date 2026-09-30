@@ -10,6 +10,8 @@ External-baseline K1-RVV comparison harness.
 - `buddy.py` — Buddy (buddy-mlir) baseline arm — ingest OUR ``model.mlir`` and run it on the K1 with RVV.
 - `buddy_native_import.py` — Buddy NATIVE torch importer helper (DynamoCompiler; runs under the torch venv).
 - `bundle.py` — Resolve a ``(model, variant)`` to its capture bundle — the shared input every baseline ingests.
+- `k1_workload_policy.py` — K1-only whole-model board feasibility for the optional baseline study.
+- `accuracy_policy.py` — baseline-only model/golden provenance labels and numerical comparison bars.
 - `contract.py` — Result contract for external-baseline K1-RVV runs (the shared honesty schema).
 - `k1_exec.py` — Generic K1 deploy/run for external baselines + a board lock (single physical board).
 - `profile.py` — Two-level profiling: whole-model E2E + per-region "kernel-style" breakdown.
@@ -138,8 +140,8 @@ Then `aggregate.collect_dir(...)` renders the merlin-vs-baselines matrix into `a
   (real/native architecture) over the truncated `_consistent`. When the resolved dir ends `_full`,
   `_workload_env(model, full=True)` uses `bundle.full_env(model)` (real depths, e.g. 22-layer
   TinyLlama / 30-layer BitNet) so the exported instance matches the full golden — NOT the TOML
-  truncation defaults. `bundle.K1_RUNNABLE` = 8 models that fit the ~3.4 GB board;
-  `bundle.K1_RAM_INFEASIBLE` = {openvla, molmoact, pi05} (7B-class, attempt-build then RAM-gap).
+  truncation defaults. `k1_workload_policy.K1_RUNNABLE` = 8 models that fit the ~3.4 GB board;
+  `k1_workload_policy.K1_RAM_INFEASIBLE` = {openvla, molmoact, pi05} (7B-class, attempt-build then RAM-gap).
 - **Status: 5 int8 models BUILD via ONNX** (Relax import → rv64gcv `relax.build` → SpacemiT
   cross-link → real riscv64 RVV `.so` → RVV-audit), torchao int8 quant applied. **small_llama int8
   is numerically correct on host (cos 0.99999999)**; rdt 0.9992, openvla 0.9916 (near-pass);
@@ -157,7 +159,7 @@ Then `aggregate.collect_dir(...)` renders the merlin-vs-baselines matrix into `a
   broadcast-Mul error compounds across 22 layers vs 0.80 at 2 layers). Full-fidelity ONNX
   export + the second host-VM `relax.build` are ~5 min PER model, so a synchronous 11-model host-cos
   sweep is impractical (and contends with the concurrent ExecuTorch arm on the shared board). The
-  runner + `bundle.full_env`/`K1_RUNNABLE`/`K1_RAM_INFEASIBLE` wiring are in place; the definitive
+  runner + `bundle.full_env`/`k1_workload_policy` wiring are in place; the definitive
   Phase-2 conclusion (torch path can't build → ONNX only; RMSNorm-Mul defect confirmed on the real
   model) stands. Per-model full-fidelity build/cos/latency for all 8 K1-runnable models is a
   follow-up sweep (each model is an independent `run_model(m, "int8")`), not a blocker.

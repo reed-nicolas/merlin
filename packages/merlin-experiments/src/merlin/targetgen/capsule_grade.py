@@ -240,6 +240,33 @@ def model_execution_check(result: dict, capsule: dict | None = None) -> dict:
         violations.append("model_layer_oracle_unavailable")
     if unrouted not in (None, 0):
         violations.append("model_contraction_layer_unrouted")
+    # The dynamic counters above cover contractions. They cannot say whether a stage the target
+    # admitted behind a contraction was actually kept in that dispatch. Compare the planner with
+    # the runtime's own outline on its normalized module, and do not turn a missing comparison into
+    # a clean bill of health. This is static emitted-structure evidence, not a second execution
+    # counter; the dispatch ledger below still proves which completed kernel ran where.
+    alignment = execution.get("planned_outlined_alignment") if isinstance(execution, dict) else None
+    if bool(((capsule or {}).get("semantic") or {}).get("must_accelerate")):
+        valid_alignment = (
+            isinstance(alignment, dict)
+            and alignment.get("schema") == "planned_outlined_alignment_v1"
+            and alignment.get("evidence") == "runtime_normalized_source_and_outlined_dispatches; static_only"
+            and isinstance(alignment.get("n_planned_accelerator_stages"), int)
+            and not isinstance(alignment.get("n_planned_accelerator_stages"), bool)
+            and alignment["n_planned_accelerator_stages"] >= 0
+            and all(
+                isinstance(alignment.get(key), list)
+                for key in ("split_stages", "unjoined_stages", "unresolved_groups")
+            )
+        )
+        if not valid_alignment or alignment.get("status") == "incomplete":
+            violations.append("planned_outlined_alignment_unverified")
+        elif alignment.get("status") == "split":
+            violations.append("planned_accelerator_group_split_in_outline")
+        elif alignment.get("status") != "matched" or any(
+            alignment[key] for key in ("split_stages", "unjoined_stages", "unresolved_groups")
+        ):
+            violations.append("planned_outlined_alignment_unverified")
 
     ledger = execution.get("dispatch_ledger") if isinstance(execution, dict) else None
     mesh_entries: list[dict] = []
@@ -503,6 +530,7 @@ def model_execution_check(result: dict, capsule: dict | None = None) -> dict:
         "matmul_layers_routed": routed,
         "matmul_layers_on_mesh": on_mesh,
         "matmul_layers_unrouted": unrouted,
+        "planned_outlined_alignment": alignment,
         "n_tiles": n_tiles,
         "n_tiles_certified": n_passed,
         "simulator_requested": requested_engine,
@@ -545,7 +573,9 @@ def enforce_model_execution_check(result: dict, capsule: dict | None, *, target:
         or v.endswith("_oracle_engine_missing_or_invalid")
         for v in violations
     )
-    status = "unavailable" if engine_unmeasured else "fail"
+    alignment_unmeasured = "planned_outlined_alignment_unverified" in violations
+    evidence_unmeasured = engine_unmeasured or alignment_unmeasured
+    status = "unavailable" if evidence_unmeasured else "fail"
     detail = "whole-model execution proof failed: " + ", ".join(violations)
     for tier in CR._rtl_tiers_of(target):
         record = (result.get("tiers") or {}).get(tier)
@@ -555,10 +585,14 @@ def enforce_model_execution_check(result: dict, capsule: dict | None, *, target:
     # Preserve a pre-existing stronger failure.  The dangerous case is the flattering pass that escaped
     # into durable QA; convert that to an honest no-measurement or protocol verdict.
     if result.get("status") == "pass":
-        result["status"] = "incomplete" if engine_unmeasured else "fail"
+        result["status"] = "incomplete" if evidence_unmeasured else "fail"
         result["failure"] = {
-            "plane": "required_rtl_engine" if engine_unmeasured else "model_execution",
-            "category": "NOT_RUN_IS_NOT_PASS" if engine_unmeasured else "PROTOCOL_VIOLATION",
+            "plane": (
+                "required_rtl_engine"
+                if engine_unmeasured
+                else "model_placement" if alignment_unmeasured else "model_execution"
+            ),
+            "category": "NOT_RUN_IS_NOT_PASS" if evidence_unmeasured else "PROTOCOL_VIOLATION",
             "detail": detail,
         }
     return result

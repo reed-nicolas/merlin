@@ -66,8 +66,8 @@ def test_moved_golden_exporter_is_masked_without_hiding_public_emitter(tmp_path,
     ],
 )
 def test_evicted_gemmini_owners_retain_historical_private_identity(tmp_path, isolated_policy, module):
-    assert module in A.declared_modules("grader")
-    assert "gemmini_conformance" in A.declared_modules("grader")
+    assert module in AS.declared_modules("grader")
+    assert "gemmini_conformance" in AS.declared_modules("grader")
     relative = "packages/merlin-experiments/src/" + module.replace(".", "/") + ".py"
     private = _write(tmp_path, relative)
     surfaces = AS.answer_surfaces(isolated_policy)
@@ -89,7 +89,7 @@ def test_relocated_evaluation_cohort_keeps_grader_mask(tmp_path, isolated_policy
 
 @pytest.mark.parametrize("module", ["merlin.targetgen.oracle_helpers.npu_emit", "atlas_program_emit"])
 def test_program_emitters_retain_private_identity(tmp_path, isolated_policy, monkeypatch, module):
-    assert module in A.declared_modules("oracle")
+    assert module in AS.declared_modules("oracle")
     if module == "atlas_program_emit":
         private = _write(tmp_path, "support/atlas_program_emit.py")
         monkeypatch.setattr(AS, "_support_package_dirs", lambda: [private.parent])
@@ -410,6 +410,41 @@ def test_installed_and_shadowed_evaluators_and_bytecode_are_masked(tmp_path, iso
     assert BW.coverage_gap(BW.apply_answer_masks(unmasked, surfaces), surfaces) == []
 
 
+def test_top_level_private_helpers_are_physically_masked_on_active_python_paths(tmp_path, isolated_policy, monkeypatch):
+    site = tmp_path / ".venv/lib/python3.12/site-packages"
+    alternate = tmp_path / "alternate/site-packages"
+    oracle = _write(site, "atlas_program_emit.py")
+    grader = _write(site, "gemmini_conformance/__init__.py").parent
+    shadowed = _write(alternate, "atlas_program_emit.py")
+    public = _write(site, "public_helper.py")
+    monkeypatch.setattr(
+        A,
+        "sys",
+        SimpleNamespace(path=[str(alternate)], prefix=str(tmp_path / "python"), modules={}),
+    )
+    surfaces = AS.answer_surfaces(isolated_policy)
+    expected = {oracle, grader, shadowed}
+    assert expected <= {surface.path for surface in surfaces}
+    assert all(surface.path != public and surface.path not in public.parents for surface in surfaces)
+    mounted = ["--ro-bind", str(tmp_path), str(tmp_path)]
+    assert expected <= {surface.path for surface in BW.coverage_gap(mounted, surfaces)}
+    assert BW.coverage_gap(BW.apply_answer_masks(mounted, surfaces), surfaces) == []
+
+
+def test_installed_semantic_search_is_masked_as_host_private_tool(tmp_path, isolated_policy):
+    source = _write(tmp_path, "src/merlin/targetgen/semantic_search/search.py")
+    installed = _write(tmp_path, ".venv/lib/python3.12/site-packages/merlin/targetgen/semantic_search/search.py")
+    public = _write(tmp_path, "src/merlin/targetgen/tool_cli.py")
+    assert "merlin.targetgen.semantic_search" in A.declared_modules("grader")
+    surfaces = AS.answer_surfaces(isolated_policy)
+    expected = {source.parent, installed.parent}
+    assert expected <= {surface.path for surface in surfaces}
+    assert all(surface.path != public and surface.path not in public.parents for surface in surfaces)
+    mounted = ["--ro-bind", str(tmp_path), str(tmp_path)]
+    assert expected <= {surface.path for surface in BW.coverage_gap(mounted, surfaces)}
+    assert BW.coverage_gap(BW.apply_answer_masks(mounted, surfaces), surfaces) == []
+
+
 def test_installed_resources_outside_checkout_keep_masks_and_audit_tokens(tmp_path, isolated_policy, monkeypatch):
     checkout = tmp_path / "checkout"
     site = tmp_path / "installed/site-packages"
@@ -516,12 +551,13 @@ def test_real_release_wheel_files_are_covered_when_installed(tmp_path, isolated_
     oracle = site / "merlin/runtime/reference.py"
     expected_output = site / "merlin/_data/contract/examples/expected_command_buffer_g0.json"
     public = site / "merlin/xdsl_dialects/interface.py"
-    assert all(path.is_file() for path in (grader, oracle, expected_output, public))
+    assert all(path.is_file() for path in (grader, oracle, public))
+    assert not expected_output.exists(), "Gemmini's answer fixture must not ship in the core wheel"
     surfaces = AS.answer_surfaces(isolated_policy)
-    assert {grader, oracle, expected_output} <= {surface.path for surface in surfaces}
+    assert {grader, oracle} <= {surface.path for surface in surfaces}
     assert all(surface.path != public and surface.path not in public.parents for surface in surfaces)
     unmasked = ["--ro-bind", str(tmp_path / ".venv"), str(tmp_path / ".venv")]
-    assert {grader, oracle, expected_output} <= {surface.path for surface in BW.coverage_gap(unmasked, surfaces)}
+    assert {grader, oracle} <= {surface.path for surface in BW.coverage_gap(unmasked, surfaces)}
     assert BW.coverage_gap(BW.apply_answer_masks(unmasked, surfaces), surfaces) == []
 
 
@@ -532,6 +568,7 @@ def test_private_resource_masks_follow_each_declared_layout(tmp_path, isolated_p
     hidden = _write(tmp_path, f"{resource_root}/capsules/hidden/sample/capsule.yaml").parents[1]
     holdout = _write(tmp_path, f"{resource_root}/capsules/profiles/test.hidden.yaml")
     expected = _write(tmp_path, f"{resource_root}/examples/expected_command_buffer.json")
+    fixture = _write(tmp_path, "merlin/tests/gemmini/fixtures/expected_command_buffer_g0.json")
     surfaces = AS.answer_surfaces(isolated_policy)
     by_path = {surface.path: surface.origin for surface in surfaces}
     assert by_path[golden] == "golden"
@@ -539,8 +576,9 @@ def test_private_resource_masks_follow_each_declared_layout(tmp_path, isolated_p
     assert by_path[hidden] == "hidden"
     assert by_path[holdout] == "hidden"
     assert by_path[expected] == "example"
+    assert by_path[fixture] == "golden"
     argv = ["--ro-bind", str(tmp_path), str(tmp_path)]
-    assert len(BW.coverage_gap(argv, surfaces)) == 5
+    assert len(BW.coverage_gap(argv, surfaces)) == 6
     assert BW.coverage_gap(BW.apply_answer_masks(argv, surfaces), surfaces) == []
     tokens = AS.audit_tokens(isolated_policy)["answer"]
     assert "capsules/hidden" in tokens and ".hidden.yaml" in tokens

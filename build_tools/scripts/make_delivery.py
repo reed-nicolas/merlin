@@ -679,7 +679,8 @@ def build_one(
         # MP_MAX_NUM_CPUS=2, and under `-p1` Zephyr waits forever for a CPU that never arrives and hangs
         # before printing anything. That failure is indistinguishable from a slow model.
         res = zm.run_on_spike(
-            ship["elf"], harts=cpus, mem_bytes=ship["ram_bytes"], timeout=timeout, vlen=vlen if vec else None
+            ship["elf"], dram_base=brd.dram_base, harts=cpus,
+            mem_bytes=ship["ram_bytes"], timeout=timeout, vlen=vlen if vec else None
         )
         res.update(zm._gate(res["prefix"], refs))
         res["backend"] = backend
@@ -1049,7 +1050,10 @@ def build_matrix(
         )
 
     if simulate:
-        res = zm.run_on_spike(twin["elf"], harts=cpus, mem_bytes=twin["ram_bytes"], timeout=timeout, vlen=vlen)
+        res = zm.run_on_spike(
+            twin["elf"], dram_base=brd.dram_base, harts=cpus,
+            mem_bytes=twin["ram_bytes"], timeout=timeout, vlen=vlen,
+        )
         res.update(zm._gate(res["prefix"], refs))
     else:
         # --no-spike: the twin is still BUILT and both images still audited (the digest match and the

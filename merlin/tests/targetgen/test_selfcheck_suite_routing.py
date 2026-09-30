@@ -39,10 +39,9 @@ def test_read_suite_matches_write_suite(target):
     )
 
 
-def test_suite_for_is_target_derived_not_the_gemmini_literal():
-    # atlas must NOT resolve to the gemmini suite literal — that identity was the whole bug.
-    assert CR.suite_for("atlas") != CR.SUITE
-    assert CR.suite_for("gemmini") == CR.SUITE  # gemmini legitimately owns the literal
+def test_suite_for_is_target_derived_not_a_reference_constant():
+    assert not hasattr(CR, "SUITE")
+    assert CR.suite_for("atlas") != CR.suite_for("gemmini")
     assert "atlas" in CR.suite_for("atlas")
 
 
@@ -58,6 +57,6 @@ def test_reader_finds_a_result_written_under_the_target_suite():
         json.dumps({"capsule": "AT2_single_tile_matmul", "status": "fail", "tiers": {}})
     )
     fixed = list((rr / "runs" / CR.suite_for("atlas")).glob("*/capsule_result.json"))
-    old = list((rr / "runs" / CR.SUITE).glob("*/capsule_result.json"))
+    old = list((rr / "runs" / CR.suite_for("gemmini")).glob("*/capsule_result.json"))
     assert len(fixed) == 1  # the fix finds the atlas result
     assert len(old) == 0  # the old gemmini-literal glob was blind

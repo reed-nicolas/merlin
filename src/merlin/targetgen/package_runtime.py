@@ -21,13 +21,24 @@ from merlin.common.access import PUBLIC_INPUT_MODULE, is_harness_module, is_publ
 from .contract import compile as oot_compile  # noqa: F401 -- legacy evaluator monkeypatch seam
 from .contract import schemas
 
-SUITE = "gemmini-contract"  # target-ok: aet suite identity of the gemmini reference contract cert flow
-# The target under certification is DERIVED per run from the package's manifest ``target`` field (via
-# ``_package_target`` / the ``target=`` param of ``certify``), never hardcoded — the runner is
-# target-agnostic and threads that value through the run record / logger calls below. The SUITE label
-# above is the fixed aet identity of the gemmini reference contract suite and is intentionally kept.
 DEFAULT_TARGET = "unknown"  # fallback only when a package manifest declares no ``target`` field
 CONTRACT_VERSION = "0.1"
+
+
+def certification_suite(target: str) -> str:
+    """AET suite for this package's declared target, not a reference-target constant.
+
+    Keep the established ``<target>-contract`` identity for existing target runs,
+    while preventing a package manifest from injecting an unsafe path component.
+    A missing target gets a neutral failure-record suite, not a claimed target.
+    """
+    from .package_records import component
+
+    if not isinstance(target, str) or any(ord(char) < 32 or ord(char) == 127 for char in target):
+        raise ValueError("package target contains a control character or is not text")
+    if target == DEFAULT_TARGET:
+        return "unresolved-contract"
+    return component(f"{component(target)}-contract")
 
 # Cycle-accurate RTL SIMULATOR tools — a property of the simulator TOOL, not of any target. A tier
 # graded by one of these carries a cycle-accurate cert; a functional tier (spike / the arc coarse

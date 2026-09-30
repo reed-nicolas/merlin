@@ -284,6 +284,13 @@ def main() -> int:
     known = set()
     if DEBT.exists():
         known = {ln.strip() for ln in DEBT.read_text().splitlines() if ln.strip() and not ln.startswith("#")}
+    if a.target:
+        # A one-target audit says nothing about other targets' debt. Without
+        # this scope the gate reports their still-open findings as "resolved".
+        from merlin_experiments.phase0.declarations import for_target
+
+        selected = for_target(a.target).target
+        known = {key for key in known if key.startswith(f"{selected}:")}
     fresh = [f for f in findings if _key(f) not in known]
     stale = sorted(known - {_key(f) for f in findings})
 

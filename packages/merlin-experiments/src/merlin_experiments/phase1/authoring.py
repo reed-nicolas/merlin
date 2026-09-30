@@ -242,7 +242,10 @@ def finalize_report(
             f"--permission-mode bypassPermissions --add-dir {ws} "
             f"--output-format stream-json --verbose < {ws / 'FINALIZE.md'}"
         )
-        cmd = EX.sandbox_command(inner, ws, bundle, context=context) if sandbox == "bwrap" else inner
+        cmd = (
+            EX.sandbox_command(inner, ws, bundle, context=context, private_run_dir=run_dir)
+            if sandbox == "bwrap" else inner
+        )
         try:
             rc = AS.stream_stamped(
                 ["bash", "-c", cmd],
@@ -1002,7 +1005,9 @@ def execute(prepared: PreparedRun, runtime: AuthoringRuntime) -> int:
                 labels={"public", "dev"},
                 contract=str(_contract_root if _contract_root is not None else context.repo / "merlin/contract"),
                 oracle_adapters=adapters,
-                timeout=CERT._verilator_l3_budget(run_dir, eligible, _cert_tier, context=context),
+                timeout=CERT._verilator_l3_budget(
+                    run_dir, eligible, _cert_tier, context=context, timing_file=runtime.oracle_timing
+                ),
                 max_workers=_CG.default_grade_workers(),
                 target=_te().target,
                 additional_forbidden=grading_inputs.additional_forbidden,

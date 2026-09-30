@@ -18,12 +18,17 @@ import fcntl
 import subprocess
 from pathlib import Path
 
+from merlin.baselines.profile import MeasurementClock
 from merlin.mining import k1
 
 # Reuse merlin's board config verbatim (env: MERLIN_K1_HOST / MERLIN_K1_SSH_KEY / MERLIN_K1_REMOTE_DIR).
 K1_HOST = k1.K1_HOST
 K1_SSH_KEY = k1.K1_SSH_KEY
 K1_REMOTE_DIR = k1.K1_REMOTE_DIR
+MEASUREMENT_CLOCK = MeasurementClock(
+    timebase_hz=k1.K1_TIMEBASE_HZ,
+    estimated_core_hz=k1.K1_CPU_HZ,
+)
 
 _SSH_OPTS = ["-i", K1_SSH_KEY, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"]
 

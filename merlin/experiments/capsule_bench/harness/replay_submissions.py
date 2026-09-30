@@ -80,7 +80,7 @@ def replay(pkg_dir: Path, *, input_mlir: Path) -> list[dict]:
     except Exception as e:  # noqa: BLE001 -- an unreadable package is a finding, not a crash
         return [{"command": "<load>", "verdict": "unactionable", "note": f"{type(e).__name__}: {str(e)[:180]}"}]
 
-    for name in sorted((pkg.manifest.get("commands") or {})):
+    for name in sorted(pkg.manifest.get("commands") or {}):
         row: dict = {"command": name}
         try:
             argv = _resolve_argv(pkg, name, input_mlir, pkg_dir / "_replay_out.json")
@@ -124,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     if src is None:
         from merlin.common.paths import repo_root
 
-        src = repo_root() / "merlin/contract/examples/g0_matmul.interface.mlir"
+        src = repo_root() / "examples/gemmini/phase0/reference/g0_matmul.interface.mlir"
 
     pkgs = discover(root)
     if not pkgs:

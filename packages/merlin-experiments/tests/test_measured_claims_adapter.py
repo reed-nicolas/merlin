@@ -1,5 +1,6 @@
 """Catalog-to-managed-checkpoint transport, not scientific qualification."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -252,7 +253,17 @@ def fake_driver(monkeypatch, command, codes):
             observed.append(list(argv))
 
         def wait(self):
-            return codes.pop(0)
+            code = codes.pop(0)
+            if code == 0 and command.get("module"):
+                output = Path(command["engine_output"])
+                output.mkdir(parents=True, exist_ok=True)
+                payload = json.dumps(
+                    {"schema": "merlin.agentic-performance-experiment.v1", "status": "GO"},
+                    sort_keys=True,
+                ).encode()
+                digest = hashlib.sha256(payload).hexdigest()
+                (output / f"experiment_manifest.{digest}.json").write_bytes(payload)
+            return code
 
     monkeypatch.setattr(R.subprocess, "Popen", Process)
     return observed
@@ -265,6 +276,19 @@ def test_interrupted_driver_resumes_same_frozen_root_and_exact_command(case, mon
     assert R.resume(case.destination) == 0
     assert observed[0] == observed[1]
     assert observed[0][observed[0].index("--root") + 1] == str(case.destination / "phase2")
+
+
+def test_completed_measured_run_refuses_changed_output(case, monkeypatch):
+    resolved = plan(case)
+    command = resolved["phases"]["2"]
+    observed = fake_driver(monkeypatch, command, [0])
+    assert R.run(resolved) == 0
+    assert R.resume(case.destination) == 0
+    output = next(Path(command["engine_output"]).glob("experiment_manifest.*.json"))
+    output.write_text('{"status":"changed"}\n')
+    with pytest.raises(SpecError, match="completed installed Phase 2 output changed"):
+        R.resume(case.destination)
+    assert len(observed) == 1
 
 
 def test_published_compiler_selection_is_frozen_across_managed_resume(case, monkeypatch):

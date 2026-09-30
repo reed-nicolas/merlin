@@ -2,8 +2,7 @@
 
 ## Purpose
 The **experiment ABI**: the repo-independent, versioned contract an out-of-tree target-backend
-package is built against (see `README.md`). Hand-authored, **frozen source-of-record** DATA — the
-gemmini OOT-backend reference instance. The *accessor code* lives in
+package is built against (see `README.md`). The *accessor code* lives in
 `merlin/python/merlin/targetgen/contract/` and reads this via `contract_dir()` / `$MERLIN_CONTRACT_DIR`.
 
 ## What lives here
@@ -20,17 +19,21 @@ gemmini OOT-backend reference instance. The *accessor code* lives in
   generated header, and stays the grader's job.
 - `schemas/` — fail-closed JSON-Schema validators (distinct from the loose YAML data-model in
   `merlin/schemas/`; only `command_buffer` overlaps, kept in sync by a test).
-- `examples/` — frozen golden inputs (g0–g2).
-- `capsules/` — the gemmini reference capsule corpus (graded benchmark INPUTS). See `capsules/MANIFEST.yaml`
-  for which capsules are regenerable (`generate_corpus.py`) vs hand-authored (A1, B3/B4, hidden H*).
-  Kept committed regardless — agents are scored against exact goldens.
+- `examples/` — compatibility links for Gemmini's g0–g2 reference inputs and
+  expected command buffer; the source inputs belong to `examples/gemmini/phase0/reference/`
+  and the expected output is a Gemmini test fixture. These are not core release data.
+- `capsules/` — retained historical public corpus snapshots across multiple targets. See
+  `capsules/MANIFEST.yaml` for regenerable and hand-authored members; hidden capsules and
+  goldens are untracked answer surfaces. New Phase 0 capsules are generated run artifacts,
+  selected through a reviewed release rather than authored here.
 
 ## What does NOT belong here
-- Accessor/tool code (→ `merlin/python/merlin/targetgen/contract/`). Generated results (→ `artifacts/`).
+- Accessor/tool code (→ `src/merlin/targetgen/contract/`). New generated results (→ `out/`).
 
 ## Used by
 `merlin.targetgen` (capsule_runner, capsule_grade, contract.*, rtl_check_runner) + the
 `gemmini_capsule_bench_v0` / `gemmini_perf_bench` experiments + `tests/gemmini/`.
 
 ## Invariants
-Frozen data only; the gemmini specifics are a reference instance — keep new general machinery out.
+The shared contract stays target-agnostic. Do not add new target-specific source inputs here.
+Retain historical corpus paths until their consumers and privacy masks are migrated together.

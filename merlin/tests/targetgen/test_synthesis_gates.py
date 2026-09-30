@@ -8,6 +8,7 @@ would make every downstream diff unreadable.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
@@ -73,7 +74,7 @@ class TestGrammarCannotClaimAShapeItCannotExpress:
         te = load_target_experiment(desc)
         for root in te.graded_roots():
             for cy in sorted(root.glob("*/capsule.yaml")):
-                prof = B.profile_capsule(cy.parent, target)
+                prof = B.profile_capsule(cy.parent, target, capability_contract={})
                 if prof.grammar != "merlin_iface":
                     continue
                 claimed = set(prof.contains) & set(self._HOST_SHAPES)
@@ -84,6 +85,15 @@ class TestGrammarCannotClaimAShapeItCannotExpress:
 
 
 class TestSynthesisIsReproducible:
+    def test_retained_mx_profile_requires_new_inputs(self):
+        proc = subprocess.run(
+            [sys.executable, str(repo_root() / "build_tools/scripts/synth_capsule_corpus.py"),
+             "--target", "mx_gemmini", "--check", "--json"],
+            capture_output=True, text=True, timeout=300,
+        )
+        assert proc.returncode == 1
+        assert json.loads(proc.stdout)[0]["status"] == "invalid_synthesis_inputs"
+
     @pytest.mark.parametrize("target", _specs())
     def test_the_tracked_file_matches_a_fresh_derivation(self, target):
         """`--check` is the cheap half of byte-stability: it needs neither torch nor an oracle, so it
@@ -92,6 +102,9 @@ class TestSynthesisIsReproducible:
         tracked = for_target(target).synth_profile
         if tracked is None or not tracked.is_file():
             pytest.skip(f"{target} has no synthesized entries yet")
+        profile = yaml.safe_load(tracked.read_text(encoding="utf-8")) or {}
+        if target == "mx_gemmini" and not (profile.get("provenance") or {}).get("selected_inputs"):
+            pytest.skip("retained MX synthesis profile predates the selected software spec")
         proc = subprocess.run(
             [
                 sys.executable,

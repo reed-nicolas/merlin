@@ -17,16 +17,12 @@ include merlin/benchmarks/semantic_memory/vla_action_chunk_decode.yaml
 include merlin/contract/README.md
 include merlin/contract/VERSION
 include merlin/contract/arc_models.yaml
-include merlin/contract/boards.yaml
 include merlin/contract/claim_models.yaml
 include merlin/contract/command_buffer_abi.yaml
 include merlin/contract/compute_endpoints.yaml
 include merlin/contract/corpora.yaml
 include merlin/contract/counter_trust.yaml
-include merlin/contract/examples/expected_command_buffer_g0.json
-include merlin/contract/examples/g0_matmul.interface.mlir
-include merlin/contract/examples/g1_relu.interface.mlir
-include merlin/contract/examples/g2_acc_scale.interface.mlir
+prune merlin/contract/examples
 include merlin/contract/functional_model_errata.yaml
 include merlin/contract/gate_phases.yaml
 include merlin/contract/hardware_pins.yaml

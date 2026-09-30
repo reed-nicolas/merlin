@@ -38,7 +38,11 @@ def test_a_real_image_passes_against_its_board():
 
 def test_an_image_larger_than_the_board_fails():
     """A region larger than physical DRAM is a boot that dies before main() with no console output."""
-    rep = elf_audit.audit(_an_elf(), boards.board("tiny", dram_bytes=4 * 1024 * 1024))
+    rep = elf_audit.audit(
+        _an_elf(),
+        boards.Board("tiny", dram_bytes=4 * 1024 * 1024, harts=1, dram_base=0x80000000,
+                     console="htif", flow="zephyr", loader="uart_tsi", loader_baud=921600),
+    )
     assert not rep.ok
     assert any("DRAM" in p or "MB" in p for p in rep.problems), rep.problems
 
@@ -62,7 +66,12 @@ def test_a_missing_htif_section_is_a_failure_for_an_htif_board():
     rep = elf_audit.audit(_an_elf(), boards.board("chipyard_kodiak"), expect_htif=True)
     assert ".htif" in rep.sections, "the chipyard images do carry .htif; if this changes, say why"
     # and the check is real: asking for it on a board whose image lacks it must fail
-    rep2 = elf_audit.audit(_an_elf(), boards.board("x", console="uart"), expect_htif=False)
+    rep2 = elf_audit.audit(
+        _an_elf(),
+        boards.Board("x", dram_bytes=1 << 28, harts=1, dram_base=0x80000000,
+                     console="uart", flow="zephyr", loader="uart_tsi", loader_baud=921600),
+        expect_htif=False,
+    )
     assert not any(".htif" in p for p in rep2.problems)
 
 

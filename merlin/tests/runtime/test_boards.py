@@ -7,6 +7,7 @@ physical DRAM dies before main(). So the descriptor is the contract, and these t
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,25 @@ import pytest
 from merlin.runtime import boards
 from merlin.runtime.backends import zephyr_model as zm
 from merlin.runtime.sdk_facts import UartConsoleFacts
+
+
+def _fixture_board(name: str, **overrides):
+    facts = {
+        "name": name,
+        "dram_bytes": 1 << 28,
+        "dram_base": 0x80000000,
+        "harts": 2,
+        "vector_harts": 2,
+        "console": boards.CONSOLE_HTIF,
+        "flow": boards.FLOW_ZEPHYR,
+        "fpu_sharing": False,
+        "zephyr_vector_ext": True,
+        "loader": boards.LOADER_UART_TSI,
+        "loader_baud": 921600,
+        "ram_label": "ram0",
+    }
+    facts.update(overrides)
+    return boards.Board(**facts)
 
 
 @pytest.fixture()
@@ -46,12 +66,124 @@ def test_kodiak_is_described_by_its_silicon_not_its_dts():
     assert b.console == boards.CONSOLE_HTIF
 
 
-def test_an_unknown_board_falls_back_conservatively_and_says_so():
-    """A new board must be tryable before anyone writes it down, but never with invented facts."""
-    b = boards.board("some_new_tapeout")
-    assert b.dram_bytes == 256 * 1024 * 1024
-    assert b.vector_max_len == 128, "unknown VLEN must assume the V minimum, not a guess"
-    assert "conservative" in b.notes
+def test_an_unknown_board_is_rejected_before_a_build():
+    """No image may be built with invented DRAM, hart or console facts."""
+    with pytest.raises(boards.BoardRegistryError, match="not in the selected catalog"):
+        boards.board("some_new_tapeout")
+
+
+def test_catalog_selection_is_explicit(monkeypatch):
+    monkeypatch.delenv(boards.BOARD_CATALOG_ENV, raising=False)
+    with pytest.raises(boards.BoardRegistryError, match="no board catalog selected"):
+        boards.load_boards()
+
+
+def test_zephyr_image_build_does_not_require_spike(monkeypatch, tmp_path):
+    zephyr = tmp_path / "zephyr"
+    sdk = tmp_path / "sdk"
+    zephyr.mkdir()
+    sdk.mkdir()
+    gcc = tmp_path / "riscv64-unknown-elf-gcc"
+    for name in ("gcc", "ld", "ar", "objcopy"):
+        (tmp_path / f"riscv64-unknown-elf-{name}").write_text("tool\n")
+    monkeypatch.setattr(zm, "_zephyr_base", lambda: zephyr)
+    monkeypatch.setattr(zm, "_sdk_dir", lambda: sdk)
+    monkeypatch.setattr(zm, "build_tool", lambda _: tmp_path / "host-tool")
+    monkeypatch.setattr(zm.toolchain, "available", lambda: True)
+    monkeypatch.setattr(zm._spike, "gcc_path", lambda: gcc)
+    monkeypatch.setattr(zm._spike, "available", lambda: False)
+    assert zm.build_available()
+    assert not zm.available()
+
+
+def test_zephyr_build_reaches_bundle_preparation_without_spike(monkeypatch, tmp_path):
+    from merlin.llvmlower import weight_prepack
+
+    selected = _fixture_board(
+        "portable",
+        zephyr_default_ram_bytes=256 << 20,
+        zephyr_link_limit_bytes=1900 << 20,
+    )
+
+    class ReachedPreparation(Exception):
+        pass
+
+    monkeypatch.setattr(boards, "board", lambda *_args, **_kwargs: selected)
+    monkeypatch.setattr(zm, "load_matrix_signatures", lambda *_args: None)
+    monkeypatch.setattr(zm, "build_available", lambda: True)
+    monkeypatch.setattr(zm, "available", lambda: pytest.fail("Spike readiness must not gate a Zephyr image build"))
+
+    def prepare(*_args):
+        raise ReachedPreparation
+
+    monkeypatch.setattr(weight_prepack, "prepare_build_bundle", prepare)
+    with pytest.raises(ReachedPreparation):
+        zm.build_app(tmp_path / "model", tmp_path / "work", board="portable")
+
+
+def test_zephyr_build_requires_board_before_creating_output(tmp_path):
+    work = tmp_path / "build"
+    with pytest.raises(zm.ZephyrModelError, match="explicitly selected"):
+        zm.build_app(tmp_path / "model", work)
+    assert not work.exists()
+
+
+def test_external_memory_layout_uses_the_selected_board_not_a_fixed_address():
+    gib = 1 << 30
+    brd = _fixture_board(
+        "shifted", dram_base=0x90000000, dram_bytes=8 * gib,
+        zephyr_default_ram_bytes=256 << 20, zephyr_link_limit_bytes=1900 << 20,
+        zephyr_external_ram_bytes=gib, zephyr_external_tail_reserve_bytes=256 << 20,
+    )
+    layout = zm._memory_plan(brd, 2 * gib + 1, 3 * gib)
+    assert layout.external
+    assert layout.weights_base == brd.dram_base + gib
+    assert layout.ram_region_bytes == gib
+    assert layout.weights_region_bytes == 2 * gib + 4096
+    assert layout.spike_span_bytes == gib + layout.weights_region_bytes
+
+
+def test_large_model_without_board_layout_fails_before_linking():
+    brd = _fixture_board(
+        "no_external", dram_bytes=8 << 30,
+        zephyr_default_ram_bytes=256 << 20, zephyr_link_limit_bytes=1900 << 20,
+    )
+    with pytest.raises(zm.ZephyrModelError, match="declares no external-weights layout"):
+        zm._memory_plan(brd, 2 << 30, 3 << 30)
+    with pytest.raises(zm.ZephyrModelError, match="RAM override"):
+        zm._memory_plan(brd, 0, 0, override=3 << 30)
+
+
+def test_external_weights_cannot_overlap_reserved_dram_tail():
+    gib = 1 << 30
+    brd = _fixture_board(
+        "small_external", dram_bytes=4 * gib,
+        zephyr_default_ram_bytes=256 << 20, zephyr_link_limit_bytes=1900 << 20,
+        zephyr_external_ram_bytes=gib, zephyr_external_tail_reserve_bytes=256 << 20,
+    )
+    with pytest.raises(zm.ZephyrModelError, match="does not fit"):
+        zm._memory_plan(brd, 3 * gib, 4 * gib)
+
+
+def test_external_image_must_leave_room_for_its_activation_arena():
+    from merlin.runtime.elf_audit import Segment
+
+    gib = 1 << 30
+    brd = _fixture_board("arena", dram_bytes=8 * gib)
+    low = gib
+    image = Segment("LOAD", brd.dram_base, 200 << 20, 200 << 20, "RWE")
+    zm._require_external_arena(brd, low, [image], 500 << 20)
+    with pytest.raises(zm.ZephyrModelError, match="external-weights ELF leaves"):
+        zm._require_external_arena(brd, low, [image], 900 << 20)
+    spill = Segment("LOAD", brd.dram_base + low - 4096, 8192, 8192, "RWE")
+    with pytest.raises(zm.ZephyrModelError, match="crosses the declared low RAM"):
+        zm._require_external_arena(brd, low, [spill], 0)
+
+
+def test_cpu_overlay_uses_declared_dt_count_not_board_name():
+    assert "cpu@2" in zm._cpu_disable_overlay(2, 4)
+    with pytest.raises(zm.ZephyrModelError, match="only 2 CPU nodes"):
+        zm._cpu_disable_overlay(3, 2)
 
 
 def test_overrides_win_so_a_delivery_can_state_what_it_built_for():
@@ -73,6 +205,13 @@ def test_the_config_follows_the_board():
     assert zm._vector_max_len_bits(b) >= b.vector_max_len
     # y mis-routes V-illegal-instruction traps into the FP path and retries forever: a silent hang.
     assert "CONFIG_FPU_SHARING=n" in conf
+
+
+def test_zephyr_config_requires_an_explicit_board_descriptor():
+    import pytest
+
+    with pytest.raises(zm.ZephyrModelError, match="board descriptor is required"):
+        zm._prj_conf(2, "rvv", None)
 
 
 def test_kodiak_lets_zephyr_manage_vector_state():
@@ -155,7 +294,7 @@ def test_the_vector_save_area_is_never_declared_smaller_than_the_tree_default():
     if not floor:
         pytest.skip("this Zephyr tree states no single numeric default for RISCV_VECTOR_MAX_LEN")
 
-    understated = boards.board("some_new_tapeout", vlen=128)
+    understated = _fixture_board("some_new_tapeout", vlen=128)
     assert understated.vector_max_len == 128, "the descriptor still reports what it was told"
     assert zm._vector_max_len_bits(understated) == floor, "but the emitted config is floored"
     conf = zm._prj_conf(understated.harts, "rvv", understated)
@@ -163,7 +302,7 @@ def test_the_vector_save_area_is_never_declared_smaller_than_the_tree_default():
 
     # The floor must not CLAMP a board that legitimately has wider registers -- that would recreate the
     # overrun on the one class of board where it is guaranteed to happen.
-    wide = boards.board("some_new_tapeout", vlen=1024)
+    wide = _fixture_board("some_new_tapeout", vlen=1024)
     assert zm._vector_max_len_bits(wide) == 1024
 
 
@@ -181,14 +320,15 @@ def test_a_uart_board_without_derived_facts_is_refused():
     failure, because the generic chipyard board's defconfig sets CONFIG_UART_HTIF=y. The image kept a
     host-assisted console and hung in its first print on silicon. There is no safe default here."""
     with pytest.raises(RuntimeError, match="no SDK facts"):
-        zm._prj_conf(2, "rvv", boards.board("x", console=boards.CONSOLE_UART))
+        zm._prj_conf(2, "rvv", _fixture_board("x", console=boards.CONSOLE_UART))
 
 
 def test_a_uart_board_turns_htif_off_and_states_both_clock_terms(uart_facts):
     """The driver computes its divisor as (SYS_CLOCK_HW_CYCLES_PER_SEC * RTC_CLOCK_DIVIDER_VALUE)/baud
     - 1, so BOTH terms must describe the chip. The board's own defaults imply a 1 GHz peripheral clock
     and would emit garbage rather than nothing -- which reads as a corrupt program, not a bad UART."""
-    conf = zm._prj_conf(2, "rvv", boards.board("x", console=boards.CONSOLE_UART), uart_facts)
+    uart_board = _fixture_board("x", console=boards.CONSOLE_UART)
+    conf = zm._prj_conf(2, "rvv", uart_board, uart_facts)
     assert "CONFIG_UART_HTIF=n" in conf
     assert "CONFIG_UART_SIFIVE=y" in conf and "CONFIG_UART_SIFIVE_PORT_0=y" in conf
     assert "CONFIG_UART_CONSOLE=y" in conf
@@ -202,7 +342,7 @@ def test_a_core_clock_that_is_not_a_multiple_of_the_mtime_rate_is_refused(uart_f
     that model must fail loudly rather than be rounded into a wrong baud rate."""
     odd = type(uart_facts)(**{**uart_facts.__dict__, "mtime_hz": 30_000})
     with pytest.raises(RuntimeError, match="integer multiple"):
-        zm._prj_conf(2, "rvv", boards.board("x", console=boards.CONSOLE_UART), odd)
+        zm._prj_conf(2, "rvv", _fixture_board("x", console=boards.CONSOLE_UART), odd)
 
 
 def test_the_scalar_backend_still_carries_no_vector_config():
@@ -442,7 +582,7 @@ def test_which_harts_have_vectors_is_stated_not_assumed():
     # A scalar image may use every hart; that is the point of having one.
     assert kodiak.hart_ids_for("scalar") == (0, 1, 2)
     # Non-contiguous sets are expressible.
-    odd = boards.board("x", harts=3, vector_hart_ids=(0, 2))
+    odd = _fixture_board("x", harts=3, vector_hart_ids=(0, 2))
     assert odd.hart_ids_for("rvv") == (0, 2) and odd.n_vector_harts == 2
     # A homogeneous board keeps the default so its image stays byte-identical.
     assert boards.board("spike_riscv64").hart_ids_for("rvv") == tuple(range(8))
@@ -553,18 +693,56 @@ def test_a_second_configuration_of_a_board_keeps_the_port_and_states_its_own_fac
 
 def test_the_board_table_is_the_registry_file_not_code(tmp_path):
     """BOARDS is loaded from the registry file, so a new board is an entry there, not a shared-code edit."""
-    from merlin.common.paths import data_path
-
-    path = data_path(*boards.BOARDS_FILE)
+    path = Path(os.environ[boards.BOARD_CATALOG_ENV])
     assert path.is_file()
     assert boards.load_boards(path) == boards.BOARDS
     reg = tmp_path / "boards.yaml"
     reg.write_text("schema_version: 1\nboards:\n  a_new_tapeout:\n    dram_bytes: 1 GiB\n    harts: 3\n"
-                   "    vlen: 256\n    console: uart\n    vector_hart_ids: [0, 2]\n", encoding="utf-8")
+                   "    dram_base: 0x80000000\n    console: uart\n    flow: zephyr\n"
+                   "    loader: pyuartsi\n    loader_baud: 57600\n    ram_label: ram0\n"
+                   "    zephyr_default_ram_bytes: 256 MiB\n    zephyr_link_limit_bytes: 1900 MiB\n"
+                   "    uart_label: uart0\n    fpu_sharing: false\n    zephyr_vector_ext: true\n"
+                   "    vlen: 256\n    vector_hart_ids: [0, 2]\n", encoding="utf-8")
     b = boards.load_boards(reg)["a_new_tapeout"]
     assert b.dram_bytes == 1 << 30 and b.harts == 3
     assert b.vector_hart_ids == (0, 2) and b.hart_ids_for("rvv") == (0, 2)
     assert b.console == boards.CONSOLE_UART
+
+
+@pytest.mark.parametrize("missing_fact", [
+    "dram_base", "console", "flow", "loader", "loader_baud",
+    "ram_label", "uart_label", "fpu_sharing", "zephyr_vector_ext",
+    "zephyr_default_ram_bytes", "zephyr_link_limit_bytes",
+])
+def test_catalog_rejects_missing_critical_facts(tmp_path, missing_fact):
+    facts = {
+        "dram_bytes": "1 GiB", "dram_base": 0x80000000, "harts": 2,
+        "console": "uart", "flow": "zephyr", "loader": "pyuartsi",
+        "loader_baud": 57600, "ram_label": "ram0", "uart_label": "uart0",
+        "zephyr_default_ram_bytes": "256 MiB", "zephyr_link_limit_bytes": "1900 MiB",
+        "fpu_sharing": False, "zephyr_vector_ext": True, "vector_harts": 2,
+    }
+    facts.pop(missing_fact)
+    import yaml
+
+    reg = tmp_path / "boards.yaml"
+    reg.write_text(yaml.safe_dump({"schema_version": 1, "boards": {"board": facts}}), encoding="utf-8")
+    with pytest.raises(boards.BoardRegistryError, match="missing required fact"):
+        boards.load_boards(reg)
+
+
+def test_baremetal_catalog_requires_declared_code_reserve(tmp_path):
+    import yaml
+
+    facts = {
+        "dram_bytes": "1 GiB", "dram_base": 0x80000000, "harts": 1,
+        "console": "htif", "flow": "baremetal", "loader": "uart_tsi",
+        "loader_baud": 921600,
+    }
+    reg = tmp_path / "boards.yaml"
+    reg.write_text(yaml.safe_dump({"schema_version": 1, "boards": {"board": facts}}), encoding="utf-8")
+    with pytest.raises(boards.BoardRegistryError, match="code_reserve"):
+        boards.load_boards(reg)
 
 
 @pytest.mark.parametrize("entry, needle", [

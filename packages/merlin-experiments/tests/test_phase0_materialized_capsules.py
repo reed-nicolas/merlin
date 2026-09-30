@@ -12,7 +12,7 @@ from merlin_experiments.phase0 import writer
 from merlin_experiments.phase0.evidence import _materialize_evidence
 from merlin_experiments.phase0.provenance import _scrub_capsule_dir
 from merlin_experiments.phase0.requirements import _materialized_iteration_capsules, _validate_capture_recipes
-from merlin_experiments.phase0.writer import _integer_reference_bound, _write_capsule
+from merlin_experiments.phase0.writer import _integer_reference_bound, _source_integer_reference_bound, _write_capsule
 
 from merlin.targetgen import capsule_source as source
 from merlin.targetgen.capsule_common import load_capsule
@@ -235,6 +235,262 @@ def test_integer_golden_bound_uses_concrete_reduction_and_internal_width():
     capsule["inputs"][1]["shape"] = [64, 2]
     with pytest.raises(ValueError, match="may_overflow"):
         _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+
+
+def test_fused_integer_matmul_bias_cannot_bypass_internal_width_bound():
+    semantics = {
+        "internal_arithmetic": {
+            "full_operation_overflow_policy": "bounded_exact_requires_each_partial_sum",
+            "mac_result_bits": 20,
+            "signed_operand_bits": 8,
+        }
+    }
+    binding = CorpusBinding("fixture", 16, "int8", "i32", True, ["L0"], "exact_int")
+    entry = {
+        "name": "fused", "kind": "layer", "source_role": "derived_sweep", "source_reference": "fixture",
+        "op": "fused_matmul_bias", "M": 16, "K": 64, "N": 16,
+    }
+    capsule, _ = build(entry, binding)
+    capsule["stimulus_range"] = [127, 127]
+    with pytest.raises(ValueError, match="may_overflow"):
+        _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+    capsule["stimulus_range"] = [1, 1]
+    proof = _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+    assert proof["status"] == "proven_safe"
+    assert proof["reduction_extent"] == 64
+    assert proof["maximum_absolute_initial_addend"] == 1
+
+
+def test_resident_reuse_bounds_each_integer_matmul(monkeypatch):
+    from merlin.runtime.tensor import Tensor
+
+    semantics = {
+        "internal_arithmetic": {
+            "full_operation_overflow_policy": "bounded_exact_requires_each_partial_sum",
+            "mac_result_bits": 20,
+            "signed_operand_bits": 8,
+        }
+    }
+    binding = CorpusBinding("fixture", 16, "int8", "i32", True, ["L0"], "exact_int")
+    entry = {
+        "name": "reuse", "kind": "layer", "source_role": "derived_sweep", "source_reference": "fixture",
+        "op": "resident_reuse", "K": 64, "N": 16,
+        "matmuls": [{"lhs": "A0", "out": "Y0", "M": 16}, {"lhs": "A1", "out": "Y1", "M": 16}],
+    }
+    capsule, _ = build(entry, binding)
+    leaves = {
+        "W": Tensor((64, 16), [127] * (64 * 16), "i8"),
+        "A0": Tensor((16, 64), [0] * (16 * 64), "i8"),
+        "A1": Tensor((16, 64), [127] * (16 * 64), "i8"),
+    }
+    monkeypatch.setattr(writer.CG, "materialize_capsule_leaves", lambda _: leaves)
+    with pytest.raises(ValueError, match="may_overflow"):
+        _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+    leaves["A1"] = Tensor((16, 64), [1] * (16 * 64), "i8")
+    proof = _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+    assert proof["status"] == "proven_safe"
+    assert proof["bound"] == 64 * 127
+    assert [(member["lhs"], member["partial_sum_bound"]["reduction_extent"]) for member in proof["members"]] == [
+        ("A0", 64), ("A1", 64),
+    ]
+    capsule["operation"]["attributes"]["matmuls"][1]["lhs"] = "missing"
+    with pytest.raises(ValueError, match="requires concrete lhs"):
+        _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+
+
+@pytest.mark.parametrize("role,transform", [("island", "xor_low_bit"), ("no_island", "none")])
+def test_host_island_bounds_both_concrete_integer_contractions(role, transform):
+    semantics = {
+        "internal_arithmetic": {
+            "full_operation_overflow_policy": "bounded_exact_requires_each_partial_sum",
+            "mac_result_bits": 20,
+            "signed_operand_bits": 8,
+        }
+    }
+    binding = CorpusBinding("fixture", 16, "int8", "i32", True, ["L0"], "exact_int")
+    entry = {
+        "name": "seam", "kind": "model_slice", "source_role": "derived_sweep", "source_reference": "fixture",
+        "op": "host_island_seam", "M": 1, "K": 1, "H": 16, "N": 1,
+        "comparison_role": role, "host_transform": transform, "xor_mask": 1,
+    }
+    capsule, _ = build(entry, binding)
+    capsule["stimulus_range"] = [127, 127]
+    proof = _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+    assert proof["status"] == "proven_safe"
+    assert [member["region"] for member in proof["members"]] == ["contraction_0", "contraction_1"]
+    assert proof["members"][0]["partial_sum_bound"]["bound"] == 127 * 127
+    assert proof["members"][1]["partial_sum_bound"]["bound"] == 16 * (126 if role == "island" else 127) * 127
+    with pytest.raises(ValueError, match="selected internal-width bound policy"):
+        _integer_reference_bound({}, capsule)
+
+    # Only the derived second input is dangerous; the first contraction remains within i20.
+    wider, _ = build({**entry, "H": 64}, binding)
+    wider["stimulus_range"] = [127, 127]
+    with pytest.raises(ValueError, match="may_overflow"):
+        _integer_reference_bound({"numerical_semantics": semantics}, wider)
+
+    capsule["operation"]["attributes"]["shared_accelerator_epilogue"] = "unknown"
+    with pytest.raises(ValueError, match="declared two-contraction i8 seam"):
+        _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+    capsule["operation"]["attributes"]["shared_accelerator_epilogue"] = "saturating_i32_to_i8"
+    capsule["inputs"][2]["shape"] = [17, 1]
+    with pytest.raises(ValueError, match="operand ABI differs"):
+        _integer_reference_bound({"numerical_semantics": semantics}, capsule)
+
+
+def _exact_source_integer_member(root, *, reduction_extent):
+    semantics = {
+        "model": {"engine": "integer_reference"},
+        "operand_dtype": "int8",
+        "accumulator_dtype": "i32",
+        "readout_dtype": "i32",
+        "internal_arithmetic": {
+            "full_operation_overflow_policy": "bounded_exact_requires_each_partial_sum",
+            "mac_result_bits": 20,
+            "signed_operand_bits": 8,
+        },
+    }
+    binding = CorpusBinding("fixture", 16, "int8", "i32", True, ["L0"], "exact_int")
+    entry = {
+        "name": "source_mm", "cat": "isa", "kind": "isa", "source_role": "model_derived",
+        "source_reference": "selected integer operation", "source": "pytorch", "capture_op": "int_matmul",
+        "op": "matmul", "M": 1, "K": reduction_extent, "N": 1,
+        "numerical_semantics": semantics,
+    }
+    capsule, _ = build(entry, binding)
+    capsule["application_signature_match"] = {
+        "status": "verified_capture_match", "source_quantization": "int8_dyn_act_int8_weight",
+    }
+    root.mkdir()
+    (root / "capsule.yaml").write_text(yaml.safe_dump(capsule))
+    values = [127] * reduction_extent
+    golden = {
+        "golden_source": "host_torch_eager",
+        "oracle_provenance": {
+            "inputs": {
+                "A0": {
+                    "shape": [1, reduction_extent], "dtype": "i8",
+                    "decoded": values, "integer_bytes_hex": bytes(values).hex(),
+                },
+                "W": {
+                    "shape": [reduction_extent, 1], "dtype": "i8",
+                    "decoded": values, "integer_bytes_hex": bytes(values).hex(),
+                },
+            }
+        },
+        "outputs": {"Y0": [[reduction_extent * 127 * 127]]},
+    }
+    (root / "golden.yaml").write_text(yaml.safe_dump(golden))
+    return entry, binding, capsule, golden
+
+
+def test_source_integer_bound_uses_captured_bytes_and_stamps_both_artifacts(tmp_path, monkeypatch):
+    directory = tmp_path / "source"
+    entry, binding, capsule, golden = _exact_source_integer_member(directory, reduction_extent=2)
+    proof = _source_integer_reference_bound(entry, capsule, directory)
+    assert proof["status"] == "proven_safe"
+    assert proof["reduction_extent"] == 2
+    assert proof["maximum_absolute_operands"] == [127, 127]
+    assert proof["maximum_absolute_initial_addend"] == 0
+    monkeypatch.setattr(writer, "_write_capsule_inner", lambda *_: directory)
+    _write_capsule(entry, binding, tmp_path)
+    saved_cap = yaml.safe_load((directory / "capsule.yaml").read_text())
+    saved_golden = yaml.safe_load((directory / "golden.yaml").read_text())
+    assert saved_cap["integer_partial_sum_bound"] == saved_golden["integer_partial_sum_bound"] == proof
+    assert saved_golden["golden_source"] == "host_torch_eager"
+    assert saved_golden["outputs"] == golden["outputs"]
+
+
+def test_source_integer_bound_refuses_overflow_and_incomplete_capture(tmp_path):
+    safe = tmp_path / "safe"
+    entry, _, capsule, golden = _exact_source_integer_member(safe, reduction_extent=2)
+    with pytest.raises(ValueError, match="selected internal-width bound policy"):
+        _source_integer_reference_bound({**entry, "numerical_semantics": {}}, capsule, safe)
+    capsule["application_signature_match"] = {}
+    with pytest.raises(ValueError, match="verified isolated i8 matmul"):
+        _source_integer_reference_bound(entry, capsule, safe)
+    capsule["application_signature_match"] = {
+        "status": "verified_capture_match", "source_quantization": "int8_dyn_act_int8_weight",
+    }
+    with pytest.raises(ValueError, match="verified isolated i8 matmul"):
+        _source_integer_reference_bound({**entry, "kind": "model"}, capsule, safe)
+    capsule["kind"] = "model"
+    with pytest.raises(ValueError, match="verified isolated i8 matmul"):
+        _source_integer_reference_bound(entry, capsule, safe)
+    capsule["kind"] = "isa"
+    golden["oracle_provenance"]["inputs"]["A0"].pop("integer_bytes_hex")
+    (safe / "golden.yaml").write_text(yaml.safe_dump(golden))
+    with pytest.raises(ValueError, match="captured bytes"):
+        _source_integer_reference_bound(entry, capsule, safe)
+    golden["oracle_provenance"]["inputs"]["A0"]["integer_bytes_hex"] = bytes([127, 127]).hex()
+    golden["outputs"]["Y0"][0][0] += 1
+    (safe / "golden.yaml").write_text(yaml.safe_dump(golden))
+    with pytest.raises(ValueError, match="host-eager output differs"):
+        _source_integer_reference_bound(entry, capsule, safe)
+
+    overflowing = tmp_path / "overflowing"
+    entry, _, capsule, _ = _exact_source_integer_member(overflowing, reduction_extent=64)
+    with pytest.raises(ValueError, match="may_overflow"):
+        _source_integer_reference_bound(entry, capsule, overflowing)
+
+
+def _exact_spec_integer_member(root, *, reduction_extent):
+    entry, binding, capsule, golden = _exact_source_integer_member(root, reduction_extent=reduction_extent)
+    entry.update(source="spec", spec_ref="gemmini:op.matmul")
+    capsule["spec_ref"] = entry["spec_ref"]
+    capsule.pop("application_signature_match")
+    golden["golden_source"] = "specir_program_gemmini"
+    golden["oracle_provenance"]["spec_ref"] = entry["spec_ref"]
+    golden["oracle_provenance"]["inputs"] = {
+        "A0": {"shape": [1, reduction_extent], "decoded": [[127] * reduction_extent]},
+        "W": {"shape": [reduction_extent, 1], "decoded": [[127] for _ in range(reduction_extent)]},
+    }
+    (root / "capsule.yaml").write_text(yaml.safe_dump(capsule))
+    (root / "golden.yaml").write_text(yaml.safe_dump(golden))
+    return entry, binding, capsule, golden
+
+
+def test_spec_integer_bound_uses_exact_program_operands_and_refuses_incomplete_provenance(tmp_path, monkeypatch):
+    safe = tmp_path / "spec"
+    entry, binding, capsule, golden = _exact_spec_integer_member(safe, reduction_extent=2)
+    bound = _source_integer_reference_bound(entry, capsule, safe)
+    assert bound["status"] == "proven_safe"
+    assert bound["maximum_absolute_operands"] == [127, 127]
+    assert bound["maximum_absolute_initial_addend"] == 0
+    assert [member["operand_stream"] for member in bound["members"]] == [
+        "spec_program", "capsule_materialized",
+    ]
+    monkeypatch.setattr(writer, "_write_capsule_inner", lambda *_: safe)
+    _write_capsule(entry, binding, tmp_path)
+    assert yaml.safe_load((safe / "capsule.yaml").read_text())["integer_partial_sum_bound"] == bound
+    assert yaml.safe_load((safe / "golden.yaml").read_text())["integer_partial_sum_bound"] == bound
+
+    golden["golden_source"] = "specir_program_other"
+    (safe / "golden.yaml").write_text(yaml.safe_dump(golden))
+    with pytest.raises(ValueError, match="exact program operand provenance"):
+        _source_integer_reference_bound(entry, capsule, safe)
+    golden["golden_source"] = "specir_program_gemmini"
+    golden["oracle_provenance"]["inputs"]["A0"].pop("decoded")
+    (safe / "golden.yaml").write_text(yaml.safe_dump(golden))
+    with pytest.raises(ValueError, match="incomplete exact i8 operand values"):
+        _source_integer_reference_bound(entry, capsule, safe)
+
+    overflowing = tmp_path / "spec_overflow"
+    entry, _, capsule, _ = _exact_spec_integer_member(overflowing, reduction_extent=64)
+    with pytest.raises(ValueError, match="may_overflow"):
+        _source_integer_reference_bound(entry, capsule, overflowing)
+
+    # The spec program can be safe while the capsule's integer grader uses
+    # independently materialized operands that overflow the selected MAC width.
+    separate = tmp_path / "spec_separate_stimulus"
+    entry, _, capsule, golden = _exact_spec_integer_member(separate, reduction_extent=64)
+    golden["oracle_provenance"]["inputs"]["A0"]["decoded"] = [[1] * 64]
+    golden["oracle_provenance"]["inputs"]["W"]["decoded"] = [[1] for _ in range(64)]
+    golden["outputs"]["Y0"] = [[64]]
+    (separate / "golden.yaml").write_text(yaml.safe_dump(golden))
+    capsule["stimulus_range"] = [127, 127]
+    with pytest.raises(ValueError, match="may_overflow"):
+        _source_integer_reference_bound(entry, capsule, separate)
 
 
 def test_rectangular_attention_score_uses_the_selected_internal_width():

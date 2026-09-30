@@ -21,6 +21,7 @@ The schemas are the cross-workstream coordination contract (see [Contracts](cont
 | `dse_result` | DSE Result | Results of comparing variants (baseline / software_visible / hardware_managed / oracle) for a candidate feature, with measurable cost-model parameters. Owned… |
 | `evidence_report` | Evidence Report Index | Machine-readable index of the source evidence TargetGen collected for a target: the files discovered (docs, Scala/Chisel, examples) with short filename/first… |
 | `exploitability_report` | Exploitability Report | How much of the oracle benefit a compiler can actually capture for a feature across a parameter sweep (the 'compiler exploitability' of an abstraction). Owne… |
+| `instruction_semantics` | Instruction Semantics | Versioned, target-owned descriptions of exact instruction computations, typed operands/results, legal parameter domains, and memory effects. Phase 0 binds th… |
 | `interface_candidate` | Interface Candidate | A concrete target-independent interface abstraction proposed for the interface dialect, with the design pressure that justifies it. Owned by design-pressure/… |
 | `kernel_record` | Kernel Record | Normalized record of a single mined kernel from an external source. Owned by the kernel-mining workstream; consumed by design-pressure/DSE. |
 | `llvm_extension_plan` | LLVM Extension Plan | Records whether and how a target needs LLVM-project changes. The default posture is out-of-tree (TableGen fragments / intrinsic headers / runtime calls) with… |

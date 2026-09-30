@@ -1,32 +1,15 @@
-"""Whole-model execution on **Zephyr** (SMP) — spike today, FireSim on the 2-tile board.
+"""Whole-model execution through a selected Zephyr RISC-V board port.
 
-This is the bring-up bridge from merlin's bare-metal spike path
-(:mod:`spike_model`) to a real RTOS image that runs on the FireSim
-``GemminiAndOPUShuttleConfig`` SoC (tile 0 = scalar/Gemmini, tile 1 = Saturn-OPU
-``rv64gcv`` vLen=128). NOTE: this whole-model Zephyr/FireSim SMP path deliberately
-uses the 2-tile gemmini+OPU SoC (it needs the Saturn vector tile); it is a distinct
-path from the Gemmini C0 RTL-certification oracle, which now runs the pure
-``GemminiRocketConfig`` (single-tile Rocket host, same 16x16 int8 Gemmini core). It reuses the *entire* data-driven C runtime
-(:mod:`merlin.llvmlower.c_runtime` + ``merlin/runtime/c/merlin_model.c`` +
-``merlin/runtime/abi/mlir_runtime.c``) and the single ``model.o`` lowered from
-``model.mlir``; only the harness changes: instead of ``crt.S``/``htif.c`` +
-absolute-addressed arena, it emits a **Zephyr application** with one worker thread
-**pinned to the RVV tile** (``k_thread_cpu_pin``) that calls ``merlin_run`` and dumps
-the output over the console (HTIF on spike, UART on FireSim).
+The model is lowered once to an object and linked with Merlin's data-driven C
+runtime into a Zephyr application. A worker is pinned to a declared compatible
+hart; on heterogeneous boards this prevents vector code from running on a scalar
+hart. The selected out-of-tree board catalog supplies the physical memory,
+Zephyr port, console and hart facts. The same image can be checked with Spike
+when its board protocol is simulator-compatible.
 
-Why a pinned worker and not ``main()``: on the FireSim board only tile 1 has the
-Saturn vector unit, so the ``rv64gcv`` ``model.o`` must execute on hart 1 — running
-it on the boot hart (tile 0, scalar) would trap an illegal vector instruction. On
-spike (``-p2``) every hart has V, so the same image runs there too.
-
-The Zephyr V recipe mirrors the verified ``samples/test_mt_rvv`` sample:
-eager per-thread V save/restore (``RISCV_ISA_EXT_V_LAZY=n`` + ``V_KERNEL_ONLY=y``),
-``SMP`` + ``SCHED_CPU_MASK_PIN_ONLY``. The model ``.o`` is built once with clang
-(``rv64gcv``) and linked as a static archive into the Zephyr image.
-
-Toolchain/env (see memory ``zephyr-multicore-rvv``): ``ZEPHYR_BASE``,
-``ZEPHYR_SDK_INSTALL_DIR`` (0.17.0), and the chipyard conda ``bin`` (west/cmake/ninja)
-on PATH. Resolved with sensible defaults, overridable via env.
+Toolchains are selected with ``ZEPHYR_BASE``, ``ZEPHYR_SDK_INSTALL_DIR`` and
+``MERLIN_CHIPYARD`` (for optional host tools). No target checkout or board map is
+assumed by importing this module.
 """
 
 from __future__ import annotations
@@ -46,26 +29,23 @@ import numpy as np
 from merlin.common import proc as _proc
 from merlin.common.paths import runtime_dir
 
-from ...common.paths import repo_root
 from ...llvmlower import c_runtime, toolchain
 from ...llvmlower.lower import lower_model_file
 from . import spike as _spike
+from .firesim_runner import FireSimRunner, select_runner
 
 # clang flags for the model object. medany keeps it position-tolerant;
 # -ffreestanding/-fno-builtin so it needs only the symbols mlir_runtime.c + libc(picolibc)
 # provide (cosf/expf/.../memrefCopy/rsqrtf/malloc). Two backends:
-#   rvv    — vector tile (rv64gcv); runs on the Saturn tile (FireSim hart 1).
-#   scalar — no vector (rv64gc); runs on the scalar tile (FireSim hart 0). The portable
-#            FireSim-safe path: no V means no Saturn-V trap (the FPU_SHARING silent-retry
-#            hang the vector path is still being brought up against).
+#   rvv    — vector-capable harts (rv64gcv), selected by the board descriptor.
+#   scalar — no vector (rv64gc); may run on any declared hart.
 _CFLAGS_COMMON = ["-mabi=lp64d", "-mcmodel=medany", "-O2", "-ffreestanding", "-fno-builtin"]
 # RVV: the ONLY vector ops are the controlled fixed-width ones baked into the IR by the
 # transform schedule (linalg.matmul/batch_matmul -> vector<MxNxf32/i32> at e32,m1/m2). clang's
 # auto-vectorizer is DISABLED (-fno-vectorize -fno-slp-vectorize): left on, it emits
-# fractional-LMUL (mf2/mf4/mf8) and other configs the Saturn-OPU (vLen=128, tuned for LMUL=1)
-# wedges on — the documented RVV-on-FASED hang. With autovec off, the non-contraction generics
-# fall through convert-linalg-to-loops to scalar code (Saturn-safe), and only the transform
-# path's fixed-width contraction vectors reach the Saturn vector lanes.
+# fractional-LMUL (mf2/mf4/mf8) and other configs unsupported by some vector
+# ports. With autovec off, non-contraction generics fall through to scalar loops;
+# only the transform path's fixed-width contraction vectors reach vector lanes.
 RVV_CFLAGS = ["-march=rv64gcv", "-fno-vectorize", "-fno-slp-vectorize", *_CFLAGS_COMMON]
 SCALAR_CFLAGS = ["-march=rv64gc", *_CFLAGS_COMMON]
 
@@ -105,41 +85,42 @@ class ZephyrModelError(RuntimeError):
 # ---- environment / toolchain resolution -------------------------------------------
 
 
-def _pick(env_var: str, default: str) -> Path:
-    """Prefer the env value, but only if it actually exists — the shell may carry a
-    stale ``ZEPHYR_BASE`` (e.g. a moved ``backup/`` path); fall back to ``.env`` (a real config
-    source, so a checkout configured there resolves without hand-exporting), then to the known-good
-    default, rather than silently failing ``available()``."""
+def _pick(env_var: str) -> Path | None:
+    """Resolve an explicitly configured toolchain path from the shell or ``.env``."""
     from ...common.paths import _dotenv
 
     v = os.environ.get(env_var)
-    if v and Path(v).exists():
-        return Path(v)
-    dv = _dotenv().get(env_var)
-    if dv and Path(dv).exists():
-        return Path(dv)
-    return Path(default)
+    if not v:
+        v = _dotenv().get(env_var)
+    return Path(v).expanduser() if v else None
 
 
 def _zephyr_base() -> Path:
-    return _pick("ZEPHYR_BASE", "/path/to/zephyr-chipyard-sw/zephyr_ws/zephyr")
+    selected = _pick("ZEPHYR_BASE")
+    if selected is None:
+        raise ZephyrModelError("ZEPHYR_BASE is not configured")
+    return selected
 
 
 def _zephyr_sw_root() -> Path:
-    # the samples/ tree (for the chipyard board overlay we clone).
-    return _pick("MERLIN_ZEPHYR_SW", "/path/to/zephyr-chipyard-sw")
+    selected = _pick("MERLIN_ZEPHYR_SW")
+    if selected is None:
+        raise ZephyrModelError("MERLIN_ZEPHYR_SW is not configured")
+    return selected
 
 
 def _sdk_dir() -> Path:
-    # Zephyr's own documented install location. The fallback used to name one person's home,
-    # which meant every other machine silently fell back to a directory that was not there.
-    return _pick("ZEPHYR_SDK_INSTALL_DIR", os.path.expanduser("~/zephyr-sdk-0.17.0"))
+    selected = _pick("ZEPHYR_SDK_INSTALL_DIR")
+    if selected is None:
+        raise ZephyrModelError("ZEPHYR_SDK_INSTALL_DIR is not configured")
+    return selected
 
 
-def _conda_bin() -> Path:
+def _conda_bin() -> Path | None:
     from ...common.paths import env as _env
 
-    return Path(_env("MERLIN_CHIPYARD", "/path/to/chipyard")) / ".conda-env" / "bin"
+    selected = _env("MERLIN_CHIPYARD")
+    return Path(selected) / ".conda-env" / "bin" if selected else None
 
 
 def build_tool(name: str) -> Path | None:
@@ -151,8 +132,9 @@ def build_tool(name: str) -> Path | None:
     made the Zephyr path unbuildable on any machine that has cmake and ninja the normal way -- with no
     env var to say so, and an `available()` that reported the Zephyr tree as the problem.
     """
-    pinned = _conda_bin() / name
-    if pinned.is_file():
+    conda_bin = _conda_bin()
+    pinned = conda_bin / name if conda_bin is not None else None
+    if pinned is not None and pinned.is_file():
         return pinned
     from shutil import which
 
@@ -165,22 +147,32 @@ def _tool_env() -> dict:
     env["ZEPHYR_BASE"] = str(_zephyr_base())
     env["ZEPHYR_TOOLCHAIN_VARIANT"] = "zephyr"
     env["ZEPHYR_SDK_INSTALL_DIR"] = str(_sdk_dir())
-    env["PATH"] = f"{_conda_bin()}:{env.get('PATH', '')}"
+    conda_bin = _conda_bin()
+    if conda_bin is not None and conda_bin.is_dir():
+        env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
     return env
 
 
-def available() -> bool:
-    """True when the Zephyr build + spike toolchain are present."""
+def build_available() -> bool:
+    """Check Zephyr build prerequisites independently of any simulator."""
     try:
+        gcc = _spike.gcc_path()
         return (
             _zephyr_base().is_dir()
             and _sdk_dir().is_dir()
             and build_tool("cmake") is not None
             and build_tool("ninja") is not None
-            and _spike.available()
+            and toolchain.available()
+            and gcc.is_file()
+            and all(gcc.with_name(f"riscv64-unknown-elf-{name}").is_file() for name in ("ld", "ar", "objcopy"))
         )
     except Exception:  # noqa: BLE001
         return False
+
+
+def available() -> bool:
+    """True when Zephyr build tools and the Spike execution path are present."""
+    return build_available() and _spike.available()
 
 
 # Bounded wall clock for the build's clang/ld steps (this is the seam apply_rvv_package's spike/K1
@@ -308,21 +300,70 @@ def perop_mr_cap() -> int:
 
 _PEROP_KC = 16
 
-DEFAULT_RAM_BYTES = 256 * 1024 * 1024  # spike/chipyard `ram0` default (0x10000000)
+_WEIGHTS_ALIGN_BYTES = 4096  # Zephyr memory-region alignment, not a board address
 
-# Above this, a weights blob linked into the image's .data overflows the medany ±2GB
-# PC-relative window (Zephyr's own .text<->.bss refs break). Past it we switch to
-# "external weights": the blob lives in its own DT memory-region at a fixed high absolute
-# address, referenced by integer-constant base (no far symbol), keeping ram0 compact.
-LINK_LIMIT = 1900 * 1024 * 1024
-EXT_RAM0_BYTES = 0x40000000  # 1 GB ram0 (code + activation arena) in ext mode
-EXT_WEIGHTS_BASE = 0xC0000000  # weights region origin (3 GB), right after ram0  # derived-ok: this backend's ext-mode layout origin, chosen together with DRAM_END below
-DRAM_END = 0x80000000 + 16 * 1024**3  # FireSim WithExtMemSize = 16 GB at 0x80000000
-# The WEIGHTS region uses a 2-cell DT container (#address/size-cells=2) so its reg can
-# express a 64-bit base+size — handling blobs > 4 GB (tiny 4.1 G, pi05 fp32 13 G), not just
-# the 1-cell <4 GB case. The only hard cap is physical DRAM: weights at EXT_WEIGHTS_BASE
-# must end before the 16 GB DRAM end (leave ram0 + margin).
-EXT_MAX_WEIGHTS = DRAM_END - EXT_WEIGHTS_BASE - (256 * 1024 * 1024)  # ~14.75 GB
+
+@dataclass(frozen=True)
+class _MemoryPlan:
+    external: bool
+    ram_region_bytes: int
+    spike_span_bytes: int
+    weights_base: int | None = None
+    weights_region_bytes: int = 0
+
+
+def _memory_plan(brd: Any, weights_bytes: int, linked_region: int, override: int | None = None) -> _MemoryPlan:
+    """Choose an in-DRAM layout using only the selected board's memory facts.
+
+    A missing external-weights layout is a refusal, not a guess at another board's
+    16 GiB map. The returned spike span covers every byte of the emitted ELF.
+    """
+    default = brd.zephyr_default_ram_bytes
+    limit = brd.zephyr_link_limit_bytes
+    if default is None or limit is None:
+        raise ZephyrModelError(f"{brd.name}: Zephyr memory facts are missing from the selected board")
+    if linked_region < 0 or weights_bytes < 0:
+        raise ZephyrModelError(f"{brd.name}: negative model memory requirement")
+    if brd.dram_base > 0xFFFFFFFF or default > 0xFFFFFFFF:
+        raise ZephyrModelError(f"{brd.name}: Zephyr RAM overlay requires one-cell DRAM address and size")
+    if override is not None:
+        if override < default or override < weights_bytes or override > limit or override > brd.dram_bytes:
+            raise ZephyrModelError(f"{brd.name}: RAM override cannot hold weights or exceeds board limits")
+        return _MemoryPlan(False, override, override)
+    if linked_region < default:
+        raise ZephyrModelError(f"{brd.name}: computed region is smaller than the port's default RAM region")
+    if linked_region <= limit:
+        if linked_region > brd.dram_bytes or linked_region > 0xFFFFFFFF:
+            raise ZephyrModelError(f"{brd.name}: linked region exceeds physical DRAM")
+        return _MemoryPlan(False, linked_region, linked_region)
+    low = brd.zephyr_external_ram_bytes
+    tail = brd.zephyr_external_tail_reserve_bytes
+    if low is None or tail is None:
+        raise ZephyrModelError(
+            f"{brd.name}: linked region exceeds the port's limit and the board declares no external-weights layout"
+        )
+    if low <= 0 or low > limit or low > 0xFFFFFFFF or tail < 0 or low + tail >= brd.dram_bytes:
+        raise ZephyrModelError(f"{brd.name}: invalid external-weights layout")
+    base = brd.dram_base + low
+    aligned = (weights_bytes + _WEIGHTS_ALIGN_BYTES - 1) & ~(_WEIGHTS_ALIGN_BYTES - 1)
+    if base % _WEIGHTS_ALIGN_BYTES or aligned + low + tail > brd.dram_bytes:
+        raise ZephyrModelError(f"{brd.name}: aligned weights blob does not fit the declared DRAM layout")
+    return _MemoryPlan(True, low, low + aligned, base, aligned)
+
+
+def _require_external_arena(brd: Any, ram_region_bytes: int, segments: list[Any], demand: int) -> None:
+    """Refuse an external image whose *linked* low-memory footprint crowds its arena."""
+    low_end = brd.dram_base + ram_region_bytes
+    low_segments = [sg for sg in segments if sg.vaddr < low_end]
+    if any(sg.vaddr < brd.dram_base or sg.end > low_end for sg in low_segments):
+        raise ZephyrModelError(f"{brd.name}: linked ELF crosses the declared low RAM region")
+    available = ram_region_bytes - sum(sg.memsz for sg in low_segments)
+    if available < demand:
+        raise ZephyrModelError(
+            f"{brd.name}: external-weights ELF leaves {available} bytes "
+            f"of low RAM for {demand} bytes of activation demand; declare a larger "
+            "external RAM region in the target-owned catalog"
+        )
 
 
 #: What one heap allocation looks like in the emitted LLVM IR. The lowered model reaches the C library
@@ -368,7 +409,8 @@ def allocation_bytes(ll_path: str | Path) -> tuple[int, int]:
 
 
 def _ram_for_weights(
-    weights_bytes: int, activation_bytes: int | None = None, allocation_bytes_total: int | None = None
+    weights_bytes: int, activation_bytes: int | None = None, allocation_bytes_total: int | None = None,
+    *, default_ram_bytes: int,
 ) -> int:
     """RAM-region size to hold the weights blob (linked into .data) plus an activation
     arena (the leftover, claimed by ARENA_SIZE=-1). Headroom scales with the model
@@ -412,7 +454,7 @@ def _ram_for_weights(
     total = weights_bytes + headroom
     align = 16 * 1024 * 1024
     total = ((total + align - 1) // align) * align
-    return max(DEFAULT_RAM_BYTES, total)
+    return max(default_ram_bytes, total)
 
 
 def _prepare_model_mlir(
@@ -1019,10 +1061,18 @@ def prepare_for_lowering(
     # below must be derived from the IR that REMAINS. Inert unless a routing was supplied, and inert
     # again unless that routing carries a selector -- the placement decision is made elsewhere
     # (merlin.system.place) and passed in, never taken here.
-    if device is not None and getattr(device, "select", None) is not None:
+    if device is not None and (
+        getattr(device, "select", None) is not None or getattr(device, "exact_selection", None) is not None
+    ):
         from ...llvmlower.device_offload import rewrite_prepared_file as _dev_rewrite
 
-        moved = _dev_rewrite(prepared, work, device.device, select=device.select)
+        exact = getattr(device, "exact_selection", None)
+        if exact is not None:
+            exact.check_package(device.package_dir)
+            exact.check_backend_contract()
+        moved = _dev_rewrite(
+            prepared, work, device.device, select=device.select, exact_selection=exact
+        )
         print(
             f"[device] routed {moved.moved} contraction(s) to {device.device} across "
             f"{len(moved.signatures)} signature(s)"
@@ -1406,6 +1456,8 @@ def _debug_harness(debug: bool, dram_base: int, region_bytes: int, n_harts: int)
     """
     if not debug:
         return _DebugHarness()
+    if dram_base <= 0 or region_bytes <= 0:
+        raise ZephyrModelError("debug memory probe requires the selected board's DRAM base and region size")
     end = dram_base + region_bytes
     return _DebugHarness(
         decls=f"""
@@ -1495,6 +1547,15 @@ static void merlin_report_stacks(void)
     )
 
 
+def _completion_metric_line(prefix: str | None) -> str:
+    if prefix is None:
+        return ""
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _=<>-:."
+    if not isinstance(prefix, str) or not prefix or any(char not in allowed for char in prefix):
+        raise ZephyrModelError("completion_metric_prefix contains unsupported C-string characters")
+    return f'  printk("{prefix} %llu\\n", (unsigned long long)(c1 - c0));\n'
+
+
 def _main_c(
     rvv_hart: int,
     dump_cap: int = 4096,
@@ -1506,8 +1567,9 @@ def _main_c(
     build_hash: str = "",
     console: str = "htif",
     debug: bool = False,
-    dram_base: int = 0x80000000,
+    dram_base: int = 0,
     region_bytes: int = 0,
+    completion_metric_prefix: str | None = None,
 ) -> str:
     """Generate the Zephyr worker main: one COOP thread pinned to ``rvv_hart`` calls
     ``merlin_run`` and dumps the output with the same OUT/ARGMAX/METRIC/DONE protocol the
@@ -1521,7 +1583,11 @@ def _main_c(
     times against the same arena, one ``METRIC iter_cycles`` line per timed iteration, so the
     host can report steady-state min/median/p95 instead of a single cold sample. The final
     iteration's output is the one dumped, so every existing correctness gate is unchanged.
+
+    An optional runner may need a terminal cycle marker before ``DONE``. Its
+    prefix is supplied by that runner's build selection, never hardcoded here.
     """
+    marker_line = _completion_metric_line(completion_metric_prefix)
     # omp_threads decouples "threads the pool fans out to" from "harts the image was lowered
     # for". Same binary, fewer threads: the A/B that separates a threading bug from a codegen
     # bug (at 1 thread the parallel regions run serially on the master through the very same
@@ -1725,9 +1791,7 @@ static void merlin_worker(void *a, void *b, void *c) {{
    * `STAGE compute_done`, computed every one of its 11,160 ops, and was then killed by the run
    * cap 2,469 PROF lines into the dump -- eight hours spent, no logits printed, nothing gradeable.
    * The answer is the product; the profile is commentary. Print the product first. */
-{dbg.post_dump}  /* Terminal sentinel reused from the ModelBlaster FireSim runner: its
-   * run_firesim() waits for this marker to know the block is complete. */
-  printk("=== MODELBLASTER_WALL_CYCLES === %llu\\n", (unsigned long long)(c1 - c0));
+{dbg.post_dump}{marker_line}
   printk("DONE\\n");
   k_sem_give(&merlin_done);
 }}
@@ -1751,16 +1815,16 @@ int main(void) {{
 """
 
 
-def _chipyard_cpu_overlay(n_harts: int, max_dt_cpus: int = 8) -> str:
+def _cpu_disable_overlay(n_harts: int, max_dt_cpus: int) -> str:
     """Disable the DT CPUs the SoC does not have.
 
-    ``chipyard-riscv64.dtsi`` declares 8 CPUs, but a given bitstream/sim has however many
-    tiles its config built; Zephyr's SMP boot hangs trying to wake harts that do not exist.
-    This is GENERATED from ``n_harts`` rather than copied from
-    ``samples/merlin_hetero_runner/boards/chipyard_riscv64.overlay``, which hard-disables
-    cpu@2..7 for the 2-tile FireSim SoC and silently caps every image at 2 harts — invisible
-    but fatal for a 4-tile multicore Saturn run.
+    The board catalog states the port's DT CPU count. An image for fewer harts
+    disables extra nodes so Zephyr does not wait for non-existent processors.
     """
+    if n_harts > max_dt_cpus:
+        raise ZephyrModelError(
+            f"image requests {n_harts} harts, but the selected port declares only {max_dt_cpus} CPU nodes"
+        )
     if n_harts >= max_dt_cpus:
         return ""
     disabled = "".join(f'\t\tcpu@{i} {{ status = "disabled"; }};\n' for i in range(n_harts, max_dt_cpus))
@@ -1796,7 +1860,10 @@ def _kconfig_symbols() -> frozenset[str]:
     comment it out rather than emit it, and an unknown symbol is a HARD build failure ("attempt to
     assign the value 'y' to the undefined symbol"), never a warning.
     """
-    base = _zephyr_base()
+    try:
+        base = _zephyr_base()
+    except ZephyrModelError:
+        return frozenset()
     roots = [base / "arch", base / "kernel", base / "subsys" / "debug"]
     found: set[str] = set()
     try:
@@ -1824,7 +1891,10 @@ def _kconfig_default_int(symbol: str) -> int | None:
     Read from the tree rather than written here because it is the tree that decides what is safe: see
     `_vector_max_len_bits` for why the default is a FLOOR and not just a fallback.
     """
-    base = _zephyr_base()
+    try:
+        base = _zephyr_base()
+    except ZephyrModelError:
+        return None
     roots = [base / "arch", base / "kernel", base / "subsys" / "debug"]
     for root in roots:
         if not root.is_dir():
@@ -1926,18 +1996,18 @@ def image_cpus(brd, harts: int, rvv_hart: int = 0) -> int:
     return min(need, int(brd.harts)) if getattr(brd, "harts", None) else need
 
 
-def _prj_conf(cpus: int, backend: str, brd=None, console_facts=None, debug: bool = False) -> str:
-    """Generated app config. ``brd`` is a :class:`runtime.boards.Board`; None keeps the
-    historical chipyard/HTIF defaults so existing callers are byte-identical.
+def _prj_conf(cpus: int, backend: str, brd, console_facts=None, debug: bool = False) -> str:
+    """Generated app config for the selected :class:`runtime.boards.Board`.
 
     ``console_facts`` is a :class:`runtime.sdk_facts.UartConsoleFacts` and is REQUIRED when the board
     declares a UART console: the baud divisor the RTOS driver computes depends on two clock numbers
     that belong to the chip, and defaulting either of them produces a console that emits garbage.
     """
     from ..boards import CONSOLE_HTIF, CONSOLE_UART
-    from ..boards import board as _board
-
-    brd = brd if brd is not None else _board("spike_riscv64")
+    if brd is None:
+        raise ZephyrModelError("a board descriptor is required for Zephyr app configuration")
+    if brd.fpu_sharing is None or brd.zephyr_vector_ext is None:
+        raise ZephyrModelError("Zephyr board must declare fpu_sharing and zephyr_vector_ext")
     # HTIF: the direct-putchar path races under SMP (a worker on hart != 0 printing) and silently
     # wedges, so use the buffered + syscall path. It is also the fix for an apparent hang: unbuffered
     # HTIF emits ONE CHARACTER per host round-trip, which on a ~20 MHz core looks like the model never
@@ -2188,7 +2258,7 @@ def build_app(
     model_dir: str | Path,
     work: str | Path,
     *,
-    board: str = "spike_riscv64",
+    board: str | None = None,
     backend: str = "rvv",
     rvv_hart: int = 0,
     arena_mb: int = 64,
@@ -2213,6 +2283,7 @@ def build_app(
     debug: bool = False,
     matrix: "MatrixRouting | None" = None,
     matrix_scalar_tile: bool = False,
+    completion_metric_prefix: str | None = None,
 ) -> dict:
     """Lower the model, generate the Zephyr app, and build ``zephyr.elf``.
 
@@ -2237,19 +2308,30 @@ def build_app(
     ``sdk_dir`` is the target's own SDK checkout, REQUIRED when the board declares a UART console:
     the UART address and the two clock rates its baud divisor depends on are derived from that SDK's
     headers (``runtime.sdk_facts``) rather than written down here.
+
+    ``completion_metric_prefix`` is an optional terminal cycle marker required
+    by some out-of-tree runners. It is folded into the image build hash.
     """
+    _completion_metric_line(completion_metric_prefix)
+    if board is None:
+        raise ZephyrModelError("a board from MERLIN_BOARD_CATALOG must be explicitly selected")
+    from ..boards import board as _board_desc
+
+    brd = _board_desc(board, **({"vlen": vlen} if vlen is not None else {}))
+    if brd.flow != "zephyr" or brd.zephyr_default_ram_bytes is None or brd.zephyr_link_limit_bytes is None:
+        raise ZephyrModelError(f"{brd.name}: selected board lacks a Zephyr port and its memory facts")
     if matrix is not None:
         matrix.provider()  # Refuse unselected/incomplete support before build output or native tools.
     else:
         load_matrix_signatures(Path(work), None)
+    if not build_available():
+        raise ZephyrModelError("Zephyr build toolchain unavailable (see env in module doc)")
     model_dir, work = Path(model_dir).resolve(), Path(work).resolve()
     work.mkdir(parents=True, exist_ok=True)
     from ...llvmlower.weight_prepack import prepare_build_bundle
 
     model_dir = prepare_build_bundle(model_dir, work, features)
     inputs_npz = inputs_npz or (model_dir / "inputs.npz")
-    if not available():
-        raise ZephyrModelError("Zephyr/spike toolchain unavailable (see env in module doc)")
     # NOTE scalar multicore IS supported (see the lowering call below): the scalar path cannot use the
     # forall-under-the-RVV-schedule route, so it parallelizes at the linalg loop level instead. This is
     # the ONLY way to use a hart that has no vector unit -- a heterogeneous SoC may bring up more cores
@@ -2271,9 +2353,6 @@ def build_app(
     # Board facts as DATA (runtime.boards): the console options, the vector-state width, the DT RAM
     # label and the DRAM ceiling all come from the descriptor instead of being assumed. `vlen` given
     # explicitly wins over the board's, so a caller can sweep it.
-    from ..boards import board as _board_desc
-
-    brd = _board_desc(board, **({"vlen": vlen} if vlen is not None else {}))
     if vlen is None and brd.vlen is not None:
         vlen = brd.vlen  # build for the board's real vector length by default
     # A vector model may only fan out over harts that HAVE a vector unit. A heterogeneous SoC is normal
@@ -2393,17 +2472,16 @@ def build_app(
     _h.update((work / "model.o").read_bytes())
     _h.update((cgen / "weights.bin").read_bytes())
 
-    # External-weights mode for blobs that would overflow medany linked into .data: rename
-    # the blob's section so Zephyr's default linker won't pull it into the image .data; a
-    # snippet diverts it to the WEIGHTS region at a fixed high address, and main.c addresses
-    # it by literal. Keeps ram0 compact (code + arena), so big fp32 models link.
+    # External-weights mode for blobs that would overflow the selected port's link
+    # window: keep the low code/arena region compact and place the blob at the
+    # board-declared contiguous DRAM address, referenced by an absolute pointer.
     # DECIDE ON THE LINKED FOOTPRINT, NOT THE BLOB SIZE. medany constrains the whole ram0 span
-    # (code + weights + activation arena), so a blob that fits LINK_LIMIT on its own can still push
+    # (code + weights + activation arena), so a blob that fits the limit on its own can still push
     # the region past the window once the arena is added -- and then linked mode is chosen for an
     # image that cannot work. MEASURED on gemma2_2b_int8_section12: 1462 MiB of weights sat under the
     # 1900 MiB threshold, linked mode was selected, the arena took ram0 to ~3.7 GiB, and the image
     # never reached its first op in 30 min (silent -- no fault, which is what made it expensive to
-    # find). The SAME bundle forced external, ram0 a compact 1 GiB and the blob at EXT_WEIGHTS_BASE,
+    # find). The SAME bundle forced external, with a compact low RAM region and a separate weights blob,
     # reaches op 0 in 8 minutes. Comparing the computed region is strictly safer than comparing the
     # blob: it can only move builds from linked to external, and external is the mode that works at
     # every size tested (1034 MiB and 2485 MiB regions both execute).
@@ -2412,33 +2490,23 @@ def build_app(
 
     peak = None  # measured only on the path that sizes the region from it
     linked_region = None
-    if ram_bytes_override is not None:
-        external = False
-    else:
+    if ram_bytes_override is None:
         # Same lock rationale as the sizing parse below: three concurrent build_app calls produced a
         # bogus ParseError on valid IR, which read as a broken build rather than a race.
         with IR_LOCK:
             peak = int(activation_peak_bytes(model_dir / "model.mlir") or 0) or None
-        linked_region = _ram_for_weights(weights_size, peak, alloc_total)
-        external = linked_region > LINK_LIMIT
-    weights_base = None
+        linked_region = _ram_for_weights(
+            weights_size, peak, alloc_total, default_ram_bytes=brd.zephyr_default_ram_bytes
+        )
+    layout = _memory_plan(brd, weights_size, linked_region or 0, ram_bytes_override)
+    external = layout.external
+    weights_base = layout.weights_base
     if external:
-        if weights_size > EXT_MAX_WEIGHTS:
-            raise ZephyrModelError(
-                f"weights blob {weights_size / 2**30:.1f} GB does not fit the 16 GB DRAM "
-                f"after ram0 (max ~{EXT_MAX_WEIGHTS / 2**30:.1f} GB) — out of envelope."
-            )
         _run([objcopy, "--rename-section", ".data=.merlin_weights", work / "weights_blob.o"])
-        weights_base = EXT_WEIGHTS_BASE
-        ram_bytes = (EXT_WEIGHTS_BASE - 0x80000000) + weights_size  # spike -m span
-    else:
-        # Size ram0 to the in-image weights blob + activation-arena headroom (default 256 MB
-        # is too small for multi-hundred-MB int8/fp8 blobs). ARENA_SIZE=-1 claims the
-        # leftover. Spike gets a matching -m; FireSim DRAM is fixed by the bitstream.
-        # `linked_region` was already computed above to MAKE the linked/external decision; reusing it
-        # is what keeps the decision and the sizing from disagreeing (recomputing invites a future
-        # edit to change one and not the other).
-        ram_bytes = ram_bytes_override if ram_bytes_override is not None else linked_region
+    # The region and simulator span differ in external mode: the linked arena only
+    # occupies the low region, while the simulator must map the weights as well.
+    ram_bytes = layout.spike_span_bytes
+    ram_region_bytes = layout.ram_region_bytes
 
     archive = work / "libmerlinmodel.a"
     archive.unlink(missing_ok=True)
@@ -2539,10 +2607,8 @@ def build_app(
 
     # Written below, once the identity it embeds is known.
     cmakelists_text = _cmake("")
-    # Board overlay. External mode: ram0 = 1 GB (code + arena) and a separate WEIGHTS
-    # memory-region holding the blob at EXT_WEIGHTS_BASE. Otherwise: grow ram0 only when
-    # the model needs > the stock 256 MB (small models keep the default that boots reliably
-    # on FireSim). Plus, for chipyard, the disable-cpu@2..7 overlay.
+    # Board overlay. External mode has a low code/arena region and a separate
+    # WEIGHTS region; their sizes and origin derive from the selected catalog.
     overlay = ""
     if console_facts is not None:
         # Point `chosen` at the chip's UART and state its address from the DERIVED fact rather than
@@ -2557,18 +2623,18 @@ def build_app(
             f"\tcurrent-speed = <{_DEFAULT_BAUD}>;\n}};\n\n"
         )
     if external:
-        wsz = (weights_size + 0xFFF) & ~0xFFF  # 4 KB align
+        wsz = layout.weights_region_bytes
         # The WEIGHTS region lives under a 2-cell (#address/size-cells=2) container so its
         # reg can express a 64-bit base+size — letting the blob exceed 4 GB (tiny, pi05).
         # The chipyard root is 1-cell, so we add a child bus with 2/2 cells. base & size are
         # emitted as <hi lo> pairs.
-        b_hi, b_lo = (EXT_WEIGHTS_BASE >> 32) & 0xFFFFFFFF, EXT_WEIGHTS_BASE & 0xFFFFFFFF
+        b_hi, b_lo = (weights_base >> 32) & 0xFFFFFFFF, weights_base & 0xFFFFFFFF
         s_hi, s_lo = (wsz >> 32) & 0xFFFFFFFF, wsz & 0xFFFFFFFF
         overlay += (
-            f"&ram0 {{\n\treg = <0x80000000 {hex(EXT_RAM0_BYTES)}>;\n}};\n\n"
+            f"&{brd.ram_label} {{\n\treg = <{hex(brd.dram_base)} {hex(ram_region_bytes)}>;\n}};\n\n"
             f"/ {{\n\tweights_bus {{\n"
             f"\t\t#address-cells = <2>;\n\t\t#size-cells = <2>;\n\t\tranges;\n"
-            f"\t\tweights0: memory@{EXT_WEIGHTS_BASE:x} {{\n"
+            f"\t\tweights0: memory@{weights_base:x} {{\n"
             f'\t\t\tcompatible = "zephyr,memory-region", "mmio-sram";\n'
             f"\t\t\treg = <{hex(b_hi)} {hex(b_lo)} {hex(s_hi)} {hex(s_lo)}>;\n"
             f'\t\t\tzephyr,memory-region = "WEIGHTS";\n\t\t}};\n\t}};\n}};\n'
@@ -2580,7 +2646,7 @@ def build_app(
         A function rather than a literal because the region may have to be CORRECTED after the link: the
         arena is the leftover after the image, and the image's size is not known until it exists.
         """
-        if size <= DEFAULT_RAM_BYTES:
+        if size <= brd.zephyr_default_ram_bytes:
             return ""
         # Never past what the chip HAS: a region larger than physical DRAM is a boot that dies before
         # main() with no console output at all.
@@ -2592,10 +2658,9 @@ def build_app(
             )
         return f"&{brd.ram_label} {{\n\treg = <{hex(brd.dram_base)} {hex(size)}>;\n}};\n"
 
-    # Keyed on the board we actually BUILD (`build_board`), not on this descriptor's name: a chip with
-    # no Zephyr port of its own is built against a generic port, and testing the descriptor name here
-    # silently skipped this overlay for exactly those boards.
-    cpu_overlay = _chipyard_cpu_overlay(cpus) if brd.build_board.startswith("chipyard") else ""
+    # The port's CPU-node count is target-owned catalog data, never inferred from
+    # its name. Unknown ports do not receive an unrelated overlay.
+    cpu_overlay = _cpu_disable_overlay(cpus, brd.dt_cpu_nodes) if brd.dt_cpu_nodes is not None else ""
     overlay_base = overlay
 
     def _overlay_for(size: int) -> str:
@@ -2623,7 +2688,8 @@ def build_app(
             console=brd.console,
             debug=debug,
             dram_base=brd.dram_base,
-            region_bytes=ram_bytes,
+            region_bytes=ram_region_bytes,
+            completion_metric_prefix=completion_metric_prefix,
         )
 
     _h.update(prj_conf_text.encode())
@@ -2685,6 +2751,11 @@ def build_app(
 
     build_hash = _emit_and_build()
     demand = alloc_total + 128 * 1024 * 1024
+    if external:
+        from ..elf_audit import read_elf as _read_elf
+
+        low_demand = (alloc_total or peak or 0) + 128 * 1024 * 1024
+        _require_external_arena(brd, ram_region_bytes, _read_elf(elf)[1], low_demand)
     if not external and alloc_total:
         from ..elf_audit import read_elf as _read_elf
 
@@ -2700,14 +2771,18 @@ def build_app(
                 flush=True,
             )
             ram_bytes = grown
+            ram_region_bytes = grown
             overlay = _overlay_for(ram_bytes)
             build_hash = _emit_and_build()
     out = {
         "elf": elf,
         "app_dir": app,
         "build_dir": build_dir,
+        "board": brd.name,
         "backend": backend,
         "ram_bytes": ram_bytes,
+        "ram_region_bytes": ram_region_bytes,
+        "weights_base": weights_base,
         "build_hash": build_hash,
         **info,
     }
@@ -2758,29 +2833,23 @@ def spike_isa(vlen: int | None = None, base: str = DEFAULT_SPIKE_ISA) -> str:
 def run_on_spike(
     elf: str | Path,
     *,
+    dram_base: int,
+    mem_bytes: int,
     harts: int = 2,
     isa: str = DEFAULT_SPIKE_ISA,
     vlen: int | None = None,
-    mem_bytes: int = 1 << 31,
     timeout: int = 3600,
 ) -> dict[str, Any]:
     """Run the Zephyr ELF on spike ``-pN``; parse the OUT/ARGMAX/METRIC/DONE markers.
 
-    ``vlen`` pins the simulated vector length (via :func:`spike_isa`); None = spike's default 128.
+    ``dram_base`` and ``mem_bytes`` describe the selected board's mapped DRAM;
+    ``vlen`` pins the simulated vector length (via :func:`spike_isa`).
     """
     isa = spike_isa(vlen, isa) if vlen is not None else isa
-    cmd = [_spike.spike_path(), f"--isa={isa}", f"-p{harts}", f"-m{hex(0x80000000)}:{hex(mem_bytes)}", str(elf)]
+    cmd = [_spike.spike_path(), f"--isa={isa}", f"-p{harts}", f"-m{hex(dram_base)}:{hex(mem_bytes)}", str(elf)]
     proc = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, timeout=timeout)
     console = proc.stdout + proc.stderr
     return _parse_console(console, proc.returncode)
-
-
-# The Zephyr board whose images the chipyard Verilator harness runs by default: the generic chipyard
-# board, whose HTIF console is what the harness speaks. WHICH SoC config elaborates it, and which
-# target's variable locates a prebuilt binary, are facts of that board's registry entry
-# (`rtl_sim_config`, `target` in merlin/contract/boards.yaml), not constants of this module -- a
-# multicore vector SoC needs a config of its own, and naming one here welded this path to one target.
-VERILATOR_BOARD = "chipyard_riscv64"
 
 
 def _verilator_facts(board: str, config: str | None) -> tuple[str | None, str | None]:
@@ -2796,7 +2865,7 @@ def _verilator_facts(board: str, config: str | None) -> tuple[str | None, str | 
     return cfg, env_name
 
 
-def verilator_sim(config: str | None = None, *, board: str = VERILATOR_BOARD) -> Path | None:
+def verilator_sim(config: str | None = None, *, board: str) -> Path | None:
     """Path to the chipyard Verilator sim for ``board`` (or an explicit ``config``), or None when it is
     not built.
 
@@ -2821,7 +2890,7 @@ def verilator_sim(config: str | None = None, *, board: str = VERILATOR_BOARD) ->
 def run_on_verilator(
     elf: str | Path,
     *,
-    board: str = VERILATOR_BOARD,
+    board: str,
     config: str | None = None,
     timeout: int = 7200,
     references: dict | None = None,
@@ -3192,34 +3261,6 @@ def _gate(prefix: np.ndarray, references, *, max_rel: float | None = None, min_c
     return out
 
 
-def _check_firesim_workload(firesim_root: str, workload: str) -> None:
-    """Fail closed when the shared ``config_runtime.yaml`` names a different workload than the one we
-    stage into.
-
-    ``FIRESIM_WORKLOAD_NAME`` only tells the RUNNER where to put the ELF. What FireSim boots comes from
-    ``workload.workload_name`` in ``config_runtime.yaml``, and when the two disagree the simulator loads
-    whatever binary the other workload last left behind -- with no error anywhere, because from
-    FireSim's side nothing is wrong. That cost a 63-minute FPGA run whose uartlog turned out to be a
-    months-old image for a different accelerator, trapping on its first custom instruction.
-
-    The queue path is immune (the daemon is passed ``--workload`` and writes a per-job config), so this
-    is checked only where the shared file is actually consulted.
-    """
-    import yaml
-
-    cfg = Path(firesim_root) / "deploy" / "config_runtime.yaml"
-    if not cfg.is_file():
-        return
-    declared = ((yaml.safe_load(cfg.read_text()) or {}).get("workload", {}) or {}).get("workload_name")
-    want = f"{workload}.json"
-    if declared != want:
-        raise RuntimeError(
-            f"{cfg} declares workload_name={declared!r} but this run stages into {workload!r}. FireSim "
-            f"would boot the binary belonging to {declared!r}, not ours. Set workload_name to {want!r} "
-            f"(and restore it afterwards), or run through the queue, which manages its own config."
-        )
-
-
 def run_on_firesim(
     elf: str | Path,
     *,
@@ -3229,59 +3270,27 @@ def run_on_firesim(
     queue: bool = True,
     firesim_root: str | None = None,
     firesim_env: str | None = None,
+    runner: FireSimRunner | None = None,
+    runner_name: str | None = None,
 ) -> dict[str, Any]:
-    """Run a ``chipyard_riscv64`` ELF on FireSim by reusing ModelBlaster's queue-safe
-    ``validation.firesim_runner.run_firesim`` (single physical FPGA → always go through
-    the queue). Parses our OUT/METRIC/DONE markers from the captured uartlog and (when a
-    reference is given) gates ``cos``/``rel``. Requires the firesim env activated and the
-    queue daemon up (see module doc / the FireSim section of the plan)."""
-    import sys
+    """Execute an ELF with a selected FireSim adapter, then parse and gate its UART.
 
-    # Resolve through paths.env (os.environ -> .env -> default), NOT os.environ alone: every
-    # other external dependency in the repo is configurable from the gitignored .env without
-    # exporting into the shell, and reading os.environ directly silently ignored a configured
-    # MERLIN_MODELBLASTER and failed with a bare ModuleNotFoundError for 'modelblaster'.
+    An out-of-tree adapter owns simulator staging, queue and environment policy.
+    An installed runner is selected by ``runner_name`` or
+    ``MERLIN_FIRESIM_RUNNER``. Direct ``runner=`` injection is for explicit
+    orchestration and tests. A checkout is never an implicit execution provider.
+    """
     from ...common.paths import env as _env
 
-    mb = _env("MERLIN_MODELBLASTER", "/path/to/ModelBlaster")
-    for p in (f"{mb}/src", mb):
-        if p not in sys.path:
-            sys.path.insert(0, p)
-    # FIRESIM_ROOT/FIRESIM_ENV default to the configured chipyard checkout rather than a
-    # placeholder, so a repo with MERLIN_CHIPYARD set needs no extra FireSim-specific config.
-    _cy = _env("MERLIN_CHIPYARD", "/path/to/chipyard")
-    fr = firesim_root or _env("FIRESIM_ROOT", f"{_cy}/sims/firesim")
-    fe = firesim_env or _env("FIRESIM_ENV", f"{_cy}/env.sh")
-    # Run under OUR FireSim workload name, not ModelBlaster's. firesim_runner reads
-    # FIRESIM_WORKLOAD_NAME into a module constant AT IMPORT, so this must be set before
-    # the (lazy) import below. The workload def lives at deploy/workloads/merlin-oscar.json.
-    os.environ.setdefault("FIRESIM_WORKLOAD_NAME", "merlin-oscar")
-    # The firesim-queue records the SUBMITTER's env, and the daemon runs the job (incl.
-    # `firesim kill`, which SSHes to localhost) with it. If we submit from a session whose
-    # SSH_AUTH_SOCK points at a dead/empty agent (e.g. a VS Code agent), fabric can't
-    # authenticate and every run aborts at the kill step. Point at the FireSim agent (the
-    # one the daemon uses, holding the localhost key) when ours is missing/dead.
-    _fs_sock = os.environ.get("FIRESIM_SSH_AUTH_SOCK", "/tmp/firesim_ssh_agent.sock")
-    _cur = os.environ.get("SSH_AUTH_SOCK", "")
-    if os.path.exists(_fs_sock) and (not _cur or not os.path.exists(_cur)):
-        os.environ["SSH_AUTH_SOCK"] = _fs_sock
-    # Tag our jobs with a distinct project so they are unmistakably separable from other
-    # workflows on the shared queue (e.g. ModelBlaster's xpurt_demo runs) — and never
-    # confused for cancellation. firesim_runner reads FIRESIM_PROJECT (default modelblaster).
-    os.environ.setdefault("FIRESIM_PROJECT", "merlin-oscar")
-    if queue:
-        os.environ["FIRESIM_QUEUE"] = "1"
-        os.environ.setdefault("FIRESIM_QUEUE_TIMEOUT", str(timeout))
-    else:
-        # Without the queue the shared config_runtime.yaml is what FireSim reads, so it has to agree
-        # with where we stage. See _check_firesim_workload.
-        _check_firesim_workload(fr, os.environ["FIRESIM_WORKLOAD_NAME"])
-    try:
-        from modelblaster.validation.firesim_runner import run_firesim  # type: ignore
-    except ModuleNotFoundError:
-        from validation.firesim_runner import run_firesim  # type: ignore
-
-    uart = run_firesim(str(elf), models=None, firesim_root=fr, firesim_env=fe, timeout=float(timeout))
+    chipyard = _env("MERLIN_CHIPYARD", "/path/to/chipyard")
+    root = firesim_root or _env("FIRESIM_ROOT", f"{chipyard}/sims/firesim")
+    environment = firesim_env or _env("FIRESIM_ENV", f"{chipyard}/env.sh")
+    if runner is not None and runner_name is not None:
+        raise ValueError("pass runner or runner_name, not both")
+    selected = runner if runner is not None else select_runner(runner_name)
+    uart = selected(str(elf), firesim_root=root, firesim_env=environment, timeout=timeout, queue=queue)
+    if not isinstance(uart, str):
+        raise ZephyrModelError("FireSim runner must return captured UART text")
     res = _parse_console(uart, 0)
     refs = references if references is not None else reference
     if refs is not None:
@@ -3293,7 +3302,7 @@ def build_and_run(
     model_dir: str | Path,
     work: str | Path,
     *,
-    board: str = "spike_riscv64",
+    board: str | None = None,
     backend: str = "rvv",
     rvv_hart: int = 0,
     harts: int = 2,
@@ -3355,9 +3364,14 @@ def build_and_run(
         # default 128); recorded so a result cannot be read as another VLEN's
         "vlen": vlen,
     }
-    if board != "spike_riscv64":
+    from ..boards import board as _board_desc
+
+    if board is None or _board_desc(board).simulator != "spike":
         return result  # FireSim path runs the elf separately (firesim_runner / queue)
-    run = run_on_spike(b["elf"], harts=harts, mem_bytes=b["ram_bytes"], timeout=timeout, vlen=vlen)
+    run = run_on_spike(
+        b["elf"], dram_base=_board_desc(board).dram_base, harts=harts,
+        mem_bytes=b["ram_bytes"], timeout=timeout, vlen=vlen,
+    )
     result.update(run)
     refs = references if references is not None else reference
     if refs is not None:

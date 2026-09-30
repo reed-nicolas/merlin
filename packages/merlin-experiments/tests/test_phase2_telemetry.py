@@ -80,9 +80,9 @@ assert callable(calibration.achievable_ceiling) and callable(capsule_verdict.cap
 
 
 def test_preflight_has_distinct_native_renderer_and_packaged_telemetry(preflight):
-    assert preflight["schema_version"] == 4
-    assert preflight["source_policy_version"] == 4
-    assert set(preflight["sources"]) == T.TREATMENT_SOURCES
+    assert preflight["schema_version"] == 5
+    assert preflight["source_policy_version"] == 5
+    assert set(preflight["sources"]) == T.TARGET_ACCESS_TREATMENT_SOURCES
     sources = preflight["sources"]
     assert sources["performance_authoring_stage"]["path"] != sources["performance_telemetry"]["path"]
     assert Path(sources["performance_telemetry"]["path"]) == module_source_path(T.__name__).resolve()
@@ -95,7 +95,7 @@ def test_preflight_has_distinct_native_renderer_and_packaged_telemetry(preflight
     assert identity["authoring_stage_sha256"] == sources["performance_authoring_stage"]["sha256"]
 
 
-@pytest.mark.parametrize("missing", sorted(T.TREATMENT_SOURCES))
+@pytest.mark.parametrize("missing", sorted(T.TARGET_ACCESS_TREATMENT_SOURCES))
 def test_each_current_source_role_is_required(preflight, missing):
     del preflight["sources"][missing]
     with pytest.raises(StageGateError, match="identity is incomplete"):
@@ -127,7 +127,7 @@ def test_packaged_extraction_receipt_remains_readable_without_new_price_fields(p
 
 
 @pytest.mark.parametrize(
-    "schema,policy", [(1, 2), (2, None), (3, 2), (True, None), (3, True), (4, 3), (4, True), (5, 5)]
+    "schema,policy", [(1, 2), (2, None), (3, 2), (True, None), (3, True), (4, 3), (4, True), (5, 4), (6, 6)]
 )
 def test_unsupported_source_policy_refuses(preflight, schema, policy):
     preflight.update(schema_version=schema, source_policy_version=policy)
@@ -135,7 +135,7 @@ def test_unsupported_source_policy_refuses(preflight, schema, policy):
         T.treatment_identity(preflight)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
 def test_source_receipt_decoding_never_reads_live_implementations(preflight, monkeypatch, version):
     old = copy.deepcopy(preflight)
     required = {
@@ -143,6 +143,7 @@ def test_source_receipt_decoding_never_reads_live_implementations(preflight, mon
         2: T.PACKAGED_TREATMENT_SOURCES,
         3: T.EXPLICIT_PRICE_TREATMENT_SOURCES,
         4: T.TREATMENT_SOURCES,
+        5: T.TARGET_ACCESS_TREATMENT_SOURCES,
     }[version]
     old["schema_version"] = version
     if version == 1:

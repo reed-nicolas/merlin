@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -188,6 +190,73 @@ def test_multi_program_roster_cannot_escape_or_become_one_forward(tmp_path):
     (root / "session_contract.yaml").write_text(yaml.safe_dump(document))
     with pytest.raises(ValueError, match="escapes"):
         Q.inspect_workflow(root)
+    document["programs"][1]["bundle"] = "recurrent"
+    document["version"] = 1
+    (root / "session_contract.yaml").write_text(yaml.safe_dump(document))
+    with pytest.raises(ValueError, match="cannot become one forward"):
+        Q.inspect_workflow(root)
+
+
+def test_session_inspection_binds_typed_abi_and_producer_receipts(tmp_path, monkeypatch):
+    from merlin.llvmlower import session_bundle
+
+    root = tmp_path / "session"
+    root.mkdir()
+    for name in ("prefix", "decode"):
+        stage = _bundle(root / name)
+        (stage / "capture_receipt.json").write_text(json.dumps({"stage": name}))
+    document = {
+        "version": 2,
+        "programs": [
+            {"name": "prefix", "bundle": "prefix", "steps": 1},
+            {"name": "decode", "bundle": "decode", "steps": 2},
+        ],
+        "provenance": {"full_checkpoint": True, "synthetic_inputs": True},
+    }
+    contract = root / "session_contract.yaml"
+    contract.write_text(yaml.safe_dump(document))
+    monkeypatch.setattr(
+        session_bundle, "load",
+        lambda *_: SimpleNamespace(program_names=("prefix", "decode"), bindings=(object(),)),
+    )
+    receipt = {
+        "schema": "merlin.model_session_capture.v1",
+        "session_contract_sha256": hashlib.sha256(contract.read_bytes()).hexdigest(),
+        "programs": [
+            {
+                "name": name,
+                "receipt_sha256": hashlib.sha256((root / name / "capture_receipt.json").read_bytes()).hexdigest(),
+                "ok": True,
+                "opaque": 0,
+                "materialized_abi": {"complete": True},
+            }
+            for name in ("prefix", "decode")
+        ],
+    }
+    (root / "session-receipt.json").write_text(json.dumps(receipt))
+    inspected = Q.inspect_workflow(root)
+    assert inspected["session_abi"] == {"status": "verified_structure", "bindings": 1}
+    assert inspected["session_capture"]["status"] == "producer_receipts_bound"
+    assert inspected["session_capture"]["source_closure_verified"] is False
+    assert "session-receipt.json" in inspected["members"]
+
+    (root / "decode" / "capture_receipt.json").write_text("changed")
+    inspected = Q.inspect_workflow(root)
+    assert inspected["session_capture"]["status"] == "unverified"
+    assert "session producer receipts" in " ".join(inspected["application_validation_blockers"])
+    monkeypatch.setattr(session_bundle, "load", lambda *_: (_ for _ in ()).throw(ValueError("ABI differs")))
+    inspected = Q.inspect_workflow(root)
+    assert inspected["session_abi"]["status"] == "unverified"
+
+
+def test_single_program_v1_session_remains_a_forward(tmp_path):
+    root = _bundle(tmp_path / "image-session")
+    (root / "session_contract.yaml").write_text(
+        yaml.safe_dump({"version": 1, "steps": 1, "provenance": {"full_checkpoint": False}})
+    )
+    inspected = Q.inspect_workflow(root)
+    assert [program["name"] for program in inspected["programs"]] == ["forward"]
+    assert inspected["session_abi"]["status"] == "not_applicable"
 
 
 def test_command_observation_requires_an_explicit_nonempty_route(tmp_path):

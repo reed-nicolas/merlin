@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from merlin_experiments import frozen_python, source_snapshot
+from merlin_experiments.measured_launch import without_unsealed_board_catalog
 
 from . import contracts as C
 from . import host_policy as HP
@@ -189,18 +190,16 @@ def resolve(original_path: Path, *, native_layout: NativeVerifierLayout | None =
         )
         argv = (sys.executable, "-c", code, str(original_path))
         roots, environment = native_layout.python_roots, {}
-    return ResolvedCheckpoint(
-        snapshot,
-        argv,
-        {
-            **os.environ,
-            **environment,
-            "MERLIN_REPO_ROOT": str(snapshot),
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONPATH": os.pathsep.join(str(snapshot / item) for item in roots),
-        },
-        original,
-    )
+    selected_environment = {
+        **os.environ,
+        **environment,
+        "MERLIN_REPO_ROOT": str(snapshot),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": os.pathsep.join(str(snapshot / item) for item in roots),
+    }
+    if "checkpoint_verifier" in launch:
+        selected_environment = without_unsealed_board_catalog(selected_environment)
+    return ResolvedCheckpoint(snapshot, argv, selected_environment, original)
 
 
 def verify(original_path: Path, *, native_layout: NativeVerifierLayout | None = None) -> dict[str, Any]:

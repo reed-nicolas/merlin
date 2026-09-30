@@ -1,7 +1,8 @@
-# Board registry: the facts a generated image needs about the machine it runs on.
+# Example board catalog: target-owned facts for bring-up demonstrations.
 #
-# Loaded by merlin/python/merlin/runtime/boards.py into `boards.BOARDS` (a dict of `Board` descriptors).
-# Targeting a new board is an entry here, not a code change -- the field meanings, and the failure mode
+# Select explicitly with MERLIN_BOARD_CATALOG=examples/board-catalog.yaml.
+# Installed Merlin has no board facts until a target-owned catalog is selected.
+# Targeting a new board is an OOT catalog entry, not a core code change -- the field meanings, and the failure mode
 # each one prevents when it is wrong, are documented on the `Board` dataclass in that module. Unknown
 # fields and unknown enum values are REFUSED at load time rather than ignored.
 #
@@ -10,6 +11,11 @@
 #
 # Value spellings:
 #   * byte sizes (`dram_bytes`, `code_reserve`) are an integer or "<n> KiB|MiB|GiB";
+#   * every entry explicitly states `dram_base`, `console`, `flow`, `loader`, and `loader_baud`;
+  #   * Zephyr entries state `ram_label` (and UART entries also state `uart_label`);
+  #   * Zephyr entries state their port's default RAM region and linked-region limit;
+  #     an external-weights layout also states its low region and reserved DRAM tail;
+#   * bare-metal entries state `code_reserve`;
 #   * `console` is htif | uart, `flow` is zephyr | baremetal, `loader` is uart_tsi | pyuartsi;
 #   * `vector_hart_ids` is a list of hart ids;
 #   * `target` names the merlin target whose RTL the board elaborates. Per-target environment names
@@ -22,9 +28,21 @@ schema_version: 1
 boards:
   # The substrates we already validate on, described here so the same code path serves them.
   spike_riscv64:
+    simulator: spike
     dram_bytes: 2 GiB
+    dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
     harts: 8
+    vector_harts: 8
+    vlen: 128
     console: htif
+    flow: zephyr
+    loader: uart_tsi
+    loader_baud: 921600
+    ram_label: ram0
+    fpu_sharing: false
+    zephyr_vector_ext: true
     notes: "functional simulator; DRAM is whatever `-m` says, VLEN comes from the ISA string"
 
   # The chipyard multicore vector SoC as Verilator elaborates it. Its config
@@ -33,25 +51,49 @@ boards:
   # stock config of that vector unit is single-core, and the only stock 2-tile SoC puts a vector unit on
   # one tile only, so neither can host a multi-hart RVV image.
   chipyard_riscv64:
+    dt_cpu_nodes: 8
     dram_bytes: 256 MiB
+    dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
     harts: 4
+    vector_harts: 4
     vlen: 256
     console: htif
+    flow: zephyr
+    loader: uart_tsi
+    loader_baud: 921600
+    ram_label: ram0
+    fpu_sharing: false
+    zephyr_vector_ext: true
     target: saturn
     rtl_sim_config: MultiSaturnV256D128ShuttleConfig
     notes: "Verilator/FireSim multi-Saturn SoC"
 
   # The FPGA TARGET is its own board, not the DTS default. `chipyard_riscv64` keeps ram0's 256 MB because
   # that is what a Verilator/spike run of that config has; the FireSim dual-Saturn target has
-  # WithExtMemSize = 16 GB at 0x80000000 (see zephyr_model.DRAM_END, and the whole-model TinyLlama run
+  # WithExtMemSize = 16 GB at 0x80000000 (see the external-memory fields below and the whole-model TinyLlama run
   # whose 482 MB of weights could not otherwise have been linked). Conflating the two is what made
   # whisper_tiny -- 464 MB of region -- look like it did not fit on a 16 GB target.
   firesim_dual_saturn:
     zephyr_board: chipyard_riscv64
+    dt_cpu_nodes: 8
     dram_bytes: 16 GiB
+    dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
+    zephyr_external_ram_bytes: 1 GiB
+    zephyr_external_tail_reserve_bytes: 256 MiB
     harts: 2
+    vector_harts: 2
     vlen: 256
     console: htif
+    flow: zephyr
+    loader: uart_tsi
+    loader_baud: 921600
+    ram_label: ram0
+    fpu_sharing: false
+    zephyr_vector_ext: true
     target: saturn
     bitstream: alveo_u250_firesim_dual_saturn_v256d128
     notes: >-
@@ -70,11 +112,17 @@ boards:
   # unit is the documented K1 trap (a fixed-width kernel lands at a lower LMUL and leaves three quarters
   # of the datapath idle), so the fact matters even though our vector code is scalable.
   chipyard_kodiak:
+    dt_cpu_nodes: 8
     dram_bytes: 512 MiB
+    dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
     harts: 3
     vector_harts: 2
     vlen: 512
     console: htif
+    flow: zephyr
+    ram_label: ram0
     # These two flags used to read `fpu_sharing: true, zephyr_vector_ext: false`, on the reasoning that
     # this board's Zephyr lacks RISCV_V_KERNEL_ONLY and routes isr.S's
     # `z_riscv_vstate_save`/`_restore` through fpu.c/fpu.S, which only compile under FPU_SHARING -- so V
@@ -119,10 +167,17 @@ boards:
   # README has to say so rather than inheriting the confidence of the one-core builds.
   kodiak_opu_2core:
     zephyr_board: chipyard_kodiak
+    dt_cpu_nodes: 8
     dram_bytes: 4 GiB
+    dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
     harts: 2
+    vector_harts: 2
     vlen: 512
     console: htif
+    flow: zephyr
+    ram_label: ram0
     fpu_sharing: false
     zephyr_vector_ext: true
     tick_hz: 100
@@ -148,10 +203,23 @@ boards:
   # two vector harts AND the outer-product unit -- not here.
   firesim_kodiak_opu:
     zephyr_board: chipyard_riscv64
+    dt_cpu_nodes: 8
     dram_bytes: 16 GiB
+    dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
+    zephyr_external_ram_bytes: 1 GiB
+    zephyr_external_tail_reserve_bytes: 256 MiB
     harts: 1
+    vector_harts: 1
     vlen: 512
     console: htif
+    flow: zephyr
+    loader: uart_tsi
+    loader_baud: 921600
+    ram_label: ram0
+    fpu_sharing: false
+    zephyr_vector_ext: true
     bitstream: alveo_u250_firesim_kodiak_opu_1core
     notes: >-
       FireSim alveo_u250_firesim_kodiak_opu_1core: single Shuttle core with the outer-product unit,
@@ -174,9 +242,13 @@ boards:
   # which is what the uart_tsi/FESVR link carries.
   gemmelos_bearly25:
     dram_bytes: 1 GiB
+    dram_base: 0x80000000
     harts: 2
     vlen: 256
     console: uart
+    loader: uart_tsi
+    loader_baud: 921600
+    code_reserve: 64 MiB
     sdk_chip: bearly25
     chip_freq_hz: 500000000
     flow: baremetal
@@ -197,10 +269,21 @@ boards:
   # SMP-boot hang, so this is a fact worth having been told.
   gemmelos_bearly25_zephyr:
     zephyr_board: chipyard_riscv64
+    dt_cpu_nodes: 8
     dram_bytes: 1 GiB
+    dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
     harts: 2
+    vector_harts: 2
     vlen: 256
     console: uart
+    loader: uart_tsi
+    loader_baud: 921600
+    ram_label: ram0
+    uart_label: uart0
+    fpu_sharing: false
+    zephyr_vector_ext: true
     sdk_chip: bearly25
     flow: zephyr
     tick_hz: 100
@@ -228,10 +311,21 @@ boards:
   # runtime/c/merlin_socinit_zephyr.c replays their bmark-lib `init_test` order against it.
   gemmelos_bearly25_zephyr_500mhz:
     zephyr_board: chipyard_riscv64
+    dt_cpu_nodes: 8
     dram_bytes: 1 GiB
+    dram_base: 0x80000000
+    zephyr_default_ram_bytes: 256 MiB
+    zephyr_link_limit_bytes: 1900 MiB
     harts: 2
+    vector_harts: 2
     vlen: 256
     console: uart
+    loader: uart_tsi
+    loader_baud: 921600
+    ram_label: ram0
+    uart_label: uart0
+    fpu_sharing: false
+    zephyr_vector_ext: true
     sdk_chip: bearly25
     chip_freq_hz: 500000000
     flow: zephyr
@@ -243,9 +337,13 @@ boards:
 
   gemmelos_dsp25:
     dram_bytes: 1 GiB
+    dram_base: 0x80000000
     harts: 2
     vlen: 128
     console: uart
+    loader: uart_tsi
+    loader_baud: 921600
+    code_reserve: 64 MiB
     sdk_chip: dsp25
     chip_freq_hz: 500000000
     flow: baremetal

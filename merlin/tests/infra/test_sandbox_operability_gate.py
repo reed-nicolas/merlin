@@ -29,6 +29,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from merlin_experiments.access_policy import MODULE_ACCESS, unresolved_modules
 from merlin_experiments.phase2 import candidate_record as RECORD
 from merlin_experiments.phase2 import checkpoint_admission as ADMISSION
 from merlin_experiments.phase2 import functional_cohort as FC
@@ -36,7 +37,7 @@ from merlin_experiments.phase2 import holdout_corpus as HOLDOUT
 from merlin_experiments.phase2 import telemetry as TEL
 from merlin_experiments.phase2.contracts import StageGateError
 
-from merlin.common.access import MODULE_ACCESS, module_locations, unresolved_modules
+from merlin.common.access import module_locations
 from merlin.common.paths import artifacts_dir, merlin_dir, repo_root
 from merlin.targetgen.sandbox import build_sandbox
 from merlin.targetgen.sandbox import preflight as PF

@@ -47,11 +47,13 @@ class DeviceRouting:
     package_dir: str | Path
     operand_dtype: str
     accum_dtype: str
-    select: "Callable[[Any], bool] | None" = None
+    select: Callable[[Any], bool] | None = None
     numeric_policy: dict | None = None
+    #: Exact Phase 0 operation/interface identities; mutually exclusive with a shape selector.
+    exact_selection: Any | None = None
 
 
-def routing_for_placement(placement, device: str, package_dir: str | Path, *, numeric_policy=None) -> "DeviceRouting":
+def routing_for_placement(placement, device: str, package_dir: str | Path, *, numeric_policy=None) -> DeviceRouting:
     """The ``DeviceRouting`` a whole-model build needs, derived from a placement rather than declared.
 
     This is the step that made the fused single-ELF path unreachable in production. Every piece of it
@@ -289,6 +291,71 @@ def _objcopy() -> str | None:
     return shutil.which("llvm-objcopy") or shutil.which("objcopy")
 
 
+def _nm() -> str | None:
+    from .toolchain import DEFAULT_LLVM_INSTALL
+
+    local = Path(DEFAULT_LLVM_INSTALL) / "bin" / "llvm-nm"
+    if local.exists():
+        return str(local)
+    return shutil.which("llvm-nm") or shutil.which("nm")
+
+
+def verify_object_symbol_binding(
+    kernel_object: Path,
+    shim_object: Path,
+    *,
+    entry_symbol: str,
+    kernel_symbol: str,
+    original_kernel_symbol: str,
+    timeout: int,
+) -> dict[str, str]:
+    """Check the exact staged objects' exported call edge before claiming build evidence.
+
+    This is an object-level check, not a link or execution verdict. In particular,
+    every external reference must resolve between these two objects; otherwise a
+    later link could silently pick up an unrelated runtime definition.
+    """
+    nm = _nm()
+    if nm is None:
+        raise ValueError("staged object symbol binding needs a readable nm tool")
+
+    def symbols(path: Path) -> tuple[list[tuple[str, str]], list[str]]:
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("staged object symbol binding needs regular object files")
+        result = _run([nm, "--format=posix", "--extern-only", str(path)], timeout=timeout)
+        if result.returncode != 0:
+            raise ValueError(f"could not inspect staged object symbols: {(result.stderr or '')[-200:]}")
+        defined, undefined = [], []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 2 or len(parts[1]) != 1:
+                raise ValueError("nm returned an unrecognized staged object symbol record")
+            if parts[1].upper() == "U":
+                undefined.append(parts[0])
+            else:
+                defined.append((parts[0], parts[1]))
+        return defined, undefined
+
+    kernel_defined, kernel_undefined = symbols(kernel_object)
+    shim_defined, shim_undefined = symbols(shim_object)
+    if (
+        kernel_defined.count((kernel_symbol, "T")) != 1
+        or shim_defined.count((entry_symbol, "T")) != 1
+        or any(name == kernel_symbol for name, _kind in shim_defined)
+        or any(name == entry_symbol for name, _kind in kernel_defined)
+        or shim_undefined.count(kernel_symbol) != 1
+        or kernel_undefined
+        or sorted(shim_undefined) != [kernel_symbol]
+        or original_kernel_symbol in [
+            *(name for name, _kind in kernel_defined), *kernel_undefined,
+            *(name for name, _kind in shim_defined), *shim_undefined,
+        ]
+    ):
+        raise ValueError("staged kernel and shim object symbols disagree or have unresolved references")
+    return {"status": "object_symbol_binding_verified", "entry_symbol": entry_symbol,
+            "kernel_symbol": kernel_symbol}
+
+
 def _run(argv: Sequence[str], *, timeout: int) -> subprocess.CompletedProcess:
     return subprocess.run([str(a) for a in argv], capture_output=True, text=True, timeout=timeout)
 
@@ -304,8 +371,11 @@ def build_device_objects(
     accum_dtype: str,
     numeric_policy: dict | None = None,
     codegen_target: str = "riscv",
-    cflags: "Sequence[str] | None" = None,
+    cflags: Sequence[str] | None = None,
     timeout: int = 900,
+    expected_interfaces: Mapping[str, Mapping[str, str]] | None = None,
+    package_sha256: str | None = None,
+    tile_edge: int | None = None,
 ) -> DeviceBuild:
     """One kernel object per signature plus the shim object, ready to archive.
 
@@ -316,6 +386,7 @@ def build_device_objects(
     declines should still build its other two and say what it lost, because the alternative is an
     all-or-nothing build whose failure names none of the shapes involved.
     """
+    from merlin.common.digest import sha256_text
     from merlin.targetgen import corpus_spec as CS
     from merlin.targetgen.oot_runner import load_package, run_entrypoint
 
@@ -325,6 +396,16 @@ def build_device_objects(
     work = Path(workdir)
     work.mkdir(parents=True, exist_ok=True)
     skipped: list[tuple[str, str]] = []
+
+    if expected_interfaces is not None:
+        from .exact_offload import _package_sha256
+
+        if set(expected_interfaces) != set(signatures) or not package_sha256:
+            raise ValueError("exact offload must bind every emitted symbol and an OOT package digest")
+        if _package_sha256(Path(package_dir)) != package_sha256:
+            raise ValueError("OOT compiler package changed after exact model selection")
+    if tile_edge is not None and (type(tile_edge) is not int or tile_edge <= 0):
+        raise ValueError("explicit shim tile edge must be a positive integer")
 
     # WHICH DEVICES THIS PATH CAN BUILD, asked of the device's derived link rather than assumed.
     #
@@ -350,10 +431,13 @@ def build_device_objects(
         pkg = load_package(str(package_dir))
     except Exception as exc:  # noqa: BLE001
         return DeviceBuild(device=device, skipped=(("all", f"package unusable: {exc}"),))
+    if expected_interfaces is not None and pkg.target != device:
+        raise ValueError("exact interface package target differs from selected device")
 
-    from merlin.compile.mesh import _mesh_tile_binding
+    if expected_interfaces is None:
+        from merlin.compile.mesh import _mesh_tile_binding
 
-    binding = _mesh_tile_binding(device, operand_dtype, accum_dtype, numeric_policy=numeric_policy)
+        binding = _mesh_tile_binding(device, operand_dtype, accum_dtype, numeric_policy=numeric_policy)
 
     objs: list[Path] = []
     kernels: dict[str, str] = {}
@@ -371,27 +455,41 @@ def build_device_objects(
         want = kernel_symbol(abi.symbol, index)
         stem = work / f"{sym}"
 
-        entry = {
-            "name": sym,
-            "op": "matmul",
-            "kind": "op",
-            "source_role": "mesh_tile_synthesized",
-            "source_reference": f"offloaded layer {m}x{k}x{n} for {device}",
-            "M": m,
-            "K": k,
-            "N": n,
-        }
-        try:
-            _capsule, iface = CS.build(entry, binding)
-        except Exception as exc:  # noqa: BLE001
-            skipped.append((sym, f"interface capsule: {exc}"))
-            continue
+        if expected_interfaces is None:
+            entry = {
+                "name": sym,
+                "op": "matmul",
+                "kind": "op",
+                "source_role": "mesh_tile_synthesized",
+                "source_reference": f"offloaded layer {m}x{k}x{n} for {device}",
+                "M": m,
+                "K": k,
+                "N": n,
+            }
+            try:
+                _capsule, iface = CS.build(entry, binding)
+            except Exception as exc:  # noqa: BLE001
+                skipped.append((sym, f"interface capsule: {exc}"))
+                continue
+        else:
+            from merlin.targetgen.contract.resident_interface_abi import bind_single_resident_matmul
+
+            chosen = expected_interfaces[sym]
+            iface = chosen.get("mlir")
+            if not isinstance(iface, str) or sha256_text(iface) != chosen.get("sha256"):
+                raise ValueError(f"{sym} no longer matches its selected interface bytes")
+            resident = bind_single_resident_matmul(iface, target=device)
+            if (resident.m, resident.n, resident.k) != (m, n, k) or resident.dtypes != tuple(dtypes[sym]):
+                raise ValueError(f"{sym} selected interface disagrees with pointer ABI, device, shape, or precision")
         ifc = stem.with_suffix(".iface.mlir")
         ifc.write_text(iface, encoding="utf-8")
 
         r = run_entrypoint(pkg, "emit_target_artifact", ifc, timeout=timeout)
         if r.returncode != 0:
             skipped.append((sym, f"package declined {m}x{k}x{n}: {(r.stderr or '').strip()[:200]}"))
+            continue
+        if expected_interfaces is not None and f"llvm.func @{abi.symbol}(" not in r.stdout:
+            skipped.append((sym, "exact package artifact has no contract-named LLVM kernel entry"))
             continue
         art = stem.with_suffix(".device.mlir")
         art.write_text(r.stdout, encoding="utf-8")
@@ -428,6 +526,7 @@ def build_device_objects(
         {s: signatures[s] for s in kernels},
         {s: dtypes.get(s, ()) for s in kernels},
         kernel_symbol_for=kernels.get,
+        tile_edge=tile_edge,
     )
     if not unit.symbols:
         return DeviceBuild(
@@ -446,7 +545,7 @@ def build_device_objects(
     )
 
 
-def _flags(codegen_target: str, cflags: "Sequence[str] | None" = None) -> list[str]:
+def _flags(codegen_target: str, cflags: Sequence[str] | None = None) -> list[str]:
     """Compile flags for the device objects: the CALLER's when it supplied them.
 
     The defaults name an ISA (`-march=rv64gcv`), and a default ISA is an assumption about the

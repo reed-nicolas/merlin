@@ -452,6 +452,11 @@ kernels-parquet = [
 kernels-plots = [
     { name = "matplotlib" },
 ]
+semantic-search = [
+    { name = "jsonschema" },
+    { name = "xdsl" },
+    { name = "z3-solver" },
+]
 targetgen = [
     { name = "jsonschema" },
 ]
@@ -474,6 +479,7 @@ requires-dist = [
     { name = "aet", marker = "extra == 'telemetry'", git = "https://github.com/ucb-bar/agentic-eval-tool.git?rev=903d4def8995e4697c6f214cc26c60a5a38d0554" },
     { name = "build", marker = "extra == 'dev'" },
     { name = "exo-lang", marker = "extra == 'kernels-exo'" },
+    { name = "jsonschema", marker = "extra == 'semantic-search'" },
     { name = "jsonschema", marker = "extra == 'targetgen'" },
     { name = "matplotlib", marker = "extra == 'kernels-plots'" },
     { name = "numpy" },
@@ -490,11 +496,13 @@ requires-dist = [
     { name = "tree-sitter", marker = "extra == 'kernels-ast'" },
     { name = "tree-sitter-c", marker = "extra == 'kernels-ast'" },
     { name = "triton", marker = "extra == 'triton'", specifier = "==3.7.1" },
+    { name = "xdsl", marker = "extra == 'semantic-search'", specifier = ">=0.68" },
     { name = "xdsl", marker = "extra == 'verify'", specifier = ">=0.68" },
     { name = "xdsl", marker = "extra == 'xdsl'", specifier = ">=0.68" },
+    { name = "z3-solver", marker = "extra == 'semantic-search'" },
     { name = "z3-solver", marker = "extra == 'verify'" },
 ]
-provides-extras = ["dev", "xdsl", "verify", "targetgen", "board", "kernels-ast", "kernels-exo", "kernels-parquet", "kernels-plots", "telemetry", "triton"]
+provides-extras = ["dev", "xdsl", "verify", "targetgen", "semantic-search", "board", "kernels-ast", "kernels-exo", "kernels-parquet", "kernels-plots", "telemetry", "triton"]
 
 [[package]]
 name = "numpy"

@@ -143,6 +143,21 @@ def _verify_phase0_sources(plan: dict) -> None:
             except (OSError, ValueError) as exc:
                 raise SpecError(f"frozen Phase 0 sources changed: {exc}") from exc
             continue
+        selection = command.get("phase0_m2m_selection")
+        if selection is not None:
+            from .phase0.m2m_runtime import observe
+
+            try:
+                profile = command["inputs"].get("synth_profile")
+                current = observe(
+                    Path(selection["root"]),
+                    Path(selection["python"]),
+                    synth_profile=Path(profile) if profile else None,
+                )
+            except (OSError, ValueError) as exc:
+                raise SpecError(f"selected Model2MLIR runtime is unavailable: {exc}") from exc
+            if current != selection:
+                raise SpecError("selected Model2MLIR runtime changed before freezing")
         entrypoint, expected = _phase0_source_inputs()
         if command["env"].get("PYTHONSAFEPATH") != "1" or command["env"].get("PYTHONPATH", "").split(os.pathsep)[
             0
@@ -168,6 +183,7 @@ _PHASE0_OPTIONAL_INPUTS = frozenset(
         "smt_profile",
         "hidden_profile",
         "software_spec",
+        "capability_contract",
         "hardware_spec",
         "rtl_facts",
     }
@@ -365,11 +381,22 @@ def _phase1_operator_inputs(command: dict) -> dict[str, str | None]:
             raise SpecError(f"bundle {kind} must contain explicit path records")
         for index, row in enumerate(rows):
             paths[f"{kind}:{index}"] = resolve_grant(row["path"], root)
+    chipyard_timing = False
+    if descriptor.is_file():
+        from merlin.targetgen.target_experiment import declared_vs_resolved_contract, load_target_experiment
+
+        selected = load_target_experiment(descriptor)
+        if selected.sim_via == "chipyard":
+            chipyard_timing = True
+            _, contract_path, agreement = declared_vs_resolved_contract(selected)
+            if agreement != "agree" or contract_path is None:
+                raise SpecError(f"selected Phase 1 target contract is not agreed and resolvable: {agreement}")
+            paths["target_contract"] = contract_path
     result = {"phase1:operator:" + name: str(path.resolve()) for name, path in paths.items()}
     target = document.get("target", "")
     for name, path in {
         "task": declared_task_root(document, root=root) or resources / "task",
-        "timing:target": resources / "scripts" / f".oracle_timing.{target}.json",
+        "timing:target": (resources if chipyard_timing else resources / "scripts") / f".oracle_timing.{target}.json",
         "timing:legacy": resources / "scripts/.oracle_timing.json",
         "environment": resources / "experiment.env",
     }.items():
@@ -386,10 +413,13 @@ def resolve_plan(
     corpus_seal: Path | None = None,
     bundle_manifest: Path | None = None,
     phase0_conformance_spec: Path | None = None,
+    phase0_capability_contract: Path | None = None,
     phase0_synth_profile: Path | None = None,
     phase0_hidden_profile: Path | None = None,
     phase0_rtl_facts: Path | None = None,
     phase0_evidence_mode: str | None = None,
+    phase0_m2m_root: Path | None = None,
+    phase0_m2m_python: Path | None = None,
 ) -> dict:
     from merlin.common.paths import out_dir, repo_root
 
@@ -405,15 +435,20 @@ def resolve_plan(
         raise SpecError("select both --corpus-seal and --bundle-manifest for a new reviewed Phase 1 run")
     if (phase0_conformance_spec is None) != (phase0_synth_profile is None):
         raise SpecError("select both --phase0-conformance-spec and --phase0-synth-profile")
+    if (phase0_m2m_root is None) != (phase0_m2m_python is None):
+        raise SpecError("select both --phase0-m2m-root and --phase0-m2m-python")
     if (
         any(
             path is not None
             for path in (
                 phase0_conformance_spec,
+                phase0_capability_contract,
                 phase0_synth_profile,
                 phase0_hidden_profile,
                 phase0_rtl_facts,
                 phase0_evidence_mode,
+                phase0_m2m_root,
+                phase0_m2m_python,
             )
         )
         and phase != "0"
@@ -422,6 +457,7 @@ def resolve_plan(
     phase0_selection = {}
     for name, path in (
         ("conformance_spec", phase0_conformance_spec),
+        ("capability_contract", phase0_capability_contract),
         ("synth_profile", phase0_synth_profile),
         ("hidden_profile", phase0_hidden_profile),
         ("rtl_facts", phase0_rtl_facts),
@@ -436,6 +472,9 @@ def resolve_plan(
         if phase0_evidence_mode not in ("diagnostic", "verified"):
             raise SpecError("Phase 0 evidence mode must be diagnostic or verified")
         phase0_selection["evidence_mode"] = phase0_evidence_mode
+    for name, path in (("m2m_root", phase0_m2m_root), ("m2m_python", phase0_m2m_python)):
+        if path is not None:
+            phase0_selection[name] = str(path.expanduser().absolute())
     commands = {}
     corpus_closures = {}
     phase1_operator_inputs = None
@@ -468,6 +507,24 @@ def resolve_plan(
                 config["bundle"] = read_yaml(selected_bundle).get("bundle_id")
             adapter.validate(config)
         command = adapter.resolve(spec, config, root, destination)
+        if adapter.name == "capsule_derivation" and command.get("phase0_m2m_selection"):
+            if not command["inputs"].get("software_spec"):
+                raise SpecError("selected Model2MLIR capture requires explicit Phase 0 software evidence")
+            if config.get("evidence_mode") != "diagnostic":
+                raise SpecError("live Model2MLIR capture runtime is diagnostic only; select diagnostic evidence mode")
+            from .phase0.m2m_runtime import observe
+
+            choice = command["phase0_m2m_selection"]
+            try:
+                profile = command["inputs"].get("synth_profile")
+                command["phase0_m2m_selection"] = observe(
+                    Path(choice["m2m_root"]),
+                    Path(choice["m2m_python"]),
+                    synth_profile=Path(profile) if profile else None,
+                )
+                command["input_owner_roots"].append(command["phase0_m2m_selection"]["base"])
+            except (OSError, ValueError) as exc:
+                raise SpecError(f"invalid selected Model2MLIR runtime: {exc}") from exc
         commands[number] = command
         inputs[f"phase{number}:entrypoint"] = command["entrypoint"]
         for name, value in command["inputs"].items():
@@ -574,6 +631,22 @@ def preflight(plan: dict) -> dict:
         _verify_corpus_closures(plan)
         _verify_phase0_sources(plan)
         _verify_phase1_sources(plan)
+        from .phase1.timing import read_verified_timing, requires_chipyard_timing
+
+        for command in plan["phases"].values():
+            if (
+                command.get("module") == PHASE1_MODULE
+                and "--no-oracle" not in command["argv"]
+                and requires_chipyard_timing(Path(command["inputs"]["descriptor"]))
+            ):
+                try:
+                    read_verified_timing(
+                        Path(command["inputs"]["oracle_timing"]),
+                        descriptor=Path(command["inputs"]["descriptor"]),
+                        target=plan["target"],
+                    )
+                except ValueError as exc:
+                    raise SpecError(str(exc)) from exc
         from .measured_launch import verify_plan
 
         verify_plan(plan)
@@ -737,6 +810,161 @@ def _verify_inputs(plan: dict) -> None:
             raise SpecError(f"frozen input changed: {name} ({pin['path']}); create a new experiment definition/run")
 
 
+_PHASE1_COMPLETION_MEMBERS = (
+    "submission",
+    "run_manifest.yaml",
+    "qa_loop_summary.yaml",
+    "timing_detailed.json",
+)
+
+
+def _phase1_completion_inputs(command: dict) -> dict[str, dict[str, str]]:
+    """Bind the installed functional compiler and its final formal evidence.
+
+    The native run may also contain mutable workspaces and caches. Those are not
+    the compiler handed to Phase 2; pin the four final handoff members instead.
+    """
+    root = Path(command["engine_output"])
+    if root.resolve() != root or root.is_symlink():
+        raise SpecError("installed Phase 1 handoff output changed location")
+    result = {}
+    for name in _PHASE1_COMPLETION_MEMBERS:
+        path = root / name
+        if path.is_symlink() or not path.exists():
+            raise SpecError(f"installed Phase 1 completion member is missing or linked: {name}")
+        if name == "submission" and not path.is_dir():
+            raise SpecError("installed Phase 1 compiler submission is not a directory")
+        if name == "submission" and any(member.is_symlink() for member in path.rglob("*")):
+            raise SpecError("installed Phase 1 compiler submission contains linked members")
+        if name != "submission" and not path.is_file():
+            raise SpecError(f"installed Phase 1 completion member is not a file: {name}")
+        result[name] = {"path": str(path), "sha256": fingerprint(path)}
+    return result
+
+
+def _verify_completed_phase1(command: dict, attempt: dict) -> None:
+    expected = attempt.get("completion_inputs")
+    if not isinstance(expected, dict) or set(expected) != set(_PHASE1_COMPLETION_MEMBERS):
+        raise SpecError("completed installed Phase 1 lacks bound handoff outputs; create a new experiment run")
+    try:
+        observed = _phase1_completion_inputs(command)
+    except (OSError, SpecError) as exc:
+        raise SpecError(f"completed installed Phase 1 handoff changed: {exc}") from exc
+    if observed != expected:
+        raise SpecError("completed installed Phase 1 handoff bytes changed; create a new experiment run")
+
+
+def _installed_phase2_output(command: dict, attempt: dict) -> dict[str, dict[str, str]]:
+    """Bind terminal evidence without hashing mutable Phase 2 work areas."""
+    from merlin.benchharness import hash_tree
+
+    output = Path(attempt["engine_output"])
+    if output.is_symlink() or output.resolve() != output or not output.is_dir():
+        raise SpecError("completed installed Phase 2 output is absent, linked or moved")
+    expected = Path(command["engine_output"])
+    if command["resume_policy"] == "checkpoint_segment":
+        if output.parent != expected or not output.name.startswith("segment-"):
+            raise SpecError("completed portfolio segment is outside its frozen output root")
+    elif output != expected:
+        raise SpecError("completed installed Phase 2 output differs from its frozen selection")
+
+    def pin(name: str, path: Path, *, directory: bool = False) -> dict[str, str]:
+        if (
+            path.is_symlink()
+            or path.resolve() != path
+            or not path.is_relative_to(output)
+            or not (path.is_dir() if directory else path.is_file())
+        ):
+            raise SpecError(f"completed installed Phase 2 terminal member is absent or linked: {name}")
+        if directory and any(member.is_symlink() for member in path.rglob("*")):
+            raise SpecError(f"completed installed Phase 2 terminal tree contains a link: {name}")
+        return {"path": str(path), "sha256": fingerprint(path)}
+
+    if command["adapter"] == "measured_claims":
+        from .phase2.checkpoint_admission import SCHEMA
+
+        finals = sorted(output.glob("experiment_manifest.*.json"))
+        if len(finals) != 1:
+            raise SpecError("completed measured Phase 2 run needs one final experiment manifest")
+        manifest = finals[0]
+        final = pin("experiment_manifest", manifest)
+        if (
+            manifest.name != f"experiment_manifest.{final['sha256']}.json"
+            or (document := _read_json(manifest)).get("schema") != SCHEMA
+            or document.get("status") != "GO"
+        ):
+            raise SpecError("completed measured Phase 2 final manifest is not a content-addressed GO record")
+        return {"experiment_manifest": final}
+
+    if command["adapter"] != "model_portfolio":
+        raise SpecError("unsupported installed Phase 2 terminal output")
+    records = output / "global_iterations"
+    result = {
+        "host_resource_telemetry": pin("host_resource_telemetry", output / "host_resource_telemetry.json"),
+        "launch": pin("launch", output / "launch.json"),
+        "agent_sequence": pin("agent_sequence", records / "agent_sequence.json"),
+    }
+    telemetry = _read_json(Path(result["host_resource_telemetry"]["path"]))
+    if telemetry.get("status") != "completed" or telemetry.get("worker_returncode") != 0:
+        raise SpecError("completed portfolio segment lacks a successful worker telemetry receipt")
+    sequence = _read_json(Path(result["agent_sequence"]["path"]))
+    selected = sequence.get("last_good_checkpoint") or {}
+    if (
+        sequence.get("schema") != "global_agent_sequence_v1"
+        or sequence.get("status") != "budget_complete"
+        or not isinstance(selected, dict)
+        or not isinstance(selected.get("path"), str)
+        or not isinstance(selected.get("candidate_sha256"), str)
+        or type(sequence.get("promotion_ready")) is not bool
+    ):
+        raise SpecError("completed portfolio segment lacks a selected terminal checkpoint")
+    checkpoint = Path(selected["path"])
+    if not checkpoint.is_relative_to(records):
+        raise SpecError("completed portfolio checkpoint escapes its segment")
+    result["selected_checkpoint"] = pin("selected_checkpoint", checkpoint)
+    if result["selected_checkpoint"]["sha256"] != selected.get("sha256"):
+        raise SpecError("completed portfolio checkpoint differs from the sequence receipt")
+    final_checkpoint = _read_json(checkpoint)
+    candidate = Path(str(final_checkpoint.get("candidate_path") or ""))
+    if not candidate.is_relative_to(records):
+        raise SpecError("completed portfolio candidate escapes its segment")
+    result["selected_candidate"] = pin("selected_candidate", candidate, directory=True)
+    if (
+        final_checkpoint.get("candidate_sha256") != selected["candidate_sha256"]
+        or hash_tree(candidate)["sha256"] != selected["candidate_sha256"]
+    ):
+        raise SpecError("completed portfolio candidate differs from its selected checkpoint")
+    # A recovered round can leave a ready checkpoint without a final review
+    # seal. The worker writes global_candidate only for failure-free sequences.
+    if sequence["promotion_ready"] and not sequence.get("failures"):
+        ready = records / "global_candidate.json"
+        result["global_candidate"] = pin("global_candidate", ready)
+        ready_record = _read_json(ready)
+        ready_candidate = Path(str(ready_record.get("candidate_path") or ""))
+        if not ready_candidate.is_relative_to(records):
+            raise SpecError("completed portfolio review candidate escapes its segment")
+        result["global_candidate_snapshot"] = pin("global_candidate_snapshot", ready_candidate, directory=True)
+        if (
+            ready_record.get("schema") != "global_perf_candidate_v1"
+            or ready_record.get("candidate_sha256") != selected["candidate_sha256"]
+            or hash_tree(ready_candidate)["sha256"] != selected["candidate_sha256"]
+        ):
+            raise SpecError("completed portfolio review candidate differs from its selected checkpoint")
+    return result
+
+
+def _verify_completed_phase2(command: dict, attempt: dict) -> None:
+    expected = attempt.get("terminal_outputs")
+    if not isinstance(expected, dict) or not expected:
+        raise SpecError("completed installed Phase 2 lacks output identity; create a new experiment run")
+    try:
+        observed = _installed_phase2_output(command, attempt)
+    except (OSError, SpecError) as exc:
+        raise SpecError(f"completed installed Phase 2 output changed: {exc}") from exc
+    if observed != expected:
+        raise SpecError("completed installed Phase 2 terminal bytes changed; create a new experiment run")
+
+
 def _process_active(pid: int | None) -> bool:
     if pid is None:
         return False
@@ -846,9 +1074,42 @@ def _execute(root: Path, plan: dict, record: dict, *, checkpoint: Path | None = 
             if attempt["state"] == "running" and _process_active(attempt.get("pid")):
                 raise SpecError(f"previous engine process {attempt['pid']} is still running")
         _verify_inputs(plan)
+        if checkpoint is not None and not any(
+            command["resume_policy"] == "checkpoint_segment" for command in plan["phases"].values()
+        ):
+            raise SpecError("--checkpoint requires a checkpoint-segment experiment")
+        if checkpoint is not None and not any(
+            plan["phases"][attempt["phase"]]["resume_policy"] == "checkpoint_segment" for attempt in record["attempts"]
+        ):
+            raise SpecError("--checkpoint requires a prior portfolio segment")
+        for attempt in record["attempts"]:
+            pin = attempt.get("resume_checkpoint")
+            if pin is not None:
+                if (
+                    not isinstance(pin, dict)
+                    or not isinstance(pin.get("path"), str)
+                    or not isinstance(pin.get("sha256"), str)
+                ):
+                    raise SpecError("previous portfolio resume checkpoint identity is malformed")
+                try:
+                    observed = fingerprint(pin["path"])
+                except (OSError, SpecError) as exc:
+                    raise SpecError("previous portfolio resume checkpoint is unavailable or changed") from exc
+                if observed != pin["sha256"]:
+                    raise SpecError("previous portfolio resume checkpoint bytes changed")
+            command = plan["phases"][attempt["phase"]]
+            if (
+                attempt["state"] == "execution_succeeded"
+                and command["adapter"] in {"measured_claims", "model_portfolio"}
+                and command.get("module")
+            ):
+                _verify_completed_phase2(command, attempt)
         for number, command in plan["phases"].items():
             previous = [entry for entry in record["attempts"] if entry["phase"] == number]
-            if previous and previous[-1]["state"] == "execution_succeeded":
+            continue_segment = bool(
+                previous and command["resume_policy"] == "checkpoint_segment" and checkpoint is not None
+            )
+            if previous and previous[-1]["state"] == "execution_succeeded" and not continue_segment:
                 if command["adapter"] == "capsule_derivation":
                     expected = previous[-1].get("output_sha256")
                     try:
@@ -857,6 +1118,8 @@ def _execute(root: Path, plan: dict, record: dict, *, checkpoint: Path | None = 
                         raise SpecError("phase-0 output identity changed; create a new experiment run") from exc
                     if not expected or observed != expected:
                         raise SpecError("phase-0 output identity changed; create a new experiment run")
+                if command["adapter"] == "capsule_bench" and command.get("module") == PHASE1_MODULE:
+                    _verify_completed_phase1(command, previous[-1])
                 continue
             argv = list(command["argv"])
             checkpoint_pin = None
@@ -940,12 +1203,30 @@ def _execute(root: Path, plan: dict, record: dict, *, checkpoint: Path | None = 
             elif returncode == 0 and command["adapter"] == "capsule_bench":
                 try:
                     _verify_inputs(plan)
+                    if command.get("module") == PHASE1_MODULE:
+                        entry["completion_inputs"] = _phase1_completion_inputs(command)
                 except (OSError, SpecError) as exc:
                     entry.update(
                         returncode=1,
                         engine_returncode=0,
                         state="execution_failed",
-                        error=f"phase1 input identity changed during execution; engine evidence unchanged: {exc}",
+                        error=f"phase1 handoff identity not established; engine evidence unchanged: {exc}",
+                    )
+                    returncode = 1
+            elif (
+                returncode == 0
+                and command["adapter"] in {"measured_claims", "model_portfolio"}
+                and command.get("module")
+            ):
+                try:
+                    _verify_inputs(plan)
+                    entry["terminal_outputs"] = _installed_phase2_output(command, entry)
+                except (OSError, SpecError) as exc:
+                    entry.update(
+                        returncode=1,
+                        engine_returncode=0,
+                        state="execution_failed",
+                        error=f"phase2 output identity not established; engine evidence unchanged: {exc}",
                     )
                     returncode = 1
             record["state"] = entry["state"]

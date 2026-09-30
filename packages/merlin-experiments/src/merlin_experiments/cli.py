@@ -51,9 +51,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         child.add_argument("--phase0-rtl-facts", type=Path, help="select exact extracted facts for a new Phase 0 run")
         child.add_argument(
+            "--phase0-capability-contract",
+            type=Path,
+            help="select exact same-target capability contract for a new Phase 0 run",
+        )
+        child.add_argument(
             "--phase0-evidence-mode",
             choices=("diagnostic", "verified"),
             help="diagnostic preserves unknowns; verified refuses unresolved required evidence",
+        )
+        child.add_argument(
+            "--phase0-m2m-root", type=Path, help="explicit Model2MLIR source root for diagnostic capture"
+        )
+        child.add_argument(
+            "--phase0-m2m-python", type=Path, help="explicit Model2MLIR venv Python for diagnostic capture"
         )
     commands.add_parser("status").add_argument("run_dir", type=Path)
     commands.add_parser("lineage", help="read frozen phase inputs and handoffs without executing engines").add_argument(
@@ -70,6 +81,10 @@ def main(argv: list[str] | None = None) -> int:
     derive.add_argument("definition", help="explicit experiment definition or catalog id")
     derive.add_argument("--application-capture", action="append", required=True, metavar="LABEL=PATH")
     derive.add_argument(
+        "--application-capture-selection", action="append", default=[], metavar="LABEL=PATH@SHA256",
+        help="pre-execution selection for each selected capture; omitted legacy captures remain diagnostic",
+    )
+    derive.add_argument(
         "--native-qualification",
         action="append",
         default=[],
@@ -80,6 +95,20 @@ def main(argv: list[str] | None = None) -> int:
         "--rtl-facts", type=Path, required=True, help="exact extraction artifact; never re-extract implicitly"
     )
     derive.add_argument("--output", type=Path, required=True, help="new immutable artifact root")
+    capture = operations.add_parser("capture", help="preselect and issue one fresh sealed CPU capture")
+    capture_ops = capture.add_subparsers(dest="capture_operation", required=True)
+    select_capture = capture_ops.add_parser("select", help="freeze source/runtime/tool bytes before capture")
+    select_capture.add_argument("--m2m-root", type=Path, required=True)
+    select_capture.add_argument("--workload-root", type=Path, required=True)
+    select_capture.add_argument("--venv", type=Path, required=True)
+    select_capture.add_argument("--dtype", choices=("fp32", "int8"), default="fp32")
+    select_capture.add_argument("--recipe", type=Path)
+    select_capture.add_argument("--run-dir", type=Path, required=True)
+    select_capture.add_argument("--output", type=Path, required=True, help="fresh owner-only selection directory")
+    select_capture.add_argument("--bwrap", type=Path)
+    issue_capture = capture_ops.add_parser("issue", help="capture only from an exact preselected identity")
+    issue_capture.add_argument("--selection", type=Path, required=True)
+    issue_capture.add_argument("--expected-sha256", required=True)
     from merlin.targetgen import group_capsules
 
     groups = operations.add_parser(
@@ -121,8 +150,34 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.verb == "corpus":
-            if args.operation == "derive":
-                from .phase0.requirements import capture_selections, derive
+            if args.operation == "capture":
+                from merlin.common.paths import module_source_path, schemas_dir
+
+                from .phase0 import capture_selection
+
+                try:
+                    if args.capture_operation == "select":
+                        result = capture_selection.select(
+                            m2m_root=args.m2m_root,
+                            workload_root=args.workload_root,
+                            worker=module_source_path("merlin").parent / "targetgen/_m2m_capture_worker.py",
+                            venv=args.venv,
+                            schemas_root=schemas_dir(),
+                            run_dir=args.run_dir,
+                            output_dir=args.output,
+                            dtype=args.dtype,
+                            recipe=args.recipe,
+                            bwrap_binary=args.bwrap,
+                        )
+                    else:
+                        receipt = capture_selection.issue(args.selection, expected_sha256=args.expected_sha256)
+                        result = {"sealed_receipt": str(receipt), "phase0_admission": "not_granted"}
+                except ValueError as exc:
+                    raise SpecError(str(exc)) from exc
+                print(json.dumps(result, indent=2))
+                return 0
+            elif args.operation == "derive":
+                from .phase0.requirements import capture_selection_specs, capture_selections, derive
 
                 try:
                     result = derive(
@@ -131,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
                         rtl_facts=args.rtl_facts,
                         output_root=args.output,
                         native_qualifications=capture_selections(args.native_qualification),
+                        capture_preselections=capture_selection_specs(args.application_capture_selection),
                     )
                 except ValueError as exc:
                     raise SpecError(str(exc)) from exc
@@ -207,10 +263,13 @@ def main(argv: list[str] | None = None) -> int:
                 corpus_seal=args.corpus_seal,
                 bundle_manifest=args.bundle_manifest,
                 phase0_conformance_spec=args.phase0_conformance_spec,
+                phase0_capability_contract=args.phase0_capability_contract,
                 phase0_synth_profile=args.phase0_synth_profile,
                 phase0_rtl_facts=args.phase0_rtl_facts,
                 phase0_evidence_mode=args.phase0_evidence_mode,
                 phase0_hidden_profile=args.phase0_hidden_profile,
+                phase0_m2m_root=args.phase0_m2m_root,
+                phase0_m2m_python=args.phase0_m2m_python,
             )
             if args.verb == "inspect":
                 result = plan

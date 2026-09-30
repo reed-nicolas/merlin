@@ -100,7 +100,8 @@ def save(case):
     case.launch_path.write_text(json.dumps(case.launch))
 
 
-def test_installed_dispatch_is_bound_to_checkpoint_owners(case):
+def test_installed_dispatch_is_bound_to_checkpoint_owners(case, monkeypatch):
+    monkeypatch.setenv("MERLIN_BOARD_CATALOG", "/unsealed/board.yaml")
     dispatch = case.launch["checkpoint_verifier"]
     assert dispatch == {
         "schema": "merlin.portfolio-checkpoint-dispatch.v1",
@@ -116,6 +117,7 @@ def test_installed_dispatch_is_bound_to_checkpoint_owners(case):
     assert resolved.document == case.document
     assert resolved.argv == (sys.executable, "-m", MODULE, "--checkpoint", str(case.checkpoint))
     assert resolved.environment["PYTHONPATH"] == str(case.snapshot / "python")
+    assert "MERLIN_BOARD_CATALOG" not in resolved.environment
 
 
 @pytest.mark.parametrize("field", ["controller_source", "contract_root", "compiler_shared_source_root"])
@@ -190,7 +192,8 @@ def test_duplicate_sealed_module_owners_refuse(case):
         R.resolve(case.checkpoint)
 
 
-def test_historical_native_layout_is_explicit_and_preserves_archived_import(case):
+def test_historical_native_layout_is_explicit_and_preserves_archived_import(case, monkeypatch):
+    monkeypatch.setenv("MERLIN_BOARD_CATALOG", "/historical/selection")
     case.launch.pop("checkpoint_verifier")
     save(case)
     layout = R.NativeVerifierLayout(
@@ -204,6 +207,7 @@ def test_historical_native_layout_is_explicit_and_preserves_archived_import(case
     assert "G.consume_global_candidate" in resolved.argv[2]
     assert resolved.argv[-1] == str(case.checkpoint)
     assert resolved.document == case.document
+    assert resolved.environment["MERLIN_BOARD_CATALOG"] == "/historical/selection"
     case.controller.write_text("# altered historical verifier\n")
     with pytest.raises(ValueError, match="changed"):
         R.resolve(case.checkpoint, native_layout=layout)

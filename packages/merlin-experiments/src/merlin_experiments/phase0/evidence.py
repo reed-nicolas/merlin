@@ -29,6 +29,66 @@ def _canonical_digest(value: Any) -> str:
     return _digest(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode())
 
 
+def _existing_receipt_path(member: Mapping) -> Path | None:
+    path = member.get("path") if isinstance(member, Mapping) else None
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        return Path(path).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _same_selected_file(left: Mapping, right: Mapping) -> bool:
+    """Compare byte-bound file identities across equivalent symlink spellings."""
+    from merlin.common.digest import is_sha256
+
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    digest = left.get("sha256")
+    resolved = _existing_receipt_path(left)
+    return (
+        is_sha256(digest)
+        and digest == right.get("sha256")
+        and resolved is not None
+        and resolved == _existing_receipt_path(right)
+    )
+
+
+def _same_source_consistency(left: Mapping, right: Mapping) -> bool:
+    """Compare full receipts after resolving only their selected source paths."""
+
+    def resolved_sources(document: Mapping) -> dict | None:
+        if not isinstance(document, Mapping) or not isinstance(document.get("sources"), list):
+            return None
+        result = copy.deepcopy(document)
+        for source in result.get("sources", []):
+            resolved = _existing_receipt_path(source)
+            if resolved is None:
+                return None
+            source["path"] = str(resolved)
+        return result
+
+    normalized_left, normalized_right = resolved_sources(left), resolved_sources(right)
+    return normalized_left is not None and normalized_right is not None and normalized_left == normalized_right
+
+
+def _reference_inventory_root(role: str, root: Path, software_doc: Mapping) -> Path:
+    """Select the source package used by a declared numerical engine.
+
+    The SpecIR adapter imports ``root/specir``. Snapshotting the entire project
+    would also bind unrelated targets, builds and generated ``out`` artifacts;
+    those are not inputs to its pure reduction model.
+    """
+    model = (software_doc.get("numerical_semantics") or {}).get("model") or {}
+    if role == "numerical_model" and model.get("engine") == "specir_fp_reduce":
+        package = root / "specir"
+        if not (package / "__init__.py").is_file():
+            raise ValueError(f"selected SpecIR source package is absent: {package}")
+        return package
+    return root
+
+
 def _native_baseline_observations(selections, applications, observe) -> dict:
     """Select exact generated host checks, never generalize them into host admission."""
     import numpy as np
@@ -225,6 +285,7 @@ class EvidenceSelection:
     views_json: bytes
     raw_facts: bytes | None
     archived_artifacts: tuple[tuple[str, bytes], ...] = ()
+    instruction_semantics_source: bytes | None = None
 
     @property
     def source_paths(self) -> tuple[Path, ...]:
@@ -245,14 +306,16 @@ class EvidenceSelection:
         support = [source for source in self.source_snapshots if source.role == "support-source"]
         root = Path(os.path.commonpath([str(source.path.absolute().parent) for source in support])) if support else None
         support_rows = [
-            {"path": str(source.path.absolute().relative_to(root)), "sha256": source.sha256}
-            for source in support
+            {"path": str(source.path.absolute().relative_to(root)), "sha256": source.sha256} for source in support
         ]
         return {
             "contract_sha256": _digest(_json(self.contract)),
             "raw_facts_sha256": self.raw_facts_sha256,
             "readout_facets_sha256": _canonical_digest(self.readout_facets),
             "support_sources_sha256": _canonical_digest(sorted(support_rows, key=lambda row: row["path"])),
+            "instruction_semantics_sha256": (
+                _digest(self.instruction_semantics_source) if self.instruction_semantics_source is not None else None
+            ),
         }
 
     def __getattr__(self, name: str) -> Any:
@@ -268,6 +331,7 @@ def select_evidence(
     target: str,
     *,
     descriptor=None,
+    capability_contract_path=None,
     facts_path=None,
     hardware_spec=None,
     software_spec=None,
@@ -287,8 +351,8 @@ def select_evidence(
 
     sources: dict[Path, EvidenceSource] = {}
     diagnostics: list[dict[str, Any]] = []
-    excluded = {".git", "__pycache__", "build", ".venv"}
-    extensions = {".py", ".json", ".yaml", ".yml", ".h", ".hpp", ".cpp", ".c", ".inc", ".S"}
+    excluded = {".git", "__pycache__", "build", ".venv", "out"}
+    extensions = {".py", ".json", ".yaml", ".yml", ".mlir", ".h", ".hpp", ".cpp", ".c", ".inc", ".S"}
 
     def observe(path, role, *, required=False) -> bytes | None:
         path = Path(path).absolute()
@@ -427,7 +491,12 @@ def select_evidence(
     if "schema" in hardware_doc and hardware_doc["schema"] != "merlin.hardware_selection.v1":
         raise ValueError("unsupported hardware selection schema")
     software_doc = document(software_spec, "software-spec")
-    contract, residual, provider = {}, {}, None
+    contract = (
+        document(capability_contract_path, "target-contract", required=True)
+        if capability_contract_path is not None
+        else {}
+    )
+    residual, provider = {}, None
     try:
         provider = target_registry.resolve(target)
     except (KeyError, FileNotFoundError, ValueError) as exc:
@@ -436,9 +505,8 @@ def select_evidence(
         # Capability input selection is independent of executable support ownership.
         # The existing explicit contract selector must not be ignored merely because
         # support code was selected from an external provider.
-        contract = document(rtl_facts.target_contract_path(target), "target-contract", required=False)
-        if contract and contract.get("name") != target:
-            raise ValueError("selected backend capability contract differs from selected target")
+        if capability_contract_path is None:
+            contract = document(rtl_facts.target_contract_path(target), "target-contract", required=False)
         residual = document(provider.base / "contracts" / "residual.yaml", "residual", required=False)
         # Bind support code and its declarative/header dependencies before hooks
         # execute. This is an inventory, not a candidate grant or qualification.
@@ -449,6 +517,8 @@ def select_evidence(
                 and not excluded.intersection(path.relative_to(provider.base).parts)
             ):
                 observe(path, "support-source")
+    if contract and contract.get("name") != target:
+        raise ValueError("selected backend capability contract differs from selected target")
     datapath = {}
     if software_spec is not None:
         from merlin.targetgen.software_spec import (
@@ -467,11 +537,12 @@ def select_evidence(
                 diagnostics.append({"component": "numerical-model", "status": "unknown", "reason": str(exc)})
             for role, path in references.items():
                 if path.is_dir():
-                    for leaf in sorted(path.rglob("*")):
+                    inventory_root = _reference_inventory_root(role, path, software_doc)
+                    for leaf in sorted(inventory_root.rglob("*")):
                         if (
                             leaf.is_file()
                             and leaf.suffix in extensions
-                            and not excluded.intersection(leaf.relative_to(path).parts)
+                            and not excluded.intersection(leaf.relative_to(inventory_root).parts)
                         ):
                             observe(leaf, f"software-reference:{role}")
                 else:
@@ -494,6 +565,37 @@ def select_evidence(
         raise ValueError("selected RTL facts must contain a facts mapping")
     if not loaded_facts.get("facts"):
         diagnostics.append({"component": "facts", "status": "unknown", "reason": "no populated RTL facts selected"})
+    instruction_semantics_source = None
+    instruction_semantics = {
+        "schema": "merlin.instruction_semantics.v1",
+        "target": target,
+        "status": "UNKNOWN",
+        "unknowns": ["selected_target_contract_has_no_instruction_semantics_resource"],
+        "instructions": [],
+    }
+    instruction_resource = contract.get("instruction_semantics")
+    if instruction_resource is not None:
+        if provider is None or not isinstance(instruction_resource, str) or not instruction_resource.strip():
+            raise ValueError("instruction_semantics requires a selected support provider and relative resource")
+        from merlin.targetgen.instruction_semantics import normalize_instruction_semantics
+        from merlin.targetgen.providers import contained_resource
+
+        selected_instruction_path = contained_resource(provider.base, instruction_resource)
+        instruction_semantics_source = observe(selected_instruction_path, "instruction-semantics", required=True)
+        authored_instructions = yaml.safe_load(instruction_semantics_source)
+        instruction_semantics = normalize_instruction_semantics(
+            authored_instructions,
+            software_spec=software_doc,
+            rtl_facts=loaded_facts,
+            target=target,
+            source_bytes=instruction_semantics_source,
+            software_source_bytes=(
+                sources[Path(software_spec).absolute()].content
+                if software_spec is not None and not isinstance(software_spec, Mapping)
+                else None
+            ),
+            rtl_source_bytes=raw_facts,
+        )
     # Only explicit full paths identify actual RTL owners. Basenames and widths
     # are not enough to reconstruct provenance or declare numeric support.
     inputs = loaded_facts.get("inputs") or {}
@@ -575,6 +677,13 @@ def select_evidence(
                 isa_taxonomy.derive_isa_taxonomy(SimpleNamespace(target=target, isa_headers=headers), model_ext=model)
             )
         except Exception as exc:  # noqa: BLE001 -- absent ISA tooling is unknown evidence
+            taxonomy = {
+                "status": "unknown",
+                "by_class": {},
+                "by_mnemonic": {},
+                "asm_mnemonics": {},
+                "unknown": {"taxonomy": f"{type(exc).__name__}: {exc}"},
+            }
             diagnostics.append(
                 {"component": "isa-taxonomy", "status": "unknown", "reason": f"{type(exc).__name__}: {exc}"}
             )
@@ -671,7 +780,7 @@ def select_evidence(
                 if (
                     genericization.get("kind") != "circt_generic_serialization"
                     or genericization.get("returncode") != 0
-                    or source != production["sources"]["core_hw"]
+                    or not _same_selected_file(source, production["sources"]["core_hw"])
                     or output != {"path": inputs.get("generic_hw_path"), "sha256": inputs.get("generic_hw_sha256")}
                     or not isinstance(command, list)
                     or len(command) != 5
@@ -685,7 +794,7 @@ def select_evidence(
                     raise ValueError("CIRCT genericization source/output/tool binding differs")
                 consistency["genericization"] = copy.deepcopy(genericization)
                 consistency["sources"].append({"role": "core_hw_generic", **output})
-            if consistency != loaded_facts.get("source_consistency"):
+            if not _same_source_consistency(consistency, loaded_facts.get("source_consistency") or {}):
                 diagnostics.append(
                     {
                         "component": "source-consistency",
@@ -776,6 +885,10 @@ def select_evidence(
         "descriptor": descriptor_doc,
         "hardware_spec": hardware_doc,
         "software_spec": software_doc,
+        "instruction_semantics": instruction_semantics,
+        "instruction_semantics_source_sha256": (
+            _digest(instruction_semantics_source) if instruction_semantics_source is not None else None
+        ),
         "datapath": datapath,
         "application_inventory": application_inventory,
         "application_inventory_identity": inventory_identity,
@@ -812,7 +925,13 @@ def select_evidence(
             ],
         },
     }
-    return EvidenceSelection(target, tuple(sources.values()), _json(views), raw_facts)
+    return EvidenceSelection(
+        target,
+        tuple(sources.values()),
+        _json(views),
+        raw_facts,
+        instruction_semantics_source=instruction_semantics_source,
+    )
 
 
 def _coverage_readme(accounting: dict, quantization: dict) -> bytes:
@@ -848,6 +967,24 @@ def _coverage_readme(accounting: dict, quantization: dict) -> bytes:
         "| --- | ---: |",
     ]
     lines += [f"| {cell(name)} | {count} |" for name, count in overall["classification_counts"].items()]
+    operation_breakdown: dict[tuple[str, str], int] = {}
+    for application in accounting["applications"].values():
+        for signature in application["signatures"]:
+            key = (signature["classification"], signature["observed_signature"]["mlir_operation"])
+            operation_breakdown[key] = operation_breakdown.get(key, 0) + signature["count"]
+    lines += [
+        "",
+        "## Normalized-IR operations by partition",
+        "",
+        "These are static occurrences from the same digest-bound accounting, not new support claims.",
+        "",
+        "| Partition | MLIR operation | Occurrences |",
+        "| --- | --- | ---: |",
+    ]
+    for (partition, operation), count in sorted(
+        operation_breakdown.items(), key=lambda item: (item[0][0], -item[1], item[0][1])
+    ):
+        lines.append(f"| {cell(partition)} | {cell(operation)} | {count} |")
     lines += [
         "",
         "## Selected hardware declaration screen",
@@ -978,6 +1115,9 @@ def export_evidence(selection: EvidenceSelection, artifact_root: str | Path) -> 
         outputs[f"hardware/effective-views/{name}.json"] = _json(value)
     for name in ("contract", "residual", "hardware_spec", "software_spec", "datapath", "diagnostics"):
         outputs[f"software/{name.replace('_', '-')}.json"] = _json(getattr(selection, name))
+    outputs["software/instruction-semantics.json"] = _json(selection.instruction_semantics)
+    if selection.instruction_semantics_source is not None:
+        outputs["software/instruction-semantics-authored.yaml"] = selection.instruction_semantics_source
     from merlin.targetgen.operation_accounting import build_operation_accounting
     from merlin.targetgen.quantization_spec import build_quantization_contract, capture_recipe_candidates
 
@@ -1156,6 +1296,17 @@ def export_evidence(selection: EvidenceSelection, artifact_root: str | Path) -> 
                 *sorted(name for name in outputs if name.startswith("software/quantization-recipes/")),
                 "coverage/operation-accounting.json",
             ],
+            "instruction_selection": [
+                "software/software-spec.json",
+                "software/contract.json",
+                "software/instruction-semantics.json",
+                *(
+                    ["software/instruction-semantics-authored.yaml"]
+                    if selection.instruction_semantics_source is not None
+                    else []
+                ),
+                *(["hardware/circt/facts.json"] if selection.raw_facts is not None else []),
+            ],
         },
         "qualification": "byte snapshots and declared/derived views only; no compiler or hardware verdict",
     }
@@ -1226,6 +1377,7 @@ def load_exported_evidence(artifact_root: str | Path) -> EvidenceSelection:
         views,
         observed.get("hardware/circt/facts.json"),
         tuple(sorted({**observed, "evidence-manifest.json": manifest_raw}.items())),
+        observed.get("software/instruction-semantics-authored.yaml"),
     )
     if selection.raw_facts_sha256 != manifest.get("raw_facts_sha256"):
         raise ValueError("raw facts identity differs from evidence manifest")

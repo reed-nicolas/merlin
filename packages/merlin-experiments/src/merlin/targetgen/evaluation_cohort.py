@@ -144,31 +144,25 @@ def _declared_l2_engine(target: str) -> str:
     return engine
 
 
-def cyclotron_l2_engine_binding(target: str) -> dict[str, Any]:
-    """Resolve the exact Cyclotron executable/config identity used by the Muon L2 adapter."""
-    from merlin.runtime.backends.base import get_backend
+def selected_l2_engine_binding(target: str) -> dict[str, Any]:
+    """Bind the selected simulator's executable and config through its OOT adapter.
 
-    # Cyclotron is the ENGINE here; the target being EVALUATED is the `target` parameter, recorded
-    # as binding["target"] and checked by _validate_l2_engine_binding.
-    # target-ok rationale: cyclotron is that backend's simulator; the EVALUATED target is `target`.
-    backend = get_backend("muon")  # target-ok: engine backend, not the evaluated target
-    binary = backend.cyclotron_path().resolve()
-    # An explicit executable override may come from a different checkout than the timing tree.  Cite
-    # both honestly: the binary's source tree is inferred from its canonical Cargo output layout while
-    # config_tree is the directory the runtime actually links into each work directory.
-    source = binary.parent.parent.parent if binary.parent.name == "release" else backend.cyclotron_root()
-    binding = configured_executable_binding(
-        engine=_declared_l2_engine(target),
-        binary=binary,
-        source=source,
-        config=backend.config_path(),
-        config_tree=backend.cyclotron_root() / "config",
-    )
-    binding["target"] = target
-    binding["binding_sha256"] = _canonical_json_sha256(
-        {key: value for key, value in binding.items() if key != "binding_sha256"}
-    )
-    return binding
+    The callback owns which paths constitute the engine. Shared evaluation verifies
+    its record but never selects a provider from a target or resource-owner name.
+    """
+    from .oracle_policy import sim_oracle_caps
+
+    engine = _declared_l2_engine(target)
+    oracle = sim_oracle_caps(engine)
+    binding = getattr(oracle, "l2_binding", None)
+    if not callable(binding):
+        raise ValueError(f"{target!r}: selected L2 engine {engine!r} has no registered l2_binding")
+    return _validate_l2_engine_binding(binding(target), target=target)
+
+
+def cyclotron_l2_engine_binding(target: str) -> dict[str, Any]:
+    """Legacy adapter entry point; new verified workflows use the selected engine."""
+    return selected_l2_engine_binding(target)
 
 
 def _validate_l2_engine_binding(binding: Any, *, target: str) -> dict[str, Any]:
@@ -178,22 +172,22 @@ def _validate_l2_engine_binding(binding: Any, *, target: str) -> dict[str, Any]:
         or binding.get("engine") != _declared_l2_engine(target)
         or binding.get("target") != target
     ):
-        raise ValueError("search score has no valid Cyclotron L2 engine binding")
+        raise ValueError("search score has no valid selected L2 engine binding")
     expected_sha = binding.get("binding_sha256")
     unsigned = {key: value for key, value in binding.items() if key != "binding_sha256"}
     if _canonical_json_sha256(unsigned) != expected_sha:
-        raise ValueError("Cyclotron L2 engine binding record digest mismatch")
+        raise ValueError("L2 engine binding record digest mismatch")
     binary = binding.get("binary")
     config = binding.get("config")
     if not isinstance(binary, dict) or not isinstance(config, dict):
-        raise ValueError("Cyclotron L2 engine binding is malformed")
-    if _file_sha256(Path(str(binary.get("path", ""))), what="bound Cyclotron executable") != binary.get("sha256"):
-        raise ValueError("bound Cyclotron executable content digest mismatch")
-    if _file_sha256(Path(str(config.get("path", ""))), what="bound Cyclotron config") != config.get("sha256"):
-        raise ValueError("bound Cyclotron config content digest mismatch")
+        raise ValueError("L2 engine binding is malformed")
+    if _file_sha256(Path(str(binary.get("path", ""))), what="bound L2 executable") != binary.get("sha256"):
+        raise ValueError("bound L2 executable content digest mismatch")
+    if _file_sha256(Path(str(config.get("path", ""))), what="bound L2 config") != config.get("sha256"):
+        raise ValueError("bound L2 config content digest mismatch")
     tree = Path(str(config.get("tree", "")))
     if tree.is_symlink() or not tree.is_dir() or _tree_sha256(tree) != config.get("tree_sha256"):
-        raise ValueError("bound Cyclotron config tree content digest mismatch")
+        raise ValueError("bound L2 config tree content digest mismatch")
     return binding
 
 
@@ -233,7 +227,7 @@ def _search_source_records(te: TargetExperiment) -> list[dict[str, str]]:
 def _search_score_problems(score: Any, expected_names: list[str], *, target: str) -> list[str]:
     """Accept only an exact, non-vacuous L2 numeric pass from the self-check score schema.
 
-    Search deliberately stops at Cyclotron L2.  Successful self-check rows are compact: ``pass`` and
+    Search deliberately stops at its selected L2 engine. Successful self-check rows are compact: ``pass`` and
     ``barrier_status`` are the numeric verdict, while ``execution_digest`` binds the executed artifact.
     Failed rows retain the detailed ``numeric`` block.  Requiring a field that successful rows omit
     would make a genuine exact all-pass impossible to seal, so this validator follows that schema
@@ -333,11 +327,8 @@ def create_search_pass_seal(
     if problems:
         raise ValueError("search pass evidence rejected: " + "; ".join(problems))
     score_binding = score_doc["per_capsule"][0]["barrier_engine_binding"]
-    if score_binding != cyclotron_l2_engine_binding(te.target):
-        raise ValueError(
-            "search pass evidence rejected: measured Cyclotron executable/config identity differs "
-            "from the current L2 engine"
-        )
+    if score_binding != selected_l2_engine_binding(te.target):
+        raise ValueError("search pass evidence rejected: L2 engine bytes differ from selected engine")
     record = {
         "schema": "descriptor_search_pass_v3",
         "claim_scope": "admitted_search_covering_set_not_e2e_readiness",
@@ -414,9 +405,9 @@ def validate_search_pass_seal(
     score_binding = score_doc["per_capsule"][0]["barrier_engine_binding"]
     if record.get("l2_engine_binding") != score_binding:
         raise ValueError("search pass seal L2 engine differs from its hash-bound score evidence")
-    current_binding = cyclotron_l2_engine_binding(te.target)
+    current_binding = selected_l2_engine_binding(te.target)
     if score_binding != current_binding:
-        raise ValueError("sealed Cyclotron executable/config identity differs from the current engine")
+        raise ValueError("sealed L2 executable/config identity differs from the current engine")
     return {**record, "seal": str(path.resolve()), "seal_sha256": seal_sha256}
 
 

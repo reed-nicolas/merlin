@@ -64,12 +64,22 @@ def test_a_cheating_proposal_is_refused_before_anything_is_built():
 
 def test_a_model_name_in_a_compiler_pass_is_a_cheat():
     """A pass that names a model is overfit by construction -- the loop exists because a lever found on
-    one model must transfer. The token list is DERIVED from the captures on disk, not hardcoded."""
+    one model must transfer. The token list comes from packaged source data, not captures on disk."""
     v = ps.gate(_proposal("if model == 'small_llama': coeffs = TUNED"), _action(), **_ok_kwargs())
     assert not v.accepted and v.stage == "cheat"
     assert any(t.startswith("model:") for t in v.detail["tokens"])
     # ...and the derivation covers captures without this file being edited
     assert "bitvla" in ps.model_name_tokens()
+
+
+def test_default_cheat_scan_still_uses_roster_without_capture_discovery(monkeypatch):
+    from merlin.capture import models
+
+    def fail_discovery():
+        raise AssertionError("capture discovery must not be needed for the anti-overfit gate")
+
+    monkeypatch.setattr(models, "discover_model_captures", fail_discovery)
+    assert "model:bitvla" in ps.scan_cheats("if model == 'bitvla': pass")
 
 
 def test_asserting_its_own_verdict_is_a_cheat():

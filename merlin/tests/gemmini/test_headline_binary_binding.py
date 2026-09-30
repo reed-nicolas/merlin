@@ -18,7 +18,7 @@ def _write(path, value):
 
 
 def test_saved_headline_binding_refuses_changed_console_or_facts(tmp_path, monkeypatch):
-    monkeypatch.syspath_prepend(str(repo_root() / "examples/gemmini/target"))
+    monkeypatch.syspath_prepend(str(repo_root() / "examples/gemmini/verification"))
     from bind_native_simulator import checked_headline_artifacts
 
     root = tmp_path / "headline"

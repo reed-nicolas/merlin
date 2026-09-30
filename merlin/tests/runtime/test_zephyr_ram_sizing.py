@@ -8,18 +8,23 @@ parameters — the case that motivated measuring the peak instead of assuming it
 
 from merlin.common.mlir_query import activation_peak_bytes
 from merlin.common.paths import repo_root
-from merlin.runtime.backends.zephyr_model import DEFAULT_RAM_BYTES, _ram_for_weights
+from merlin.runtime.backends.zephyr_model import _ram_for_weights
 
 MB = 1024 * 1024
+DEFAULT_RAM_BYTES = 256 * MB  # selected example port's device-tree default
+
+
+def _sized(weights, peak=None):
+    return _ram_for_weights(weights, peak, default_ram_bytes=DEFAULT_RAM_BYTES)
 
 
 def test_measured_activations_never_shrink_the_region():
     """Passing a peak may only GROW the region: no image that boots today may get less RAM."""
     for weights_mb in (1, 16, 128, 512, 2048):
         w = weights_mb * MB
-        base = _ram_for_weights(w)
+        base = _sized(w)
         for peak_mb in (0, 1, 64, 256, 4096):
-            assert _ram_for_weights(w, peak_mb * MB) >= base
+            assert _sized(w, peak_mb * MB) >= base
 
 
 def test_a_big_working_set_grows_the_region_past_the_weight_scaled_guess():
@@ -29,8 +34,8 @@ def test_a_big_working_set_grows_the_region_past_the_weight_scaled_guess():
     leaving a 163 MB arena for a 210 MB peak — an allocation failure on a board with enough DRAM.
     """
     w, peak = 117 * MB, 210 * MB
-    assert _ram_for_weights(w) < w + peak
-    assert _ram_for_weights(w, peak) >= w + peak
+    assert _sized(w) < w + peak
+    assert _sized(w, peak) >= w + peak
 
 
 def test_a_small_working_set_leaves_the_default_region_alone():
@@ -40,13 +45,13 @@ def test_a_small_working_set_leaves_the_default_region_alone():
     region for a model that does not need it is a regression, not a safety margin.
     """
     for weights_mb, peak_mb in ((1, 13), (7, 12), (11, 4)):
-        assert _ram_for_weights(weights_mb * MB, peak_mb * MB) == DEFAULT_RAM_BYTES
+        assert _sized(weights_mb * MB, peak_mb * MB) == DEFAULT_RAM_BYTES
 
 
 def test_an_unmeasurable_peak_falls_back_to_the_weight_scaled_size():
     """``activation_peak_bytes`` returns None on IR it cannot measure; sizing must not break."""
     w = 64 * MB
-    assert _ram_for_weights(w, None) == _ram_for_weights(w)
+    assert _sized(w, None) == _sized(w)
 
 
 def test_peak_is_measured_from_a_real_bundle_when_one_is_present():

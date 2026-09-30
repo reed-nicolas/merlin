@@ -158,7 +158,13 @@ def certify_rvv(
 
     # K2 — build
     try:
-        build = apply_rvv_package(pkg, model_dir, gen, board="spike_riscv64", harts=harts, arena_mb=64)
+        from ..runtime.boards import BOARDS
+
+        simulator_boards = [name for name, desc in BOARDS.items() if desc.simulator == "spike"]
+        if len(simulator_boards) != 1:
+            raise ValueError("select a board catalog with exactly one Spike simulator descriptor")
+        sim_board = BOARDS[simulator_boards[0]]
+        build = apply_rvv_package(pkg, model_dir, gen, board=sim_board.name, harts=harts, arena_mb=64)
         model_o = gen / "model.o"
         ladder["K2"] = "pass"
     except Exception as e:
@@ -198,7 +204,10 @@ def certify_rvv(
     refs = _load_references(model_dir)
     if "spike" in targets:
         try:
-            run = zm.run_on_spike(build["elf"], harts=harts, mem_bytes=build.get("ram_bytes", 1 << 31), timeout=timeout)
+            run = zm.run_on_spike(
+                build["elf"], dram_base=sim_board.dram_base, harts=harts,
+                mem_bytes=build["ram_bytes"], timeout=timeout,
+            )
             gate = zm._gate(run["prefix"], refs) if refs else {"ok": None}
             rec["correctness"] = {
                 "gate_ok": gate.get("ok"),

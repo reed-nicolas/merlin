@@ -1337,16 +1337,37 @@ def test_oracles_endtoend():
             f"barrier={cv.get('barrier_tier')}/{cv.get('barrier_status')}",
         )
         if l3:
-            (SCRIPTS / ".oracle_timing.json").write_text(
-                _json.dumps(
-                    {
-                        "verilator_per_capsule_s": round(dt, 1),
-                        "config": "GemminiRocketConfig",
-                        "measured_by": "readiness_check",
-                    }
+            from merlin_experiments.phase1.timing import timing_path
+
+            from merlin.common.digest import sha256_file
+            from merlin.targetgen.target_experiment import declared_vs_resolved_contract, load_capability_manifest
+
+            _, contract_path, agreement = declared_vs_resolved_contract(_TE)
+            config = (
+                (load_capability_manifest(TARGET, contract_path=contract_path).contract.get("runtime") or {}).get(
+                    "rtl_sim_config"
                 )
+                if agreement == "agree" and contract_path is not None
+                else None
             )
-            _ok("wrote .oracle_timing.json (T_obs for the driver timeout)", True, f"T_obs={dt:.0f}s")
+            sim = _cy / "sims" / "verilator" / f"simulator-chipyard.harness-{config}" if config else None
+            if not isinstance(config, str) or not config.strip() or sim is None or not sim.is_file():
+                _ok("target-bound oracle timing record", False, "declared RTL sim config/binary unavailable")
+            else:
+                selected = timing_path(EXP, TARGET)
+                selected.write_text(
+                    _json.dumps(
+                        {
+                            "target": TARGET,
+                            "config": config,
+                            "verilator_per_capsule_s": round(dt, 1),
+                            "simulator_sha256": sha256_file(sim),
+                            "measured_by": "readiness_check",
+                        },
+                        sort_keys=True,
+                    ) + "\n"
+                )
+                _ok("wrote target-bound oracle timing record", True, f"{selected} T_obs={dt:.0f}s")
         # WHICH ENGINE WOULD CERTIFY, AND WHAT IT WAS CHOSEN OVER — reported, never gated.
         #
         # Gating would be wrong: any elaborated-RTL engine is a valid L3, so a target with only Verilator

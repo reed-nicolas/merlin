@@ -50,7 +50,7 @@ def test_a_new_isa_family_is_one_data_file(feature_dir):
 
 
 def test_target_feature_contract_requires_explicit_selection():
-    path = repo_root() / "examples/gemmini/target/feature-extraction.yaml"
+    path = repo_root() / "examples/gemmini/kernel-mining/feature-extraction.yaml"
     assert M.target_family("gemmini") == "generic"
     assert FC.load_feature_contract("gemmini") == {}
     assert "weight_stationary_dataflow" not in M.fired_markers("replace_gemmini_calls()", "exo_schedule")
@@ -74,7 +74,7 @@ def test_selected_target_mining_index_extract_audit(tmp_path):
     (kernels / "kernel_abcd.c").write_bytes(
         (merlin_dir() / "tests/data/kernels/autocomp_gemmini_matmul.c").read_bytes()
     )
-    selected = repo_root() / "examples/gemmini/target/feature-extraction.yaml"
+    selected = repo_root() / "examples/gemmini/kernel-mining/feature-extraction.yaml"
     bare_index = tmp_path / "bare.json"
     selected_index = tmp_path / "selected.json"
     common = ["--source", "autocomp", "--repo", str(source), "--target", "gemmini"]
@@ -88,7 +88,7 @@ def test_selected_target_mining_index_extract_audit(tmp_path):
     assert "dispatch_metrics" not in bare["records"][0]["features"]
     assert chosen["records"][0]["features"]["dispatch_metrics"]["n_dispatches"] > 0
     assert chosen["feature_contract"]["sha256"]
-    caller = repo_root() / "examples/gemmini/target/autocomp-framework.yaml"
+    caller = repo_root() / "examples/gemmini/kernel-mining/autocomp-framework.yaml"
     default_index = tmp_path / "declared-default.json"
     assert (
         index_main(
@@ -134,8 +134,8 @@ def test_selected_caller_contract_reaches_dossier_and_trace():
     from merlin.kernels.trace import expert_steps_from_contract
     from merlin.kernels.types import NormalizedKernel
 
-    caller = repo_root() / "examples/gemmini/target/autocomp-framework.yaml"
-    feature = repo_root() / "examples/gemmini/target/feature-extraction.yaml"
+    caller = repo_root() / "examples/gemmini/kernel-mining/autocomp-framework.yaml"
+    feature = repo_root() / "examples/gemmini/kernel-mining/feature-extraction.yaml"
     kernel = NormalizedKernel(
         source="autocomp", target="gemmini", path="k.c", op="matmul", dtype="i8", raw_text="compute_preloaded();"
     )

@@ -51,16 +51,13 @@ CHEAT_TOKENS: tuple[str, ...] = (
 
 
 #: A pass that names a MODEL is overfit by construction: the whole point of the loop is that a lever
-#: found on one model transfers. Checked against the corpus's own model list rather than a literal set,
-#: so a new capture is covered without editing this file.
+#: found on one model transfers. Checked against the source-owned workload roster, which remains
+#: available in an installed core even when the capture corpus is absent.
 def model_name_tokens() -> tuple[str, ...]:
-    """Model names the proposal must not mention, derived from the captures actually on disk."""
-    try:
-        from ..capture import bundle as _b
+    """Roster names the proposal must not mention; fail closed if the roster is unavailable."""
+    from ..capture import bundle as _b
 
-        return tuple(sorted(_b.known_models()))
-    except Exception:  # noqa: BLE001 - a fresh checkout with no registry still gates on CHEAT_TOKENS
-        return ()
+    return tuple(_b.known_models())
 
 
 @dataclass

@@ -1,13 +1,15 @@
 # Authored target inputs
 
-`descriptor.yaml` is the single source for this example's target setup and experiment
-policy. Its explicit `resources_root` retains harness/bundle locations during
-migration; `task_root` selects public prompts in `../phase1/task`. Do not copy
-private bundles or generated capsules here.
+`descriptor.yaml` selects experiment resources and workload policy; the other
+YAML files in this directory own software semantics, hardware selection,
+candidate host capabilities, and evidence vocabulary. Its explicit
+`resources_root` retains harness/bundle locations during migration;
+`task_root` selects public prompts in `../phase1/task`. Do not copy private
+bundles or generated capsules here.
 Generated releases remain under the configured artifact root. Historical receipts
 retain their original paths; the legacy descriptor path is only a compatibility link.
 
-`contracts/` owns public prototype capability declarations and derivation residuals;
+`contracts/` owns the public prototype selected contract and its derivation residual;
 `evidence_concepts.yaml` owns the evidence vocabulary. These inputs contain no
 runtime backend or private oracle implementation. Shared metadata discovery is
 layout-based; runtime support still requires explicit selection of the OOT provider.

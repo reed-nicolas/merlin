@@ -56,6 +56,7 @@ def _frozen_bundle_double(monkeypatch):
 def _descriptor_pinned_host_lane(monkeypatch):
     """These tests isolate capstone verdict logic from the independently tested host-lane resolver."""
     from merlin.targetgen import capsule_runner as CR
+    monkeypatch.setattr(CR, "_resolve_model_numeric_policy", lambda target: (None, None))
     monkeypatch.setattr(CR, "_resolve_model_host_lane", lambda target, dtype: (
         None, repo_root() / "frozen-test-host", {
             "package_sha256": "a" * 64,
@@ -286,6 +287,7 @@ def _grade_with(mesh_exec: dict, declared=("L0", "L1", "L2", "L3"), *, on_mesh=1
                "required_oracle_tiers": list(declared),
                "semantic": {"semantic_family": "contraction", "must_accelerate": True}}
     out = {"status": "verified", "verify": {"gate_ok": True},
+           "placement_census": _DEFAULT_PLACEMENT_CENSUS,
            "mesh_tile_verification": mesh_exec,
            "mesh_execution": {"target": "gemmini", "matmul_layers_routed": on_mesh + fallback,
                               "matmul_layers_on_mesh": on_mesh,
@@ -309,7 +311,7 @@ def test_a_tier_passes_when_every_tile_passed():
     assert r["status"] == "pass", r
 
 
-def test_model_tier_preserves_aggregate_rtl_provenance_and_dynamic_cycles():
+def test_model_tier_does_not_invent_cycles_from_dispatch_ledger():
     oracle = {"result": "pass", "derived_from_rtl": True,
               "cycle_accurate": True, "cycles": 569}
     ledger = [
@@ -318,52 +320,32 @@ def test_model_tier_preserves_aggregate_rtl_provenance_and_dynamic_cycles():
         {"ordinal": 1, "symbol": "layer1", "lane": "on_mesh", "status": "pass",
          "oracle_evidence": dict(oracle)},
     ]
-    tiles = {
-        "n_tiles": 2, "n_passed": 2, "n_failed": 0,
-        "n_unavailable": 0, "n_unsynthesizable": 0,
-        "per_tile": [
-            {"status": "pass", "derived_from_rtl": True, "cycle_accurate": True, "cycles": 569},
-            {"status": "pass", "derived_from_rtl": True, "cycle_accurate": True, "cycles": 569},
-        ],
-    }
-
     from merlin.targetgen import capsule_runner as CR
 
     model_exec = {"matmul_layers_on_mesh": 2, "matmul_layers_host_fallback": 0,
                   "dispatch_ledger": ledger}
-    l3 = CR._model_tier_map(["L0", "L1", "L2", "L3"], "gemmini",
-                            model_exec, tiles)["L3"].to_dict()
+    l3 = CR._model_tier_map(["L0", "L1", "L2", "L3"], "gemmini", model_exec)["L3"].to_dict()
 
     assert l3["status"] == "pass"
-    assert l3["derived_from_rtl"] is True
-    assert l3["cycle_accurate"] is True
-    assert l3["cycles"] == 1138, "synthetic tile cycles must not be double-counted"
-    assert l3["evidence"] == (
-        "mesh_execution.dispatch_ledger + mesh_tile_verification.per_tile"
-    )
+    assert l3["cycles"] is None, "per-call cycles are not a measured model total"
+    assert not l3["cycle_accurate"]
 
 
-def test_model_tier_fidelity_fails_closed_when_any_contributor_omits_it():
+def test_model_tier_fidelity_is_not_inferred_from_dispatch_ledger():
     ledger = [
         {"ordinal": 0, "symbol": "layer0", "lane": "on_mesh", "status": "pass",
          "oracle_evidence": {"result": "pass", "derived_from_rtl": True,
                              "cycle_accurate": True, "cycles": 7}},
     ]
-    tiles = {
-        "n_tiles": 1, "n_passed": 1, "n_failed": 0,
-        "n_unavailable": 0, "n_unsynthesizable": 0,
-        "per_tile": [{"status": "pass", "derived_from_rtl": True}],
-    }
-
     from merlin.targetgen import capsule_runner as CR
 
     model_exec = {"matmul_layers_on_mesh": 1, "matmul_layers_host_fallback": 0,
                   "dispatch_ledger": ledger}
-    l3 = CR._model_tier_map(["L0", "L1", "L2", "L3"], "gemmini",
-                            model_exec, tiles)["L3"].to_dict()
+    l3 = CR._model_tier_map(["L0", "L1", "L2", "L3"], "gemmini", model_exec)["L3"].to_dict()
 
-    assert l3["derived_from_rtl"] is True
-    assert l3["cycle_accurate"] is False
+    assert l3["status"] == "pass"
+    assert not l3["derived_from_rtl"]
+    assert not l3["cycle_accurate"]
 
 
 def test_a_tier_that_ran_and_failed_is_not_a_pass():
@@ -417,12 +399,16 @@ def _model_capsule(tmp_path, **semantic):
     return cap
 
 
-def _fake_compile(monkeypatch, *, on_mesh, fallback, tiles_pass=15):
+_DEFAULT_PLACEMENT_CENSUS = {"silent_fallbacks_status": "offloaded", "silent_fallbacks": []}
+
+
+def _fake_compile(monkeypatch, *, on_mesh, fallback, tiles_pass=15, placement_census=_DEFAULT_PLACEMENT_CENSUS):
     """A compile_model whose MODEL ran `on_mesh` layers on the accelerator while its synthesized TILE
     certification is perfect — the exact shape that used to read as a pass."""
     def _cm(*a, **k):
         return {"status": "verified",
                 "verify": {"gate_ok": True, "fp32_cos": 1.0, "ok": True},
+                "placement_census": placement_census,
                 "mesh_execution": {"target": k.get("target"), "matmul_layers_routed": on_mesh + fallback,
                                    "matmul_layers_on_mesh": on_mesh,
                                    "matmul_layers_host_fallback": fallback},
@@ -457,6 +443,48 @@ def test_a_partial_fallback_is_also_a_failure(tmp_path, monkeypatch):
     res = _grade_model_capsule(cap, target="probe_target", timeout=1)
     assert res["status"] == "fail", res
     assert res["failure"]["category"] == "FALLBACK_ON_ELIGIBLE_REGION"
+
+
+def test_unmatched_eligible_model_region_cannot_hide_behind_matmul_execution(tmp_path, monkeypatch):
+    """A model's matmuls can all run on mesh while another eligible op stays on host."""
+    from merlin.targetgen.capsule_runner import _grade_model_capsule
+
+    _fake_compile(
+        monkeypatch,
+        on_mesh=15,
+        fallback=0,
+        placement_census={"silent_fallbacks_status": "offloaded", "silent_fallbacks": ["residual_add"]},
+    )
+    cap = _model_capsule(tmp_path, must_accelerate=True, eligible="auto", semantic_family="contraction")
+    res = _grade_model_capsule(cap, target="probe_target", timeout=1)
+    assert res["status"] == "fail", res
+    assert res["failure"]["category"] == "FALLBACK_ON_ELIGIBLE_REGION"
+    assert "residual_add" in res["failure"]["detail"]
+
+
+def test_undecided_whole_module_placement_is_not_a_pass(tmp_path, monkeypatch):
+    from merlin.targetgen.capsule_runner import _grade_model_capsule
+
+    _fake_compile(
+        monkeypatch,
+        on_mesh=15,
+        fallback=0,
+        placement_census={"silent_fallbacks_status": "incomplete", "silent_fallbacks": []},
+    )
+    cap = _model_capsule(tmp_path, must_accelerate=True, eligible="auto", semantic_family="contraction")
+    res = _grade_model_capsule(cap, target="probe_target", timeout=1)
+    assert res["status"] == "incomplete", res
+    assert res["failure"]["category"] == "PLACEMENT_NOT_MEASURED"
+
+
+def test_missing_whole_module_census_is_not_a_pass(tmp_path, monkeypatch):
+    from merlin.targetgen.capsule_runner import _grade_model_capsule
+
+    _fake_compile(monkeypatch, on_mesh=15, fallback=0, placement_census=None)
+    cap = _model_capsule(tmp_path, must_accelerate=True, eligible="auto", semantic_family="contraction")
+    res = _grade_model_capsule(cap, target="probe_target", timeout=1)
+    assert res["status"] == "incomplete", res
+    assert res["failure"]["category"] == "PLACEMENT_NOT_MEASURED"
 
 
 def test_a_model_fully_on_the_mesh_is_not_blocked(tmp_path, monkeypatch):

@@ -73,7 +73,7 @@ git clone --branch stable/gemmini_xdsl_rtl_v0 \
   https://github.com/ucb-bar/gemmini-mlir.git "$qual_root/compiler"
 test "$(git -C "$qual_root/compiler" rev-parse HEAD)" = \
   390623a67db81bcf595ec3805f0921f1fb69e378
-cp merlin/contract/examples/g0_matmul.interface.mlir "$qual_root/input.mlir"
+cp examples/gemmini/phase0/reference/g0_matmul.interface.mlir "$qual_root/input.mlir"
 (
   cd "$qual_root"
   env -i PATH=/usr/bin:/bin HOME=/tmp PYTHONDONTWRITEBYTECODE=1 \

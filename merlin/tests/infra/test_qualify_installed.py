@@ -86,10 +86,14 @@ def test_output_refuses_existing_even_empty_and_linked_ancestors(tmp_path):
 
 
 def test_environment_removes_source_and_provider_overrides(monkeypatch):
-    for key in ("PYTHONPATH", "PYTHONHOME", "MERLIN_TARGET_PATH", "AET_CONFIG", "CHIA_CONFIG"):
+    for key in (
+        "PYTHONPATH", "PYTHONHOME", "MERLIN_TARGET_PATH", "AET_CONFIG", "CHIA_CONFIG",
+        "UV_OVERRIDE", "UV_EXCLUDE", "UV_CONSTRAINT", "UV_BUILD_CONSTRAINT",
+    ):
         monkeypatch.setenv(key, "must not leak")
     environment = Q.clean_environment()
     assert not any(k.startswith(("PYTHON", "MERLIN", "AET_", "CHIA_")) for k in environment)
+    assert not {"UV_OVERRIDE", "UV_EXCLUDE", "UV_CONSTRAINT", "UV_BUILD_CONSTRAINT"} & environment.keys()
 
 
 def test_versions_and_assisted_extra_come_from_projects(tmp_path):

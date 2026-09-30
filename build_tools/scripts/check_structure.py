@@ -75,6 +75,7 @@ for _t in _discovered_targets():
 
 REQUIRED_SCHEMAS = [
     "target_contract",
+    "instruction_semantics",
     "dialect_plan",
     "kernel_record",
     "abstraction_candidate",

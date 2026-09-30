@@ -31,7 +31,7 @@ def test_memory_behavior_and_measured_reuse():
 def test_dispatch_metrics_present_for_gemmini():
     bare = _rec("autocomp_gemmini_matmul.c", "autocomp", "gemmini", "matmul", "i8")
     assert "dispatch_metrics" not in bare["features"]
-    with use_feature_contract(repo_root() / "examples/gemmini/target/feature-extraction.yaml"):
+    with use_feature_contract(repo_root() / "examples/gemmini/kernel-mining/feature-extraction.yaml"):
         r = _rec("autocomp_gemmini_matmul.c", "autocomp", "gemmini", "matmul", "i8")
     dm = r["features"]["dispatch_metrics"]
     assert dm["n_dispatches"] > 0
@@ -114,7 +114,7 @@ def test_exo_schedule_markers_fire():
         "gemmini = tile_outer_loops(gemmini)\n"
         "gemmini = replace_gemmini_calls(gemmini)\n"
     )
-    with use_feature_contract(repo_root() / "examples/gemmini/target/feature-extraction.yaml"):
+    with use_feature_contract(repo_root() / "examples/gemmini/kernel-mining/feature-extraction.yaml"):
         fired = fired_markers(sched, "exo_schedule")
     assert "accumulator_lifetime" in fired  # GEMM_ACCUM
     assert "packed_rhs" in fired  # GEMM_SCRATCH staging

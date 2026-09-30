@@ -17,6 +17,7 @@ would disagree -- which is exactly the state this work exists to end.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -48,6 +49,7 @@ class Routed:
     reduction: tuple[int, ...]
     dtypes: tuple[str, str, str]
     fqn: str = ""
+    operation_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,15 @@ class DeviceRewrite:
     signatures: dict[str, tuple[int, ...]] = field(default_factory=dict)
     #: (symbol-or-"all", reason). A decline is reported, never silent.
     skipped: tuple[tuple[str, str], ...] = ()
+    package_sha256: str | None = None
+    transport: str | None = None
+    abi_sha256: str | None = None
+    certification_sha256: tuple[str, ...] = ()
+    release_review_digest: str | None = None
+    software_spec_sha256: str | None = None
+    capability_contract_sha256: str | None = None
+    #: symbol -> exact Phase 0 interface bytes and hash, if selected by operation ID.
+    expected_interfaces: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @property
     def moved(self) -> int:
@@ -79,9 +90,18 @@ class DeviceRewrite:
                             "reduction": list(r.reduction),
                             "dtypes": list(r.dtypes),
                             "fqn": r.fqn,
+                            "operation_id": r.operation_id,
                         }
                         for r in self.routed
                     ],
+                    "package_sha256": self.package_sha256,
+                    "transport": self.transport,
+                    "abi_sha256": self.abi_sha256,
+                    "certification_sha256": list(self.certification_sha256),
+                    "release_review_digest": self.release_review_digest,
+                    "software_spec_sha256": self.software_spec_sha256,
+                    "capability_contract_sha256": self.capability_contract_sha256,
+                    "expected_interfaces": self.expected_interfaces,
                 },
                 indent=1,
             ),
@@ -149,7 +169,7 @@ def _signature_key(shape) -> tuple[int, ...]:
     return (*(int(d) for d in shape.parallel), int(shape.reduction[0]))
 
 
-def emit_device_program(module, device: str, *, select=None) -> list:
+def emit_device_program(module, device: str, *, select=None, selected_ops=None) -> list:
     """Record the offload as ``runtime`` dialect ops and return the contractions it claimed.
 
     Merlin owns a ``runtime`` dialect that says exactly this -- ``device.get``, a command buffer, an
@@ -169,7 +189,10 @@ def emit_device_program(module, device: str, *, select=None) -> list:
     from merlin.xdsl_dialects import runtime as r
     from merlin.xdsl_dialects._common import HAS_XDSL
 
-    chosen = [(op, sh) for op, sh in offloadable_contractions(module, device) if select is None or select(sh)]
+    chosen = [
+        (op, sh) for op, sh in offloadable_contractions(module, device)
+        if (op in selected_ops if selected_ops is not None else select is None or select(sh))
+    ]
     if not chosen or not HAS_XDSL:
         return chosen
 
@@ -237,7 +260,8 @@ def lower_device_submits(module, device: str, *, transport: str | None) -> int:
 
 
 def rewrite_contractions_to_device(
-    module, device: str, *, select: Callable[[Any], bool] | None = None, sidecar_dir: str | Path | None = None
+    module, device: str, *, select: Callable[[Any], bool] | None = None, sidecar_dir: str | Path | None = None,
+    exact_selection=None, model_sha256: str | None = None,
 ) -> DeviceRewrite:
     """Replace each SELECTED contraction with a call to ``device``'s kernel. Mutates ``module``.
 
@@ -251,11 +275,38 @@ def rewrite_contractions_to_device(
 
     from merlin.system.offload import device_dtype_triples, offloadable_contractions
 
-    if select is None:
+    if exact_selection is not None and select is not None:
+        raise ValueError("exact operation selection and a shape selector cannot both decide placement")
+    if exact_selection is not None and not exact_selection.certified:
+        raise ValueError("exact operation selection has no independent accelerator certification")
+    if exact_selection is not None:
+        exact_selection.check_release()
+        exact_selection.check_backend_contract()
+    if exact_selection is None and select is None:
         return DeviceRewrite(device=device, skipped=(("all", "no selector supplied, so nothing is routed"),))
+
+    selected_ops = None
+    ids_by_op = {}
+    if exact_selection is not None:
+        from merlin.common import mlir_query as mq
+        from merlin.targetgen.application_inventory import exact_int_mm_generic_operation
+
+        if exact_selection.target != device or model_sha256 != exact_selection.model_sha256:
+            raise ValueError("exact offload selection does not match device or model bytes")
+        ids_by_op = {
+            op: f"mlir:{model_sha256}:{ordinal}" for ordinal, op in enumerate(mq.walk(module))
+        }
+        selected_by_id = exact_selection.by_operation_id
+        selected_ops = {op for op, operation_id in ids_by_op.items() if operation_id in selected_by_id}
+        if len(selected_ops) != len(selected_by_id) or any(
+            not exact_int_mm_generic_operation(op) for op in selected_ops
+        ):
+            raise ValueError("selected operation IDs no longer identify exact integer contractions")
 
     triples = device_dtype_triples(device)
     if not triples:
+        if exact_selection is not None:
+            raise ValueError(f"{device!r} declares no derivable datapath for exact selection")
         return DeviceRewrite(device=device, skipped=(("all", f"{device!r} declares no derivable datapath"),))
 
     # THROUGH THE RUNTIME DIALECT. The offload is recorded as runtime ops first and realized second,
@@ -272,8 +323,10 @@ def rewrite_contractions_to_device(
         _endpoint = None
     _transport = link_for(device, _endpoint).command_transport
 
-    chosen = emit_device_program(module, device, select=select)
     candidates = offloadable_contractions(module, device)
+    if selected_ops is not None and not selected_ops.issubset({op for op, _shape in candidates}):
+        raise ValueError("selected operation is not eligible on this device; host fallback must be explicit")
+    chosen = emit_device_program(module, device, select=select, selected_ops=selected_ops)
     lower_device_submits(module, device, transport=_transport)
     skipped: list[tuple[str, str]] = []
     if not chosen:
@@ -282,17 +335,29 @@ def rewrite_contractions_to_device(
         )
 
     stem = symbol_stem(device)
-    symbols: dict[tuple[int, ...], str] = {}
+    # Extents alone are not a callee identity when a device has multiple
+    # datapaths: one symbol cannot stand for both i8 and floating arithmetic.
+    symbols: dict[tuple[tuple[int, ...], tuple[str, str, str]], str] = {}
     sig_dtypes: dict[str, tuple[str, str, str]] = {}
+    expected_interfaces: dict[str, dict[str, str]] = {}
     routed: list[Routed] = []
 
     for op, shape in chosen:
         key = _signature_key(shape)
-        sym = symbols.get(key)
+        dtypes = tuple(shape.dtypes)
+        signature = (key, dtypes)
+        sym = symbols.get(signature)
         if sym is None:
             sym = f"{stem}_{len(symbols)}"
-            symbols[key] = sym
-            sig_dtypes[sym] = tuple(shape.dtypes)  # type: ignore[assignment]
+            symbols[signature] = sym
+            sig_dtypes[sym] = dtypes  # type: ignore[assignment]
+        operation_id = ids_by_op.get(op, "")
+        if exact_selection is not None:
+            selected = exact_selection.by_operation_id[operation_id]
+            expected = {"sha256": selected.interface_sha256, "mlir": selected.interface_mlir}
+            if sym in expected_interfaces and expected_interfaces[sym] != expected:
+                raise ValueError(f"{sym} shares one extent but selected interfaces differ")
+            expected_interfaces[sym] = expected
 
         operands = list(op.operands)
         if len(operands) != 3 or len(op.results) != 1:
@@ -315,12 +380,13 @@ def rewrite_contractions_to_device(
                 reduction=tuple(shape.reduction),
                 dtypes=tuple(shape.dtypes),  # type: ignore[arg-type]
                 fqn=prov.data if isinstance(prov, StringAttr) else "",
+                operation_id=operation_id,
             )
         )
 
     body: Block = module.body.block
     minted: dict[str, tuple[int, ...]] = {}
-    for key, sym in symbols.items():
+    for (key, _dtypes), sym in symbols.items():
         types = _signature_types(key, sig_dtypes[sym])
         if types is None:
             skipped.append((sym, f"no MLIR type for datapath {sig_dtypes[sym]}; signature declined"))
@@ -341,14 +407,30 @@ def rewrite_contractions_to_device(
         )
         minted[sym] = key
 
-    out = DeviceRewrite(device=device, routed=tuple(routed), signatures=minted, skipped=tuple(skipped))
+    if exact_selection is not None and (
+        len(routed) != len(selected_ops) or set(minted) != set(expected_interfaces)
+    ):
+        raise ValueError("an exactly selected operation was not rewritten and declared in full")
+
+    out = DeviceRewrite(
+        device=device, routed=tuple(routed), signatures=minted, skipped=tuple(skipped),
+        package_sha256=exact_selection.package_sha256 if exact_selection is not None else None,
+        transport=exact_selection.transport if exact_selection is not None else None,
+        abi_sha256=exact_selection.abi_sha256 if exact_selection is not None else None,
+        certification_sha256=exact_selection.certification_sha256 if exact_selection is not None else (),
+        release_review_digest=exact_selection.release_binding.review_digest if exact_selection is not None else None,
+        software_spec_sha256=exact_selection.software_spec_sha256 if exact_selection is not None else None,
+        capability_contract_sha256=exact_selection.capability_contract_sha256 if exact_selection is not None else None,
+        expected_interfaces=expected_interfaces,
+    )
     if sidecar_dir is not None:
         out.write_sidecar(sidecar_dir)
     return out
 
 
 def rewrite_prepared_file(
-    prepared: str | Path, work: str | Path, device: str, *, select: Callable[[Any], bool] | None
+    prepared: str | Path, work: str | Path, device: str, *, select: Callable[[Any], bool] | None = None,
+    exact_selection=None,
 ) -> DeviceRewrite:
     """Rewrite a prepared module ON DISK in place and record what it minted.
 
@@ -371,8 +453,13 @@ def rewrite_prepared_file(
     from .declaration_access import patch_declaration_arg_attrs, unpatched_declarations
 
     prepared, work = Path(prepared), Path(work)
+    model_sha256 = hashlib.sha256(prepared.read_bytes()).hexdigest()
+    if exact_selection is not None and exact_selection.model_sha256 != model_sha256:
+        raise ValueError("prepared model bytes changed after exact operation selection")
     module = parse_mlir_file(prepared)
-    rewrite = rewrite_contractions_to_device(module, device, select=select)
+    rewrite = rewrite_contractions_to_device(
+        module, device, select=select, exact_selection=exact_selection, model_sha256=model_sha256
+    )
     if rewrite.moved:
         text = patch_declaration_arg_attrs(
             to_text(module), rewrite.signatures, argument_access=("read", "read", "write")

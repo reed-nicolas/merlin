@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from merlin_experiments.phase2 import chia_launch
+from merlin_experiments.measured_launch import without_unsealed_board_catalog
 
 
 @dataclass(frozen=True)
@@ -184,6 +185,7 @@ def execute_coordinator(command: list[str], cwd: str, plan: dict, receipt_root: 
             environment.pop(key, None)
         else:
             environment[key] = value
+    environment = without_unsealed_board_catalog(environment)
     # Transport is prepared in the guarded parent and sealed into the plan. Ray workers do
     # not inherit a process-local import finder (or necessarily the parent's environment).
     returncode = run(plan.get("transport_command", command), cwd=cwd, env=environment)

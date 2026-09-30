@@ -157,6 +157,106 @@ def _members(root: Path) -> dict[str, tuple[Path, dict]]:
     return result
 
 
+def generation_lineage(plan: dict, generated: Path) -> dict | None:
+    """Reconcile the selected Phase 0 receipt with the corpus being released.
+
+    The run output receipt binds these bytes as a whole; this projection makes
+    the requirement, evidence, omissions, coverage and capsule membership
+    individually inspectable in the operator's private preparation record.
+    """
+    from ..runner import fingerprint
+
+    bundle_name = plan.get("phase0_evidence_bundle")
+    if bundle_name is None:
+        return None  # Historical runs have no selected evidence or generation receipt.
+    bundle = Path(bundle_name)
+    receipt_path = bundle / "coverage" / "generation.json"
+    manifest_path = bundle / "evidence-manifest.json"
+    for path in (receipt_path, manifest_path):
+        ordinary_tree(path)
+        if not path.is_file():
+            raise SpecError("selected Phase-0 lineage member is not a file")
+    receipt = json.loads(receipt_path.read_bytes())
+    provenance = read_yaml(generated / "MANIFEST.yaml")
+    if (
+        receipt.get("schema") != "merlin.phase0_generation.v1"
+        or receipt.get("target") != plan["target"]
+        or receipt.get("corpus_manifest") != str(generated / "MANIFEST.yaml")
+        or (provenance.get("phase0_evidence") or {}).get("generation_receipt") != str(receipt_path)
+        or (provenance.get("phase0_evidence") or {}).get("manifest") != str(manifest_path)
+    ):
+        raise SpecError("Phase-0 generation receipt does not identify the selected corpus and evidence")
+    from ..phase0.evidence import load_exported_evidence
+
+    evidence = load_exported_evidence(bundle)
+    if evidence.target != plan["target"] or receipt.get("evidence_status") != evidence.status:
+        raise SpecError("Phase-0 generation receipt differs from selected evidence")
+    selected = plan["phases"]["0"]["inputs"]
+    requirement = selected.get("conformance_spec")
+    if requirement is None:
+        raise SpecError("selected Phase-0 lineage has no conformance requirement")
+    requirement_sha = fingerprint(Path(requirement))
+    source_requirements = [row for row in evidence.source_snapshots if row.role == "conformance-spec"]
+    if len(source_requirements) != 1 or source_requirements[0].sha256 != requirement_sha:
+        raise SpecError("generated corpus requirement differs from selected evidence")
+    coverage = receipt.get("coverage_inputs")
+    if coverage != provenance.get("coverage_inputs"):
+        raise SpecError("generated corpus coverage inputs differ from generation receipt")
+    from ..phase0.coverage_commitment import read_inputs
+
+    inputs = read_inputs(generated, provenance)
+    if inputs is None or inputs.get("conformance") != read_yaml(Path(requirement)):
+        raise SpecError("generated corpus coverage requirement differs from frozen selection")
+    members = _members(generated)
+    commitments = receipt.get("capsule_commitments")
+    if not isinstance(commitments, list) or len(commitments) != len(members):
+        raise SpecError("Phase-0 generation receipt has incomplete capsule membership")
+    committed = {}
+    for row in commitments:
+        if not isinstance(row, dict) or not isinstance(row.get("member"), str):
+            raise SpecError("Phase-0 generation receipt has malformed capsule membership")
+        name = row["member"]
+        if name in committed or name not in members or row.get("sha256") != fingerprint(members[name][0]):
+            raise SpecError("Phase-0 generation receipt differs from emitted capsule bytes")
+        committed[name] = row["sha256"]
+    if set(committed) != set(members) or receipt.get("capsules_written") != len(members):
+        raise SpecError("Phase-0 generation receipt omits emitted capsules")
+    for phase, record in (receipt.get("cohort_coverage") or {}).items():
+        if phase not in {"phase1", "phase2"} or not isinstance(record, dict):
+            raise SpecError("Phase-0 generation coverage record is malformed")
+        path = bundle / "coverage" / f"{phase}-capsule-coverage.json"
+        ordinary_tree(path)
+        if record.get("path") != str(path) or fingerprint(path) != record.get("sha256"):
+            raise SpecError("Phase-0 generation coverage report changed")
+        report = json.loads(path.read_bytes())
+        if record.get("status") != report.get("status") or record.get("n_capsules") != (report.get("cohort") or {}).get(
+            "n_capsules"
+        ):
+            raise SpecError("Phase-0 generation coverage summary differs from report")
+    if set(receipt.get("cohort_coverage") or {}) != {"phase1", "phase2"}:
+        raise SpecError("Phase-0 generation requires both cohort coverage reports")
+    omitted = receipt.get("omitted")
+    if not isinstance(omitted, list):
+        raise SpecError("Phase-0 generation receipt has no omission accounting")
+
+    def digest(value) -> str:
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    return {
+        "requirement_sha256": requirement_sha,
+        "evidence_manifest_sha256": fingerprint(manifest_path),
+        "generation_receipt_sha256": fingerprint(receipt_path),
+        "generated_manifest_sha256": fingerprint(generated / "MANIFEST.yaml"),
+        "capsules": len(members),
+        "capsule_roster_sha256": digest(sorted(committed.items())),
+        "omissions": {"count": len(omitted), "sha256": digest(omitted)},
+        "coverage": {
+            phase: {"sha256": row["sha256"], "status": row["status"]}
+            for phase, row in sorted(receipt["cohort_coverage"].items())
+        },
+    }
+
+
 def _reviewed_retirements(path: Path | None) -> tuple[dict[str, str], str | None]:
     """Read an explicit public-only retirement decision, bound by its source bytes."""
     from ..runner import fingerprint
@@ -502,10 +602,17 @@ def admission(descriptor: Path, *, coverage_output: Path | None = None) -> dict:
     capsule_runner.discover_capsules(te.graded_roots(), labels={"public", "dev"})
     materialized = materialize_public_cohort(te, tier_ceiling=_TIER_ORDER[-1])
     public = validate_materialized_cohort(materialized, te)
-    from ..phase0.coverage_commitment import observe_cohort, read_inputs, requires_workload_coverage
+    from ..phase0.coverage_commitment import (
+        build_phase0_readiness,
+        observe_cohort,
+        phase0_readiness_identity,
+        read_inputs,
+        requires_workload_coverage,
+    )
 
     coverage_inputs = read_inputs(te.capsule_corpus.parent)
     completeness = observe_cohort(coverage_inputs, materialized, target=te.target)
+    readiness = build_phase0_readiness(completeness)
     workload_required = requires_workload_coverage(te, coverage_inputs)
     if coverage_output is not None:
         private_json(coverage_output, completeness)
@@ -527,6 +634,7 @@ def admission(descriptor: Path, *, coverage_output: Path | None = None) -> dict:
         "hidden_admitted": admitted,
         "public_commitment": public["admitted_name_set_sha256"],
         "scope": "native cohort admission only; numerical and hardware readiness not executed",
+        "phase0_readiness": phase0_readiness_identity(readiness, required=workload_required),
         "whole_workload_phase1": {
             "status": completeness["status"],
             "cohort_sha256": completeness["cohort"]["sha256"],

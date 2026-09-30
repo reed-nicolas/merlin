@@ -194,6 +194,14 @@ def build(
         from .zephyr_model import load_matrix_signatures
 
         load_matrix_signatures(Path(work), None)
+    if device is not None and getattr(device, "exact_selection", None) is not None:
+        if getattr(device, "select", None) is not None:
+            raise ValueError("exact operation selection and shape selector cannot both route the model")
+        if not device.exact_selection.certified:
+            raise ValueError("exact operation selection has no independent accelerator certification")
+        device.exact_selection.check_release()
+        device.exact_selection.check_package(device.package_dir)
+        device.exact_selection.check_backend_contract()
     model_dir, work = Path(model_dir).resolve(), Path(work).resolve()
     work.mkdir(parents=True, exist_ok=True)
     from ...llvmlower.weight_prepack import prepare_build_bundle
@@ -236,7 +244,9 @@ def build(
                 "prepare_for_lowering; build it with int8_compute/features/rvv_schedule so the "
                 "object and the argument table agree"
             )
-        if int8_compute or features or rvv_schedule:
+        if int8_compute or features or rvv_schedule or (
+            device is not None and getattr(device, "exact_selection", None) is not None
+        ):
             from . import zephyr_model as _zm
 
             prepared_path, features = _zm.prepare_for_lowering(
@@ -403,6 +413,19 @@ def build(
                 f"{len(_dev_sigs)} device signature(s) were offloaded but no `device=` routing is "
                 "available to build them against; the image would not link"
             )
+        if _dev_side.get("device") != device.device:
+            raise RuntimeError("device offload sidecar does not match selected device")
+        exact = getattr(device, "exact_selection", None)
+        if exact is not None:
+            routed_ids = {row.get("operation_id") for row in _dev_side.get("routed") or ()}
+            if (
+                routed_ids != set(exact.by_operation_id)
+                or _dev_side.get("package_sha256") != exact.package_sha256
+                or _dev_side.get("transport") != exact.transport
+                or _dev_side.get("abi_sha256") != exact.abi_sha256
+                or _dev_side.get("certification_sha256") != list(exact.certification_sha256)
+            ):
+                raise RuntimeError("device offload sidecar lost exact operation or package identity")
         from ...llvmlower.device_build import build_device_objects
 
         _dev_dts = {r["symbol"]: tuple(r["dtypes"]) for r in (_dev_side.get("routed") or [])}
@@ -418,10 +441,15 @@ def build(
             numeric_policy=device.numeric_policy,
             # the SAME ISA the rest of the image is built for -- see device_build._flags
             cflags=[CLANG_TARGET, *clang_cflags],
+            expected_interfaces=_dev_side.get("expected_interfaces") or None,
+            package_sha256=_dev_side.get("package_sha256"),
         )
-        if not _dev_build.ok:
+        if exact is not None:
+            exact.check_package(device.package_dir)
+            exact.check_backend_contract()
+        if not _dev_build.ok or set(_dev_build.kernels) != set(_dev_sigs):
             raise RuntimeError(
-                f"device offload produced no linkable objects for {device.device!r}: {_dev_build.skipped}"
+                f"device offload did not build every routed kernel for {device.device!r}: {_dev_build.skipped}"
             )
         objs.extend(_dev_build.objects)
         print(

@@ -76,6 +76,43 @@ def _descriptor_for(target: str) -> Path:
     return repo_root() / "merlin" / "experiments" / "capsule_bench" / "targets" / target / "target_experiment.yaml"
 
 
+def _require_distinct_corpus_destinations(te, *, output_root: str | Path, evidence_root: str | Path | None) -> None:
+    """Keep generated Phase 0 bytes out of retained and descriptor-selected input corpora.
+
+    The legacy corpus is still addressable by frozen benchmark grants. Rewriting it
+    under a new derivation would silently change those experiments, even when the
+    caller explicitly supplied ``--output-root``. Resolve paths before comparing
+    them so an alias cannot bypass this source-ownership check.
+    """
+    from merlin.common.paths import checkout_root
+    from merlin.targetgen.corpora import capsule_corpus_roots
+
+    # In source mode MERLIN_REPO_ROOT may select an external experiment
+    # workspace that has no copy of this checkout's historical registry. The
+    # implementation checkout still owns those retained paths; an installed
+    # wheel instead reads its bundled registry. Both modes keep malformed or
+    # missing selected metadata fail-closed.
+    sources = [*capsule_corpus_roots(owner_root=checkout_root())]
+    selected = getattr(te, "capsule_corpus", None)
+    if selected:
+        sources.append(Path(selected))
+    for method_name in ("graded_roots", "perf_roots", "hidden_roots"):
+        method = getattr(te, method_name, None)
+        if callable(method):
+            sources.extend(method())
+    sources = sorted({Path(source).expanduser().resolve() for source in sources})
+    for field, raw in (("output_root", output_root), ("evidence_root", evidence_root)):
+        if raw is None:
+            continue
+        destination = Path(raw).expanduser().resolve()
+        for source in sources:
+            if destination == source or destination in source.parents or source in destination.parents:
+                raise ValueError(
+                    f"Phase 0 {field} {destination} overlaps source capsule corpus {source}; "
+                    "select a separate run artifact destination"
+                )
+
+
 def _ensure_contract_on_path(descriptor: Path) -> None:
     """If the descriptor names an out-of-tree ``target_contract`` (e.g. radiance's contract lives under
     the ``radiance`` target package), prepend its package root to ``MERLIN_TARGET_PATH`` so the registry
@@ -235,6 +272,7 @@ def generate_target(
     profiles_root: str | Path | None = None,
     recipe: str | Path | None = None,
     software_spec: str | Path | None = None,
+    capability_contract: str | Path | None = None,
     hardware_spec: str | Path | None = None,
     rtl_facts: str | Path | None = None,
     evidence_root: str | Path | None = None,
@@ -273,6 +311,7 @@ def generate_target(
     if evidence_input is None:
         _ensure_contract_on_path(descriptor)
     te = load_target_experiment(descriptor)
+    _require_distinct_corpus_destinations(te, output_root=output_root, evidence_root=evidence_root)
     hardware_target = te.target if explicit_descriptor else target
     profile = load_profile(
         target, descriptor=descriptor, **{key: value for key, value in profile_inputs.items() if value is not None}
@@ -309,6 +348,7 @@ def generate_target(
             evidence = select_evidence(
                 hardware_target,
                 descriptor=descriptor,
+                capability_contract_path=capability_contract,
                 facts_path=rtl_facts,
                 software_spec=software_spec or profile.get("_software_spec_path"),
                 hardware_spec=hardware_spec,
@@ -623,7 +663,8 @@ def generate_target(
         name = str(error.get("member") or error.get("family") or "<performance sweep>")
         if name not in failed_names:
             kind = str(error.get("error_type") or "unknown error")
-            failures.append((name, f"performance materialization failed ({kind}); inspect MANIFEST.yaml"))
+            detail = str(error.get("detail") or "no further detail recorded").replace("\n", " ")[:240]
+            failures.append((name, f"performance materialization failed ({kind}): {detail}; inspect MANIFEST.yaml"))
             failed_names.add(name)
     if failures:
         print(f"  [FAIL] {len(failures)} capsule(s) could not be written:")

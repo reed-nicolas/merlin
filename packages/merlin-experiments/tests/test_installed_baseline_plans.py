@@ -208,6 +208,76 @@ def test_baseline_resume_keeps_frozen_installed_command(baseline, monkeypatch, t
     assert (root / "run/resolved-plan.json").read_bytes() == frozen
 
 
+@pytest.mark.parametrize(
+    "changed",
+    ("submission", "run_manifest.yaml", "qa_loop_summary.yaml", "timing_detailed.json"),
+)
+def test_completed_installed_phase1_resume_checks_exact_handoff(baseline, monkeypatch, changed):
+    from merlin_experiments import runner
+
+    destination = baseline.parent / "run"
+    plan = resolve_plan(load_spec(baseline), run_dir=destination)
+    output = Path(plan["phases"]["1"]["engine_output"])
+    calls = []
+
+    class FinishedProcess:
+        pid = 2**30
+
+        def __init__(self, argv, **_kwargs):
+            calls.append(list(argv))
+            output.mkdir(parents=True)
+            submission = output / "submission"
+            submission.mkdir()
+            (submission / "compiler.py").write_text("# synthetic submitted compiler\n")
+            for name in ("run_manifest.yaml", "qa_loop_summary.yaml", "timing_detailed.json"):
+                (output / name).write_text("synthetic: true\n")
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", FinishedProcess)
+    monkeypatch.setattr(runner, "_process_group_active", lambda _group: False)
+    assert run(plan) == 0
+    record = json.loads((destination / "orchestration.json").read_text())
+    assert set(record["attempts"][0]["completion_inputs"]) == {
+        "submission",
+        "run_manifest.yaml",
+        "qa_loop_summary.yaml",
+        "timing_detailed.json",
+    }
+    assert resume(destination) == 0
+    assert len(calls) == 1
+    member = output / changed
+    if member.is_dir():
+        member = member / "compiler.py"
+    member.write_text(member.read_text() + "# changed after completion\n")
+    with pytest.raises(SpecError, match="completed installed Phase 1 handoff bytes changed"):
+        resume(destination)
+    assert len(calls) == 1
+
+
+def test_installed_phase1_zero_exit_without_handoff_is_not_complete(baseline, monkeypatch):
+    from merlin_experiments import runner
+
+    class EmptyProcess:
+        pid = 2**30
+
+        def __init__(self, _argv, **_kwargs):
+            pass
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", EmptyProcess)
+    monkeypatch.setattr(runner, "_process_group_active", lambda _group: False)
+    destination = baseline.parent / "run"
+    assert run(resolve_plan(load_spec(baseline), run_dir=destination)) == 1
+    attempt = json.loads((destination / "orchestration.json").read_text())["attempts"][0]
+    assert attempt["engine_returncode"] == 0
+    assert attempt["state"] == "execution_failed"
+    assert "completion member is missing" in attempt["error"]
+
+
 def test_historical_rtlchecks_resume_keeps_recorded_native_command(baseline, monkeypatch):
     select_treatment(baseline, "rtlchecks")
     root = baseline.parent

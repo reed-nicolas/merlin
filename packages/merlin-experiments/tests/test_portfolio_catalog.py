@@ -95,10 +95,19 @@ def test_execution_discards_ambient_python_selection(plan, monkeypatch):
     monkeypatch.setenv("PYTHONHOME", "/unselected")
     monkeypatch.setenv("PYTHONUSERBASE", "/unselected")
     monkeypatch.setenv("PYTHONPATH", "/unselected")
+    monkeypatch.setenv("MERLIN_BOARD_CATALOG", "/unsealed/board.yaml")
     command = plan["phases"]["2"]
     environment = execution_environment(command)
     assert "PYTHONHOME" not in environment and "PYTHONUSERBASE" not in environment
     assert environment["PYTHONPATH"] == command["env"]["PYTHONPATH"]
+    assert "MERLIN_BOARD_CATALOG" not in environment
+
+
+def test_installed_execution_refuses_an_explicit_unsealed_board_catalog(plan):
+    command = copy.deepcopy(plan["phases"]["2"])
+    command["env"]["MERLIN_BOARD_CATALOG"] = "/unsealed/board.yaml"
+    with pytest.raises(SpecError, match="unsealed board catalog"):
+        execution_environment(command)
 
 
 def test_replay_refuses_candidate_inside_pinned_source(plan):

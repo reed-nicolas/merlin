@@ -22,6 +22,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import _common as C  # noqa: E402 — active target (descriptor-driven), bootstraps merlin/python
+from merlin_experiments.phase1.timing import requires_chipyard_timing, timing_path  # noqa: E402
 
 REPO = C.REPO
 PY = sys.executable
@@ -95,7 +96,11 @@ def main():
                 "--repo",
                 str(C.REPO),
                 "--timing-file",
-                str(HERE / ".oracle_timing.json"),
+                str(
+                    timing_path(C.EXP, C.TARGET)
+                    if requires_chipyard_timing(C.DESCRIPTOR)
+                    else HERE / ".oracle_timing.json"
+                ),
                 "--ws",
                 str(ws),
                 "--max-jobs",

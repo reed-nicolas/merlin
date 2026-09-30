@@ -3,11 +3,13 @@ title: Capture execution attestation boundary
 kind: design
 status: current
 owner: targetgen
-last_verified: 2026-09-27
+last_verified: 2026-09-29
 related: [phase0_specification, model2mlir, reproducibility]
 code_refs:
   - packages/merlin-experiments/src/merlin_experiments/phase0/capture_execution_attestation.py
   - packages/merlin-experiments/src/merlin_experiments/capture_execution/sealed_static.py
+  - packages/merlin-experiments/src/merlin_experiments/capture_execution/sealed_m2m.py
+  - packages/merlin-experiments/src/merlin_experiments/capture_execution/sealed_python.py
   - packages/merlin-experiments/src/merlin_experiments/capture_execution/python_preflight.py
   - src/merlin/targetgen/application_inventory.py
 ---
@@ -40,6 +42,15 @@ Its receipt says `local_sealed_static_execution`; replay returns
 because unsigned JSON and replay cannot prove the historical issuing process.
 The observed scope is `static_elf_process_only`. This is not a model2MLIR or
 PyTorch capture attestation and is not wired into Phase 0 admission.
+
+`sealed_python.py` now tests the analogous *process isolation* seam for a caller-supplied
+guest Python root and source tree. It copies and hashes both trees, runs an isolated
+Python script without host home, checkout or network access, and independently
+replays the saved inputs and output bytes. The guest root is still a caller
+selection: this diagnostic cannot prove that its Python packages, native `dlopen`
+dependencies, checkpoints and preprocessing data form the complete
+Model2MLIR/PyTorch closure. Its receipt explicitly says
+`phase0_admissible: false` and `source_closure_verified: false`; Phase 0 rejects it.
 
 A future verified issuer must perform a *fresh* capture in a new output directory.
 It must privately snapshot the complete loader/importer source, Python runtime and
@@ -118,3 +129,39 @@ adapter. Those entries appear as `selected_checkout_sources` with observed and
 current hashes, separately from `selected_m2m_sources`. They are not silently
 absorbed into the receipt's direct-owner list, and a matching hash still does not
 prove a complete import or checkpoint-data closure.
+
+The bounded `sealed_m2m` CPU runner has a separate v2 policy for either FP32
+without a recipe or static int8 with an explicitly selected, content-validated
+`quant_recipe_v1` whose numerical engine is `integer_reference`. Its plan names
+the dtype and recipe bytes, selected Model2MLIR revision, workload, Merlin worker
+package, its canonical schema tree, and Python runtime. Issuance copies those
+inputs into a private empty-root process. Replay reconstructs the selected
+command and checks bundled schema membership and bytes. It also checks the
+recipe against capture metadata and independent integer-reference agreement.
+Historical FP32 v1 receipts retain their original replay
+policy. Neither version is an authenticated historical-execution attestation or
+Phase 0 admission; the result explicitly says `phase0_admission: not_granted`.
+Loaders that read ambient environment values or require checkpoints outside the
+selected trees remain unsupported by this bounded policy.
+
+Phase 0's experiments-owned `assess_sealed_m2m_capture` accepts a selected
+`model.mlir` path and the caller's independently selected SHA-256 digests for
+the model, materialized capture receipt and `sealed_m2m_pending.json`.
+It requires that path to be the run's `capture/model.mlir`, verifies the adjacent
+materialized receipt, checks all three selected byte identities before and
+after replay, and invokes the sealed v2 replay verifier. The pending receipt
+commits to the issued command, selected input plan, sandbox policy, copied
+source/runtime snapshots, process result and output inventory. Selecting its
+digest independently prevents a different pending record from silently
+satisfying the same assessment. It does not authenticate who issued that
+record or which historical process ran. V2 replay compares the copied M2M package,
+workload, venv, base Python, and schemas against their selected tree digests,
+and checks the selected worker bytes. The Merlin package tree is compared when
+the schemas were selected within it; an external schema tree is injected into
+the copied package after its original tree digest was recorded, so its complete
+copied bytes remain bound by the sealed snapshot and the schema's own digest.
+The assessment reports `replay_verified_nonadmissible` and
+`phase0_admission: not_granted` on success. The unsigned M2M plan cannot
+authenticate the original clean Git revision or runtime provenance, and the
+selected Python/framework/model-data closure lacks an independent pin. The
+Phase 0 verified-issuer gate therefore remains closed.

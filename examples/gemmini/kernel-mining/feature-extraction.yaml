@@ -1,4 +1,4 @@
-# Gemmini kernel-mining features. Pass explicitly with kernel-index --feature-contract.
+# Authored Gemmini kernel-mining features. Pass explicitly with kernel-index --feature-contract.
 family: gemmini
 targets: [gemmini]
 platform_targets:

@@ -3,7 +3,7 @@ title: TinyLlama int8 on multicore RVV under Zephyr — end to end
 kind: guide
 status: current
 owner: runtime
-last_verified: 2026-09-04
+last_verified: 2026-09-29
 related: [getting_started, rvv_e2e, zephyr, model2mlir, reproducibility, compilation_strategies, vision_workloads_rvv_zephyr]
 code_refs:
   - src/merlin/compile_cli.py
@@ -500,13 +500,15 @@ $MERLIN_EXT_FIRESIM_QUEUE/bin/firesim-queue status      # daemon must be ALIVE
 $MERLIN_EXT_FIRESIM_QUEUE/bin/firesim-queue daemon      # start it if not (leave running)
 ```
 
-`zephyr_model.run_on_firesim()` already defaults to `queue=True`. It resolves ModelBlaster's
-runner via `MERLIN_MODELBLASTER` and FireSim's paths from `MERLIN_CHIPYARD`, all through `.env`.
+`zephyr_model.run_on_firesim()` defaults to `queue=True`. Install and select an
+out-of-tree runner first (see [FireSim](firesim.md)); the example adapter uses
+`MERLIN_FIRESIM_RUNNER=modelblaster` and `MERLIN_MODELBLASTER`. Merlin resolves
+FireSim paths from `MERLIN_CHIPYARD`, all through `.env`.
 
 Three failure modes worth recognising, because none of the errors names its real cause:
 
-- **`ModuleNotFoundError: No module named 'modelblaster'`** — `MERLIN_MODELBLASTER` is unset or
-  wrong. It names neither the setting nor the path it wanted.
+- **No selected FireSim runner** — install an adapter and set `MERLIN_FIRESIM_RUNNER`.
+  The example adapter's preflight names a missing `MERLIN_MODELBLASTER` checkout.
 - **`insmod: ERROR: could not load module poll_mode=1`** at `INFRASETUP` — the XDMA kernel module
   is not loaded. FireSim's helper searches for `xdma.ko`, but a modern kernel ships
   `xdma.ko.zst` (compressed), so the search finds nothing and `poll_mode=1` is mistaken for the

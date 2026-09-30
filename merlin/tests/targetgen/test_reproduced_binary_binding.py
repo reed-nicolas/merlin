@@ -92,7 +92,7 @@ def test_any_broken_pin_refuses_binding(tmp_path, mutation):
 
 
 def test_target_receipt_members_cannot_escape_their_evidence_root(monkeypatch):
-    monkeypatch.syspath_prepend(str(repo_root() / "examples/gemmini/target"))
+    monkeypatch.syspath_prepend(str(repo_root() / "examples/gemmini/verification"))
     from bind_native_simulator import _safe_member
 
     assert _safe_member("kernel_matmul")

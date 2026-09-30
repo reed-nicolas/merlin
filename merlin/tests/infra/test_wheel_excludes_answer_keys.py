@@ -71,6 +71,7 @@ def test_archives_never_include_unreviewed_answer_files(release_archives):
     for files in (wheel, sdist):
         assert files
         assert all(b"PRIVATE_RELEASE_CANARY" not in contents for contents in files.values())
+        assert not any("/contract/examples/" in name for name in files)
 
 
 def test_every_declared_public_resource_survives_both_builds(release_archives):
@@ -84,6 +85,7 @@ def test_every_declared_public_resource_survives_both_builds(release_archives):
 def test_resource_manifest_never_names_private_corpus_files():
     files = json.loads((repo_root() / "build_tools/package_resources.json").read_text())["files"]
     assert "merlin/contract/schemas/command_buffer.schema.json" in files
+    assert not any(name.startswith("merlin/contract/examples/") for name in files)
     assert len(files) == len(set(files))
     for name in files:
         path = Path(name)

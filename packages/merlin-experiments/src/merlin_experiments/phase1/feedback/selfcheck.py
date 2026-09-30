@@ -1007,13 +1007,14 @@ def main(argv=None, *, context=None, capsules_root: Path | None = None, contract
         _barrier_cycles = _barrier_record.get("cycles") if isinstance(_barrier_record, dict) else None
         if isinstance(_barrier_cycles, int) and not isinstance(_barrier_cycles, bool) and _barrier_cycles > 0:
             row["barrier_cycles"] = _barrier_cycles
-        # The L2 cycle count is meaningful only with the exact performance-model bytes and timing
-        # configuration that produced it.  The Cyclotron adapter writes this sidecar immediately around
-        # the successful invocation; absent/malformed provenance stays absent so the downstream seal
-        # rejects the row instead of attributing it to whichever simulator happens to be installed later.
+        # The L2 cycle count is meaningful only with the exact selected simulator bytes and timing
+        # configuration that produced it.  The selected OOT adapter writes this generic sidecar around
+        # its successful invocation; absent/malformed provenance stays absent so the downstream seal
+        # rejects the row. Historical cyclotron_engine_binding.json files remain inspectable as old
+        # artifacts, but cannot silently qualify a newly scored run.
         if bar_used == "L2":
             try:
-                _binding = json.loads((gen / "cyclotron_engine_binding.json").read_text())
+                _binding = json.loads((gen / "l2_engine_binding.json").read_text())
             except (OSError, json.JSONDecodeError):
                 _binding = None
             if isinstance(_binding, dict):

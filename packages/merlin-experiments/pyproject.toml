@@ -15,12 +15,15 @@ dependencies = [
 [project.optional-dependencies]
 bedrock = ["boto3"]
 # Immutable source archive: the Python package does not need example submodules.
-# Official ucb-bar/chia main, verified 2026-09-27; AET remains independently pinned above.
-chia = ["chialoops @ https://github.com/ucb-bar/chia/archive/e85318e465718ccc382a72bd3a0bab58ba11a174.tar.gz"]
+# Official ucb-bar/chia main, verified 2026-09-29; AET remains independently pinned above.
+chia = ["chialoops @ https://github.com/ucb-bar/chia/archive/dd976318012f1a9807a339bb7856da157cd24f87.tar.gz"]
 
 [project.scripts]
 merlin-experiment = "merlin_experiments.cli:main"
 merlin-evaluation-cohort = "merlin.targetgen.evaluation_cohort:main"
+
+[project.entry-points."merlin.exact_offload_release"]
+reviewed_phase0 = "merlin_experiments.corpus.release:verify_exact_offload_binding"
 
 [tool.setuptools.packages.find]
 where = ["src"]

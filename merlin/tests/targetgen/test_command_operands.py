@@ -95,7 +95,7 @@ def test_every_real_command_buffer_in_the_tree_is_clean():
     import glob
 
     noisy = []
-    paths = ["merlin/contract/examples/expected_command_buffer_g0.json"]
+    paths = [str(repo_root() / "merlin/tests/gemmini/fixtures/expected_command_buffer_g0.json")]
     paths += glob.glob(str(repo_root() / "merlin/contract/capsules/**/capsule.command_buffer.json"), recursive=True)
     for p in sorted(set(paths)):
         cb = json.loads(open(p).read())

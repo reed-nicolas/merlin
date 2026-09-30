@@ -142,9 +142,8 @@ def test_an_explicit_request_beats_every_derivation(broker, stub_cost):
     assert broker._per_capsule_timeout(77, context=feedback_context())[0] == 77
 
 
-def test_without_a_fit_the_recorded_verilator_measurement_still_applies(broker, monkeypatch, tmp_path):
-    """The historical path is KEPT for a target with no cert history, so the new code cannot make an
-    unmeasured target worse off than before."""
+def test_without_a_fit_the_legacy_unbound_measurement_is_diagnostic(broker, monkeypatch, tmp_path):
+    """A legacy scalar cannot shorten a cert budget without target and simulator identity."""
     from merlin.targetgen import cert_cost
 
     monkeypatch.setattr(cert_cost, "fits_cycles_for", lambda target, **kw: {})
@@ -152,8 +151,8 @@ def test_without_a_fit_the_recorded_verilator_measurement_still_applies(broker, 
 
     (tmp_path / ".oracle_timing.json").write_text(json.dumps({"verilator_per_capsule_s": 1500.0}))
     secs, why = broker._per_capsule_timeout(0, context=feedback_context(), timing_file=tmp_path / ".oracle_timing.json")
-    assert secs == 3000, why
-    assert "verilator measurement" in why, why
+    assert secs == broker._CERT_TIMEOUT_FALLBACK_S, why
+    assert "not bound to target" in why, why
 
 
 def test_with_neither_a_fit_nor_a_measurement_the_old_constant_applies(broker, monkeypatch, tmp_path):

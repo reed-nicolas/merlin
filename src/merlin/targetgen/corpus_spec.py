@@ -323,6 +323,15 @@ def _classes_source(te, contract: dict, *, taxonomy: dict | None = None) -> Call
             )
 
         return _from_taxonomy
+    # A self-hosted ISA with missing model tooling is not a command-ISA target.
+    # In particular, an unknown taxonomy must not be misdiagnosed as a missing
+    # RoCC issue order or silently generate capsules with no required classes.
+    if "self_hosted_isa" in (contract.get("features") or ()) or any(
+        str(header).endswith("isa_definition.py") for header in (getattr(te, "isa_headers", ()) or ())
+    ):
+        IT.require_taxonomy(
+            tax, f"target {getattr(te, 'target', '?')!r}", needs="Phase 0 instruction-class derivation"
+        )
     # Command target: its OWN contract declares the corpus obligation and issue order. A common
     # transport says nothing about whether this machine is weight-stationary, has configuration
     # instructions, or even names its work as a load/compute/store sequence. Do not infer a

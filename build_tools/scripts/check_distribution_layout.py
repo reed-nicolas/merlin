@@ -169,7 +169,11 @@ def audit_sources(wheels: list[Path], root: Path) -> list[str]:
     owners: dict[str, Path] = {}
     inventories: dict[str, dict[str, Path]] = {}
     errors = []
-    projects = [root / "pyproject.toml", *sorted((root / "packages").glob("*/pyproject.toml"))]
+    projects = [
+        root / "pyproject.toml",
+        *sorted((root / "packages").glob("*/pyproject.toml")),
+        *sorted((root / "examples").glob("*/pyproject.toml")),
+    ]
     for project in projects:
         metadata = tomllib.loads(project.read_text())
         name = metadata["project"]["name"].replace("-", "_").lower()

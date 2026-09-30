@@ -32,11 +32,99 @@ not a whole-model compiler or correctness test.
 
 The available ResNet-50 and SmolVLA denoise-step captures expose the current
 gap. Requested `int8` routing identifies Gemmini-capable contractions, but
-the standard captures retain FP32/BF16 operands; the W8A8 ResNet capture
-still has 53 FP32 contractions. No target-native quantization bridge or
-general whole-model Gemmini binary is established by those routes. A separate
-historical ResNet program from an alternate capture is useful evidence for a
-tracer bullet, not certification of this generated Phase 1 compiler.
+some standard captures retain FP32/BF16 operands. A separately integerized
+W8A8 ResNet capture has exact `i8 × i8 → i32` candidates, but isolated kernel
+emission does not establish reviewed SW admission, host/device stitching or
+whole-model execution. No general whole-model Gemmini binary is established by
+those routes. A separate historical ResNet program from an alternate capture
+is useful evidence for a tracer bullet, not certification of this generated
+Phase 1 compiler.
+
+For an already-integerized capture, you can materialize the exact signed
+`i8 × i8 → i32` contraction kernels as standalone `merlin_iface` inputs:
+
+```sh
+merlin-target-tools outline-int-mm --target gemmini \
+  --mlir /absolute/capture/model.mlir \
+  --software-spec /absolute/phase0-artifacts/software/software-spec.json \
+  --capability-contract /absolute/phase0-artifacts/software/contract.json \
+  --out /configured/out/artifacts/model-kernels/int8-iteration-001
+```
+
+The fresh directory contains `manifest.json` plus one interface MLIR file per
+outlined contraction. Both operator-selected Phase 0 files are required: the SW spec must
+declare accelerator contraction with a matching precision/rank, and the capability
+contract must explicitly declare the resident-packed, accumulator-commit and
+command-buffer class.
+Missing, foreign or malformed selections refuse; an unsupported declaration emits
+no interface. The manifest binds the exact model, SW spec and capability-contract
+byte hashes, MLIR operation and operand-producing SSA values. Its `stitching`
+inventory lists ordered source operations, function return bindings, and typed
+SSA crossings into or out of each contraction. These are *transfer requirements*,
+not generated DMA or a working dispatch. For the integerized `coverage_mlp`
+capture, both matmuls consume host-produced quantization/transpose results and
+feed further host math. Each crossing keeps the byte-bound source value and
+consumer identity so later placement and pointer order need not be guessed from
+tensor names. The inventory remains `diagnostic_unexecutable`. Each candidate's
+`software_admission` can still be `unknown` (the current unreviewed example is),
+and `compiler_support` remains `not_evaluated`; this is an inspectable diagnostic,
+not a Phase 0 provenance certificate or a claim that the target compiler supports the operation. Submit an interface
+to the selected OOT compiler to check kernel code generation separately. This does
+not lower the intervening quantization, transpose, dequantization or host operations, connect the kernels back to the
+model, or establish numerical execution. The published Gemmini compiler still
+declines the *whole* upstream Linalg module; an isolated kernel command buffer
+does not change that verdict.
+To record what the selected OOT package emits for every candidate in the
+captured model, without hand-writing scripts in `out/`, run:
+
+```sh
+merlin-target-tools probe-int-mm-route --target gemmini \
+  --mlir /absolute/capture/model.mlir \
+  --software-spec /absolute/phase0-artifacts/software/software-spec.json \
+  --capability-contract /absolute/phase0-artifacts/software/contract.json \
+  --package /absolute/selected-oot-package \
+  --out /configured/out/artifacts/model-kernels/route-probe.json
+```
+
+The fresh receipt binds model/spec/contract/package bytes, source SSA operands,
+the OOT command buffer for each distinct interface, explicit declines, and a
+separate direct whole-model emission observation. Read `emission_counts`,
+`complete_model_direct_emission`, `stitching.obligations` and
+`whole_model_offload_verified` together. Successful isolated kernels do not
+imply that their inputs and outputs are connected back into a running model.
+
+The outline's focused test numerically checks its isolated signed `i8×i8→i32`
+interface on a non-square K-tail against scalar arithmetic. It does not execute
+the OOT compiler output, connect the host operations, or compare a model golden.
+
+An opt-in whole-model handoff now exists for *qualified* outlines. Its identity
+is the normalized MLIR file produced by `prepare_for_lowering`, not an earlier
+raw capture that preparation may rewrite. `ExactOffloadSelection.from_outline`
+re-derives the candidate IDs and interfaces from that file and the selected SW
+spec/contract bytes; it refuses the current `unknown` SW admission. Before
+certification, the experiments owner must call `bind_exact_offload` with the
+reviewed Phase 0 release seal, selected descriptor, and application label. The
+binding checks that the exact model and both contract byte strings are selected
+sources of that release, and is reopened at certification, rewrite, and build.
+If preparation changes the raw capture, the normalized model needs its own
+selected capture receipt; a matching outline alone cannot confer admission.
+The `certify` step runs the selected interface through the OOT numerical oracle
+with an accelerator trace, and only then may `DeviceRouting(exact_selection=...)`
+replace those exact operations. The rewrite and object build recheck model,
+package, transport, pointer ABI, release lineage, and interface identities;
+unselected operations stay on the host path. This is a trusted-host evidence
+gate, not a sandbox against arbitrary Python in the host process, and is not a
+full-model numerical certificate. The present example has neither reviewed
+admission nor a demonstrated OOT whole-model execution, so its outline remains
+diagnostic.
+
+For a new numerical accelerator certificate, the compiler must emit
+`compiler_pointer_abi: {version: 1, arguments: [...]}` in its command buffer.
+Merlin compares that asserted pointer order with the selected target runner's
+`kernel_abi_from_commands` order before execution. A missing or mismatched
+declaration stops qualification; older compiler packages remain inspectable.
+Matching declarations are only a structural prerequisite: the emitted kernel
+must still execute and match the independent numerical reference.
 
 For a capture that has the two named sidecars, run:
 

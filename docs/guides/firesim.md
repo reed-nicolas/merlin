@@ -3,9 +3,9 @@ title: FireSim — whole-model cycle truth on the FPGA
 kind: guide
 status: current
 owner: runtime
-last_verified: 2026-09-07
+last_verified: 2026-09-29
 related: [zephyr, tinyllama_int8_rvv_zephyr, getting_started, reproducibility, reproducing_whole_model_on_rtl, whole_model_on_accelerator]
-code_refs: [src/merlin/runtime/backends/zephyr_model.py, src/merlin/perf/firesim_receipt.py, src/merlin/perf/firesim_checkpoint.py, build_tools/chipyard/setup_multicore_saturn.py, build_tools/chipyard/MerlinSaturnConfigs.scala, build_tools/scripts/firesim_sweep.py, build_tools/scripts/fsq.py, build_tools/firesim/README.md, build_tools/firesim/preflight.py]
+code_refs: [src/merlin/runtime/backends/zephyr_model.py, src/merlin/runtime/backends/firesim_runner.py, src/merlin/perf/firesim_receipt.py, src/merlin/perf/firesim_checkpoint.py, build_tools/chipyard/setup_multicore_saturn.py, build_tools/chipyard/MerlinSaturnConfigs.scala, build_tools/scripts/firesim_sweep.py, build_tools/scripts/fsq.py, build_tools/firesim/README.md, build_tools/firesim/preflight.py, examples/firesim_modelblaster/README.md]
 ---
 
 # FireSim — whole-model cycle truth on the FPGA
@@ -43,6 +43,8 @@ An earlier single-vector-unit bitstream ran considerably slower.
 ## What is verified, and what is not
 
 Be exact about this before planning work on it.
+The runner selection and installed-wheel path were checked without an FPGA;
+they do not revalidate the historical hardware measurements below.
 
 | Claim | Status |
 |---|---|
@@ -66,7 +68,8 @@ Complete the base install in [Getting started](getting_started.md), then set the
 |---|---|---|
 | `MERLIN_CHIPYARD` / `MERLIN_EXT_CHIPYARD` | the chipyard checkout | no FireSim manager, no configs |
 | `MERLIN_EXT_FIRESIM_QUEUE` | the shared job queue directory | runs bypass the queue and collide on the single FPGA |
-| `MERLIN_MODELBLASTER` | the ModelBlaster checkout, whose `validation/firesim_runner.py` merlin reuses | `ModuleNotFoundError: No module named 'modelblaster'` — an error naming neither the setting nor the path |
+| `MERLIN_FIRESIM_RUNNER` | explicitly selected installed runner name, e.g. `modelblaster` | Merlin refuses to submit without a selected provider |
+| `MERLIN_MODELBLASTER` | ModelBlaster checkout, only for the optional example adapter | the adapter preflight names the missing checkout or runner source |
 | `ZEPHYR_BASE`, `MERLIN_ZEPHYR_SW`, `ZEPHYR_SDK_INSTALL_DIR` | the Zephyr workspace and SDK | cannot build the ELF to run |
 
 Then check the host, read-only — this submits nothing and does not touch the FPGA:
@@ -75,7 +78,7 @@ Then check the host, read-only — this submits nothing and does not touch the F
 .venv/bin/python build_tools/firesim/preflight.py
 ```
 
-It verifies the chipyard checkout, the ModelBlaster runner, the queue **daemon's liveness**,
+It verifies the chipyard checkout, the selected runner (including its optional read-only preflight), the queue **daemon's liveness**,
 the XDMA devices, the `default_hw_config` → hwdb → bitstream-tar chain, and prints the
 effective clock of the most recent run. `check_repro_env.py` also reports a `firesim`
 capability, but its liveness test only checks that `daemon.pid` *exists* — which stays true
@@ -153,20 +156,42 @@ queue simply fills up silently. It has been found down for two weeks with jobs w
 it. Before starting it, run `status` and look for work that has been PENDING since before you
 arrived; that is someone else's job about to start the moment you bring the daemon up.
 
-From merlin, the queue is the default and needs no argument:
+Install the optional [ModelBlaster runner example](../../examples/firesim_modelblaster/README.md)
+or a separately maintained runner distribution, and select its entry-point name
+with `MERLIN_FIRESIM_RUNNER` in `.env`. Merlin's core wheel contains no runner.
+This is a breaking migration from older checkouts: `run_on_firesim` no longer
+imports ModelBlaster implicitly, and generic `build_app` no longer embeds its
+terminal marker. Existing FireSim callers must install/select a runner and
+pass its `completion_metric_prefix` when building the ELF.
+From Merlin, the queue is the default and needs no argument:
 
 ```python
 from merlin.runtime.backends import zephyr_model as zm
-b = zm.build_app(model_dir, work, board="chipyard_riscv64", backend="scalar", cpus=2)
-r = zm.run_on_firesim(b["elf"], reference=golden, timeout=5400)   # queue=True by default
+from merlin.runtime.backends.firesim_runner import select_runner
+runner = select_runner()  # MERLIN_FIRESIM_RUNNER from .env or process environment
+b = zm.build_app(model_dir, work, board="chipyard_riscv64", backend="scalar", cpus=2,
+                 completion_metric_prefix=getattr(runner, "completion_metric_prefix", None))
+r = zm.run_on_firesim(b["elf"], reference=golden, timeout=5400, runner=runner)
 ```
 
-`run_on_firesim` sets `FIRESIM_QUEUE=1` and `FIRESIM_QUEUE_TIMEOUT`, tags jobs with
+The image carries the selected runner's terminal marker. The example runner refuses
+an image without it before submitting work. The example runner sets `FIRESIM_QUEUE=1`
+and `FIRESIM_QUEUE_TIMEOUT`, tags jobs with
 `FIRESIM_PROJECT=merlin-oscar` so they are distinguishable from other workflows on the shared
 queue, runs under the `merlin-oscar` workload definition (`deploy/workloads/merlin-oscar.json`,
 `common_bootbinary: zephyr0-zephyr.elf`), and repairs `SSH_AUTH_SOCK` when the submitting
 session's agent is dead — the queue records the *submitter's* environment and the daemon later
 runs `firesim kill`, which SSHes to localhost.
+
+These settings belong to the optional ModelBlaster adapter, not the Merlin core.
+`run_on_firesim` resolves the explicitly selected installed entry point; missing or duplicate
+providers fail before submission. A caller can also pass `runner_name=` or `runner=` to
+`run_on_firesim`. The callable receives the ELF
+path and keyword arguments `firesim_root`, `firesim_env`, `timeout`, and `queue`, and returns raw
+UART text. The out-of-tree runner owns staging, workload/project identity, queue submission, and
+simulator imports; Merlin alone parses `OUT`/`METRIC`/`DONE` and applies the reference gate. A
+runner must honor `queue=True` on shared hardware. Passing one does not by itself certify that it
+used the queue or that the expected bitstream executed.
 
 Mind the **timeout**. `run_on_firesim` defaults to 900 s, which is a small model. Whole models
 are hours: at 25 MHz, cycles/2.5×10⁷ = seconds. `firesim_sweep.py` defaults to 5400 s and takes
@@ -175,11 +200,12 @@ are hours: at 25 MHz, cycles/2.5×10⁷ = seconds. `firesim_sweep.py` defaults t
 For a batch:
 
 ```bash
-.venv/bin/python build_tools/scripts/firesim_sweep.py BUNDLE [BUNDLE ...] --timeout 25200
+.venv/bin/python build_tools/scripts/firesim_sweep.py BUNDLE [BUNDLE ...] --runner modelblaster --timeout 25200
 .venv/bin/python build_tools/scripts/fsq.py            # queue, with model names resolved
 ```
 
-`firesim_sweep.py` builds each `chipyard_riscv64` image locally, submits the run to the queue,
+`firesim_sweep.py` builds each `chipyard_riscv64` image with the selected runner's
+terminal marker, submits the run to the queue,
 gates `cos` against `golden.npy`, and appends to a JSONL ledger so a re-run skips what already
 passed. `fsq.py` exists because the native `status` labels every merlin job by its staged
 bootbinary (`zephyr0-zephyr.elf`) — indistinguishable across model × dtype — so it recovers the
@@ -394,8 +420,9 @@ OUT 2048 3202454993 3195417912 ...
 DONE
 ```
 
-`MODELBLASTER_WALL_CYCLES` is the terminal marker the runner waits for; `OUT`/`METRIC`/`DONE`
-are what merlin parses and gates on. A run that reaches `=== merlin_zephyr hart=… ===` and then
+`MODELBLASTER_WALL_CYCLES` is the optional example runner's terminal marker; generic
+Merlin images do not embed it. `OUT`/`METRIC`/`DONE` are what Merlin parses and gates on.
+A run that reaches `=== merlin_zephyr hart=… ===` and then
 goes quiet has *started* correctly and is either slow or wedged — which the heartbeat tells you.
 
 **`heartbeat.csv`** — two columns, `target cycles` and `seconds since start`:
@@ -436,9 +463,9 @@ literal rather than a relocation.
 
 Ordered roughly by how much time each one costs before you work out what it was.
 
-**`ModuleNotFoundError: No module named 'modelblaster'`.** `MERLIN_MODELBLASTER` is unset or
-wrong. The message names neither the setting nor the path it wanted. `run_on_firesim` resolves
-it through `.env`, so it does not need exporting — but it does need to be *there*.
+**No selected FireSim runner.** Install a runner package and set `MERLIN_FIRESIM_RUNNER`
+or pass `runner_name=`. For the example runner, set `MERLIN_MODELBLASTER` to a checkout
+containing `validation/firesim_runner.py`; preflight reports the exact missing path.
 
 **`insmod: ERROR: could not load module poll_mode=1` at INFRASETUP.** The XDMA kernel module is
 not loaded. FireSim's helper searches for a literal `xdma.ko`; a modern kernel ships

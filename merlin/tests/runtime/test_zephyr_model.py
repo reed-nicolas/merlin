@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from merlin.common.paths import merlin_dir, repo_root
+from merlin.common.paths import repo_root
 from merlin.xdsl_dialects import _common
 
 pytestmark = pytest.mark.skipif(not _common.HAS_XDSL, reason="xDSL not installed")
@@ -54,7 +54,7 @@ def test_small_llama_on_zephyr_spike(rvv_hart, tmp_path):
     )
     assert res["ok"], (res.get("cos"), res.get("rel"))
     assert res["metrics"].get("cycles", 0) > 0
-    assert "MODELBLASTER_WALL_CYCLES" in res["console"]
+    assert "DONE" in res["console"]
 
 
 @pytest.mark.skipif(not _zm().available(), reason="Zephyr/spike toolchain unavailable")
@@ -92,30 +92,95 @@ def test_gate_multi_tier_and_legacy():
     assert _gate(far, {"fp32": fp32})["ok"] is False
 
 
-def test_firesim_workload_mismatch_is_refused(tmp_path):
-    """A ``config_runtime.yaml`` naming someone else's workload must raise, not run.
+def test_firesim_runner_seam_parses_and_gates_without_legacy_setup(monkeypatch):
+    """An OOT runner owns execution; Merlin consumes only its UART text."""
+    import sys
 
-    The staging name and the booted name are two different settings, and when they disagree FireSim
-    boots the OTHER workload's leftover binary and reports nothing unusual -- the run just produces the
-    wrong program's output, or none. Only the no-queue path consults this file; the queue daemon is
-    passed the workload explicitly and writes its own config.
-    """
-    from merlin.runtime.backends.zephyr_model import _check_firesim_workload
+    zm = _zm()
+    before_path = list(sys.path)
+    before_env = dict(os.environ)
+    received = {}
 
-    deploy = tmp_path / "deploy"
-    deploy.mkdir()
-    cfg = deploy / "config_runtime.yaml"
+    def runner(elf, *, firesim_root, firesim_env, timeout, queue):
+        received.update(elf=elf, firesim_root=firesim_root, firesim_env=firesim_env, timeout=timeout, queue=queue)
+        return "OUT 2 1065353216 1073741824\nMETRIC cycles 1234\nDONE\n"
 
-    cfg.write_text("workload:\n  workload_name: modelblaster-firesim.json\n  terminate_on_completion: true\n")
-    with pytest.raises(RuntimeError) as e:
-        _check_firesim_workload(str(tmp_path), "merlin-oscar")
-    assert "modelblaster-firesim.json" in str(e.value) and "merlin-oscar" in str(e.value)
+    def no_installed(*args, **kwargs):
+        raise AssertionError("the explicit runner must not load an installed adapter")
 
-    cfg.write_text("workload:\n  workload_name: merlin-oscar.json\n")
-    _check_firesim_workload(str(tmp_path), "merlin-oscar")  # agrees -> silent
+    monkeypatch.setattr(zm, "select_runner", no_installed)
+    result = zm.run_on_firesim(
+        "image.elf",
+        reference=np.array([1.0, 2.0], dtype=np.float32),
+        firesim_root="/selected/firesim",
+        firesim_env="/selected/env.sh",
+        timeout=23,
+        runner=runner,
+    )
+    assert received == {
+        "elf": "image.elf",
+        "firesim_root": "/selected/firesim",
+        "firesim_env": "/selected/env.sh",
+        "timeout": 23,
+        "queue": True,
+    }
+    assert result["ok"] is True
+    assert result["metrics"]["cycles"] == 1234
+    assert sys.path == before_path
+    assert dict(os.environ) == before_env
 
-    # An absent config is not this check's business: FireSim itself reports it, with its own message.
-    _check_firesim_workload(str(tmp_path / "nowhere"), "merlin-oscar")
+
+def test_firesim_runner_requires_uart_text():
+    zm = _zm()
+
+    def wrong_result(elf, *, firesim_root, firesim_env, timeout, queue):
+        return {"ok": True}
+
+    with pytest.raises(zm.ZephyrModelError, match="captured UART text"):
+        zm.run_on_firesim("image.elf", runner=wrong_result)
+
+
+def test_firesim_installed_runner_keeps_existing_call_shape(monkeypatch):
+    zm = _zm()
+    calls = []
+
+    def installed(elf, *, firesim_root, firesim_env, timeout, queue):
+        calls.append((elf, timeout, queue))
+        return "OUT 2 1065353216 1073741824\nMETRIC cycles 7\nDONE\n"
+
+    monkeypatch.setattr(zm, "select_runner", lambda name: installed)
+    result = zm.run_on_firesim("image.elf", timeout=900)
+    assert calls == [("image.elf", 900, True)]
+    assert result["metrics"]["cycles"] == 7
+
+
+def test_firesim_runner_requires_explicit_installed_selection(monkeypatch):
+    from merlin.runtime.backends import firesim_runner
+
+    monkeypatch.setattr(firesim_runner, "env", lambda name: None)
+    with pytest.raises(firesim_runner.FireSimRunnerError, match="MERLIN_FIRESIM_RUNNER"):
+        firesim_runner.select_runner()
+
+
+def test_firesim_runner_rejects_duplicate_installed_names(monkeypatch):
+    from types import SimpleNamespace
+
+    from merlin.runtime.backends import firesim_runner
+
+    providers = [SimpleNamespace(name="selected") for _ in range(2)]
+    monkeypatch.setattr(firesim_runner, "entry_points", lambda group: providers)
+    with pytest.raises(firesim_runner.FireSimRunnerError, match="2 installed providers"):
+        firesim_runner.select_runner("selected")
+
+
+def test_zephyr_image_uses_only_selected_runner_completion_marker():
+    zm = _zm()
+    generic = zm._main_c(0)
+    assert "MODELBLASTER_WALL_CYCLES" not in generic
+    selected = zm._main_c(0, completion_metric_prefix="=== RUNNER_CYCLES ===")
+    assert 'printk("=== RUNNER_CYCLES === %llu\\n"' in selected
+    with pytest.raises(zm.ZephyrModelError, match="completion_metric_prefix"):
+        zm._main_c(0, completion_metric_prefix='bad"; evil')
 
 
 def test_console_parse_surfaces_per_op_profile():

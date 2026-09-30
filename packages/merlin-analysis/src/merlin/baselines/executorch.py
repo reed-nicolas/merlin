@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from merlin.baselines import bundle as _bundle
-from merlin.baselines import k1_exec, profile, rvv_audit
+from merlin.baselines import accuracy_policy, k1_exec, k1_workload_policy, profile, rvv_audit
 from merlin.baselines.contract import BaselineResult, RegionProfile, ScalarFallback
 from merlin.baselines.executorch_identity import (
     ExecuTorchIdentity,
@@ -1154,12 +1154,12 @@ def run_model(
     # below the absolute one.
     int8_bar = None
     if quantize:
-        cos_thr, rel_thr = _bundle.FP32_TIER_MIN_COS, _bundle.ABSOLUTE_INT8_REL
+        cos_thr, rel_thr = accuracy_policy.FP32_TIER_MIN_COS, accuracy_policy.ABSOLUTE_INT8_REL
     # Random-init models ship no reproducible weights, so their CAPTURED golden is unreachable by a
     # re-instantiated export: gating against it measures weight provenance, not the framework. Recompute
     # the reference from THIS instance (as the int8 path already does) and LABEL the cell — the cos then
     # means lowering-exactness, never a semantic match. Non-random-init models are untouched.
-    lowering_exact_only = _bundle.golden_unreproducible(model) and not compute_golden and not replay_captured_weights
+    lowering_exact_only = accuracy_policy.golden_unreproducible(model) and not compute_golden and not replay_captured_weights
     if lowering_exact_only:
         compute_golden = True
     res = BaselineResult(
@@ -1175,7 +1175,7 @@ def run_model(
         timestamp=artifacts.utc_stamp(),
     )
     if lowering_exact_only:
-        res.notes += _bundle.lowering_exactness_note(model)
+        res.notes += accuracy_policy.lowering_exactness_note(model)
 
     b = resolve_bundle(model, variant)
     # WHICH bundle this measurement is on. Part of the measurement, not metadata: resolve()
@@ -1185,7 +1185,7 @@ def run_model(
     # refuses one unless BOTH sides record this.
     res.bundle_id = b.root.name
     if quantize:
-        int8_bar = _bundle.int8_accuracy_bar(b.root)
+        int8_bar = accuracy_policy.int8_accuracy_bar(b.root)
         res.cos_threshold, res.rel_threshold = int8_bar["cos_threshold"], int8_bar["rel_threshold"]
         res.notes += f" int8 bar {int8_bar['basis']}."
     # WHICH int8 arithmetic this cell ran. Recorded from the SELECTED recipe, not inferred from the
@@ -1440,7 +1440,7 @@ def run_all(
 
 
 # All 11 m2m models: the 8 K1-runnable + the 3 RAM-infeasible VLAs (attempted, RAM-gapped).
-ALL_MODELS = tuple(sorted(_bundle.K1_RUNNABLE | _bundle.K1_RAM_INFEASIBLE))
+ALL_MODELS = tuple(sorted(k1_workload_policy.K1_RUNNABLE | k1_workload_policy.K1_RAM_INFEASIBLE))
 
 
 def run_all_int8(

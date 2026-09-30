@@ -24,6 +24,34 @@ from merlin.common.paths import data_path, module_source_path, python_import_roo
 from merlin.targetgen.sandbox import bwrap as BW
 
 
+def test_phase1_requires_the_exact_reviewed_phase0_handoff(monkeypatch):
+    from merlin_experiments.phase0 import coverage_commitment as CC
+
+    report = {"selected": "frozen-input"}
+    readiness = {
+        "schema": CC.READINESS_SCHEMA,
+        "status": "ready",
+        "blockers": [],
+        "inputs_sha256": "a" * 64,
+        "cohort_sha256": "b" * 64,
+        "deferred_phase1": [{"component": "support_lowering"}],
+    }
+    monkeypatch.setattr(
+        CC,
+        "build_phase0_readiness",
+        lambda observed: readiness if observed == report else {**readiness, "cohort_sha256": "c" * 64},
+    )
+    review = {
+        "whole_workload_phase1": {"required": True},
+        "phase0_readiness": CC.phase0_readiness_identity(readiness, required=True),
+    }
+    S._verify_phase0_handoff(review, report)
+    with pytest.raises(ValueError, match="differs from the reviewed corpus"):
+        S._verify_phase0_handoff(review, {"selected": "changed-input"})
+    with pytest.raises(ValueError, match="differs from the reviewed corpus"):
+        S._verify_phase0_handoff({"whole_workload_phase1": {"required": True}}, report)
+
+
 def assemble(bundle, ws, sandbox, *, context):
     assert sandbox == "bwrap"
     BW.materialize_bundle_inputs(ws, bundle, repo=Path(os.environ["SESSION_TEST_ROOT"]))
@@ -191,6 +219,50 @@ def test_real_prepare_retains_views_and_post_staging_tool_observation(project, m
 
     assert _run(request, continuation) == 0
     assert not storage_lifecycle.blockers(observed[0].workspace.parent, require_terminal=True)
+
+
+def test_reviewed_semantic_diagnostic_is_private_and_resume_bound(project, monkeypatch):
+    _external_substitutes(monkeypatch)
+    from merlin_experiments.corpus import release
+
+    from merlin.targetgen import capsule_runner
+
+    monkeypatch.setattr(capsule_runner, "qa_loop_adapters", lambda *_args, **_kwargs: {"L0": object()})
+    monkeypatch.setattr(capsule_runner, "oracle_adapters", lambda *_args, **_kwargs: {"L0": object()})
+
+    # Substitute only the reviewed release boundary. The run still uses its
+    # actual frozen public corpus and Phase 1 admission/resume machinery.
+    model = project / "private-instruction-semantics.json"
+    model.write_text(json.dumps({"schema": "merlin.instruction_semantics.v1", "status": "UNKNOWN"}))
+
+    def reviewed_snapshot(*_args, **_kwargs):
+        return release.VerifiedCorpusSnapshot(
+            {
+                "release": str(project / "reviewed-release"),
+                "review_digest": "fixture-review",
+                "payload_sha256": "fixture-payload",
+                "whole_workload_phase1": {"required": False, "status": "not_established"},
+            },
+            model,
+        )
+
+    monkeypatch.setattr(release, "verify_snapshot_for_phase1", reviewed_snapshot)
+    monkeypatch.setenv("MERLIN_CORPUS_SEAL", str(project / "reviewed-release/private/seal.json"))
+    request = dataclasses.replace(_request(project), treatment=Treatment())
+
+    def continuation(prepared):
+        assert "instruction_semantics_snapshot" not in prepared.environment["corpus_review"]
+        assert prepared.environment["semantic_search_diagnostic"]["status"] == "recorded"
+        receipt = prepared.run_dir / "semantic_search_diagnostic.json"
+        assert receipt.stat().st_mode & 0o077 == 0
+        assert not BW.is_exposed(BW.base_argv(prepared.workspace, prepared.bundle, repo=project), receipt)
+        return 0
+
+    assert _run(request, continuation) == 0
+    assert _run(dataclasses.replace(_request(project, resume=True), treatment=Treatment()), continuation) == 0
+    model.write_text(json.dumps({"schema": "merlin.instruction_semantics.v1", "status": "described"}))
+    with pytest.raises(RuntimeError, match="semantic-search instruction model changed"):
+        _run(dataclasses.replace(_request(project, resume=True), treatment=Treatment()), continuation)
 
 
 def test_treatment_gets_authored_bundle_and_resumes_without_restaging(project, monkeypatch):

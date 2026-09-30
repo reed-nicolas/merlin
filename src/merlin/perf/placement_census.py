@@ -418,6 +418,93 @@ def census_of_module(
     )
 
 
+def planned_outlined_alignment(module: Any, target: str, outlined: Any) -> dict[str, Any]:
+    """Check whether the runtime outline preserves accelerator groups it could form.
+
+    This is deliberately a *static* comparison on the runtime's normalized module, not an
+    execution certificate. The group's members are joined to outlined symbols by the exact source
+    operation objects for the one-op outline, or by the outliner's own group index and exact stage
+    sequence for a grouped outline. A missing join is unknown, never a clean placement.
+    """
+    from merlin.xdsl_dialects.lowering import compute_groups as CG
+    from merlin.xdsl_dialects.lowering.outline import _is_root
+
+    functions = [op for op in module.walk() if op.name == "func.func" and op.body.blocks]
+    if not functions:
+        return {"schema": "planned_outlined_alignment_v1", "status": "incomplete", "reason": "no source function"}
+    groups = CG.form_groups(module, target)
+    roots = [op for op in functions[0].body.blocks[0].ops if _is_root(op)]
+    dispatches = list(outlined.dispatches)
+    grouped = {dispatch.group: dispatch for dispatch in dispatches if dispatch.group is not None}
+    if len(grouped) != sum(dispatch.group is not None for dispatch in dispatches):
+        return {
+            "schema": "planned_outlined_alignment_v1",
+            "status": "incomplete",
+            "reason": "more than one outlined dispatch claims a compute group index",
+        }
+    one_op_outline = not grouped
+    if one_op_outline and (
+        len(roots) != len(dispatches)
+        or any(op.name != dispatch.root_op for op, dispatch in zip(roots, dispatches))
+    ):
+        return {
+            "schema": "planned_outlined_alignment_v1",
+            "status": "incomplete",
+            "reason": "source compute roots do not match one-op outlined dispatches in program order",
+            "source_roots": len(roots),
+            "outlined_dispatches": len(dispatches),
+        }
+    symbol_of = {id(op): dispatch.symbol for op, dispatch in zip(roots, dispatches)} if one_op_outline else {}
+    position = {id(op): index for index, op in enumerate(functions[0].body.blocks[0].ops)}
+    split: list[dict[str, Any]] = []
+    unjoined: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    assessed = 0
+    for group in groups:
+        if group.placement == CG.HOST:
+            continue
+        if group.refusal == CG.READOUT_UNDECLARED:
+            unresolved.append({"group": group.index, "reason": group.reason})
+        if group.root is None:
+            continue
+        root_symbol = symbol_of.get(id(group.root))
+        grouped_dispatch = grouped.get(group.index)
+        for member in group.members:
+            if member is group.root or position.get(id(member), -1) <= position.get(id(group.root), -1):
+                continue  # operand preparation is not an accelerator readout stage
+            stage = CG.classify(member)
+            if stage is None or stage.kind in (CG.VIEW, CG.PAD, CG.MOVEMENT):
+                continue
+            assessed += 1
+            row = {"group": group.index, "stage": stage.kind, "root_symbol": root_symbol}
+            if grouped_dispatch is not None:
+                if (
+                    grouped_dispatch.root_op != group.root.name
+                    or grouped_dispatch.placement != group.placement
+                    or grouped_dispatch.stages != group.stages
+                ):
+                    unjoined.append({**row, "reason": "outlined group identity, placement or stages differ"})
+                continue
+            symbol = symbol_of.get(id(member))
+            if root_symbol is None or symbol is None:
+                unjoined.append({**row, "outlined_symbol": symbol})
+            elif symbol != root_symbol:
+                split.append({**row, "outlined_symbol": symbol})
+    return {
+        "schema": "planned_outlined_alignment_v1",
+        "status": "split" if split else ("incomplete" if unjoined or unresolved else "matched"),
+        "evidence": "runtime_normalized_source_and_outlined_dispatches; static_only",
+        "n_planned_accelerator_stages": assessed,
+        "split_stages": split,
+        "unjoined_stages": unjoined,
+        "unresolved_groups": unresolved,
+        "note": (
+            "A matched outline is not evidence that its symbol executed on the accelerator; "
+            "use the dynamic dispatch ledger separately."
+        ),
+    }
+
+
 def require_offload(report: dict[str, Any]) -> None:
     """Refuse a build that could have used the accelerator and used none of it.
 

@@ -29,13 +29,12 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import _common as C
 import yaml
-
-from merlin.common.paths import ext_path  # noqa: E402
+from merlin_experiments.phase1.timing import read_verified_timing, timing_path
 
 SCRIPTS = C.EXP / "scripts"
 # arm -> (driver, extra args, run-id prefix, run-dir subdir, realistic bundle id, full bundle id)
@@ -542,9 +541,8 @@ def main(argv=None):
         print("\n=== --preflight: protect host surfaces + assert cheat-clean (launches NOTHING) ===")
         commands = [_arm_cmd(arm, rid, a, cond) for arm, rid, _rd, cond in planned]
         rc = _run_preflight(commands)
-        print(
-            f"\n[preflight] {'PASS — safe to launch (drop --preflight, keep flags)' if rc == 0 else 'FAILED — DO NOT launch'}"
-        )
+        verdict = "PASS — safe to launch (drop --preflight, keep flags)" if rc == 0 else "FAILED — DO NOT launch"
+        print(f"\n[preflight] {verdict}")
         return rc
 
     if a.dry_run:
@@ -554,9 +552,9 @@ def main(argv=None):
         )
         return 0
 
-    # HARD pre-flight: verilator timing must be FRESH (readiness_check measured it on a known-good backend
-    # AFTER the current sim binary was built). This is the abc7 safeguard — never launch a run whose
-    # verilator timeout/availability was never actually verified. (Skip for --sandbox none legacy.)
+    # HARD pre-flight: timing must match the selected simulator bytes measured by readiness_check.
+    # This is the abc7 safeguard — never launch a run whose Verilator timeout/availability was
+    # never actually verified. (Skip for --sandbox none legacy.)
     # It is target-conditional: the freshness gate guards a chipyard verilator sim, so a target whose RTL
     # tier is the mlc arc model (sim_via != "chipyard": atlas/npu_model, radiance, saturn …) has no
     # verilator binary to time against — the gate is N/A and would spuriously refuse an otherwise-ready run.
@@ -576,32 +574,19 @@ def main(argv=None):
                 f"readiness to record it). N/A for pure mlc-arc targets."
             )
     elif a.sandbox == "bwrap":
-        timing = SCRIPTS / ".oracle_timing.json"
-        if not timing.is_file():
+        timing = timing_path(C.EXP, C.TARGET)
+        try:
+            measured = read_verified_timing(timing, descriptor=C.DESCRIPTOR, target=C.TARGET)
+        except ValueError as exc:
             print(
-                "REFUSING TO LAUNCH: scripts/.oracle_timing.json missing — run readiness_check.py "
+                f"REFUSING TO LAUNCH: {exc}; run readiness_check.py "
                 "(it RUNS spike+verilator on the reference backend) first.",
                 file=sys.stderr,
             )
             return 3
-        # Resolve the verilator binary the SAME way the sandbox and readiness_check do (.env chipyard),
-        # and take the design name from the timing record readiness_check wrote — a literal path here
-        # silently never matched, so the staleness half of this gate could not fire at all.
-        _cfg = (json.loads(timing.read_text()) or {}).get("config")
-        sim = (ext_path("chipyard") / "sims" / "verilator" / f"simulator-chipyard.harness-{_cfg}") if _cfg else None
-        if sim is None or not sim.is_file():
-            print(
-                f"[pre-flight] verilator staleness check SKIPPED (no binary at {sim}) — the timing "
-                f"record exists but cannot be compared against a build."
-            )
-        elif timing.stat().st_mtime < sim.stat().st_mtime:
-            print(
-                "REFUSING TO LAUNCH: .oracle_timing.json is STALE (older than the verilator binary) — "
-                "re-run readiness_check.py to re-measure.",
-                file=sys.stderr,
-            )
-            return 3
-        print(f"[pre-flight] oracle timing fresh: {timing.read_text().strip()[:80]}")
+        # read_verified_timing compared the selected config and simulator SHA256;
+        # timestamps are not an identity and may change when identical bytes are copied.
+        print(f"[pre-flight] oracle timing verified: {measured['config']} {timing.name}")
 
     env = dict(os.environ)
     if acct:
@@ -619,7 +604,7 @@ def main(argv=None):
     manifest = {
         "tag": a.tag,
         "mode": a.mode,
-        "launched_at": datetime.now(timezone.utc).isoformat(),
+        "launched_at": datetime.now(UTC).isoformat(),
         "model": a.model,
         "effort": a.effort,
         "account_config_dir": acct or None,
@@ -669,9 +654,8 @@ def main(argv=None):
                 env=env,
             )
         manifest["chain_pid"] = p.pid
-        print(
-            f"launched sequential chain pid={p.pid}  chain-log={clog}\n  order: {[r['run_id'] for r in manifest['runs']]}"
-        )
+        print(f"launched sequential chain pid={p.pid}  chain-log={clog}")
+        print(f"  order: {[r['run_id'] for r in manifest['runs']]}")
 
     mpath = C.RUNS / f"ab_batch_{a.tag}.json"
     mpath.write_text(json.dumps(manifest, indent=2))

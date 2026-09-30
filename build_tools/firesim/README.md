@@ -53,7 +53,7 @@ in one overlay, before submitting.
 .venv/bin/python build_tools/firesim/preflight.py --json    # machine
 ```
 
-Checks the chipyard checkout, the ModelBlaster runner `run_on_firesim()` imports, the queue
+Checks the chipyard checkout, the explicitly selected installed FireSim runner, the queue
 daemon's liveness (not merely its pid file), the XDMA device nodes, the `default_hw_config` →
 hwdb → bitstream-tar chain, and the effective clock of the most recent run. Touches nothing:
 no job is submitted, the FPGA is not opened, the daemon is not started. Exit 1 on any FAIL.

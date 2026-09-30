@@ -15,9 +15,28 @@ from merlin.runtime import boards
 from merlin.runtime.backends import zephyr_model as zm
 
 
+def _fixture_board(name: str, *, harts: int, **extra):
+    facts = {
+        "name": name,
+        "dram_bytes": 1 << 28,
+        "dram_base": 0x80000000,
+        "harts": harts,
+        "vector_harts": harts,
+        "console": boards.CONSOLE_HTIF,
+        "flow": boards.FLOW_ZEPHYR,
+        "fpu_sharing": False,
+        "zephyr_vector_ext": True,
+        "loader": boards.LOADER_UART_TSI,
+        "loader_baud": 921600,
+        "ram_label": "ram0",
+    }
+    facts.update(extra)
+    return boards.Board(**facts)
+
+
 @pytest.fixture()
 def acme_board(monkeypatch):
-    b = boards.Board(name="acme_board", dram_bytes=1 << 28, harts=2, target="acme", rtl_sim_config="AcmeSoCConfig")
+    b = _fixture_board("acme_board", harts=2, target="acme", rtl_sim_config="AcmeSoCConfig")
     monkeypatch.setitem(boards.BOARDS, b.name, b)
     monkeypatch.delenv(target_env_name("acme", "VERILATOR"), raising=False)
     return b
@@ -37,7 +56,7 @@ def test_the_override_variable_and_config_derive_from_the_board(acme_board, tmp_
 
 
 def test_a_board_that_declares_no_simulator_fails_closed(monkeypatch, tmp_path):
-    bare = boards.Board(name="bare_board", dram_bytes=1 << 28, harts=1)
+    bare = _fixture_board("bare_board", harts=1)
     monkeypatch.setitem(boards.BOARDS, bare.name, bare)
     monkeypatch.setenv("MERLIN_CHIPYARD", str(tmp_path))
     assert zm.verilator_sim(board=bare.name) is None
@@ -45,9 +64,9 @@ def test_a_board_that_declares_no_simulator_fails_closed(monkeypatch, tmp_path):
         zm.run_on_verilator(tmp_path / "x.elf", board=bare.name)
 
 
-def test_the_default_board_keeps_the_variable_and_config_it_always_had():
-    desc = boards.board(zm.VERILATOR_BOARD)
-    cfg, env_name = zm._verilator_facts(zm.VERILATOR_BOARD, None)
+def test_the_declared_board_keeps_the_variable_and_config_it_always_had():
+    desc = boards.board("chipyard_riscv64")
+    cfg, env_name = zm._verilator_facts(desc.name, None)
     assert cfg and cfg == desc.rtl_sim_config
     assert env_name == target_env_name(desc.target, "VERILATOR")
     # The names existing setups export and build; derived now, but unchanged.

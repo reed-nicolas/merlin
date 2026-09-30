@@ -205,6 +205,36 @@ def _valid_model_row() -> dict:
     }
 
 
+def test_must_accelerate_requires_runtime_outline_to_preserve_planned_groups():
+    from merlin.targetgen import capsule_grade as CGR
+
+    capsule = {"semantic": {"must_accelerate": True}}
+    row = _valid_model_row()
+    missing = CGR.model_execution_check(row, capsule)
+    assert "planned_outlined_alignment_unverified" in missing["violations"]
+    withheld = CGR.enforce_model_execution_check(
+        {**row, "status": "pass", "tiers": {}}, capsule, target="gemmini"
+    )
+    assert withheld["status"] == "incomplete" and withheld["failure"]["plane"] == "model_placement"
+
+    alignment = {
+        "schema": "planned_outlined_alignment_v1",
+        "evidence": "runtime_normalized_source_and_outlined_dispatches; static_only",
+        "n_planned_accelerator_stages": 1,
+        "split_stages": [{"stage": "elementwise"}],
+        "unjoined_stages": [],
+        "unresolved_groups": [],
+        "status": "split",
+    }
+    row["mesh_execution"]["planned_outlined_alignment"] = alignment
+    split = CGR.model_execution_check(row, capsule)
+    assert "planned_accelerator_group_split_in_outline" in split["violations"]
+
+    row["mesh_execution"]["planned_outlined_alignment"] = {**alignment, "status": "matched", "split_stages": []}
+    matched = CGR.model_execution_check(row, capsule)
+    assert not [v for v in matched["violations"] if "outlined" in v]
+
+
 def _remove_scalar_lane(row: dict) -> None:
     ledger = row["mesh_execution"]["dispatch_ledger"]
     ledger.pop(1)

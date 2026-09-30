@@ -9,7 +9,7 @@ from merlin.common.paths import repo_root
 
 
 def load_probe():
-    source = repo_root() / "examples/gemmini/target/probe_native_kernel.py"
+    source = repo_root() / "examples/gemmini/verification/probe_native_kernel.py"
     spec = importlib.util.spec_from_file_location("gemmini_native_kernel_probe", source)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

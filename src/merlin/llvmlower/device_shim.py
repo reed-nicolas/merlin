@@ -52,6 +52,8 @@ typedef struct {{
   intptr_t strides[3];
 }} merlin_memref_3d;
 
+{pointer_guard}
+
 /* The device kernels, per the OOT backend contract's kernel_abi. Supplied by the archive.
  * One per signature: the package emits its entry under a single contract-declared name, so a model
  * with several distinct extents produces several objects that all define it. They are renamed apart
@@ -61,6 +63,32 @@ typedef struct {{
 
 {entries}
 /* {n} entry point(s) emitted. */
+"""
+
+_RANK2_POINTER_GUARD = """
+/* The resident kernel takes flat row-major buffers.  An overlapping output or
+ * strided descriptor cannot be repaired by reinterpreting its pointer. */
+static int merlin_span(const void *aligned, intptr_t offset, intptr_t rows, intptr_t cols,
+                       uintptr_t elem_bytes, uintptr_t *start, uintptr_t *length) {
+  if (!aligned || offset < 0 || rows <= 0 || cols <= 0 || !elem_bytes) return 0;
+  uintptr_t base = (uintptr_t)aligned, off = (uintptr_t)offset;
+  uintptr_t r = (uintptr_t)rows, c = (uintptr_t)cols;
+  if (r > UINTPTR_MAX / c || off > UINTPTR_MAX / elem_bytes) return 0;
+  uintptr_t elements = r * c;
+  if (elements > UINTPTR_MAX / elem_bytes) return 0;
+  uintptr_t delta = off * elem_bytes, bytes = elements * elem_bytes;
+  if (delta > UINTPTR_MAX - base) return 0;
+  uintptr_t address = base + delta;
+  if (bytes > UINTPTR_MAX - address) return 0;
+  *start = address; *length = bytes;
+  return 1;
+}
+
+static int merlin_disjoint(const void *a, uintptr_t a_bytes, const void *b, uintptr_t b_bytes) {
+  uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+  if (!x || !y || a_bytes > UINTPTR_MAX - x || b_bytes > UINTPTR_MAX - y) return 0;
+  return x + a_bytes <= y || y + b_bytes <= x;
+}
 """
 
 _ENTRY_2D = """
@@ -84,11 +112,18 @@ merlin_memref_2d {symbol}(
     bad.sizes[0] = 0; bad.sizes[1] = 0; bad.strides[0] = 0; bad.strides[1] = 0;
     return bad;
   }}
-  (void)a_alloc; (void)b_alloc; (void)a_st0; (void)a_st1; (void)b_st0; (void)b_st1;
+  if (a_st0 != {k} || a_st1 != 1 || b_st0 != {n} || b_st1 != 1 ||
+      c_st0 != {n} || c_st1 != 1) __builtin_trap();
+  (void)a_alloc; (void)b_alloc;
+  uintptr_t a_addr, b_addr, c_addr, a_bytes, b_bytes, c_bytes;
+  if (!merlin_span(a_aligned, a_off, a_s0, a_s1, {lhs_bytes}u, &a_addr, &a_bytes) ||
+      !merlin_span(b_aligned, b_off, b_s0, b_s1, {rhs_bytes}u, &b_addr, &b_bytes) ||
+      !merlin_span(c_aligned, c_off, c_s0, c_s1, {out_bytes}u, &c_addr, &c_bytes) ||
+      !merlin_disjoint((void *)a_addr, a_bytes, (void *)c_addr, c_bytes) ||
+      !merlin_disjoint((void *)b_addr, b_bytes, (void *)c_addr, c_bytes))
+    __builtin_trap();
   /* arg_order is [the single resident weight] ++ [lhs] ++ [outputs]: the rhs is the weight. */
-  {kernel}((char *)b_aligned + b_off * {rhs_bytes},
-           (char *)a_aligned + a_off * {lhs_bytes},
-           (char *)c_aligned + c_off * {out_bytes});
+  {kernel}((void *)b_addr, (void *)a_addr, (void *)c_addr);
   merlin_memref_2d r;
   r.allocated = c_alloc; r.aligned = c_aligned; r.offset = c_off;
   r.sizes[0] = c_s0; r.sizes[1] = c_s1;
@@ -126,11 +161,20 @@ merlin_memref_2d {symbol}(
     bad.sizes[0] = 0; bad.sizes[1] = 0; bad.strides[0] = 0; bad.strides[1] = 0;
     return bad;
   }}
-  (void)a_alloc; (void)b_alloc; (void)a_st0; (void)a_st1; (void)b_st0; (void)b_st1;
+  if (a_st0 != {k} || a_st1 != 1 || b_st0 != {n} || b_st1 != 1 ||
+      c_st0 != {n} || c_st1 != 1) __builtin_trap();
+  (void)a_alloc; (void)b_alloc;
   {{
-    const unsigned char *src_a = (const unsigned char *)a_aligned + a_off * {lhs_bytes};
-    const unsigned char *src_b = (const unsigned char *)b_aligned + b_off * {rhs_bytes};
-    unsigned char *dst_c = (unsigned char *)c_aligned + c_off * {out_bytes};
+    uintptr_t a_addr, b_addr, c_addr, a_bytes, b_bytes, c_bytes;
+    if (!merlin_span(a_aligned, a_off, a_s0, a_s1, {lhs_bytes}u, &a_addr, &a_bytes) ||
+        !merlin_span(b_aligned, b_off, b_s0, b_s1, {rhs_bytes}u, &b_addr, &b_bytes) ||
+        !merlin_span(c_aligned, c_off, c_s0, c_s1, {out_bytes}u, &c_addr, &c_bytes) ||
+        !merlin_disjoint((void *)a_addr, a_bytes, (void *)c_addr, c_bytes) ||
+        !merlin_disjoint((void *)b_addr, b_bytes, (void *)c_addr, c_bytes))
+      __builtin_trap();
+    const unsigned char *src_a = (const unsigned char *)a_addr;
+    const unsigned char *src_b = (const unsigned char *)b_addr;
+    unsigned char *dst_c = (unsigned char *)c_addr;
     long i, j;
     for (i = 0; i < {mp} * {kp} * {lhs_bytes}; ++i) {symbol}_a[i] = 0;
     for (i = 0; i < {kp} * {np_} * {rhs_bytes}; ++i) {symbol}_b[i] = 0;
@@ -284,11 +328,17 @@ def tile_edge_for(device: str) -> int | None:
         body = _f.body_if_present(device)
     except Exception:            # noqa: BLE001
         return None
+    edges = set()
     for arr in (body.get("arrays") or ()):
+        if not isinstance(arr, dict):
+            return None
         rows, cols = arr.get("rows"), arr.get("cols")
-        if rows and cols:
-            return int(min(int(rows), int(cols)))
-    return None
+        if type(rows) is not int or type(cols) is not int or rows <= 0 or rows != cols:
+            # The current shim stages square tiles. A rectangular mesh cannot
+            # safely be represented by choosing its smaller dimension.
+            return None
+        edges.add(rows)
+    return edges.pop() if len(edges) == 1 else None
 
 
 def _elem_bytes(token: str) -> int | None:
@@ -304,7 +354,7 @@ def emit_translation_unit(device: str,
                           signatures: Mapping[str, Sequence[int]],
                           dtypes: Mapping[str, Sequence[str]],
                           *,
-                          kernel_symbol_for: "Callable[[str], str] | None" = None,
+                          kernel_symbol_for: Callable[[str], str] | None = None,
                           tile_edge: int | None = None) -> ShimUnit:
     """One entry per signature, adapting the MLIR ABI to ``device``'s kernel.
 
@@ -370,7 +420,9 @@ def emit_translation_unit(device: str,
 
     kernels = sorted({kernel_for(sym) for sym in emitted})
     externs = "\n".join(f"extern void {k}(void *weight, void *lhs_0, void *out_0);" for k in kernels)
-    text = (_PREAMBLE.format(device=device, externs=externs, entries="".join(entries),
+    pointer_guard = _RANK2_POINTER_GUARD if any(len(signatures[sym]) == 3 for sym in emitted) else ""
+    text = (_PREAMBLE.format(device=device, pointer_guard=pointer_guard,
+                             externs=externs, entries="".join(entries),
                              n=len(emitted)) if emitted else "")
     return ShimUnit(text=text, symbols=tuple(emitted), kernel=abi.symbol,
                     kernels=tuple(kernels), skipped=tuple(skipped))

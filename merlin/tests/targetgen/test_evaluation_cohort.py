@@ -53,7 +53,7 @@ def _working_search_engine(tmp_path, monkeypatch):
     )
     _SEARCH_BINDING.clear()
     _SEARCH_BINDING.update(binding)
-    monkeypatch.setattr(EC, "cyclotron_l2_engine_binding", lambda _target: copy.deepcopy(binding))
+    monkeypatch.setattr(EC, "selected_l2_engine_binding", lambda _target: copy.deepcopy(binding))
     return binding
 
 
@@ -191,7 +191,7 @@ assert pathlib.Path(cohort.__file__).is_relative_to(sys.argv[2])
 work = pathlib.Path(sys.argv[3])
 cohort.repo_root = lambda: work
 cohort._declared_l2_engine = lambda target: payload['binding']['engine']
-cohort.cyclotron_l2_engine_binding = lambda target: payload['binding']
+cohort.selected_l2_engine_binding = lambda target: payload['binding']
 te = SimpleNamespace(target='synthetic', path=work / 'target_experiment.yaml',
     descriptor_sha256=payload['descriptor_sha256'], graded_cohort_policy='synthetic_test_only',
     graded_include=('fixture',), graded_roots=lambda: (work / 'corpus',))

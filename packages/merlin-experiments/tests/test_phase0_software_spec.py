@@ -56,6 +56,27 @@ def test_gemmini_software_spec_does_not_admit_integer_shift_as_fused_readout():
     assert any(row["role"] == "epilogue" and row["status"] == "unsupported" for row in decision["decisions"])
 
 
+def test_recipe_selects_only_contained_oot_software_spec(tmp_path, monkeypatch):
+    provider = tmp_path / "provider"
+    (provider / "contracts").mkdir(parents=True)
+    (provider / "provider.yaml").write_text(
+        "schema: merlin.provider.v1\nid: selected\ntarget: test_device\nrole: support\n"
+        "contract: contracts/target_contract.yaml\n"
+    )
+    (provider / "contracts/target_contract.yaml").write_text("name: test_device\n")
+    selected = provider / "contracts/software-spec.yaml"
+    selected.write_text("schema: merlin.software_spec.v1\ntarget: test_device\n")
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text(
+        "software_spec: {provider: test_device, resource: contracts/software-spec.yaml}\n"
+    )
+    monkeypatch.setenv("MERLIN_TARGET_PATH", str(provider))
+    assert SS.software_spec_path_for_recipe(recipe) == selected
+    recipe.write_text("software_spec: {provider: test_device, resource: ../outside.yaml}\n")
+    with pytest.raises(ValueError, match="escapes provider root"):
+        SS.software_spec_path_for_recipe(recipe)
+
+
 def test_versioned_selection_preserves_bytes_and_rejects_incoherent_semantics(tmp_path):
     path = tmp_path / "software-spec.yaml"
     doc = _spec()
@@ -292,3 +313,28 @@ def test_synthesis_producer_binds_explicit_software_and_hardware_selection(tmp_p
     assert provenance["selected_inputs"]["software_spec_sha256"] == SS.software_spec_identity(spec)["sha256"]
     assert provenance["hardware_evidence"]["status"] == "diagnostic"
     assert provenance["software_spec"]["status"] == "unreviewed"
+    requirement.write_text("cells: [{cell: contraction/bf16/aligned, family: contraction, dtype: bf16}]\n")
+    conflict = producer.synth_for("test_device", software_spec=spec, rtl_facts=tmp_path / "facts.json")
+    assert conflict["status"] == "invalid_synthesis_inputs"
+    assert "contraction/bf16/aligned" in conflict["detail"]
+
+
+def test_mx_conformance_rejects_legacy_accelerator_formats():
+    import importlib.util
+
+    from merlin.common.paths import repo_root
+
+    root = repo_root()
+    module_spec = importlib.util.spec_from_file_location(
+        "mx_software_spec_synthesis", root / "build_tools/scripts/synth_capsule_corpus.py"
+    )
+    producer = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(producer)
+    software = SS.load_software_spec(root / "examples/mx_gemmini/target/software-spec.yaml", target="mx_gemmini")
+    old_requirement = yaml.safe_load(
+        (root / "experiments/reference-data/phase0/conformance/mx_gemmini.yaml").read_text()
+    )
+    conflicts = producer._software_cell_conflicts(old_requirement, software)
+    assert "contraction/bf16/aligned" in conflicts
+    assert "contraction/i8/aligned" in conflicts
+    assert "contraction/mxfp4/aligned" not in conflicts

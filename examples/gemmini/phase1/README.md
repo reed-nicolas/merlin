@@ -20,6 +20,10 @@ Prepare and review a fresh corpus release through the
 before verified execution. Preparation copies these inputs into the release and
 removes the live source pointers. New bundles grant the declared task directory;
 old bundles or frozen runs are not rewritten to adopt this layout.
+Phase 1 startup rechecks the sealed `phase0_readiness` against the frozen corpus;
+the distinct `whole_workload_phase1` verdict remains incomplete until a compiler
+produces and executes the required typed routes. A diagnostic capture replay is
+not sufficient for the Phase 0 handoff.
 
 ## What the functional finish line must prove
 
@@ -31,11 +35,28 @@ operator inventory, an accounted route for every region (Gemmini or a declared
 host lane), a whole-model compile with no unsupported-op escape, executable
 artifacts, numerical comparison against an independent framework reference,
 and observed dispatch evidence that the admitted accelerator work actually ran.
+For fused stages, inspect `planned_outlined_alignment` beside the dynamic
+`dispatch_ledger`: a routing plan or group proposal alone does not prove the
+runtime emitted one accelerator dispatch, much less executed it. Missing alignment
+is incomplete; an eligible group split into host work is a functional placement
+failure. The current runtime does not yet execute grouped epilogues on its mesh
+path, so do not claim fused-stage coverage from a passing contraction counter.
 Keep the capture, quantization scheme, weights/manifest, compiler submission
 hash, intermediate MLIR and run receipts together; a storage dtype alone does
 not establish the arithmetic or accelerator placement. The
 [whole-model example](../whole-model/README.md) explains IR inspection, but its
 lowering smoke is not this functional certificate.
+
+Placement is a separate acceptance condition: every source compute region must
+appear in the whole-module census, and every region admitted by the independent
+Gemmini eligibility contract must execute on Gemmini (possibly as a declared
+fused stage). A correct host result does not satisfy that condition. A host
+region is acceptable only when the target contract explains why it is not
+Gemmini-eligible; an unknown precision, unclassified operation, missing census,
+or unobserved dispatch leaves the claim incomplete. Review both region recall
+and estimated-work recall, since a single missed contraction can dominate model
+time even when the region count looks good. The exact minimum Phase 0 source-op
+witness basis is not a substitute for this Phase 1 placement and execution check.
 
 The current example does **not** claim that finish line has been reached.
 The descriptor makes `M2_microvit_gemmini`, `M3_host_island_seam_gemmini`, and
@@ -125,13 +146,23 @@ The direct installed CLI below selects the same treatment. For an installed
 [`baseline-functional-template`](../../../experiments/definitions/baseline-functional-template.yaml)
 with its required operator inputs; changing treatment changes the experiment.
 
+Phase 1's semantic-search receipt is a host-private diagnostic over the frozen
+public capsules. It is not shown to the agent, does not select a treatment, and
+does not count as compiler or grading evidence. An agent-visible search helper
+would be a separately declared and frozen treatment so its results can be
+compared fairly with the current experiment.
+
 For direct invocation, set the variables below to actual operator-selected inputs.
 `CORPUS_SEAL` is the release's `private/seal.json`; `DESCRIPTOR` must belong to
 that release. `RESOURCE_ROOT` resolves declared resource paths. `BUNDLE_ID` must
 match `BUNDLE_MANIFEST`; use reviewed RTL-checks inputs, not an invented bundle.
 `ORACLE_TIMING` must name an existing operator-owned timing record. The example
-path is not supplied here: provision a genuine record or select an existing one;
-do not fabricate an empty placeholder or change it after freezing a run.
+selects `.oracle_timing.gemmini.json` in the target resource directory. The native
+readiness check writes that file only after a real L3 pass and binds its target,
+declared simulator configuration and simulator SHA256. The installed preflight
+rechecks those bytes. Older records under the shared `scripts/` link are diagnostic
+only. Provision a genuine record or select an existing measured one; do not
+fabricate a placeholder or change it after freezing a run.
 
 ```sh
 MERLIN_CORPUS_SEAL="${CORPUS_SEAL:?}" python -m merlin_experiments.phase1 \

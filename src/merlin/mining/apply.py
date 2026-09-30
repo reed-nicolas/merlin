@@ -223,7 +223,7 @@ def apply_rvv_package(
     model_dir: str | Path,
     work: str | Path,
     *,
-    board: str = "spike_riscv64",
+    board: str | None = None,
     harts: int = 2,
     arena_mb: int = 64,
     int8_compute: bool | None = None,
@@ -242,6 +242,8 @@ def apply_rvv_package(
     :func:`shape_adapted_features`. Opt-in because it changes the emitted schedule for workloads the
     pinned block does not fit, which is a measurement-visible change.
     """
+    if board is None:
+        raise ValueError("apply_rvv_package requires a board from MERLIN_BOARD_CATALOG")
     if not isinstance(pkg, RvvPackage):
         pkg = load_rvv_package(pkg)
     if int8_compute is None:

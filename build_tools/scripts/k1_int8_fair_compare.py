@@ -50,7 +50,7 @@ from statistics import median
 import numpy as np
 
 from merlin.baselines import executorch as et
-from merlin.baselines.bundle import int8_accuracy_bar
+from merlin.baselines.accuracy_policy import int8_accuracy_bar
 from merlin.common.paths import repo_root
 from merlin.mining import k1
 from merlin.mining.registry import load_rvv_package
@@ -421,7 +421,7 @@ def same_rule_both_arms(ours: dict, arm: dict, ours_bundle: str) -> dict:
     """Both arms' fp32 cos/rel under the same absolute int8 quality bar.
 
     The two arms are graded by DIFFERENT rules today, and the asymmetry favours the reference.
-    ``baselines.bundle.int8_accuracy_bar`` derives a bar from the model's OWN quantization noise
+    ``baselines.accuracy_policy.int8_accuracy_bar`` derives a bar from the model's OWN quantization noise
     (``rel = max(ABSOLUTE_INT8_REL, QUANT_EXCESS_K * floor_rel)``) and the ExecuTorch arm is held to
     it; our arm is held to ``zephyr_model._gate``'s ABSOLUTE T1 (cos > 0.999, rel < 1e-2). On
     tiny_llama that is cos>0.9487 / rel<3.8325 for them against cos>0.999 / rel<0.01 for us -- about
@@ -435,7 +435,7 @@ def same_rule_both_arms(ours: dict, arm: dict, ours_bundle: str) -> dict:
     our stricter bar refused is exactly where the difference decides how the row reads.
     """
     try:
-        from merlin.baselines.bundle import FP32_TIER_MIN_COS
+        from merlin.baselines.accuracy_policy import FP32_TIER_MIN_COS
 
         cos_thr, rel_thr = FP32_TIER_MIN_COS, None
         g = ours.get("gate") or {}

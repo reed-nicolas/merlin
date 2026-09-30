@@ -112,6 +112,24 @@ def capture_selections(selections: list[str]) -> dict[str, Path]:
     return result
 
 
+def capture_selection_specs(selections: list[str]) -> dict[str, tuple[Path, str]]:
+    """Parse independent pre-execution selection paths and exact byte digests."""
+    result = {}
+    for item in selections:
+        label, separator, location = item.partition("=")
+        name, digest_separator, digest = location.rpartition("@")
+        if (
+            not separator or not digest_separator or not label or not name or label in result
+            or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"invalid/duplicate capture preselection {item!r}; use LABEL=PATH@SHA256")
+        path = Path(name).expanduser().absolute()
+        if path.is_symlink() or any(parent.is_symlink() for parent in path.parents) or not path.is_file():
+            raise ValueError(f"capture preselection is absent or indirect: {path}")
+        result[label] = (path, digest)
+    return result
+
+
 def _validate_capture_recipes(captures: dict[str, Path], selected_recipe_hashes: set[str]) -> None:
     """A realized quantized graph must use a recipe this provider actually derived."""
     for label, path in sorted(captures.items()):
@@ -144,6 +162,7 @@ def derive(
     rtl_facts: str | Path,
     output_root: str | Path,
     native_qualifications: dict[str, Path] | None = None,
+    capture_preselections: dict[str, tuple[Path, str]] | None = None,
 ) -> dict:
     """Write a byte-bound requirement, complete census and diagnostic candidate plan.
 
@@ -163,10 +182,24 @@ def derive(
         )
     if len({str(path.resolve()) for path in captures.values()}) != len(captures):
         raise ValueError("distinct application labels cannot select the same capture path")
+    capture_preselections = capture_preselections or {}
+    if capture_preselections and set(capture_preselections) != set(captures):
+        raise ValueError("capture preselection must cover the entire declared iteration roster")
+    selected_capture_evidence = {}
+    if capture_preselections:
+        from .capture_selection import verify
+
+        for label, (selection_path, selected_sha256) in sorted(capture_preselections.items()):
+            selected_capture_evidence[label] = verify(
+                selection_path, expected_sha256=selected_sha256, model_path=captures[label]
+            )
     spec = load_spec(definition)
     config = spec.document["phases"]["0"]["config"]
     software = selected_software_spec_path(
         declaration.recipe, spec.resolve(config["software_spec"]) if config.get("software_spec") else None
+    )
+    capability_contract_path = (
+        spec.resolve(config["capability_contract"]) if config.get("capability_contract") else None
     )
     hardware = spec.resolve(config["hardware_spec"]) if config.get("hardware_spec") else None
     if software is None:
@@ -174,6 +207,7 @@ def derive(
     selected = select_evidence(
         te.target,
         descriptor=declaration.descriptor,
+        capability_contract_path=capability_contract_path,
         software_spec=software,
         hardware_spec=hardware,
         facts_path=rtl_facts,
@@ -225,6 +259,13 @@ def derive(
     selected_recipes = capture_recipe_candidates(selected.software_spec, quantization)
     _validate_capture_recipes(captures, {row["recipe"]["recipe_sha256"] for row in selected_recipes})
     requirement["application_demands"]["sidecar"] = "application-demands.json"
+    if selected_capture_evidence:
+        requirement["capture_execution_preselections"] = {
+            "schema": "merlin.phase0.capture_preselections.v1",
+            "status": "replay_verified_nonadmissible",
+            "applications": selected_capture_evidence,
+            "phase0_admission": "not_granted",
+        }
     requirement = intersect_requirement(requirement, selected.software_spec, selected.contract)
     # The recipe's tier ladder is an authored PLAN, not evidence that an oracle
     # was constructed. Keep it separate from ``oracle_tiers`` (which remains
@@ -258,6 +299,8 @@ def derive(
         "requirements.yaml": yaml.safe_dump(requirement, sort_keys=False).encode(),
         "application-demands.json": _json(full),
     }
+    if selected_capture_evidence:
+        outputs["capture-preselections.json"] = _json(requirement["capture_execution_preselections"])
     # Save the census even when an exact writer cannot express every signature.
     # Such a plan is diagnostic and must not become a selectable verified corpus.
     try:
@@ -302,6 +345,7 @@ def derive(
     selected = select_evidence(
         te.target,
         descriptor=declaration.descriptor,
+        capability_contract_path=capability_contract_path,
         software_spec=software,
         hardware_spec=hardware,
         facts_path=rtl_facts,

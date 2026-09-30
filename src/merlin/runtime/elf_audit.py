@@ -1,7 +1,7 @@
 """Audit a produced ELF against a board's memory map, BEFORE anyone loads it onto that board.
 
-Every "will it fit" decision in this repo is *predictive arithmetic* (``_ram_for_weights``,
-``LINK_LIMIT``, ``EXT_MAX_WEIGHTS``); nothing has ever looked at the artifact to confirm the prediction
+Every "will it fit" decision in this repo is *predictive arithmetic* (``_ram_for_weights``
+and the selected board's external-memory layout); nothing has ever looked at the artifact to confirm the prediction
 came true. That is tolerable when the person running the binary can attach a debugger. It is not
 tolerable when the binary is mailed to someone else's bench, because the failure modes are silent:
 
@@ -33,14 +33,8 @@ from typing import Any
 
 from merlin.common import proc as _proc
 
-#: Fallback UART-TSI throughput, bytes/second, for a caller with no board descriptor. 921600 baud 8N1
-#: carries 10 bits per byte ≈ 92 KB/s. Prefer `Board.loader_bytes_per_s`, which derives this from the
-#: baud the board's own loader command uses — a fixed constant here was wrong by 16x for Kodiak.
-UART_BYTES_PER_S = 92_000
-
-
 def _bytes_per_s(brd) -> float:
-    return float(getattr(brd, "loader_bytes_per_s", None) or UART_BYTES_PER_S)
+    return float(brd.loader_bytes_per_s)
 
 
 def upload_bytes(brd, segments: list[Segment], sections: dict[str, tuple[int, int, str]]) -> tuple[int, str]:
@@ -57,7 +51,7 @@ def upload_bytes(brd, segments: list[Segment], sections: dict[str, tuple[int, in
     """
     from .boards import LOADER_PYUARTSI
 
-    if getattr(brd, "loader", None) == LOADER_PYUARTSI:
+    if brd.loader == LOADER_PYUARTSI:
         total = sum(size for (addr, size, kind) in sections.values() if kind == "PROGBITS" and addr > 0)
         return total, "PROGBITS sections with addr>0 (pyuartsi skips NOBITS)"
     return sum(s.memsz for s in segments), "PT_LOAD MemSiz incl. zero-fill (uart_tsi/fesvr)"
@@ -217,8 +211,8 @@ def audit(
     rep.facts["image_filesz_mb"] = round(total_file / 2**20, 2)
     up_bytes, up_note = upload_bytes(brd, segments, sections)
     rep.facts["upload_bytes"] = up_bytes
-    rep.facts["upload_loader"] = getattr(brd, "loader", "uart_tsi")
-    rep.facts["upload_baud"] = getattr(brd, "loader_baud", 921_600)
+    rep.facts["upload_loader"] = brd.loader
+    rep.facts["upload_baud"] = brd.loader_baud
     rep.facts["upload_basis"] = up_note
     rep.facts["upload_estimate_s"] = round(up_bytes / _bytes_per_s(brd), 1)
     rep.facts["dram_used_pct"] = round(100.0 * total_mem / max(1, brd.dram_bytes), 1)

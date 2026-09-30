@@ -29,6 +29,7 @@ import _common as C
 import sandbox_toolchain as TC
 from merlin_experiments.phase1 import workspace_transport as WT
 from merlin_experiments.phase1.providers import execution as EX
+from merlin_experiments.phase1.timing import requires_chipyard_timing, timing_path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 ARM_BUNDLE = {
@@ -46,8 +47,11 @@ def _ok(name, cond, detail=""):
 
 def _source_masks(root: Path) -> dict[str, Path]:
     """Probe existing implementations, never count a missing historical path as masked."""
-    from merlin.common.access import MODULE_ACCESS, module_locations
+    from merlin_experiments.access_policy import MODULE_ACCESS, require_current_policy
 
+    from merlin.common.access import module_locations
+
+    require_current_policy()
     required = {"merlin.runtime.reference", "merlin.runtime.simulator", "merlin.targetgen.capsule_grade"}
     masks = {}
     for item in MODULE_ACCESS:
@@ -385,7 +389,11 @@ def main(argv=None):
                 "--repo",
                 str(C.REPO),
                 "--timing-file",
-                str(SCRIPTS_DIR / ".oracle_timing.json"),
+                str(
+                    timing_path(C.EXP, C.TARGET)
+                    if requires_chipyard_timing(C.DESCRIPTOR)
+                    else SCRIPTS_DIR / ".oracle_timing.json"
+                ),
                 "--ws",
                 str(ws),
             ],

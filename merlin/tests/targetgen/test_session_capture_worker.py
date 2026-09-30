@@ -87,8 +87,9 @@ def test_worker_captures_the_entire_declared_session_with_owned_sidecars(tmp_pat
             "7",
             "--materialize-bundle",
             "--out",
-            str(out),
+            "capture",
         ],
+        cwd=tmp_path,
         capture_output=True,
         text=True,
         timeout=120,
@@ -104,6 +105,7 @@ def test_worker_captures_the_entire_declared_session_with_owned_sidecars(tmp_pat
     for program in session.programs:
         stage = program.bundle
         assert verify_capture_receipt(stage / "model.mlir")["status"] == "verified_materialized"
+        assert f'prov.weights_file = "{stage / "weights.safetensors"}"' in (stage / "model.mlir").read_text()
         assert json.loads((stage / "frontend-trace.json").read_bytes())["status"] == "complete"
         metadata = json.loads((stage / "meta.json").read_bytes())
         assert metadata["input_abi"]

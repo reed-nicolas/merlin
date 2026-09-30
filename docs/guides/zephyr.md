@@ -3,9 +3,9 @@ title: Zephyr runtime backend
 kind: guide
 status: current
 owner: runtime
-last_verified: 2026-07-22
+last_verified: 2026-09-29
 related: [getting_started, reproducibility, runtime, tinyllama_int8_rvv_zephyr]
-code_refs: [src/merlin/runtime/backends/zephyr_model.py]
+code_refs: [src/merlin/runtime/backends/zephyr_model.py, src/merlin/runtime/boards.py]
 ---
 
 # Zephyr runtime backend
@@ -26,16 +26,41 @@ runtime dialect
 ## Prerequisites
 
 **Shared base:** complete the base install + `.env` setup in [Getting started](getting_started.md)
-first, then `check_repro_env.py` to confirm the `zephyr_spike` capability is runnable here.
+first. `check_repro_env.py` checks the combined `zephyr_spike` capability when
+running an image on Spike; building an image does not require Spike.
 
 **Workflow-specific prerequisites** (only for building/running the whole-model `build_app` path; the
 generic module-layout description below needs none):
 
 - **Required — Zephyr SW workspace + SDK 0.17.0**: `MERLIN_ZEPHYR_SW` (workspace root), `ZEPHYR_BASE`
   (the zephyr tree), `ZEPHYR_SDK_INSTALL_DIR`.
-- **Required — spike** via `MERLIN_CHIPYARD` (or `MERLIN_SPIKE`) for the SMP RVV-on-Saturn run.
+- **Required — RISC-V cross compiler** via `MERLIN_RISCV_GCC` or `MERLIN_CHIPYARD`
+  for the image build. `zephyr_model.build_available()` checks build prerequisites.
+- **Spike only for a Spike run** via `MERLIN_CHIPYARD` or `MERLIN_SPIKE`.
+  `zephyr_model.available()` checks the combined build-and-Spike path;
+  `build_app` uses the build-only check.
 - **Optional — FireSim** (2-tile SMP) is board/FPGA-gated and **not fresh-machine reproducible** (see
-  [Getting started §5](getting_started.md)); **spike substitutes** for the functional whole-model run.
+  [Getting started §5](getting_started.md)). It also needs a separately installed,
+  explicitly selected [FireSim runner](firesim.md); **spike substitutes** for the functional whole-model run.
+- **Required — board catalog and selection**: set `MERLIN_BOARD_CATALOG` to a
+  target-owned YAML catalog and pass its board name to `build_app(board=...)` or
+  `merlin-compile --board ...`. The [example catalog](../../examples/board-catalog.yaml)
+  is for demonstrations; it is not bundled into the Merlin wheel. No board or
+  unknown board fails before build output is created.
+
+For a Zephyr board, the catalog must also declare `zephyr_default_ram_bytes`
+(the selected port's unmodified device-tree region) and
+`zephyr_link_limit_bytes` (the model-object relocation window). If weights and
+arena would exceed that window, Merlin uses a separate weights region **only**
+when the board declares `zephyr_external_ram_bytes` and
+`zephyr_external_tail_reserve_bytes`. The weights base is computed as
+`dram_base + zephyr_external_ram_bytes`; the aligned blob and reserved tail
+must fit inside `dram_bytes`. No 16 GiB board, fixed `ram0` address, or Spike
+memory size is assumed by the runtime. A missing or impossible layout is an
+error before the Zephyr link; the build result records the low RAM region,
+simulator span, and weights base for inspection. Mark a simulator descriptor
+with `simulator: spike` if the certification runner should select it as its
+functional substrate.
 
 ## Generated module layout
 

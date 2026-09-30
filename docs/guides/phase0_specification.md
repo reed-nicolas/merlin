@@ -3,13 +3,15 @@ title: Defining and inspecting Phase 0 inputs
 kind: guide
 status: current
 owner: targetgen
-last_verified: 2026-09-27
+last_verified: 2026-09-29
 related: [generating_capsules, adding_a_target, integrations]
 code_refs:
   - src/merlin/targetgen/software_spec.py
+  - src/merlin/targetgen/instruction_semantics.py
   - src/merlin/targetgen/rtl/circt_introspect.py
   - packages/merlin-experiments/src/merlin_experiments/phase0/evidence.py
   - packages/merlin-experiments/src/merlin_experiments/phase0/generation.py
+  - packages/merlin-experiments/src/merlin_experiments/phase0/m2m_runtime.py
 ---
 
 # Define the software contract before generating tests
@@ -18,6 +20,31 @@ Phase 0 combines selected hardware evidence, a software specification, and workl
 policy. See the matching [Atlas](../../examples/atlas/phase0/README.md) and
 [Gemmini](../../examples/gemmini/phase0/README.md) examples. The installed generator belongs
 to `merlin-experiments`; target-specific inputs belong to examples or selected OOT support.
+
+## Select a frontend capture runtime for a frozen diagnostic run
+
+Frozen Phase 0 never inherits `MERLIN_M2M_DIR`, `MERLIN_MODEL2MLIR`, or
+`MERLIN_M2M_PYTHON` from the invoking shell. If the selected synthesis profile
+requires live PyTorch capsules, provide both `--phase0-m2m-root` and
+`--phase0-m2m-python` to `merlin experiment run ... --phase 0`, with
+`--phase0-evidence-mode diagnostic`. The same two fields may be declared as
+`m2m_root` and `m2m_python` in a Phase 0 experiment definition. Neither field
+belongs in a target's SW spec.
+
+The run copies the selected `m2m` package and exact workload directories named
+by live model entries, then records their membership and bytes in
+`phase0/private/m2m-runtime.json`. It checks the selected virtual environment
+and base Python byte inventories before freezing and on resume, and routes all
+M2M aliases to the copied source. A requested frontend capsule cannot silently
+disappear when the selected interpreter becomes unavailable. A workload that
+names a different interpreter or external source requires a separate materialized
+capture; it is not silently run in the wrong environment.
+
+This is **diagnostic host execution**, not verified capture admission: the venv
+and base Python remain at selected host paths, native libraries and arbitrary
+loader file reads are not isolated, and old capture receipts gain no historical
+authentication. For a reviewed corpus, select newly materialized, independently
+verified capture inputs rather than promoting this runtime receipt.
 
 ## Start with five decisions
 
@@ -94,6 +121,7 @@ software-visible behavior. It is not a second handwritten hardware geometry tabl
 | Input | Define explicitly | Do not treat it as |
 | --- | --- | --- |
 | SW spec | Operation/signature constraints; layouts, tails, broadcasting, aliasing, placement, selected numeric behavior, quantization eligibility and transfer constraints | Automatically proven by an instruction name or storage width |
+| Selected capability contract | Target ISA/runner intent and extraction anchors that RTL facts cannot establish; explicit same-target Phase 0 input | Executable OOT support, extracted geometry or certification |
 | Selected OOT provider/backend config | Runtime implementation, ISA vocabulary/protocol ownership, extraction anchors and callable references | A second mandatory software spec to hand-maintain |
 | Hardware selection | Which evidence is required and which source/configuration is selected | A capability declaration or certificate |
 | Extracted RTL facts | Array and memory geometry, interfaces, observed decoder fields, datatype evidence and structural timing where established | Complete operation latency, numerical behavior, endpoint kind or software legality |
@@ -106,6 +134,41 @@ and executable typed constraints. Use semantic `families` for a shared class, or
 Numerical semantics select an independent model and its rounding/reduction policy,
 never a target-name default. Generated source audits, test counts, qualification hashes
 and long diagnostic reports belong in artifacts, not this YAML.
+
+When the SW spec is minimal, `experiment.yaml` must select its same-target
+`capability_contract` as a separate file. Installed Phase 0 freezes that file's
+exact bytes and refuses a changed contract on resume. For a new run, use
+`--phase0-capability-contract PATH` to select a reviewed replacement without
+editing the experiment definition. An authored prototype remains diagnostic
+until the required RTL and executable support evidence are separately qualified.
+
+## Describe instruction semantics separately
+
+The SW spec states which behavior software may rely on. It does not define an
+accelerator instruction set. When a target has an independently reviewed instruction
+description, keep it in its OOT support package and select its relative path with
+`instruction_semantics` in the target contract. Phase 0 validates its SW-operation
+links and binds it to the selected CIRCT facts, then freezes both the exact
+authored bytes (`software/instruction-semantics-authored.yaml`) and the normalized
+consumer model (`software/instruction-semantics.json`). The normalized model records
+the exact authored and selected-input byte hashes when file bytes were supplied;
+in-memory selected views carry canonical content hashes instead.
+Neither file belongs in Merlin core, and neither is a generated compiler.
+
+Each instruction description needs typed operands/results, a computation pattern
+(indexing maps, iterators and scalar SSA body), applicable SW operation, side effects,
+and any local-memory constraints. Unknown effects, missing SW links, or incomplete
+memory capacity remain explicit `UNKNOWN` entries. CIRCT facts can justify observed
+structure, but a decoder field alone cannot supply complete functional semantics.
+Do not copy an instruction from a related target or fill missing behavior by name.
+If no description is selected, Phase 0 emits an `UNKNOWN` model, not a guessed one.
+`described` means the checked declaration is internally complete, not that the
+instruction has been proved against RTL or executed on hardware.
+
+This extra input is intentionally separate from the minimal SW spec: an author writes
+software-visible behavior once, the OOT owner describes instruction behavior once,
+and Phase 0 binds both to exact hardware evidence. The schema is
+[`instruction_semantics.schema.yaml`](../../merlin/schemas/instruction_semantics.schema.yaml).
 
 The Atlas and Gemmini examples use directly named operations and transfers; authors
 do not need IDs, `signature` wrappers or duplicate copy endpoint constraints.

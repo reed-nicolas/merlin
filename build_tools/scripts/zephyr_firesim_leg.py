@@ -29,7 +29,6 @@ carry none. Either way it fails closed rather than handing back a leg that measu
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
@@ -37,7 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "merlin" / "python"))
 
 
-def main(argv: "list[str] | None" = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="zephyr_firesim_leg", description=__doc__.split("\n\n")[0])
     ap.add_argument("bundle", help="capture bundle name under out/artifacts/recaptures/")
     ap.add_argument("leg", choices=("device", "control"), help="route to the matrix unit, or not")
@@ -71,6 +70,7 @@ def main(argv: "list[str] | None" = None) -> int:
     ap.add_argument("--harts", type=int, default=1)
     ap.add_argument("--vlen", type=int, default=512)
     ap.add_argument("--arena-mb", type=int, default=0, help="0 = derive from the model's activation peak (see below)")
+    ap.add_argument("--runner", help="installed FireSim runner name (or set MERLIN_FIRESIM_RUNNER)")
     a = ap.parse_args(argv)
     if not a.matrix_support_target:
         ap.error("routing and unit audit require --matrix-support-target (not inferred from --unit)")
@@ -82,9 +82,11 @@ def main(argv: "list[str] | None" = None) -> int:
     from merlin.llvmlower.impr_features import OPU_MATMUL_NAME, PEROP_BLOCK_NAME
     from merlin.mining.registry import load_rvv_package
     from merlin.runtime.backends import zephyr_model as zm
+    from merlin.runtime.backends.firesim_runner import select_runner
     from merlin.targetgen.plugins import load_declared
 
     provider = load_declared(a.matrix_support_target, "matrix_lowering")
+    selected_runner = select_runner(a.runner)
     enc = provider.derive_encodings(provider.load_contract(a.unit)).encodings
 
     bundle = repo_root() / "out/artifacts/recaptures" / a.bundle
@@ -125,6 +127,7 @@ def main(argv: "list[str] | None" = None) -> int:
         vlen=a.vlen,
         inputs_npz=bundle / "inputs.npz",
         debug=True,
+        completion_metric_prefix=getattr(selected_runner, "completion_metric_prefix", None),
         **kw,
     )
     print(

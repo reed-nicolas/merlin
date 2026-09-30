@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from merlin.common.yaml import dump_yaml, load_yaml
+from merlin.targetgen import package_records
 from merlin.targetgen import publish as pub
 
 pytestmark = pytest.mark.target("gemmini")
@@ -392,6 +393,46 @@ def test_payload_change_with_same_ids_changes_publish_fingerprint(out_root, monk
     assert second.committed and not second.noop
     again = pub.publish("rvv", dry_run=False, gate=False)
     assert again.noop and again.fingerprint == second.fingerprint
+
+
+def test_publication_record_change_with_same_payload_requires_new_publish(out_root, monkeypatch):
+    """A changed external verdict must not be hidden by branch-tip idempotency."""
+    troot = out_root / "artifacts" / "targets"
+    package = _make_rvv_package(troot)
+    manifest = load_yaml(package / "manifest.yaml")
+    record = {"certified_by_run": "same-run", "certification_tier": {"oracles": ["functional"]}}
+    package_records.write_record(package, manifest, record)
+    _bare_remote(out_root, "rvv", monkeypatch)
+    monkeypatch.setattr(pub, "_git_sha_full", lambda: "a" * 40)
+    first = pub.publish("rvv", dry_run=False, gate=False)
+
+    record["certification_tier"] = {"oracles": ["rtl"]}
+    package_records.write_record(package, manifest, record)
+    second = pub.publish("rvv", dry_run=False, gate=False)
+    assert second.fingerprint != first.fingerprint
+    assert second.committed and not second.noop
+
+
+def test_record_change_during_staging_refuses_before_remote_use(out_root, monkeypatch):
+    troot = out_root / "artifacts" / "targets"
+    package = _make_rvv_package(troot)
+    manifest = load_yaml(package / "manifest.yaml")
+    package_records.write_record(package, manifest, {"certified_by_run": "same-run"})
+    _bare_remote(out_root, "rvv", monkeypatch)
+    assemble = pub.assemble_repo_tree
+
+    def change_record_after_assembly(*args, **kwargs):
+        result = assemble(*args, **kwargs)
+        package_records.write_record(package, manifest, {"certified_by_run": "same-run", "changed": True})
+        return result
+
+    def forbid_remote(*args, **kwargs):
+        pytest.fail("remote was reached after publication record changed")
+
+    monkeypatch.setattr(pub, "assemble_repo_tree", change_record_after_assembly)
+    monkeypatch.setattr(pub, "_git_publish", forbid_remote)
+    with pytest.raises(pub.PublishError, match="selected publication inputs changed before push"):
+        pub.publish("rvv", dry_run=False, gate=False)
 
 
 def test_recorded_certification_keeps_its_tier(out_root, tmp_path):

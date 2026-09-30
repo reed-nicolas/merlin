@@ -25,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "merlin" / "python"))
 from merlin.common.paths import env  # noqa: E402
+from merlin.runtime.backends.firesim_runner import select_runner  # noqa: E402
 
 OK, WARN, FAIL = "OK", "WARN", "FAIL"
 # The queue daemon writes its pid file on start and refreshes a heartbeat row; a pid file older
@@ -46,28 +47,19 @@ def check_chipyard() -> list[dict]:
     return [_r("chipyard", OK, str(deploy))]
 
 
-def check_modelblaster() -> list[dict]:
-    """run_on_firesim() reuses ModelBlaster's queue-safe runner.  When MERLIN_MODELBLASTER is
-    unset the failure is a bare `ModuleNotFoundError: No module named 'modelblaster'` that names
-    neither the setting nor the path — so check it up front."""
-    mb = env("MERLIN_MODELBLASTER")
-    if not mb:
-        return [
-            _r(
-                "modelblaster",
-                FAIL,
-                "MERLIN_MODELBLASTER unset -> run_on_firesim() will die with a bare ModuleNotFoundError",
-            )
-        ]
-    # run_on_firesim() puts both `<mb>/src` and `<mb>` on sys.path and tries the packaged import
-    # (`modelblaster.validation.firesim_runner`) before the flat one, so accept either layout.
-    for runner in (
-        Path(mb) / "src" / "modelblaster" / "validation" / "firesim_runner.py",
-        Path(mb) / "validation" / "firesim_runner.py",
-    ):
-        if runner.is_file():
-            return [_r("modelblaster", OK, str(runner))]
-    return [_r("modelblaster", FAIL, f"no validation/firesim_runner.py under {mb}")]
+def check_runner() -> list[dict]:
+    """Check explicit installed runner selection; delegate optional read-only checks."""
+    try:
+        runner = select_runner()
+        check = getattr(runner, "preflight", None)
+        if check is None:
+            return [_r("runner", WARN, "selected runner has no read-only preflight; inspect its own requirements")]
+        detail = check()
+        if not isinstance(detail, str):
+            raise TypeError("preflight must return a detail string")
+        return [_r("runner", OK, detail)]
+    except Exception as exc:  # noqa: BLE001 - selected provider may fail
+        return [_r("runner", FAIL, str(exc))]
 
 
 def _pid_alive(pid: int) -> bool:
@@ -229,7 +221,7 @@ def main(argv: list[str]) -> int:
     a = ap.parse_args(argv)
 
     results: list[dict] = []
-    for fn in (check_chipyard, check_modelblaster, check_queue, check_xdma, check_bitstream, check_heartbeat):
+    for fn in (check_chipyard, check_runner, check_queue, check_xdma, check_bitstream, check_heartbeat):
         results.extend(fn())
 
     if a.json:

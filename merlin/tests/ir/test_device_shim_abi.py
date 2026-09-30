@@ -101,6 +101,75 @@ def test_the_abi_round_trips_through_a_real_call(tmp_path):
     assert run.returncode == 0, f"ABI round-trip failed: {run.stdout} {run.stderr}"
 
 
+@pytest.mark.skipif(_CC is None, reason="no C compiler available")
+def test_padded_rank2_bridge_is_numerical_and_refuses_bad_pointer_descriptors(tmp_path):
+    """The generated bridge passes B,A,C to a kernel and copies valid windows exactly.
+
+    The C kernel is a stand-in for the OOT target artifact, so this proves the
+    host pointer/transfer bridge, not accelerator execution or model equivalence.
+    """
+    unit = emit_translation_unit(
+        "gemmini", {"selected": (3, 7, 5)}, {"selected": ("i8", "i8", "i32")},
+        kernel_symbol_for=lambda _sym: "selected_kernel", tile_edge=16,
+    )
+    (tmp_path / "shim.c").write_text(unit.text, encoding="utf-8")
+    (tmp_path / "kernel.c").write_text(
+        """
+#include <stdint.h>
+void selected_kernel(void *weight, void *lhs, void *out) {
+  const int8_t *b = weight, *a = lhs;
+  int32_t *c = out;
+  for (int i = 0; i < 16; ++i)
+    for (int j = 0; j < 16; ++j) {
+      int32_t sum = 0;
+      for (int p = 0; p < 16; ++p) sum += (int32_t)a[i*16+p] * b[p*16+j];
+      c[i*16+j] = sum;
+    }
+}
+""", encoding="utf-8",
+    )
+    (tmp_path / "driver.c").write_text(
+        """
+#include <stdint.h>
+typedef struct { void *alloc, *aligned; intptr_t off, size[2], stride[2]; } mr2;
+extern mr2 selected(void*,void*,intptr_t,intptr_t,intptr_t,intptr_t,intptr_t,
+                    void*,void*,intptr_t,intptr_t,intptr_t,intptr_t,intptr_t,
+                    void*,void*,intptr_t,intptr_t,intptr_t,intptr_t,intptr_t);
+int main(int argc, char **argv) {
+  (void)argv;
+  static int8_t a[3*5], b[5*7];
+  static int32_t c[3*7];
+  for (int i = 0; i < 3*5; ++i) a[i] = (int8_t)((i*3)%11-5);
+  for (int i = 0; i < 5*7; ++i) b[i] = (int8_t)((i*7)%13-6);
+  int bad_stride = argc == 2;
+  intptr_t bad_offset = argc == 4 ? INTPTR_MAX : 0;
+  void *out = argc == 3 ? (void*)a : (void*)c;
+  mr2 r = selected(a,a,0,3,5,5+bad_stride,1,
+                   b,b,0,5,7,7,1, out,out,bad_offset,3,7,7,1);
+  if (r.aligned != out) return 1;
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 7; ++j) {
+      int32_t want = 0;
+      for (int p = 0; p < 5; ++p) want += (int32_t)a[i*5+p] * b[p*7+j];
+      if (c[i*7+j] != want) return 2;
+    }
+  return 0;
+}
+""", encoding="utf-8",
+    )
+    exe = tmp_path / "bridge"
+    build = subprocess.run(
+        [_CC, "-Wall", "-Wextra", "-Werror", str(tmp_path / "shim.c"),
+         str(tmp_path / "kernel.c"), str(tmp_path / "driver.c"), "-o", str(exe)],
+        capture_output=True, text=True,
+    )
+    assert build.returncode == 0, build.stderr
+    assert subprocess.run([str(exe)], capture_output=True).returncode == 0
+    assert subprocess.run([str(exe), "bad_stride"], capture_output=True).returncode != 0
+    assert subprocess.run([str(exe), "bad", "alias"], capture_output=True).returncode != 0
+    assert subprocess.run([str(exe), "bad", "offset", "overflow"], capture_output=True).returncode != 0
+
+
 # --------------------------------------------------------------- declines, reported not guessed
 
 
@@ -154,6 +223,14 @@ def test_extents_on_the_tile_edge_need_no_staging(tmp_path):
     )
     assert unit.symbols == ("s",)
     assert "static unsigned char" not in unit.text
+    assert "merlin_span(a_aligned" in unit.text
+    if _CC is not None:
+        (tmp_path / "direct.c").write_text(unit.text, encoding="utf-8")
+        built = subprocess.run(
+            [_CC, "-Wall", "-Wextra", "-Werror", "-c", str(tmp_path / "direct.c"),
+             "-o", str(tmp_path / "direct.o")], capture_output=True, text=True,
+        )
+        assert built.returncode == 0, built.stderr
 
 
 def test_extents_off_the_tile_edge_are_staged_into_padded_buffers(tmp_path):
@@ -203,6 +280,20 @@ def test_the_tile_edge_is_derived_from_the_device_not_assumed():
     if edge is None:
         pytest.skip("no mesh facts derivable here")
     assert edge > 0
+
+
+def test_rectangular_or_ambiguous_mesh_does_not_mint_a_square_shim_edge(monkeypatch):
+    from merlin.llvmlower.device_shim import tile_edge_for
+    from merlin.targetgen.rtl import facts
+
+    monkeypatch.setattr(facts, "body_if_present", lambda _target: {
+        "arrays": [{"rows": 16, "cols": 32}],
+    })
+    assert tile_edge_for("example") is None
+    monkeypatch.setattr(facts, "body_if_present", lambda _target: {
+        "arrays": [{"rows": 16, "cols": 16}, {"rows": 32, "cols": 32}],
+    })
+    assert tile_edge_for("example") is None
 
 
 def test_an_underivable_edge_declines_rather_than_guessing():

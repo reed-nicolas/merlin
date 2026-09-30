@@ -19,6 +19,7 @@ Target-agnostic: nothing here names a hardware target; the declarations are keye
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 
@@ -146,6 +147,13 @@ def test_declared_loader_env_reaches_the_capture_worker(tmp_path, monkeypatch):
     # a smoke-fidelity knob is NOT replayed (it would capture a smaller model than the golden)
     assert "ACME_LAYERS" not in seen["env"]
     assert d.is_dir()
+    declaration = (tmp_path / "model2MLIR/workloads/acme_net_v2/capture.toml").read_bytes()
+    assert _prov(d)["capture_declaration"] == {
+        "status": "selected",
+        "path": "workloads/acme_net_v2/capture.toml",
+        "sha256": hashlib.sha256(declaration).hexdigest(),
+        "bytes": len(declaration),
+    }
 
 
 def test_declared_interpreter_is_used_when_the_workload_pins_one(tmp_path, monkeypatch):
@@ -162,8 +170,52 @@ def test_declared_interpreter_is_used_when_the_workload_pins_one(tmp_path, monke
 
 
 def test_a_workload_that_pins_nothing_keeps_the_default_interpreter(tmp_path, monkeypatch):
-    _d, seen = _write(tmp_path, monkeypatch)
+    d, seen = _write(tmp_path, monkeypatch)
     assert seen["cmd"][0].endswith("model2MLIR/.venv/bin/python")
+    assert _prov(d)["capture_declaration"] == {
+        "status": "absent", "path": "workloads/acme_net_v2/capture.toml"
+    }
+
+
+def test_selected_checkout_owns_capture_declaration(tmp_path, monkeypatch):
+    selected, _ = _fake_m2m(tmp_path / "selected", "acme_net_v2")
+    ambient, _ = _fake_m2m(tmp_path / "ambient", "acme_net_v2")
+    selected_cache = tmp_path / "selected_cache"
+    ambient_cache = tmp_path / "ambient_cache"
+    selected_cache.mkdir()
+    ambient_cache.mkdir()
+    (selected / "workloads/acme_net_v2/capture.toml").write_text(
+        f'[env]\nACME_HOME = "{selected_cache}"\n', encoding="utf-8"
+    )
+    (ambient / "workloads/acme_net_v2/capture.toml").write_text(
+        f'[env]\nACME_HOME = "{ambient_cache}"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("MERLIN_M2M_DIR", str(ambient))
+    assert CSrc.model_capture_env("acme_net_v2", selected)["ACME_HOME"] == str(selected_cache)
+
+
+@pytest.mark.parametrize(
+    ("declaration", "reason"),
+    [
+        ("[env\nACME_HOME = 'x'\n", "cannot read selected"),
+        ("[env]\nACME_HOME = 17\n", "environment is invalid"),
+        ('venv = "missing"\n', "pins a missing Python"),
+    ],
+)
+def test_bad_selected_declaration_is_not_recorded_as_an_unbuildable_model(
+    tmp_path, monkeypatch, declaration, reason
+):
+    with pytest.raises(CSrc.M2MUnavailable, match=reason):
+        _write(tmp_path, monkeypatch, capture_toml=declaration)
+
+
+def test_ambiguous_workload_revision_is_not_silently_treated_as_an_in_repo_loader(tmp_path):
+    root, _ = _fake_m2m(tmp_path, "acme_net_v1")
+    second = root / "workloads/acme_net_v2"
+    second.mkdir()
+    (second / "loader.py").write_text("def get_model_and_inputs(): ...\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="matches 2 workload directories"):
+        CSrc.resolve_model_workload({"model": "acme_net"}, root)
 
 
 def test_capture_cache_is_keyed_on_the_declared_environment(tmp_path, monkeypatch):

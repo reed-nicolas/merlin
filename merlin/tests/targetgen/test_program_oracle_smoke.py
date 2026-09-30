@@ -111,6 +111,66 @@ def test_smoke_fails_closed_when_program_ships_no_golden(monkeypatch):
             )
 
 
+def test_functional_oracle_rejects_a_halted_program_with_incomplete_decode(monkeypatch, tmp_path):
+    """A runner may substitute NOPs for unsupported words; halting is not proof of execution."""
+    monkeypatch.setattr(PO, "_func_program_helper", lambda _: tmp_path / "runner.py")
+    monkeypatch.setattr(PO, "emit_bundle", lambda **_: {"words": [0xFFFFFFFF]})
+    monkeypatch.setattr(PO, "_bundle_preload", lambda *_: [])
+    monkeypatch.setattr(
+        PO,
+        "_resolve_out_specs",
+        lambda *_: {"Y0": {"base": 0, "shape": [1], "dtype": "i8", "physical": None}},
+    )
+    base_result = {"halted": True, "outputs": {"0": "Kg=="}}
+
+    for decode_evidence, reason in (
+        ({}, "did not report instruction decode coverage"),
+        ({"unsupported": [{"index": 0, "word": 0xFFFFFFFF}]}, "substituted 1 unsupported"),
+    ):
+        monkeypatch.setattr(PO, "_run_func_helper", lambda *_: base_result | decode_evidence)
+        with pytest.raises(PO.OracleUnavailable, match=reason):
+            PO.run_program_functional_oracle(
+                "fixture", model_ext="fixture", program="fixture_program", workdir=tmp_path
+            )
+
+    monkeypatch.setattr(PO, "_run_func_helper", lambda *_: base_result | {"unsupported": []})
+    accepted = PO.run_program_functional_oracle(
+        "fixture", model_ext="fixture", program="fixture_program", workdir=tmp_path
+    )
+    assert accepted["outputs"] == {"Y0": [42]}
+
+
+def test_functional_debugger_refuses_substituted_instruction_trace(monkeypatch, tmp_path):
+    """The agent must not inspect plausible state from a NOP-substituted program."""
+    from merlin.targetgen import dram_facts
+
+    monkeypatch.setattr(PO, "_func_program_helper", lambda _: tmp_path / "runner.py")
+    monkeypatch.setattr(PO, "emit_bundle", lambda **_: {"words": [0xFFFFFFFF]})
+    monkeypatch.setattr(PO, "_bundle_preload", lambda *_: [])
+    monkeypatch.setattr(PO, "_resolve_out_spec", lambda *_: {"base": 0, "shape": [1], "dtype": "i8"})
+    monkeypatch.setattr(dram_facts, "dram_base_for", lambda _: 0)
+    result = {"halted": True, "pc": 4, "regs": [0], "dram_dumps": {}}
+    kernel = tmp_path / "kernel.S"
+
+    for decode_evidence, reason in (
+        ({}, "did not report instruction decode coverage"),
+        ({"unsupported": [{"index": 0, "word": 0xFFFFFFFF}]}, "substituted 1 unsupported"),
+    ):
+        monkeypatch.setattr(PO, "_run_func_helper", lambda *_: result | decode_evidence)
+        with pytest.raises(PO.OracleUnavailable, match=reason):
+            PO.run_program_debug(
+                "fixture", model_ext="fixture", cb={}, kernel_s=kernel,
+                dump_regions=[], workdir=tmp_path,
+            )
+
+    monkeypatch.setattr(PO, "_run_func_helper", lambda *_: result | {"unsupported": []})
+    accepted = PO.run_program_debug(
+        "fixture", model_ext="fixture", cb={}, kernel_s=kernel,
+        dump_regions=[], workdir=tmp_path,
+    )
+    assert accepted["unsupported"] == [] and accepted["pc"] == 4
+
+
 def test_program_oracle_smoke_bit_exact_end_to_end():
     """Gated: run the descriptor-declared known-good program through the full assemble -> arc -> readback
     path and require a bit-exact match to its own golden. Skips cleanly when the model venv / cosim is

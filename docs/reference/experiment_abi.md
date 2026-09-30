@@ -88,7 +88,7 @@ Running
 ```
 python -m merlin.targetgen.oot_runner --contract merlin/contract \
   --package out/artifacts/targets/gemmini/hand_smoke_oot \
-  --input merlin/contract/examples/g0_matmul.interface.mlir \
+  --input examples/gemmini/phase0/reference/g0_matmul.interface.mlir \
   --run-id contract_smoke_g0 --simulator verilator
 ```
 

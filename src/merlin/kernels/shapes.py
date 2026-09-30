@@ -50,9 +50,9 @@ def zero_initialised(op) -> bool:
     anything not recognised is the fail-closed direction: an unrecognised init might be zero, and a
     contraction wrongly left on the vector path is merely slower.
 
-    Structural: the init operand's defining op must be ``linalg.fill`` of an ``arith.constant`` zero,
-    integer OR float. A block argument (whose ``owner`` is a ``Block``, not an ``Operation``) is not a
-    fill and is rejected by the same check.
+    Structural: the init operand's defining op must be ``linalg.fill`` or ``tensor.splat``
+    of an ``arith.constant`` zero, integer OR float. A block argument (whose ``owner`` is a
+    ``Block``, not an ``Operation``) is rejected by the same check.
 
     The float case is not cosmetic. This predicate is a CORRECTNESS condition -- it decides whether the
     addend may be dropped -- and "is the init all zeros" has nothing to do with the element type. While
@@ -66,7 +66,7 @@ def zero_initialised(op) -> bool:
     if len(operands) < 3:
         return False
     fill = operands[2].owner
-    if not isinstance(fill, Operation) or getattr(fill, "name", "") != "linalg.fill":
+    if not isinstance(fill, Operation) or getattr(fill, "name", "") not in {"linalg.fill", "tensor.splat"}:
         return False
     fill_operands = list(fill.operands)
     if not fill_operands:

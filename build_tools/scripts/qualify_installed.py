@@ -206,6 +206,7 @@ SUITES = {
             "test_phase1_formal_handoff.py",
             "test_checkpoint_lifecycle.py",
             "test_corpus_release.py",
+            "test_exact_offload_release_binding.py",
         ),
         "support_files": ("reviewed_corpus_fixtures.py", "phase1_feedback_fixtures.py"),
         "core_extras": ("xdsl",),
@@ -216,6 +217,10 @@ SUITES = {
             "merlin_experiments.phase2.functional_inputs",
         ),
         "required_modules": ("xdsl",),
+        "required_entry_points": (
+            "merlin.exact_offload_release:reviewed_phase0="
+            "merlin_experiments.corpus.release:verify_exact_offload_binding",
+        ),
     },
     "phase1": {
         "tests": ("test_phase1_controller.py", "test_phase1_cli.py", "test_phase1_rtlchecks.py"),
@@ -475,6 +480,7 @@ LIMITATIONS = [
     "Packaging and selected functional regressions only; no numerical/hardware certification.",
     "External venv and import-origin checks are not a security isolation guarantee.",
     "Dependency resolution uses configured indexes; exact resulting freeze is retained, not a lockfile replay.",
+    "Unrecorded dependency overrides are removed from child environments; a local diagnostic override is not qualification.",
     "External venv is deliberately retained on success or failure; this command never deletes evidence.",
 ]
 
@@ -484,7 +490,12 @@ def digest(path):
 
 
 def clean_environment():
-    return {k: v for k, v in os.environ.items() if not k.startswith(("MERLIN", "PYTHON", "AET_", "CHIA_"))}
+    excluded = {"UV_OVERRIDE", "UV_EXCLUDE", "UV_CONSTRAINT", "UV_BUILD_CONSTRAINT"}
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("MERLIN", "PYTHON", "AET_", "CHIA_")) and k not in excluded
+    }
 
 
 def resolve_ref(root, ref):
@@ -619,6 +630,7 @@ def qualify(root, output, commit, suite, timeout, *, requested_ref=None, invocat
         "core_extras": list(SUITES[suite]["core_extras"]),
         "probe_modules": list(SUITES[suite]["probe_modules"]),
         "required_modules": list(SUITES[suite]["required_modules"]),
+        "required_entry_points": list(SUITES[suite].get("required_entry_points", ())),
         "test_process_policy": (
             "deny_processes_and_listeners" if SUITES[suite].get("guarded_tests") else "suite_defined"
         ),
@@ -709,6 +721,8 @@ def qualify(root, output, commit, suite, timeout, *, requested_ref=None, invocat
             probe_args.extend(("--module", module))
         for module in SUITES[suite]["required_modules"]:
             probe_args.extend(("--require-module", module))
+        for entry_point in SUITES[suite].get("required_entry_points", ()):
+            probe_args.extend(("--require-entry-point", entry_point))
         runner.run("payload-probe", [*probe_args, *wheels], external)
         runner.run("pytest-install", ["uv", "pip", "install", "--python", python, "pytest"], external)
         runner.run("freeze", ["uv", "pip", "freeze", "--python", python], external, stdout=output / "dependencies.txt")

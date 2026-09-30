@@ -146,8 +146,8 @@ class Tensor:
     def requant(self, shift: int) -> "Tensor":
         """Rounding arithmetic right shift by ``shift`` (a fixed-point requantization).
 
-        merlin's native integer requant: round-half-UP. Distinct from Gemmini's float
-        acc_scale (see ``requant_acc_scale``) — kept for the host/runtime-side path.
+        Integer requantization rounds half up. A command buffer can instead declare
+        a floating-point ``acc_scale`` stage (see ``requant_acc_scale``).
         """
         if shift <= 0:
             return Tensor(self.shape, list(self.data), self.dtype)
@@ -156,13 +156,12 @@ class Tensor:
         return Tensor(self.shape, out, self.dtype)
 
     def requant_acc_scale(self, scale: float) -> "Tensor":
-        """Gemmini-faithful float acc_scale: round-to-nearest-EVEN of ``x * scale`` in
-        float32, matching ``gemmini_params.h`` ``ACC_SCALE``/``ROUND_NEAR_EVEN`` exactly.
+        """Scale in float32 and round to the nearest integer, ties to even.
 
-        The i8 saturation that ACC_SCALE folds in is applied separately by ``to_i8`` (via
-        ``output_dtype: i8``), so the composition is bit-identical to the macro. This is an
-        ADDITIVE second requant format alongside the integer ``requant`` — Gemmini's i8
-        accumulator-readout path uses this, not the round-half-up shift."""
+        This is the declared ``acc_scale`` command-buffer arithmetic. An ``output_dtype: i8``
+        stage applies saturation separately through :meth:`to_i8`; integer-shift
+        :meth:`requant` remains a distinct operation.
+        """
         import struct
 
         def f32(v: float) -> float:  # round a Python float to IEEE-754 single
@@ -171,7 +170,7 @@ class Tensor:
         s = f32(scale)
         out = []
         for x in self.data:
-            prod = f32(f32(float(x)) * s)  # float32 product, as the C macro computes it
+            prod = f32(f32(float(x)) * s)
             i = int(prod)  # trunc toward zero
             nxt = i - 1 if prod < 0 else i + 1
             rem = abs(prod - i)

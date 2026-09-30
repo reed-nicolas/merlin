@@ -83,6 +83,131 @@ def test_inspect_preflight_run_status_resume_processes(workflow, capsys):
     assert len(status(destination)["attempts"]) == 4
 
 
+def test_completed_portfolio_segment_can_resume_from_explicit_checkpoint(tmp_path, monkeypatch):
+    from merlin_experiments import portfolio_catalog
+
+    monkeypatch.setenv("MERLIN_REPO_ROOT", str(tmp_path))
+    monkeypatch.setenv("MERLIN_OUT_ROOT", str(tmp_path / "out"))
+    monkeypatch.setattr(portfolio_catalog, "verify_plan", lambda _plan: None)
+    engine = tmp_path / "segment_engine.py"
+    engine.write_text(
+        "import argparse, hashlib, json, pathlib\n"
+        "from merlin.benchharness import hash_tree\n"
+        "p=argparse.ArgumentParser(); p.add_argument('--output'); "
+        "p.add_argument('--resume-checkpoint')\n"
+        "a=p.parse_args(); out=pathlib.Path(a.output); out.mkdir(parents=True)\n"
+        "records=out/'global_iterations'; records.mkdir()\n"
+        "candidate=records/'blocked_submission'; candidate.mkdir()\n"
+        "(candidate/'compiler.py').write_text('synthetic compiler for '+out.name+'\\n')\n"
+        "candidate_sha=hash_tree(candidate)['sha256']\n"
+        "checkpoint=records/'round_0000_authoring.json'\n"
+        "raw=json.dumps({'schema':'global_authoring_checkpoint_v1',"
+        "'candidate_path':str(candidate),'candidate_sha256':candidate_sha}).encode()\n"
+        "checkpoint.write_bytes(raw)\n"
+        "sequence={'schema':'global_agent_sequence_v1','status':'budget_complete',"
+        "'promotion_ready':False,'last_good_checkpoint':{'path':str(checkpoint),"
+        "'sha256':hashlib.sha256(raw).hexdigest(),'candidate_sha256':candidate_sha}}\n"
+        "(records/'agent_sequence.json').write_text(json.dumps(sequence))\n"
+        "(out/'launch.json').write_text('{}')\n"
+        "(out/'host_resource_telemetry.json').write_text(json.dumps("
+        "{'status':'completed','worker_returncode':0}))\n"
+    )
+    destination = tmp_path / "run"
+    first = destination / "phase2/segment-0001"
+    monkeypatch.setitem(
+        ADAPTERS,
+        "fixture_segment",
+        Adapter(
+            "fixture_segment",
+            "2",
+            "segment_engine.py",
+            {"output": Option(required=True)},
+            resume="checkpoint_segment",
+        ),
+    )
+    definition = tmp_path / "definition.yaml"
+    definition.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "id": "segment-fixture",
+                "target": "synthetic",
+                "phases": {"2": {"adapter": "fixture_segment", "config": {"output": str(first)}}},
+            }
+        )
+    )
+    plan = resolve_plan(load_spec(definition), run_dir=destination)
+    plan["phases"]["2"].update(adapter="model_portfolio", module="synthetic.installed.segment")
+    assert run(plan) == 0
+    assert status(destination)["phases"]["2"]["engine_output"] == str(first)
+    assert resume(destination) == 0
+    assert len(status(destination)["attempts"]) == 1
+    # A selected checkpoint may be a separately retained copy; the native
+    # portfolio verifier owns its scientific/lineage admission.
+    checkpoint = tmp_path / "selected-checkpoint.json"
+    checkpoint.write_bytes((first / "global_iterations/round_0000_authoring.json").read_bytes())
+    assert resume(destination, checkpoint=checkpoint) == 0
+    second = destination / "phase2/segment-0002"
+    attempts = status(destination)["attempts"]
+    assert [entry["engine_output"] for entry in attempts] == [str(first), str(second)]
+    assert all("terminal_outputs" in entry for entry in attempts)
+    assert attempts[1]["resume_checkpoint"]["path"] == str(checkpoint)
+    assert resume(destination) == 0
+    # The native worker does not write a final review seal when a recovered
+    # round left failures, even if its last checkpoint is promotion-ready.
+    from merlin_experiments.runner import _installed_phase2_output
+
+    sequence_path = first / "global_iterations/agent_sequence.json"
+    sequence_bytes = sequence_path.read_bytes()
+    recovered = json.loads(sequence_bytes)
+    recovered.update(promotion_ready=True, failures=[{"recovery": "next_budgeted_round_from_consumed_checkpoint"}])
+    sequence_path.write_text(json.dumps(recovered))
+    assert "global_candidate" not in _installed_phase2_output(plan["phases"]["2"], attempts[0])
+    recovered["failures"] = []
+    sequence_path.write_text(json.dumps(recovered))
+    with pytest.raises(SpecError, match="global_candidate"):
+        _installed_phase2_output(plan["phases"]["2"], attempts[0])
+    sequence_path.write_bytes(sequence_bytes)
+    candidate = first / "global_iterations/blocked_submission/compiler.py"
+    original = candidate.read_bytes()
+    candidate.write_text("changed after segment 2\n")
+    with pytest.raises(SpecError, match="completed portfolio candidate differs|terminal bytes changed"):
+        resume(destination)
+    candidate.write_bytes(original)
+    # The native scientific digest skips build/, but the orchestration pin
+    # must still detect any later bytes under the selected snapshot.
+    ignored = candidate.parent / "build"
+    ignored.mkdir()
+    (ignored / "codegen.py").write_text("changed executable state\n")
+    with pytest.raises(SpecError, match="terminal bytes changed"):
+        resume(destination)
+    (ignored / "codegen.py").unlink()
+    ignored.rmdir()
+    linked = candidate.parent / "linked.py"
+    linked.symlink_to(candidate)
+    with pytest.raises(SpecError, match="terminal tree contains a link"):
+        resume(destination)
+    linked.unlink()
+    checkpoint.write_text("changed checkpoint bytes\n")
+    with pytest.raises(SpecError, match="previous portfolio resume checkpoint bytes changed"):
+        resume(destination)
+    original_checkpoint = (first / "global_iterations/round_0000_authoring.json").read_bytes()
+    checkpoint.write_bytes(original_checkpoint)
+    from merlin_experiments import runner as runner_module
+
+    original_fingerprint = runner_module.fingerprint
+
+    def unavailable(path):
+        if Path(path) == checkpoint:
+            raise OSError("selected checkpoint cannot be read")
+        return original_fingerprint(path)
+
+    monkeypatch.setattr(runner_module, "fingerprint", unavailable)
+    with pytest.raises(SpecError, match="resume checkpoint is unavailable or changed"):
+        resume(destination)
+    assert len(status(destination)["attempts"]) == 2
+
+
 @pytest.mark.parametrize("mutation", ["changed_input", "missing_input", "changed_script", "changed_definition"])
 def test_resume_rejects_drift(workflow, mutation):
     definition, destination, control, engine = workflow
@@ -322,7 +447,7 @@ def test_driver_exit_does_not_release_a_live_worker_group(workflow):
     assert not runner._process_active(pid)
 
 
-@pytest.mark.parametrize("policy", ["native_flag", "native_chain", "checkpoint_segment"])
+@pytest.mark.parametrize("policy", ["native_flag", "native_chain"])
 def test_native_resume_policies_use_real_processes(tmp_path, monkeypatch, policy):
     monkeypatch.setenv("MERLIN_REPO_ROOT", str(tmp_path))
     monkeypatch.setenv("MERLIN_OUT_ROOT", str(tmp_path / "out"))
@@ -337,8 +462,7 @@ def test_native_resume_policies_use_real_processes(tmp_path, monkeypatch, policy
     )
     receipt = tmp_path / "receipt"
     receipt.mkdir()
-    mode = "model_portfolio" if policy == "checkpoint_segment" else None
-    name = "model_portfolio" if mode else "fixture"
+    name = "fixture"
     monkeypatch.setitem(
         ADAPTERS,
         name,
@@ -347,33 +471,19 @@ def test_native_resume_policies_use_real_processes(tmp_path, monkeypatch, policy
             "2",
             "engine.py",
             {"receipt": Option("workspace", True)},
-            mode=mode,
             resume=policy,
         ),
     )
     phase = {"adapter": name, "config": {"receipt": "receipt"}}
-    if mode:
-        phase["mode"] = mode
     definition = tmp_path / "experiment.yaml"
     definition.write_text(
         yaml.safe_dump({"schema_version": 1, "id": "resume-policies", "target": "sample", "phases": {2: phase}})
     )
     destination = tmp_path / "run"
     assert run(resolve_plan(load_spec(definition), run_dir=destination)) == 7
-    checkpoint = None
-    if policy == "checkpoint_segment":
-        with pytest.raises(SpecError, match="requires --checkpoint"):
-            resume(destination)
-        checkpoint = tmp_path / "sealed-checkpoint"
-        checkpoint.mkdir()
-        (checkpoint / "proof.json").write_text("{}")
-    assert resume(destination, checkpoint=checkpoint) == 0
+    assert resume(destination) == 0
     observed = json.loads((receipt / "seen.json").read_text())
     assert observed["resume"] == (policy == "native_flag")
-    if checkpoint:
-        assert observed["resume_checkpoint"] == str(checkpoint)
-        assert observed["output"].endswith("segment-0002")
-        assert status(destination)["attempts"][-1]["resume_checkpoint"]["sha256"]
 
 
 def test_production_flags_exist_in_legacy_argparse_contract(tmp_path):
@@ -410,6 +520,17 @@ def test_production_flags_exist_in_legacy_argparse_contract(tmp_path):
                 experiments_package_root=str(module_source_path("merlin_experiments").parent),
                 experiments_namespace_root=str(module_source_path("merlin.targetgen.capsule_runner").parent.parent),
             )
+        if adapter.name == "model_portfolio":
+            from merlin_experiments.phase2.portfolio_options import build_parser as portfolio_parser
+
+            flags = {flag for action in portfolio_parser()._actions for flag in action.option_strings}
+            declared = {
+                option.flag or "--" + name.replace("_", "-")
+                for name, option in adapter.options.items()
+                if option.flag != ""
+            }
+            assert declared <= flags
+            continue
         command = adapter.resolve(spec, config, root, tmp_path / "run")
         if adapter.name == "capsule_bench":
             from merlin_experiments.phase1.options import build_parser
@@ -500,7 +621,7 @@ def test_target_catalog_definitions_have_one_home_in_examples():
 
     root = repo_root()
     target_specs = [path for path in catalog().values() if load_spec(path).document.get("kind") != "template"]
-    assert len(target_specs) == 6
+    assert set(target_specs) == set((root / "examples").glob("*/experiment.yaml"))
     for path in target_specs:
         assert path.parent.parent == root / "examples"
         assert path.name == "experiment.yaml"
@@ -518,19 +639,36 @@ def test_catalog_examples_declare_operator_prerequisites_not_ready_runs():
         if spec.document.get("kind") == "template":
             assert not preflight(resolve_plan(spec))["configuration_ready"]
         else:
-            assert from_definition(path).recipe.is_file()
-            assert preflight(resolve_plan(spec, phase="0"))["configuration_ready"]
-            functional = resolve_plan(spec, phase="1")
-            command = functional["phases"]["1"]
+            if "0" in spec.document["phases"]:
+                assert from_definition(path).recipe.is_file()
+                phase0_readiness = preflight(resolve_plan(spec, phase="0"))
+                assert phase0_readiness["configuration_ready"] or (
+                    phase0_readiness["errors"]
+                    and all("selected synthesis is unverified_legacy" in error for error in phase0_readiness["errors"])
+                )
+            else:
+                with pytest.raises(SpecError, match="not a concrete capsule derivation definition"):
+                    from_definition(path)
             config = spec.document["phases"]["1"]["config"]
-            assert command["module"] == "merlin_experiments.phase1"
-            assert command["argv"][1:3] == ["-m", "merlin_experiments.phase1"]
             assert config["treatment"] == "rtlchecks"
             assert config["bundle"] == "merlin_assisted_rtlchecks_public_v0"
+            try:
+                functional = resolve_plan(spec, phase="1")
+            except SpecError as exc:
+                assert str(exc) == "phase-1 selected target contract is not agreed and resolvable: none"
+                continue
+            command = functional["phases"]["1"]
+            assert command["module"] == "merlin_experiments.phase1"
+            assert command["argv"][1:3] == ["-m", "merlin_experiments.phase1"]
             assert command["argv"][command["argv"].index("--treatment") + 1] == "rtlchecks"
             assert command["argv"][command["argv"].index("--bundle") + 1] == config["bundle"]
             assert not any(name.startswith("phase1:native:") for name in functional["input_paths"])
             expected_errors = set()
+            if config.get("require_reviewed_corpus"):
+                expected_errors.add(
+                    "this functional experiment requires a reviewed Phase 0 release; "
+                    "select its seal and release descriptor before starting Phase 1"
+                )
             declared_inputs = set(command["inputs"].values())
             for name, value in functional["input_paths"].items():
                 if name.startswith("phase1:operator:") or value in declared_inputs:
@@ -623,6 +761,7 @@ def test_phase0_output_and_manifest_are_run_owned(tmp_path):
     import copy
     from types import SimpleNamespace
 
+    from merlin_experiments.phase0.generation import _require_distinct_corpus_destinations
     from merlin_experiments.phase0.profiles import validate_profile_inputs
     from merlin_experiments.spec import ExperimentSpec
 
@@ -644,10 +783,12 @@ def test_phase0_output_and_manifest_are_run_owned(tmp_path):
         "load_target_experiment": lambda _: SimpleNamespace(
             capsule_corpus=canonical / "isa", target="external-hardware"
         ),
+        "_require_distinct_corpus_destinations": _require_distinct_corpus_destinations,
         "load_profile": lambda _, **kwargs: {},
         "CS": SimpleNamespace(derive_binding=lambda *args: None),
         "_performance_facts": lambda target: hardware_targets.append(target) or {"sha256": "0" * 64},
         "expand_sweeps": lambda *args, **kwargs: [],
+        "assert_no_claim_capsules": lambda *args, **kwargs: None,
         "_prune_superseded_synth": lambda *args, **kwargs: [],
         "update_provenance_manifest": lambda *args, **kwargs: recorded.append(kwargs),
     }

@@ -461,7 +461,7 @@ def test_the_reference_accuracy_bar_is_recorded_so_it_can_be_compared_with_ours(
 
 
 def test_gate_basis_separates_reproducible_from_trained(monkeypatch):
-    from merlin.baselines import bundle as _b
+    from merlin.baselines import accuracy_policy as _b
 
     assert _b.golden_unreproducible("bitvla") and _b.weights_are_random_init("bitvla")
     assert not _b.weights_are_random_init("small_llama")
@@ -481,7 +481,7 @@ def test_gate_basis_separates_reproducible_from_trained(monkeypatch):
 
 
 def test_every_random_init_classification_carries_its_evidence():
-    from merlin.baselines import bundle as _b
+    from merlin.baselines import accuracy_policy as _b
 
     # A bare set would let a model be classified with no record of what was checked.
     for model in _b.RANDOM_INIT_WEIGHTS:

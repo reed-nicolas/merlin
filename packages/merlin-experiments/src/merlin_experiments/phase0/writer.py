@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 from pathlib import Path
 
 import yaml
@@ -21,6 +22,23 @@ from .numerics import (
     float_semantics,
     specir_oracle_source_identity,
 )
+
+
+def _m2m_unavailable_reason() -> str:
+    if "MERLIN_PHASE0_FROZEN_SOURCE_MAP" in os.environ:
+        if os.environ.get("MERLIN_PHASE0_M2M_REQUIRED") == "1":
+            return "selected Model2MLIR capture runtime is unavailable"
+        return "frozen Phase 0 has no selected Model2MLIR capture runtime"
+    return "model2MLIR capture runtime unavailable (set MERLIN_M2M_PYTHON)"
+
+
+def _skip_or_require_m2m(entry: dict) -> None:
+    reason = _m2m_unavailable_reason()
+    required = os.environ.get("MERLIN_PHASE0_M2M_REQUIRED") == "1"
+    verified = os.environ.get("MERLIN_PHASE0_EVIDENCE_MODE") == "verified"
+    if required or verified:
+        raise ValueError(f"{entry['name']}: {reason}; requested frontend capsule cannot be omitted")
+    print(f"  [skip] {entry['name']}: {reason}")
 
 
 def _entry_regime(entry, binding):
@@ -48,13 +66,26 @@ def _integer_reference_bound(entry: dict, cap: dict) -> dict:
     from merlin.targetgen.operation_numerics import integer_partial_sum_bound
 
     semantics = entry.get("numerical_semantics") or {}
-    policy = (semantics.get("internal_arithmetic") or {}).get("full_operation_overflow_policy")
-    if policy != "bounded_exact_requires_each_partial_sum":
-        return {"status": "unknown", "reason": "no selected full-operation internal-width bound policy"}
     operation = cap["operation"]
     op, attrs = operation["op"], operation.get("attributes") or {}
-    if op not in {"matmul", "linear", "matmul_bias", "residual_seam", "conv2d", "scope_chain", "attention_qk"}:
-        return {"status": "not_applicable", "reason": "this writer path is not a single integer contraction"}
+    policy = (semantics.get("internal_arithmetic") or {}).get("full_operation_overflow_policy")
+    if policy != "bounded_exact_requires_each_partial_sum":
+        if op == "host_island_seam":
+            raise ValueError("host-island integer contractions require a selected internal-width bound policy")
+        return {"status": "unknown", "reason": "no selected full-operation internal-width bound policy"}
+    if op not in {
+        "matmul",
+        "linear",
+        "matmul_bias",
+        "fused_matmul_bias",
+        "resident_reuse",
+        "host_island_seam",
+        "residual_seam",
+        "conv2d",
+        "scope_chain",
+        "attention_qk",
+    }:
+        return {"status": "not_applicable", "reason": "this writer path has no modeled integer contraction"}
     if op == "scope_chain":
         families = attrs.get("scope_families")
         if (
@@ -66,6 +97,116 @@ def _integer_reference_bound(entry: dict, cap: dict) -> dict:
             raise ValueError("integer scope chain needs one selected contraction and only post-contraction maps")
     leaves = CG.materialize_capsule_leaves(cap)
 
+    def bounded_matmul(lhs_name: str, rhs_name: str, *, initial_values=()) -> dict:
+        if lhs_name not in leaves or rhs_name not in leaves:
+            raise ValueError("integer contraction bound requires concrete lhs and weight operands")
+        lhs, rhs = leaves[lhs_name], leaves[rhs_name]
+        if len(lhs.shape) != 2 or len(rhs.shape) != 2 or lhs.shape[1] != rhs.shape[0]:
+            raise ValueError("integer matmul bound requires matching rank-2 reduction extents")
+        result = integer_partial_sum_bound(
+            semantics,
+            reduction_extent=lhs.shape[1],
+            lhs_values=[int(v) for v in lhs.data],
+            rhs_values=[int(v) for v in rhs.data],
+            initial_values=initial_values,
+        )
+        if result["status"] != "proven_safe":
+            raise ValueError(f"integer mathematical golden cannot qualify selected internal MAC width: {result}")
+        return result
+
+    if op == "resident_reuse":
+        weight_name, matmuls = attrs.get("weight"), attrs.get("matmuls")
+        if not isinstance(weight_name, str) or not isinstance(matmuls, list) or not matmuls:
+            raise ValueError("resident reuse bound requires a weight and nonempty matmul roster")
+        members = []
+        for member in matmuls:
+            if (
+                not isinstance(member, dict)
+                or not isinstance(member.get("lhs"), str)
+                or not isinstance(member.get("out"), str)
+            ):
+                raise ValueError("resident reuse bound has a malformed matmul member")
+            members.append(
+                {
+                    "lhs": member["lhs"],
+                    "out": member["out"],
+                    "partial_sum_bound": bounded_matmul(member["lhs"], weight_name),
+                }
+            )
+        bounds = [member["partial_sum_bound"] for member in members]
+        return {
+            "status": "proven_safe",
+            "scope": "each listed resident-weight contraction; not full-kernel execution",
+            "bound": max(bound["bound"] for bound in bounds),
+            "signed_positive_limit": bounds[0]["signed_positive_limit"],
+            "mac_result_bits": bounds[0]["mac_result_bits"],
+            "members": members,
+        }
+
+    if op == "host_island_seam":
+        from merlin.runtime.tensor import Tensor
+
+        role, transform = attrs.get("comparison_role"), attrs.get("host_transform")
+        if (
+            role not in {"island", "no_island"}
+            or {"island": "xor_low_bit", "no_island": "none"}[role] != transform
+            or attrs.get("accelerator_contractions") != 2
+            or attrs.get("shared_accelerator_epilogue") != "saturating_i32_to_i8"
+            or (semantics.get("internal_arithmetic") or {}).get("signed_operand_bits") != 8
+        ):
+            raise ValueError("host-island bound requires the declared two-contraction i8 seam")
+        lhs_name, first_weight_name, second_weight_name = (
+            attrs.get("lhs"), attrs.get("weight0"), attrs.get("weight1")
+        )
+        if not all(isinstance(name, str) for name in (lhs_name, first_weight_name, second_weight_name)) or set(
+            leaves
+        ) != {lhs_name, first_weight_name, second_weight_name} or len(leaves) != 3:
+            raise ValueError("host-island bound requires exactly its three concrete input tensors")
+        lhs, first_weight, second_weight = (
+            leaves[lhs_name], leaves[first_weight_name], leaves[second_weight_name]
+        )
+        dimensions = tuple(attrs.get(key) for key in ("M", "K", "H", "N"))
+        if (
+            any(type(value) is not int or value < 1 for value in dimensions)
+            or lhs.shape != dimensions[:2]
+            or first_weight.shape != dimensions[1:3]
+            or second_weight.shape != dimensions[2:]
+            or any(tensor.dtype != "i8" for tensor in (lhs, first_weight, second_weight))
+        ):
+            raise ValueError("host-island bound operand ABI differs from its declared contractions")
+        first = bounded_matmul(lhs_name, first_weight_name)
+        # The first sum is proven inside the selected MAC width above. Its
+        # saturating narrow and optional bitwise map therefore give the exact
+        # signed i8 operand bytes consumed by the second contraction.
+        middle = lhs.matmul(first_weight).to_i8()
+        if transform == "xor_low_bit":
+            mask = attrs.get("xor_mask")
+            if type(mask) is not int or not 0 < mask < 128:
+                raise ValueError("host-island bound has an invalid low-bit XOR mask")
+            middle = Tensor(middle.shape, [value ^ mask for value in middle.data], "i8")
+        second = integer_partial_sum_bound(
+            semantics,
+            reduction_extent=dimensions[2],
+            lhs_values=middle.data,
+            rhs_values=second_weight.data,
+        )
+        if second["status"] != "proven_safe":
+            raise ValueError(f"integer mathematical golden cannot qualify selected internal MAC width: {second}")
+        return {
+            "status": "proven_safe",
+            "scope": (
+                "both host-island contractions on the concrete input and derived middle tensor; "
+                "not full-kernel execution"
+            ),
+            "bound": max(first["bound"], second["bound"]),
+            "signed_positive_limit": first["signed_positive_limit"],
+            "mac_result_bits": first["mac_result_bits"],
+            "members": [
+                {"region": "contraction_0", "partial_sum_bound": first},
+                {"region": "contraction_1", "partial_sum_bound": second},
+            ],
+        }
+
     def name(role, declared):
         return attrs.get(declared) or next((row["name"] for row in cap["inputs"] if row.get("role") == role), None)
 
@@ -76,6 +217,11 @@ def _integer_reference_bound(entry: dict, cap: dict) -> dict:
     if lhs_name not in leaves or rhs_name not in leaves:
         raise ValueError("integer contraction bound requires concrete lhs and weight operands")
     lhs, rhs = leaves[lhs_name], leaves[rhs_name]
+    if op in {"matmul", "linear", "matmul_bias", "fused_matmul_bias"}:
+        initial = [
+            int(value) for key, tensor in leaves.items() if key not in {lhs_name, rhs_name} for value in tensor.data
+        ]
+        return bounded_matmul(lhs_name, rhs_name, initial_values=initial)
     if op == "attention_qk" and rhs.shape[-1] != lhs.shape[-1]:
         raise ValueError("attention score reduction extents differ between query and key")
     if op == "scope_chain" and rhs.shape[-1] != lhs.shape[-1]:
@@ -92,6 +238,158 @@ def _integer_reference_bound(entry: dict, cap: dict) -> dict:
     if result["status"] != "proven_safe":
         raise ValueError(f"integer mathematical golden cannot qualify selected internal MAC width: {result}")
     return result
+
+
+def _source_integer_reference_bound(entry: dict, cap: dict, directory: Path) -> dict:
+    """Bound exact source i8 matmul inputs, including the zero initial sum.
+
+    A source-backed model or quantized PyTorch graph can contain contractions
+    whose internal operands are not the capsule's external inputs. Isolated
+    PyTorch integer matmul has captured bytes; spec matmul has program operands
+    that must be checked alongside its separately materialized capsule inputs.
+    """
+    semantics = entry.get("numerical_semantics") or {}
+    internal = semantics.get("internal_arithmetic") or {}
+    if internal.get("full_operation_overflow_policy") != "bounded_exact_requires_each_partial_sum":
+        raise ValueError("source-backed integer contraction lacks a selected internal-width bound policy")
+    if entry.get("source") == "spec" or entry.get("spec_ref"):
+        return _spec_integer_reference_bound(entry, cap, directory)
+    operation = cap.get("operation") or {}
+    attrs = operation.get("attributes") or {}
+    if (
+        entry.get("kind") == "model"
+        or entry.get("op") == "model"
+        or not (entry.get("source") == "pytorch" or entry.get("pytorch_ref"))
+        or entry.get("capture_op") != "int_matmul"
+        or operation.get("op") != "matmul"
+        or cap.get("kind") == "model"
+        or (cap.get("numeric_policy") or {}) != {"compare": "exact_int", "dtype": "i32"}
+        or semantics.get("operand_dtype") not in {"int8", "i8"}
+        or semantics.get("accumulator_dtype") != "i32"
+        or attrs.get("epilogue") not in ([], ())
+        or len(cap.get("inputs") or []) != 2
+        or not CG.is_exact_pytorch_integer_source(cap)
+    ):
+        raise ValueError("source-backed integer contraction lacks a verified isolated i8 matmul and exact inputs")
+    scoped = {**cap, "__dir__": str(directory)}
+    # This checks the saved host output against an independent recomputation
+    # from the captured bytes. It also refuses missing/mismatched input bytes.
+    CG.golden(scoped, directory)
+    bound = _integer_reference_bound(entry, scoped)
+    if bound["status"] != "proven_safe":
+        raise ValueError("source-backed integer contraction has no proven internal partial-sum bound")
+    return bound
+
+
+def _spec_integer_reference_bound(entry: dict, cap: dict, directory: Path) -> dict:
+    """Bound both the spec program and the separately materialized capsule operands."""
+    from merlin.targetgen.operation_numerics import integer_partial_sum_bound
+
+    operation = cap.get("operation") or {}
+    attrs = operation.get("attributes") or {}
+    lhs_name, rhs_name, out_name = (attrs.get(key) for key in ("lhs", "weight", "out"))
+    inputs = cap.get("inputs") or []
+    by_name = {row.get("name"): row for row in inputs if isinstance(row, dict)}
+    if (
+        entry.get("kind") == "model"
+        or entry.get("op") != "matmul"
+        or operation.get("op") != "matmul"
+        or cap.get("kind") == "model"
+        or not isinstance(entry.get("spec_ref"), str)
+        or cap.get("spec_ref") != entry["spec_ref"]
+        or (cap.get("numeric_policy") or {}) != {"compare": "exact_int", "dtype": "i32"}
+        or attrs.get("epilogue") not in ([], ())
+        or not all(isinstance(name, str) for name in (lhs_name, rhs_name, out_name))
+        or len(inputs) != 2
+        or set(by_name) != {lhs_name, rhs_name}
+        or (entry.get("numerical_semantics") or {}).get("operand_dtype") not in {"int8", "i8"}
+        or (entry.get("numerical_semantics") or {}).get("accumulator_dtype") != "i32"
+    ):
+        raise ValueError("spec-backed integer contraction lacks an isolated exact i8 matmul")
+    golden = yaml.safe_load((directory / "golden.yaml").read_text(encoding="utf-8")) or {}
+    if not isinstance(golden, dict):
+        raise ValueError("spec-backed integer contraction lacks an independent golden document")
+    provenance = golden.get("oracle_provenance") or {}
+    if not isinstance(provenance, dict):
+        raise ValueError("spec-backed integer contraction lacks exact program operand provenance")
+    saved_inputs = provenance.get("inputs") or {}
+    if (
+        golden.get("golden_source") != f"specir_program_{entry['spec_ref'].partition(':')[0]}"
+        or provenance.get("spec_ref") != entry["spec_ref"]
+        or not isinstance(saved_inputs, dict)
+        or set(saved_inputs) != {lhs_name, rhs_name}
+    ):
+        raise ValueError("spec-backed integer contraction lacks exact program operand provenance")
+
+    def matrix(name: str, role: str) -> list[list[int]]:
+        spec, saved = by_name[name], saved_inputs[name]
+        shape = spec.get("shape")
+        rows = saved.get("decoded") if isinstance(saved, dict) else None
+        if (
+            spec.get("role") != role
+            or spec.get("dtype") != "i8"
+            or not isinstance(saved, dict)
+            or not isinstance(shape, list)
+            or len(shape) != 2
+            or any(type(dim) is not int or dim < 1 for dim in shape)
+            or saved.get("shape") != shape
+            or not isinstance(rows, list)
+            or len(rows) != shape[0]
+            or any(
+                not isinstance(row, list)
+                or len(row) != shape[1]
+                or any(type(value) is not int or not -128 <= value <= 127 for value in row)
+                for row in rows
+            )
+        ):
+            raise ValueError("spec-backed integer contraction has incomplete exact i8 operand values")
+        return rows
+
+    lhs, rhs = matrix(lhs_name, "input"), matrix(rhs_name, "weight")
+    if len(lhs[0]) != len(rhs):
+        raise ValueError("spec-backed integer matmul has mismatched reduction extents")
+    recomputed = [
+        [sum(lhs[m][k] * rhs[k][n] for k in range(len(rhs))) for n in range(len(rhs[0]))]
+        for m in range(len(lhs))
+    ]
+    outputs = golden.get("outputs")
+    observed = outputs.get(out_name) if isinstance(outputs, dict) else None
+    if (
+        not isinstance(observed, list)
+        or any(not isinstance(row, list) or any(type(value) is not int for value in row) for row in observed)
+        or observed != recomputed
+    ):
+        raise ValueError("spec-backed integer golden differs from exact operand recomputation")
+    program_bound = integer_partial_sum_bound(
+        entry["numerical_semantics"],
+        reduction_extent=len(rhs),
+        lhs_values=[value for row in lhs for value in row],
+        rhs_values=[value for row in rhs for value in row],
+    )
+    if program_bound["status"] != "proven_safe":
+        raise ValueError(f"spec-backed integer golden cannot qualify selected internal MAC width: {program_bound}")
+    capsule_bound = _integer_reference_bound(entry, cap)
+    if capsule_bound["status"] != "proven_safe":
+        raise ValueError("spec-backed integer capsule inputs have no proven internal partial-sum bound")
+    dominant = max((program_bound, capsule_bound), key=lambda bound: bound["bound"])
+    return {
+        **dominant,
+        "scope": "spec-program and separately materialized integer-capsule matmul operands",
+        "members": [
+            {"operand_stream": "spec_program", "partial_sum_bound": program_bound},
+            {"operand_stream": "capsule_materialized", "partial_sum_bound": capsule_bound},
+        ],
+    }
+
+
+def _is_source_backed(entry: dict) -> bool:
+    return bool(
+        entry.get("kind") == "model"
+        or entry.get("op") == "model"
+        or entry.get("source") in {"pytorch", "spec"}
+        or entry.get("pytorch_ref")
+        or entry.get("spec_ref")
+    )
 
 
 # ------------------------------------------------------------------------------------------------
@@ -113,6 +411,22 @@ def _write_capsule(entry, binding, out_root, facts_sha: str = ""):
         return written
     cap = yaml.safe_load(capf.read_text()) or {}
     dirty = False
+    regime, _ = _entry_regime(entry, binding)
+    if regime == "int" and _is_source_backed(entry):
+        bound = _source_integer_reference_bound(entry, cap, d)
+        golden_path = d / "golden.yaml"
+        golden = yaml.safe_load(golden_path.read_bytes())
+        source = golden.get("golden_source") if isinstance(golden, dict) else None
+        if source != "host_torch_eager" and not (isinstance(source, str) and source.startswith("specir_program_")):
+            raise ValueError("source-backed integer bound requires its independently captured golden")
+        cap["integer_partial_sum_bound"] = bound
+        golden["integer_partial_sum_bound"] = bound
+        golden["qualification"] = (
+            "source-backed integer contraction with concrete operand-stream internal-width bounds; "
+            "target execution and full-mesh ordering unverified"
+        )
+        golden_path.write_text(yaml.safe_dump(golden, sort_keys=False), encoding="utf-8")
+        dirty = True
     if not (cap.get("semantic") or {}).get("generalization_axis"):
         _, eb = _entry_regime(entry, binding)
         cap["semantic"] = CS._semantic_block(entry, eb)
@@ -494,7 +808,7 @@ def _write_capsule_inner(entry, binding, out_root, facts_sha: str = ""):
             return CSRC.write_model_capsule(entry, eb, out_root, artifact=artifact)
         src = CSRC.PytorchRefSource()
         if not src.available():
-            print(f"  [skip] {entry['name']}: model capsule needs the m2m venv (set MERLIN_M2M_PYTHON)")
+            _skip_or_require_m2m(entry)
             return None
         # A DERIVED micro model writes its own loader first. Without this the entry names a loader that
         # does not exist, and the capsule that the composition axis exists to produce cannot be built.
@@ -534,10 +848,9 @@ def _write_capsule_inner(entry, binding, out_root, facts_sha: str = ""):
 
         src = CSRC.PytorchRefSource()
         if not src.available():
-            # A pytorch capsule needs the m2m venv (torch) at generation time. It is additive: skip it
-            # (loudly) rather than sink the whole target, so a checkout without the venv still regenerates
-            # the direct-MLIR corpus. A capture that STARTS but fails (opaque/crash) still raises.
-            print(f"  [skip] {entry['name']}: pytorch source needs the m2m venv (set MERLIN_M2M_PYTHON)")
+            # Diagnostic derivation without a selected runtime may skip a
+            # frontend capsule. Selected or verified runs must fail closed.
+            _skip_or_require_m2m(entry)
             return None
         return CSRC.write_pytorch_capsule(entry, eb, out_root, source=src)
     # Spec source: a capsule whose PROGRAM + bit-exact golden come from the specir verification spec itself

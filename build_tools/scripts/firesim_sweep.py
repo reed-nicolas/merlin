@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "merlin" / "python"))
 from merlin.common.artifacts import recaptures_dir  # noqa: E402
 from merlin.runtime.backends import zephyr_model as zm  # noqa: E402
+from merlin.runtime.backends.firesim_runner import select_runner  # noqa: E402
 
 
 def already_done(ledger: Path, bundle: str) -> bool:
@@ -124,6 +125,7 @@ def main() -> int:
     # sit at ~94%. /scratch is the project's filesystem with terabytes free.
     ap.add_argument("--workroot", default="/path/to/tmp/merlin_fs")
     ap.add_argument("--timeout", type=int, default=5400)
+    ap.add_argument("--runner", help="installed FireSim runner name (or set MERLIN_FIRESIM_RUNNER)")
     ap.add_argument("--force", action="store_true", help="re-run even if already passed")
     args = ap.parse_args()
     ledger = Path(args.ledger)
@@ -141,6 +143,9 @@ def main() -> int:
 
     if args.report:
         return cycle_report(ledger)
+
+    selected_runner = select_runner(args.runner)
+    completion_metric_prefix = getattr(selected_runner, "completion_metric_prefix", None)
 
     if matrix:
         from merlin.targetgen.plugins import load_declared
@@ -180,6 +185,7 @@ def main() -> int:
                 rvv_hart=args.rvv_hart,
                 cpus=2,
                 int8_compute=args.int8,
+                completion_metric_prefix=completion_metric_prefix,
                 **extra,
             )
             rec["ram_mb"] = b["ram_bytes"] // (1024 * 1024)
@@ -209,7 +215,9 @@ def main() -> int:
                 refs = {"fp32": golden}
                 if w8a8_path.is_file():
                     refs["w8a8"] = np.load(w8a8_path)
-                r = zm.run_on_firesim(b["elf"], references=refs, queue=True, timeout=args.timeout)
+                r = zm.run_on_firesim(
+                    b["elf"], references=refs, queue=True, timeout=args.timeout, runner=selected_runner
+                )
                 rec.update(
                     w8a8_cos=r.get("w8a8_cos"),
                     w8a8_rel=r.get("w8a8_rel"),
@@ -217,7 +225,9 @@ def main() -> int:
                     fp32_argmax=r.get("fp32_argmax"),
                 )
             else:
-                r = zm.run_on_firesim(b["elf"], reference=golden, queue=True, timeout=args.timeout)
+                r = zm.run_on_firesim(
+                    b["elf"], reference=golden, queue=True, timeout=args.timeout, runner=selected_runner
+                )
             rec.update(
                 cos=r.get("cos"), rel=r.get("rel"), ok=bool(r.get("ok")), cycles=r.get("metrics", {}).get("cycles")
             )

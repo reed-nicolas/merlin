@@ -3,7 +3,7 @@ title: Generating capsules for a target
 kind: guide
 status: current
 owner: targetgen
-last_verified: 2026-09-28
+last_verified: 2026-09-29
 related: [adding_a_target, gemmini_experiment, capsule_bench, integrations, phase0_specification]
 code_refs:
   - experiments/catalog.yaml
@@ -55,6 +55,13 @@ also needs an explicit cheaper sibling; it does not certify an unrun simulator.
 The installed generator lives in `merlin_experiments.phase0`; shared derivation primitives
 remain in core. There is no need to copy generation scripts into `out/`. Generated capsules
 are artifacts, not new library code or files to sync into a wheel.
+
+The tracked `merlin/contract/capsules/` tree is retained historical benchmark input,
+not the destination for a new Phase 0 run. Existing descriptors and frozen input
+bundles still name its exact paths; it is excluded from the installed core wheel.
+The generator rejects output or evidence destinations that overlap either this
+legacy tree or the descriptor-selected source corpus. Keep new derived capsules in
+the run artifact, then prepare and seal a reviewed release for Phase 1 and Phase 2.
 
 ## Inspect, preflight, then generate
 
@@ -123,6 +130,12 @@ even when its files are under the reviewed release.
 Inspection reports aggregate counts and commitments. Detailed diagnostics and review records
 are owner-only under `private/`. Keep hidden capsules, goldens and private weights out of public
 examples, shared packages and agent-visible bundles. Being gitignored is not access control.
+For a run with selected evidence, `private/preparation.json` also records the exact
+requirement, evidence, generation receipt and generated manifest digests, the
+capsule roster, omissions and both cohort-coverage commitments. `corpus inspect`
+shows only `generation_lineage_sha256`; sealing rechecks the private record against
+the frozen run. A missing or changed member requires a new preparation, not a
+manual manifest edit.
 
 Only after reviewing the prepared inputs and private diagnostics, acknowledge the exact
 digest returned by inspection:

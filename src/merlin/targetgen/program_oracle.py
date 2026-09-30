@@ -707,6 +707,23 @@ def _run_func_helper(target: str, model_ext: str, req: dict, workdir: Path, time
     return json.loads(outfile.read_text())
 
 
+def _require_complete_functional_decode(target: str, result: dict[str, Any]) -> None:
+    """Refuse model output when any submitted instruction was replaced during decode.
+
+    Both grading and the agent-facing debugger consume this runner. A debugger
+    trace from a program with substituted instructions is as misleading as a
+    passing grade from that program, even when the model reports a halt.
+    """
+    unsupported = result.get("unsupported")
+    if not isinstance(unsupported, list):
+        raise OracleUnavailable(f"{target}: functional runner did not report instruction decode coverage")
+    if unsupported:
+        raise OracleUnavailable(
+            f"{target}: functional runner substituted {len(unsupported)} unsupported instruction(s); "
+            f"first: {unsupported[0]!r}"
+        )
+
+
 def run_program_functional_oracle(
     target: str,
     *,
@@ -762,6 +779,7 @@ def run_program_functional_oracle(
     }
     _t0 = time.monotonic()
     res = _run_func_helper(target, model_ext, req, Path(workdir), timeout)
+    _require_complete_functional_decode(target, res)
     if not res.get("halted"):
         raise ProgramDidNotHalt(f"{target} program did not halt within {max_cycles} instructions (functional)")
 
@@ -918,6 +936,7 @@ def run_program_debug(
         "state_summary": bool(state_summary),
     }
     res = _run_func_helper(target, model_ext, req, Path(workdir), timeout)
+    _require_complete_functional_decode(target, res)
     dmap = res.get("dram_dumps") or {}
     regions = []
     for b, n in allowed:
@@ -939,6 +958,7 @@ def run_program_debug(
         "pc": res.get("pc"),
         "regs": res.get("regs"),
         "program_words": len(words),
+        "unsupported": res.get("unsupported"),
         "regions": regions,
         "rejected_regions": rejected,
         "on_chip": res.get("state_summary"),  # value-free populated-map (vmem/mrf/acc), or None

@@ -8,6 +8,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -15,9 +16,173 @@ from merlin_experiments.adapters import ADAPTERS
 from merlin_experiments.cli import main
 from merlin_experiments.corpus import release as corpus_release
 from merlin_experiments.corpus.coverage import _public_category_roots
-from merlin_experiments.corpus.preparation import assemble
+from merlin_experiments.corpus.preparation import assemble, generation_lineage
 from merlin_experiments.runner import fingerprint
 from merlin_experiments.spec import SpecError
+
+
+def test_release_uses_phase0_readiness_without_promoting_phase1(monkeypatch, tmp_path):
+    from merlin.targetgen import target_experiment
+    from merlin_experiments.phase0 import coverage_commitment as commitment
+
+    root = tmp_path / "release"
+    private = root / "private"
+    private.mkdir(parents=True)
+    # Compiler-owned support-lowering remains incomplete in the original
+    # certificate. This wiring test supplies a synthetic policy verdict only;
+    # real readiness still requires a verified capture issuer.
+    report = {"schema": commitment.SCHEMA, "phase": "phase1", "status": "incomplete", "blockers": [
+        {"component": "support_lowering", "reason": "pending compiler evidence"}
+    ]}
+    coverage = private / "workload-coverage.json"
+    coverage.write_text(json.dumps(report))
+    coverage.chmod(0o600)
+    readiness = {
+        "schema": commitment.READINESS_SCHEMA,
+        "status": "ready",
+        "inputs_sha256": "a" * 64,
+        "cohort_sha256": "b" * 64,
+        "blockers": [],
+        "deferred_phase1": report["blockers"],
+    }
+    monkeypatch.setattr(target_experiment, "load_target_experiment", lambda _: SimpleNamespace(capsule_corpus=root))
+    monkeypatch.setattr(commitment, "read_inputs", lambda _: {"selected": True})
+    monkeypatch.setattr(commitment, "requires_workload_coverage", lambda *_: True)
+    monkeypatch.setattr(commitment, "build_phase0_readiness", lambda observed: readiness if observed == report else {})
+    summary = {"required": True, "status": "incomplete", "report_sha256": corpus_release._digest(report)}
+    prepared = {"admission": {
+        "whole_workload_phase1": summary,
+        "phase0_readiness": commitment.phase0_readiness_identity(readiness, required=True),
+    }}
+    assert corpus_release._verify_workload_coverage(root, prepared) == summary
+    prepared["admission"]["phase0_readiness"]["report_sha256"] = "0" * 64
+    with pytest.raises(SpecError, match="readiness differs"):
+        corpus_release._verify_workload_coverage(root, prepared)
+
+
+def test_generation_lineage_reconciles_selected_inputs_and_exact_capsules(monkeypatch, tmp_path):
+    from merlin_experiments.phase0 import evidence
+    from merlin_experiments.phase0.coverage_commitment import INPUT_PATH, INPUT_SCHEMA
+
+    generated = tmp_path / "generated"
+    capsule = generated / "isa" / "one"
+    capsule.mkdir(parents=True)
+    (capsule / "capsule.yaml").write_text("name: one\n")
+    requirement = tmp_path / "requirements.yaml"
+    requirement.write_text("scope: {}\n")
+    bundle = tmp_path / "phase0"
+    (bundle / "coverage").mkdir(parents=True)
+    (bundle / "evidence-manifest.json").write_text("{}\n")
+    inputs_path = generated / INPUT_PATH
+    inputs_path.parent.mkdir()
+    inputs_path.write_text(json.dumps({"schema": INPUT_SCHEMA, "conformance": {"scope": {}}}) + "\n")
+    coverage_input = {"path": INPUT_PATH.as_posix(), "sha256": fingerprint(inputs_path)}
+    receipt_path = bundle / "coverage/generation.json"
+    (generated / "MANIFEST.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "generated": ["isa/one"],
+                "coverage_inputs": coverage_input,
+                "phase0_evidence": {
+                    "generation_receipt": str(receipt_path),
+                    "manifest": str(bundle / "evidence-manifest.json"),
+                },
+            }
+        )
+    )
+    cohorts = {}
+    for phase in ("phase1", "phase2"):
+        path = bundle / "coverage" / f"{phase}-capsule-coverage.json"
+        path.write_text(json.dumps({"status": "incomplete", "cohort": {"n_capsules": 1}}))
+        cohorts[phase] = {"path": str(path), "sha256": fingerprint(path), "status": "incomplete", "n_capsules": 1}
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "schema": "merlin.phase0_generation.v1",
+                "target": "fixture-device",
+                "evidence_status": "verified",
+                "corpus_manifest": str(generated / "MANIFEST.yaml"),
+                "coverage_inputs": coverage_input,
+                "capsules_written": 1,
+                "capsule_commitments": [{"member": "isa/one", "sha256": fingerprint(capsule)}],
+                "cohort_coverage": cohorts,
+                "omitted": [{"reason": "fixture omission"}],
+            }
+        )
+    )
+    monkeypatch.setattr(
+        evidence,
+        "load_exported_evidence",
+        lambda _root: SimpleNamespace(
+            target="fixture-device",
+            status="verified",
+            source_snapshots=(SimpleNamespace(role="conformance-spec", sha256=fingerprint(requirement)),),
+        ),
+    )
+    plan = {
+        "target": "fixture-device",
+        "phase0_evidence_bundle": str(bundle),
+        "phases": {"0": {"inputs": {"conformance_spec": str(requirement)}}},
+    }
+    lineage = generation_lineage(plan, generated)
+    assert lineage["capsules"] == 1
+    assert lineage["generation_receipt_sha256"] == fingerprint(receipt_path)
+    (capsule / "capsule.yaml").write_text("name: one\nchanged: true\n")
+    with pytest.raises(SpecError, match="emitted capsule bytes"):
+        generation_lineage(plan, generated)
+
+
+def test_selected_instruction_model_is_private_and_bound_to_release(monkeypatch, tmp_path):
+    from merlin_experiments.phase0 import evidence
+
+    bundle = tmp_path / "selected-evidence"
+    member = bundle / "software/instruction-semantics.json"
+    member.parent.mkdir(parents=True)
+    member.write_text('{"schema":"merlin.instruction_semantics.v1","target":"fixture-device","status":"UNKNOWN"}\n')
+    (bundle / "evidence-manifest.json").write_text('{"schema":"phase0_evidence_v1"}\n')
+    monkeypatch.setattr(
+        evidence,
+        "load_exported_evidence",
+        lambda _path: SimpleNamespace(
+            target="fixture-device",
+            archived_artifacts=(
+                ("software/instruction-semantics.json", member.read_bytes()),
+                ("evidence-manifest.json", (bundle / "evidence-manifest.json").read_bytes()),
+            ),
+        ),
+    )
+    root = tmp_path / "release"
+    private = root / "private"
+    private.mkdir(parents=True)
+    (root / "payload").mkdir()
+    (root / "payload/source.txt").write_text("frozen corpus\n")
+    commitment = corpus_release._stage_instruction_model(
+        {"phase0_evidence_bundle": str(bundle), "target": "fixture-device"}, private
+    )
+    copied = private / "instruction-semantics.json"
+    assert copied.read_bytes() == member.read_bytes()
+    assert copied.stat().st_mode & 0o077 == 0
+    prepared = {"payload_sha256": fingerprint(root / "payload"), "instruction_semantics": commitment}
+    corpus_release._content(root, prepared)
+    prepared["instruction_semantics"] = {**commitment, "sha256": "0" * 64}
+    with pytest.raises(SpecError, match="private instruction model changed"):
+        corpus_release._content(root, prepared)
+    copied.chmod(0o644)
+    with pytest.raises(SpecError, match="owner-only"):
+        corpus_release._content(
+            root, {"payload_sha256": fingerprint(root / "payload"), "instruction_semantics": commitment}
+        )
+    monkeypatch.setattr(
+        evidence,
+        "load_exported_evidence",
+        lambda _path: SimpleNamespace(
+            target="fixture-device", archived_artifacts=(("software/instruction-semantics.json", b"changed"),)
+        ),
+    )
+    with pytest.raises(SpecError, match="changed after evidence verification"):
+        corpus_release._stage_instruction_model(
+            {"phase0_evidence_bundle": str(bundle), "target": "fixture-device"}, tmp_path / "other-private"
+        )
 
 
 def _member(root: Path, category: str, name: str, label: str) -> None:
@@ -932,7 +1097,7 @@ def test_native_harness_binds_seal_before_any_agent_launch():
     session = ast.parse(module_source_path("merlin_experiments.phase1.session").read_text())
     admission = next(node for node in session.body if isinstance(node, ast.FunctionDef) and node.name == "prepare")
     calls = [node for node in ast.walk(admission) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
-    verification = [node.lineno for node in calls if node.func.id == "verify_snapshot"]
+    verification = [node.lineno for node in calls if node.func.id == "verify_snapshot_for_phase1"]
     assert not any(node.func.id == "_launch" for node in calls)
     launches = [
         node

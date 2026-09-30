@@ -63,7 +63,11 @@ def test_sweep_passes_explicit_provider_distinct_from_unit(monkeypatch):
         ["sweep", "--matrix-unit", "unit", "--matrix-config", "config", "--matrix-support-target", "provider"],
     )
     # No bundles: parse and construct routing, never call a build.
-    _main("firesim_sweep.py", zm=SimpleNamespace(MatrixRouting=lambda **kw: seen.append(kw)))()
+    _main(
+        "firesim_sweep.py",
+        zm=SimpleNamespace(MatrixRouting=lambda **kw: seen.append(kw)),
+        select_runner=lambda name: object(),
+    )()
     assert seen == [{"unit": "unit", "config": "config", "support_target": "provider"}]
 
 

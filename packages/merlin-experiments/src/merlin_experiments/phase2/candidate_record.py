@@ -416,20 +416,22 @@ def _validate_audit_requalification(document: Mapping[str, Any]) -> None:
     round_rows = agent.get("rounds") if isinstance(agent, Mapping) else None
     expected_roles = {"audit_implementation", "answer_surface_policy"}
     version = requalification.get("schema_version")
-    if version in (2, 3, 4):
+    if version in (2, 3, 4, 5):
         expected_roles.add("shared_access_policy")
     if version == 3:
         expected_roles.add("native_controller")
-    if version == 4:
+    if version in (4, 5):
         identity = requalification.get("phase2_source_identity")
         TEL._validate_package_source_record(identity)
         if not {"candidate_record.py", "candidate_verification.py", "telemetry.py"} <= set(identity["members"]):
             raise StageGateError("audit requalification lacks candidate policy source owners")
         expected_roles.add("python_source_membership")
         expected_roles.update(f"phase2:{name}" for name in identity["members"])
+    if version == 5:
+        expected_roles.update({"historical_target_access_policy", "historical_target_access_data"})
     if (
         type(version) is not int
-        or version not in (1, 2, 3, 4)
+        or version not in (1, 2, 3, 4, 5)
         or requalification.get("kind") != AUDIT_REQUALIFICATION_KIND
         or requalification.get("reason") != AUDIT_REQUALIFICATION_REASON
         or not isinstance(source, Mapping)
@@ -474,7 +476,7 @@ def _validate_audit_requalification(document: Mapping[str, Any]) -> None:
         or not _is_sha256(requalification.get("policy_set_sha256"))
     ):
         raise StageGateError("audit requalification provenance is incomplete")
-    if version == 4:
+    if version in (4, 5):
         members = requalification["phase2_source_identity"]["members"]
         if any(
             row["sha256"] != members[row["role"].removeprefix("phase2:")]

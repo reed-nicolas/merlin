@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,7 +11,7 @@ from merlin.common.paths import repo_root
 
 
 def _probe():
-    path = repo_root() / "examples/gemmini/target/probe_native_kernel.py"
+    path = repo_root() / "examples/gemmini/verification/probe_native_kernel.py"
     spec = importlib.util.spec_from_file_location("gemmini_native_kernel_probe", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -39,3 +40,12 @@ def test_legacy_manifest_remains_selectable_but_ambiguous_inputs_fail(tmp_path):
     current.write_text("{}")
     with pytest.raises(ValueError, match="ambiguous"):
         probe.phase0_manifest_path(corpus)
+
+
+def test_two_engine_receipt_refuses_missing_rtl():
+    probe = _probe()
+    backend = SimpleNamespace(available=lambda simulator: simulator == "spike")
+    with pytest.raises(RuntimeError, match="verilator unavailable"):
+        probe.require_two_engine_backend(backend)
+    backend.available = lambda _simulator: True
+    probe.require_two_engine_backend(backend)

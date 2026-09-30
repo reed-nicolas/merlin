@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from merlin.baselines import bundle as _bundle
-from merlin.baselines import k1_exec, profile, rvv_audit
+from merlin.baselines import k1_exec, k1_workload_policy, profile, rvv_audit
 from merlin.baselines.buddy_harness import (
     _buddy_model_call_c,
     _m2m_harness_c,
@@ -1037,7 +1037,7 @@ def run_model_native(
 
     Ingests the REAL torch model (buddy's own importer, full-fidelity ``bundle.full_env``) instead of
     m2m's linalg ``model.mlir`` — DIFFERENT IR that may bypass the m2m-path SIGSEGV. Records honest
-    gaps: RAM-infeasible 7B VLAs (``bundle.K1_RAM_INFEASIBLE``) are ``not_run`` (attempt build, never
+    gaps: RAM-infeasible 7B VLAs (``k1_workload_policy.K1_RAM_INFEASIBLE``) are ``not_run`` (attempt build, never
     a false fit); import/lower/link failures are ``not_built``.
     """
     import numpy as np
@@ -1123,7 +1123,7 @@ def run_model_native(
         return _finish(res, model, variant, write)
 
     # 4. RAM-infeasible 7B VLAs: attempt build (done) but never fit on the 3.8 GB board.
-    if model in _bundle.K1_RAM_INFEASIBLE:
+    if model in k1_workload_policy.K1_RAM_INFEASIBLE:
         res.gap_reason = (
             f"{model} is 7B-class — {param_elems * 4 / 1e9:.1f} GB params exceed the 3.8 GB "
             "K1 RAM even at int8 (built + RVV audited; on-board run RAM-infeasible)"
@@ -1177,7 +1177,7 @@ def _run_native_on_board(res: BaselineResult, elf: Path, arg0: Path, b: _bundle.
     metrics = parsed.get("metrics", {}) if isinstance(parsed.get("metrics"), dict) else {}
     if metrics.get("time_ticks") is not None:
         res.e2e_rdtime_ticks = int(metrics["time_ticks"])
-        res.e2e_cycles = profile.ticks_to_cycles(int(metrics["time_ticks"]))
+        res.e2e_cycles = profile.ticks_to_cycles(int(metrics["time_ticks"]), clock=k1_exec.MEASUREMENT_CLOCK)
     if metrics.get("wall_ns") is not None:
         res.e2e_wall_ns = int(metrics["wall_ns"])
     if res.e2e_rdtime_ticks is not None:
@@ -1282,14 +1282,14 @@ def _run_on_board(res: BaselineResult, elf: Path, b: _bundle.CaptureBundle, work
     ticks = metrics.get("time_ticks")
     if ticks is not None:
         res.e2e_rdtime_ticks = int(ticks)
-        res.e2e_cycles = profile.ticks_to_cycles(int(ticks))
+        res.e2e_cycles = profile.ticks_to_cycles(int(ticks), clock=k1_exec.MEASUREMENT_CLOCK)
     if metrics.get("wall_ns") is not None:
         res.e2e_wall_ns = int(metrics["wall_ns"])
     if metrics.get("cycles") is not None and res.e2e_cycles is None:
         res.e2e_cycles = int(metrics["cycles"])
     # compute-vs-overhead split from the harness MERLIN_REGION brackets (compute = whole monolithic
     # forward; overhead = the descriptor-pack loop — the only runtime cost outside buddy's compute).
-    _wm, _regions = profile.parse_profile(console)
+    _wm, _regions = profile.parse_profile(console, clock=k1_exec.MEASUREMENT_CLOCK)
     ov_ticks = next(
         (int(r.rdtime_ticks) for r in _regions if r.name == "overhead" and r.rdtime_ticks is not None), None
     )
@@ -1308,7 +1308,7 @@ def _run_on_board(res: BaselineResult, elf: Path, b: _bundle.CaptureBundle, work
                 RegionProfile(
                     name="overhead",
                     rdtime_ticks=ov_ticks,
-                    cycles=profile.ticks_to_cycles(ov_ticks),
+                    cycles=profile.ticks_to_cycles(ov_ticks, clock=k1_exec.MEASUREMENT_CLOCK),
                     rvv_coverage=0.0,
                     note="descriptor-pack (runtime dispatch overhead; near-zero)",
                 )

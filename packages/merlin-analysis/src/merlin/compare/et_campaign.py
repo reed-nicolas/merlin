@@ -32,6 +32,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from merlin.baselines import accuracy_policy
 from merlin.capture import bundle as _bundle
 from merlin.common.artifacts import recaptures_dir
 from merlin.compare import executorch_column as _etc
@@ -407,9 +408,9 @@ def golden_coverage(root: Path) -> dict:
 
 def quantization_floor(root: Path) -> dict:
     """How far this bundle's own W8A8 reference sits from its fp32 golden, and whether the fp32 tier
-    is reachable here at all. Delegates to :func:`merlin.baselines.bundle.quantization_floor` so the
+    is reachable here at all. Delegates to :func:`merlin.baselines.accuracy_policy.quantization_floor` so the
     campaign and the reference arm read ONE definition of the floor."""
-    return _bundle.quantization_floor(root)
+    return accuracy_policy.quantization_floor(root)
 
 
 # --- W8A8 reference provenance ------------------------------------------------------------------

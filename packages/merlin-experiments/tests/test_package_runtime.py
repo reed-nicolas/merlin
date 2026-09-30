@@ -6,11 +6,76 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from merlin.common.paths import python_import_roots
 from merlin.targetgen import oot_runner, package_runtime
+
+
+@pytest.mark.parametrize("target", ["gemmini", "atlas"])
+def test_certification_suite_follows_declared_target_in_run_and_record(tmp_path, monkeypatch, target):
+    from merlin.common.yaml import load_yaml
+    from merlin.targetgen import package_certification, provenance
+
+    source = tmp_path / "input.interface.mlir"
+    source.write_text("module {}\n")
+    paths = SimpleNamespace(
+        run_path=tmp_path / target, logs=tmp_path / target / "logs",
+        artifacts_dir=tmp_path / target / "artifacts", generated=tmp_path / target / "generated",
+        contracts=tmp_path / target / "contracts",
+    )
+    observed = {}
+
+    def run_paths(spec, run_id):
+        observed["spec_suite"] = spec.suite
+        return paths
+
+    class Logger:
+        def log_params(self, *_): pass
+        def log_metrics(self, *_): pass
+        def log_event(self, *_): pass
+        def finish(self, **_): pass
+
+    class Store:
+        def __init__(self, *_): pass
+        def record(self, *_, **__): pass
+
+    def start_logger(**kwargs):
+        observed["logger_suite"] = kwargs["suite"]
+        return Logger()
+
+    def refuse_package(*_args, **_kwargs):
+        raise package_runtime.CertFailure("contract", "structural_invariant_violation", "fixture")
+
+    monkeypatch.setattr(package_runtime, "RunPaths", SimpleNamespace(from_spec=run_paths))
+    monkeypatch.setattr(package_runtime, "EvalRunLogger", SimpleNamespace(start=start_logger))
+    monkeypatch.setattr(package_runtime, "ArtifactStore", Store)
+    monkeypatch.setattr(package_runtime, "_record", package_certification._record)
+    monkeypatch.setattr(provenance, "toolchain_shas", lambda _: {})
+    monkeypatch.setattr(package_runtime, "load_package", refuse_package)
+    result = package_certification.certify(
+        tmp_path / "package", source, target=target, runs_root=tmp_path,
+        run_id=f"{target}-run",
+    )
+    assert result["status"] == "fail"
+    expected = f"{target}-contract"
+    assert observed == {"spec_suite": expected, "logger_suite": expected}
+    assert load_yaml(paths.run_path / "run_manifest.yaml")["suite"] == expected
+
+
+@pytest.mark.parametrize(
+    ("target", "reason"),
+    [("../other", "single path component"), ("bad\nname", "control character"), ("bad\x00name", "control character")],
+)
+def test_certification_suite_rejects_unsafe_target_components(target, reason):
+    with pytest.raises(ValueError, match=reason):
+        package_runtime.certification_suite(target)
+
+
+def test_missing_package_target_uses_neutral_failure_suite():
+    assert package_runtime.certification_suite(package_runtime.DEFAULT_TARGET) == "unresolved-contract"
 
 
 def test_legacy_module_and_error_identity_and_internal_patching(tmp_path, monkeypatch):

@@ -44,13 +44,22 @@ def _registry() -> dict:
     return _load_registry(data_path(*_REGISTRY))
 
 
-def capsule_corpus_roots() -> list[Path]:
+def capsule_corpus_roots(*, owner_root: Path | None = None) -> list[Path]:
     """Existing historical capsule-corpus roots for read-only diagnostics.
 
     New grading uses a descriptor-selected, reviewed release; callers must not
     treat this broad registry as an implicit corpus for a target.
+
+    ``owner_root`` selects an explicit source checkout for historical-corpus
+    protection when a process is otherwise rooted in an external experiment
+    workspace. The registry remains mandatory and is read from that owner.
     """
-    roots = [merlin_dir() / str(rel) for rel in _registry().get("capsule_corpora") or []]
+    if owner_root is None:
+        root, registry = merlin_dir(), _registry()
+    else:
+        root = Path(owner_root) / "merlin"
+        registry = _load_registry(root.joinpath(*_REGISTRY))
+    roots = [root / str(rel) for rel in registry.get("capsule_corpora") or []]
     return [r for r in roots if r.is_dir()]
 
 

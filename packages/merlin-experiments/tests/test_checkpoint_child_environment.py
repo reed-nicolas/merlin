@@ -79,3 +79,21 @@ def test_legacy_absent_selection_stays_absent(inputs, monkeypatch):
     )
     result = AD.child_environment(*inputs)
     assert all(key not in result for key in KEYS)
+
+
+def test_board_catalog_is_not_inherited_or_supplied_by_backend(inputs, monkeypatch):
+    monkeypatch.setenv("MERLIN_BOARD_CATALOG", "/unsealed/board.yaml")
+
+    def clean(*, environment, **kwargs):
+        assert "MERLIN_BOARD_CATALOG" not in environment
+        return environment
+
+    monkeypatch.setattr(base, "get_backend", lambda target: SimpleNamespace(runtime_environment=clean))
+    assert "MERLIN_BOARD_CATALOG" not in AD.child_environment(*inputs)
+
+    def inject(*, environment, **kwargs):
+        return {**environment, "MERLIN_BOARD_CATALOG": "/unsealed/board.yaml"}
+
+    monkeypatch.setattr(base, "get_backend", lambda target: SimpleNamespace(runtime_environment=inject))
+    with pytest.raises(AD.ExperimentError, match="unsealed board catalog"):
+        AD.child_environment(*inputs)

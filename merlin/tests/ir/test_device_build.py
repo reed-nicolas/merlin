@@ -116,6 +116,68 @@ def test_an_unusable_package_is_reported_not_raised(tmp_path):
     assert not b.ok and b.skipped and any("package" in why for _, why in b.skipped)
 
 
+def test_exact_model_build_hands_the_selected_interface_to_the_oot_package(tmp_path, monkeypatch):
+    """The build must not regenerate a same-shaped but different capsule."""
+    from types import SimpleNamespace
+
+    from merlin.common.digest import sha256_text
+    from merlin.common.tree_hash import hash_tree
+    from merlin.targetgen import oot_runner
+    from merlin.targetgen.contract.interface_emit import emit_interface_mlir
+
+    cb = {
+        "abi_version": "0.1", "target": "gemmini",
+        "tensors": {
+            "B": {"shape": [19, 8], "dtype": "i8", "role": "input"},
+            "A": {"shape": [4, 19], "dtype": "i8", "role": "input"},
+        },
+        "commands": [
+            {"opcode": "RES_PACK", "operands": {"src": "B", "dst": "B_res"},
+             "attributes": {"layout": "packed_rhs"}},
+            {"opcode": "MATMUL_RESIDENT", "operands": {"lhs": "A", "rhs": "B_res", "dst": "acc"}},
+            {"opcode": "COMMIT", "operands": {"src": "acc", "dst": "Y"},
+             "attributes": {"output_dtype": "i32", "epilogue": []}},
+        ],
+    }
+    interface = emit_interface_mlir(cb)
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "manifest.yaml").write_text("target: gemmini\n")
+    monkeypatch.setattr("merlin.llvmlower.device_build.objects_buildable", lambda _device: None)
+    monkeypatch.setattr(oot_runner, "load_package", lambda _path: SimpleNamespace(target="gemmini"))
+    monkeypatch.setattr(
+        "merlin.targetgen.corpus_spec.build", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("shape-based capsule regeneration is forbidden")
+        ),
+    )
+    seen = []
+
+    def inspect_package_call(_pkg, _entrypoint, path, **_kwargs):
+        seen.append(path.read_text())
+        return SimpleNamespace(returncode=1, stderr="synthetic stop after interface handoff", stdout="")
+
+    monkeypatch.setattr(oot_runner, "run_entrypoint", inspect_package_call)
+    result = build_device_objects(
+        "gemmini", {"selected": (4, 8, 19)}, {"selected": ("i8", "i8", "i32")},
+        package_dir=package, workdir=tmp_path / "build", operand_dtype="int8", accum_dtype="i32",
+        expected_interfaces={"selected": {"mlir": interface, "sha256": sha256_text(interface)}},
+        package_sha256=hash_tree(package)["sha256"],
+    )
+    assert seen == [interface]
+    assert not result.ok and "synthetic stop" in result.skipped[0][1]
+
+    cb["tensors"] = {"A": cb["tensors"]["A"], "B": cb["tensors"]["B"]}
+    swapped = emit_interface_mlir(cb)
+    with pytest.raises(ValueError, match="pointer ABI"):
+        build_device_objects(
+            "gemmini", {"selected": (4, 8, 19)}, {"selected": ("i8", "i8", "i32")},
+            package_dir=package, workdir=tmp_path / "bad", operand_dtype="int8", accum_dtype="i32",
+            expected_interfaces={"selected": {"mlir": swapped, "sha256": sha256_text(swapped)}},
+            package_sha256=hash_tree(package)["sha256"],
+        )
+    assert seen == [interface], "wrong pointer order must be refused before package invocation"
+
+
 def test_a_batched_signature_builds_the_same_kernel_as_its_unbatched_form(tmp_path):
     """The batch is a loop in the shim over disjoint slices, not a third axis the device sees.
     Building a separate kernel per batch size would mint one per B for identical work."""

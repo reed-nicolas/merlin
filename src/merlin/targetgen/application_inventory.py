@@ -49,6 +49,30 @@ def exact_int_mm_generic_operation(op) -> bool:
     results = [query.type_shape_dtype(value.type) for value in op.results]
     if [dtype for _shape, dtype in [*operands, *results]] != ["i8", "i8", "i32", "i32"]:
         return False
+    # Operation names alone do not prove this is a matrix product. A body that
+    # multiplies the left operand by itself, or drops the accumulator, has the
+    # same five names and types but different numerical semantics.
+    block = op.regions[0].blocks[0]
+    if len(block.args) != 3 or len(block.ops) != 5:
+        return False
+    ext_a, ext_b, multiply, add, yield_op = list(block.ops)
+    for inner in (ext_a, ext_b, multiply, add, yield_op):
+        semantic_attributes = {
+            key: str(value)
+            for key, value in {**inner.attributes, **inner.properties}.items()
+            if not key.startswith("prov.")
+        }
+        allowed = {"overflowFlags": "#arith.overflow<none>"} if inner in (multiply, add) else {}
+        if any(allowed.get(key) != value for key, value in semantic_attributes.items()):
+            return False
+    if not (
+        list(ext_a.operands) == [block.args[0]]
+        and list(ext_b.operands) == [block.args[1]]
+        and set(multiply.operands) == {ext_a.results[0], ext_b.results[0]}
+        and set(add.operands) == {block.args[2], multiply.results[0]}
+        and list(yield_op.operands) == [add.results[0]]
+    ):
+        return False
     a, weight, out = (shape for shape, _dtype in operands)
     result = results[0][0]
     return (

@@ -29,6 +29,7 @@ import yaml
 
 from merlin.common.digest import sha256_file
 from merlin.common.tree_hash import hash_tree
+from merlin_experiments.measured_launch import without_unsealed_board_catalog
 
 SCHEMA = "merlin.model_qualification.v1"
 MODULE = "merlin_experiments.model_qualification"
@@ -134,6 +135,10 @@ def inspect_workflow(bundle: Path) -> dict:
     if not isinstance(session, dict):
         raise ValueError("model session contract must be a mapping")
     programs = []
+    if session_path.exists() and session.get("version") not in (1, 2):
+        raise ValueError("model session contract must have version 1 or 2")
+    if session.get("version") == 1 and session.get("programs"):
+        raise ValueError("a multi-program session cannot become one forward")
     if session.get("version") == 2:
         roster = session.get("programs")
         if not isinstance(roster, list) or not roster:
@@ -186,6 +191,75 @@ def inspect_workflow(bundle: Path) -> dict:
         program["missing_runtime_inputs"] = missing
     if session_path.exists():
         members["session_contract.yaml"] = {"sha256": sha256_file(session_path), "bytes": session_path.stat().st_size}
+    session_abi = {"status": "not_applicable", "bindings": 0}
+    session_capture = {"status": "not_applicable", "source_closure_verified": False}
+    if session.get("version") == 2:
+        # The shared session loader validates ordered programs, recurrent child
+        # contracts and the actual typed MLIR ABIs at every cross-program edge.
+        # A name-only roster check silently misses a changed cache or action
+        # tensor even when each program still lowers in isolation.
+        from merlin.llvmlower.session_bundle import load as load_session
+
+        try:
+            selected = load_session(bundle)
+            if selected.program_names != tuple(program["name"] for program in programs):
+                raise ValueError("validated session differs from selected program roster")
+            session_abi = {"status": "verified_structure", "bindings": len(selected.bindings)}
+        except Exception as exc:
+            session_abi = {"status": "unverified", "bindings": None, "reason": f"{type(exc).__name__}: {exc}"}
+
+        receipt_path = bundle / "session-receipt.json"
+        if receipt_path.exists():
+            _plain(receipt_path)
+            members["session-receipt.json"] = {
+                "sha256": sha256_file(receipt_path),
+                "bytes": receipt_path.stat().st_size,
+            }
+            try:
+                receipt = json.loads(receipt_path.read_bytes())
+                rows = receipt.get("programs") if isinstance(receipt, dict) else None
+                if (
+                    not isinstance(receipt, dict)
+                    or receipt.get("schema") != "merlin.model_session_capture.v1"
+                    or receipt.get("session_contract_sha256") != members["session_contract.yaml"]["sha256"]
+                    or not isinstance(rows, list)
+                    or len(rows) != len(programs)
+                ):
+                    raise ValueError("session receipt schema, contract or program count differs")
+                for program, row in zip(programs, rows, strict=True):
+                    relative = Path(program["bundle"]).relative_to(bundle) / "capture_receipt.json"
+                    stage_receipt = members.get(relative.as_posix())
+                    if (
+                        not isinstance(row, dict)
+                        or row.get("name") != program["name"]
+                        or row.get("receipt_sha256") != (stage_receipt or {}).get("sha256")
+                        or row.get("ok") is not True
+                        or type(row.get("opaque")) is not int
+                        or row["opaque"] != 0
+                        or not isinstance(row.get("materialized_abi"), dict)
+                        or row["materialized_abi"].get("complete") is not True
+                    ):
+                        raise ValueError(f"session receipt does not bind valid stage {program['name']}")
+                session_capture = {
+                    "status": "producer_receipts_bound",
+                    "receipt_sha256": members["session-receipt.json"]["sha256"],
+                    "source_closure_verified": False,
+                    "qualification": (
+                        "producer-stated stage receipts; not an independent source or numerical attestation"
+                    ),
+                }
+            except (ValueError, TypeError, KeyError) as exc:
+                session_capture = {
+                    "status": "unverified",
+                    "source_closure_verified": False,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+        else:
+            session_capture = {
+                "status": "unverified",
+                "source_closure_verified": False,
+                "reason": "session-receipt.json is absent",
+            }
     provenance = session.get("provenance") or {}
     blockers = []
     if provenance.get("full_checkpoint") is not True:
@@ -194,10 +268,16 @@ def inspect_workflow(bundle: Path) -> dict:
         blockers.append("attributed non-synthetic application inputs are not established")
     if not session:
         blockers.append("no end-to-end application session contract; only a single forward is available")
+    elif session.get("version") == 2 and session_abi["status"] != "verified_structure":
+        blockers.append("cross-program typed ABI and binding structure are unverified")
+    if session.get("version") == 2 and session_capture["status"] != "producer_receipts_bound":
+        blockers.append("session producer receipts do not bind all selected programs")
     return {
         "programs": programs,
         "session": session,
         "members": members,
+        "session_abi": session_abi,
+        "session_capture": session_capture,
         "application_validation_blockers": blockers,
         "scope": "declared session roster and artifact identities; not checkpoint/source closure certification",
     }
@@ -791,7 +871,7 @@ def qualify(
         "--worker",
         str(output),
     ]
-    environment = dict(os.environ)
+    environment = without_unsealed_board_catalog(os.environ)
     worker_tmp = output / "worker-tmp"
     worker_tmp.mkdir(mode=0o700)
     environment["TMPDIR"] = str(worker_tmp)

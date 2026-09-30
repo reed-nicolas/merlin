@@ -14,7 +14,7 @@ Phase 1 develops the functional compiler; Phase 2 uses a separate performance co
 | [Host capabilities](../target/host-capabilities.yaml) | Separately pinned host compiler and reviewed operation/precision support |
 | [Recipe](recipe.yaml) | Derived-only policy, comparison tolerances and oracle tiers; no authored capsule list |
 | [Descriptor](../target/descriptor.yaml) | Independent iteration roster, held-out validation roster and experiment resources |
-| [Selected capability contract](../target/contracts/target_contract.yaml) | Example-specific command order and runner profile bound to the OOT support package |
+| [Selected capability contract](../target/contracts/target_contract.yaml) | Prototype command order and runner intent, explicitly frozen by the experiment; not an OOT support certificate |
 | Shared performance template | Phase 2 objectives and families, not additional functional capability |
 
 The selected configuration has signed 8-bit operands, a 20-bit MAC result and
@@ -24,6 +24,8 @@ compute precision.
 
 [regression-seeds.yaml](regression-seeds.yaml) preserves historical authored tests
 for explicit compatibility studies. It is **not** a default derivation input.
+The small hand-authored g0–g2 interface samples in [reference/](reference/)
+exercise the historical OOT contract; they are not a generated Phase 0 release.
 Generated capsules, weights and goldens are artifacts, never committed examples.
 Read [the shared specification guide](../../../docs/guides/phase0_specification.md)
 for what belongs in a SW spec versus extracted evidence.
@@ -61,7 +63,50 @@ Repeat with the other three loader names and distinct output directories.
 inputs/goldens and `capture_receipt.json` from the **same conversion and model
 instance**; it does not recapture an unrelated model. Inspect `frontend-trace.json`
 and `pytorch-opset.json` for source correspondence and build-specific operator scope.
+The direct worker command is a development capture, not a verified source-closure
+receipt. For a fresh, checkpoint-free capture whose source and runtime bytes must
+be selected *before* execution, use the explicit sealed diagnostic workflow:
+
+```sh
+merlin experiment corpus capture select \
+  --m2m-root "$MODEL2MLIR_ROOT" \
+  --workload-root examples/workloads/coverage_mlp \
+  --venv "$MODEL2MLIR_VENV" --dtype fp32 \
+  --run-dir "$CAPTURE_ROOT/sealed-coverage-mlp" \
+  --output "$CAPTURE_ROOT/selection-coverage-mlp"
+merlin experiment corpus capture issue \
+  --selection "$CAPTURE_ROOT/selection-coverage-mlp/capture-selection.json" \
+  --expected-sha256 "$SELECTION_SHA256"
+```
+
+Record the exact `sha256` returned by `select` as `SELECTION_SHA256`; both
+directories must be absent before selection. Inspect the owner-only
+`capture-selection.json`, `sealed_m2m_pending.json` and captured sidecars in
+the run directory. Repeat separately for each iteration workload. When deriving
+from those exact captures, pass a matching
+`--application-capture-selection "LABEL=PATH@SHA256"` for **every** roster label;
+mixing selected and legacy captures is refused. This establishes an auditable
+preselection and replay, but **does not grant Phase 0 admission**: the selection
+and receipt are owner-controlled, not an independent verified issuer. It also
+does not support external checkpoints yet.
+The worker anchors `--out` before Model2MLIR writes its weight reference, so a
+relative command-line output path still yields an absolute source reference.
+Phase 0 later copies the receipt-bound weights and rewrites that one reference
+to the capsule-local sidecar; do not edit the captured MLIR by hand.
 FP32 captures inventory frontend demand; they do not imply FP32 device support.
+If the selected Model2MLIR build lacks the same-conversion bundle/receipt APIs,
+`--materialize-bundle` fails before capture. For raw frontend inventory only,
+replace it with `--diagnostic-model-copy` and use a fresh output directory.
+This copies the exact converted MLIR to `model.mlir` and hashes the observed
+files in `diagnostic-capture.json`, but emits no `capture_receipt.json`, runtime
+input/golden ABI, or Phase 0 admission. It cannot substitute for a verified
+materialized derivation input.
+The diagnostic record lists missing same-conversion, frontend-trace and static
+integerization APIs separately. The frozen M2M selection records those API
+checks too; an API reported as available only permits a sealed preflight, not
+source-closure verification or corpus admission. In particular, the older
+`write_bundle` that calls `m2m.convert` again cannot establish that its runtime
+bundle has the argument map of the inspected conversion.
 
 TinyLlama, SmolVLA and ResNet50 remain held-out validation workloads. Their
 captures and layer frequencies do not select or tune the derivation corpus.
@@ -89,10 +134,16 @@ The recipe declares stable performance oracle names (`spike` for L2 and
 to be installed; execution still verifies the selected engine and hardware
 revision. Before freezing a run that will execute those members, select
 `MERLIN_EXT_CHIPYARD` for the Chipyard tree containing the concrete Gemmini L3
-simulator, and set
-`MERLIN_M2M_DIR` to the selected Model2MLIR source tree and
-`MERLIN_M2M_PYTHON` to its pinned interpreter for generated
-PyTorch-sourced capsules. The L3 performance members cannot execute if the
+simulator. For separate capture/derivation, set `MERLIN_M2M_DIR` to the selected
+Model2MLIR source tree and `MERLIN_M2M_PYTHON` to its pinned interpreter.
+The frozen Phase 0 runner does not inherit those ambient variables. For live
+PyTorch-sourced capsules, explicitly select the source tree and interpreter
+with `--phase0-m2m-root` and `--phase0-m2m-python` on the run command. That
+selection copies and checks the chosen source package and workload loaders,
+and checks the host interpreter tree on launch and resume. It remains a
+diagnostic managed-host execution, not a sandboxed capture-source attestation
+or verified Phase 0 admission.
+The L3 performance members cannot execute if the
 simulator cannot be resolved; a missing exporter also leaves source capsules unwritten.
 Static-int8 source capsules require `m2m/capture/pt2e_integerize.py` in the
 selected tree. Captures that may fold Conv+BatchNorm also require the
@@ -215,17 +266,19 @@ from an older provider cannot be reused just because their MLIR parses.
 ## 5. Generate a fresh corpus and keep cohorts distinct
 
 Select the realized requirement/profile together for inspect, preflight and run:
-Pin the same Model2MLIR checkout and capture interpreter used to realize the
-iteration workloads. In particular, a sibling checkout may lack the selected
-recipe's integerization implementation; Phase 0 must fail instead of falling
-back to a different capture path.
+the selected materialized bundles already bind their Model2MLIR capture outputs.
+The frozen runner does not recapture from an ambient sibling checkout or
+inherit a live capture interpreter. Source capsules require the explicit
+diagnostic runtime selection below; if it or a required API is missing they
+remain omissions, not verified Phase 0 coverage.
 
 ```sh
-MERLIN_M2M_DIR="$MODEL2MLIR_ROOT" MERLIN_M2M_PYTHON="$CAPTURE_PYTHON" \
-  merlin experiment run gemmini-functional --phase 0 \
+merlin experiment run gemmini-functional --phase 0 \
   --phase0-rtl-facts "$RTL_ROOT/facts.json" \
   --phase0-conformance-spec "$REALIZED_DERIVATION_ROOT/requirements.yaml" \
   --phase0-synth-profile "$REALIZED_DERIVATION_ROOT/synthesis.yaml" \
+  --phase0-m2m-root "$MODEL2MLIR_ROOT" \
+  --phase0-m2m-python "$CAPTURE_PYTHON" \
   --phase0-evidence-mode diagnostic --run-dir "$RUN_ROOT"
 ```
 
@@ -265,11 +318,15 @@ selected capability contract, without consulting an ambient provider. Mixed
 host/device composition stays unmeasured until an emitted boundary is bound to
 that same selected source; a declared legal boundary is not an execution proof.
 
-Verified admission also requires reviewed software and host semantics, complete
-capture source closure, independent numerical and compiler checks, resolved
-operation/transfer obligations, and an operator-owned hidden cohort. These
-cannot be inferred from a diagnostic run or supplied by changing a status
-field. Review the generated model inventory and `grading.resource_bound` for
+The release records two separate verdicts: `phase0_readiness` for the deterministic
+corpus handoff, and `whole_workload_phase1` for compiler qualification. Phase 0
+readiness requires reviewed software and host semantics, verified capture-source
+closure, complete graph/source correspondence, witnessed functional capsules,
+selected hardware evidence, and an operator-owned hidden cohort. Artifact-backed
+support lowering, emitted host/device routes and transfers, numerical target
+checks, and executed composition remain explicit Phase 1 obligations; they are
+not silently counted as passed at release time. None of these claims follows
+from a diagnostic run or a changed status field. Review the generated model inventory and `grading.resource_bound` for
 the *selected* cohort; if policy changes, freeze a new run rather than editing
 an old receipt. With a separately selected private hidden category, prepare a
 candidate release using:

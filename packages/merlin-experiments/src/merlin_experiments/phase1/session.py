@@ -35,6 +35,30 @@ _MODEL_HOST_SNAPSHOT_ROOT_ENV = "MERLIN_MODEL_HOST_LANE_SNAPSHOT_ROOT"
 _MODEL_HOST_SNAPSHOT_REQUIRED_ENV = "MERLIN_MODEL_HOST_LANE_SNAPSHOT_REQUIRED"
 
 
+def _verify_phase0_handoff(corpus_review: dict | None, workload_coverage: dict | None) -> None:
+    """Bind the reviewed Phase 0 handoff to the frozen corpus view.
+
+    Compiler-produced support lowering and execution cannot be required before the
+    Phase 1 agent starts. They remain obligations of the later strict qualification;
+    this check admits only a reviewed, source-closed deterministic corpus.
+    """
+    review = corpus_review or {}
+    if not (review.get("whole_workload_phase1") or {}).get("required"):
+        return
+    from ..phase0.coverage_commitment import (
+        build_phase0_readiness,
+        phase0_readiness_identity,
+        require_phase0_ready,
+    )
+
+    readiness = build_phase0_readiness(workload_coverage or {})
+    expected = review.get("phase0_readiness")
+    observed = phase0_readiness_identity(readiness, required=True)
+    if expected != observed:
+        raise ValueError("frozen Phase 0 readiness differs from the reviewed corpus")
+    require_phase0_ready(readiness)
+
+
 @dataclass(frozen=True)
 class RunRequest:
     context: InvocationContext
@@ -155,10 +179,7 @@ class PreparedRun:
                 repo=self.request.context.repo,
                 reviewed_roots=self.reviewed_roots,
             )
-            if (self.environment.get("corpus_review") or {}).get("whole_workload_phase1", {}).get("required"):
-                from ..phase0.coverage_commitment import require_complete
-
-                require_complete(view.workload_coverage or {})
+            _verify_phase0_handoff(self.environment.get("corpus_review"), view.workload_coverage)
 
 
 def task_scope(
@@ -339,6 +360,8 @@ def prepare(
     _hidden_dir = None
     _corpus_seal = os.environ.get("MERLIN_CORPUS_SEAL", "").strip()
     _corpus_review = None
+    _semantic_model_snapshot = None
+    _semantic_diagnostic = None
     if _corpus_seal and a.sandbox != "bwrap":
         raise RuntimeError("sealed corpus admission requires a verified native bwrap input snapshot")
     if a.sandbox == "bwrap":
@@ -348,18 +371,34 @@ def prepare(
         _BWS.require_snapshot_ownership(_BWS.verify_bundle_snapshot(ws, bundle, repo=context.repo))
         _snapshot_root = _BWS.bundle_snapshot_root(ws).resolve(strict=True)
         if _corpus_seal:
-            from merlin_experiments.corpus.release import verify_snapshot
+            from merlin_experiments.corpus.release import verify_snapshot_for_phase1
 
-            _corpus_review = verify_snapshot(Path(_corpus_seal), context.descriptor, ws, bundle, repo=context.repo)
+            _reviewed = verify_snapshot_for_phase1(
+                Path(_corpus_seal), context.descriptor, ws, bundle, repo=context.repo
+            )
+            _corpus_review = _reviewed.review
+            _semantic_model_snapshot = _reviewed.private_instruction_model
             _reviewed_corpus_roots = tuple(_te().graded_roots())
         _bundle_snapshot_record = _BWS.snapshot_record(ws)
         _corpus_view = CI.resolve(ws, bundle, _corpus_record, repo=context.repo, reviewed_roots=_reviewed_corpus_roots)
-        if (_corpus_review or {}).get("whole_workload_phase1", {}).get("required"):
-            from ..phase0.coverage_commitment import require_complete
-
-            require_complete(_corpus_view.workload_coverage or {})
+        _verify_phase0_handoff(_corpus_review, _corpus_view.workload_coverage)
         _public_root, _policy_root = _corpus_view.public, _corpus_view.policy
         _contract_root = _corpus_view.contract
+        if _corpus_seal:
+            from . import semantic_diagnostics as _SD
+
+            _model_path = _semantic_model_snapshot
+            if _resuming:
+                # Old reviewed runs had no diagnostic. Do not mint a new
+                # receipt or change their admission identity on resume.
+                if "semantic_search_diagnostic" in _environment_record:
+                    _SD.verify(
+                        _environment_record["semantic_search_diagnostic"],
+                        run_dir,
+                        workspace=ws,
+                        model_path=_model_path,
+                        public_root=_public_root,
+                    )
         _te_setup = _te()
         if _te_setup.numeric_profile is not None:
             from merlin_experiments.corpus.numeric_policy import (
@@ -467,6 +506,19 @@ def prepare(
     else:
         _treatment_snapshot = RI.treatment_snapshot_record(ws, run_dir, bundle_dir, _resolved_tool_ids)
     mask = transport.probe(ws, bundle, a.sandbox, context=context)
+    if _corpus_seal and not _resuming:
+        # The receipt is host-private. Mint it only after all prompt staging
+        # and the trusted workspace probe have finished, so neither receives
+        # a run directory that already contains search history.
+        from . import semantic_diagnostics as _SD
+
+        _semantic_diagnostic = _SD.create(
+            run_dir,
+            workspace=ws,
+            model_path=_semantic_model_snapshot,
+            public_root=_public_root,
+            contract_root=_contract_root,
+        )
     if not _resuming:
         _environment_record = {
             "run_id": a.run_id,
@@ -492,6 +544,7 @@ def prepare(
             "authored_bundle_manifest_sha256": _authored_bundle_sha256,
             "public_corpus_input": _corpus_record,
             "corpus_review": _corpus_review,
+            **({"semantic_search_diagnostic": _semantic_diagnostic} if _corpus_seal else {}),
             "hidden_capsule_snapshot": _hidden_snapshot_record,
             "model_host_lane_snapshot": _model_host_lane_snapshot,
             "repo_sha": repo_sha(repo=context.repo),

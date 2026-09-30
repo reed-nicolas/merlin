@@ -163,11 +163,13 @@ scientific policy is separate. Native presentation remains outside this package.
 Versioned telemetry source sets are exact; never fill missing historical pins from live code.
 Historical preflight v1 has 20 roles; extraction v2 has 23; current explicit-price v3 has
 27, including AET pricing owners. V4 has 29 roles: those 27 plus the complete Phase 2
-Python membership/hash closure and its shared discovery implementation. Additions,
+Python membership/hash closure and its shared discovery implementation. V5 adds
+the experiments-owned historical target-access implementation and exact packaged
+JSON bytes, for 31 roles. Additions,
 removals and changed bytes invalidate new execution without per-module role growth.
 Decode historical closure evidence without reading live implementations; verify live
 membership before execution. Historical native authoring-stage identities are never substituted.
-V3/V4 use one normalized, sealed AET price snapshot for
+V3/V4/V5 use one normalized, sealed AET price snapshot for
 rounds and finalization. Never mutate ambient pricing/cache state or silently reprice old evidence.
 `claims/` owns measured decision procedures and historical-identity resolution.
 Preserve independent measured-claim and model-portfolio policies and historical
@@ -239,8 +241,9 @@ isolation. Its implementation remains private grader code under this package's
 existing recursive access and source-membership policies.
 `candidate_record.py` owns record/formal-claim validation; `candidate_verification.py`
 owns byte verification, handoffs and audit-only requalification. New requalification
-v4 pins and snapshots the complete Phase 2 Python membership plus its discovery
-implementation, auditor, answer-surface and shared-access policies. Historical v1-v3
+v5 pins and snapshots the complete Phase 2 Python membership plus its discovery
+implementation, auditor, answer-surface, shared-access and packaged historical
+target-access policies. Historical v1-v4
 records retain their old roles and are inspection-only under the extracted live
 implementation. Never relabel a native-controller hash as installed verification
 or replace archived authoring identities with current implementation identities.

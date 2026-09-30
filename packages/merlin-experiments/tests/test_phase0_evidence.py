@@ -13,7 +13,26 @@ from merlin_experiments.phase0.provenance import _scrub_capsule_dir
 from merlin.perf import profile
 from merlin.runtime.backends import base
 from merlin.targetgen import readout_facet, target_registry
-from merlin.targetgen.rtl import facts
+from merlin.targetgen.rtl import facts, source_selection
+
+
+def test_specir_source_inventory_excludes_unrelated_generated_project_files(tmp_path):
+    package = tmp_path / "specir"
+    package.mkdir()
+    (package / "__init__.py").write_text("\n")
+    (package / "oracle.py").write_text("VALUE = 1\n")
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "generated.mlir").write_text("unrelated\n")
+    selected = evidence._reference_inventory_root(
+        "numerical_model", tmp_path, {"numerical_semantics": {"model": {"engine": "specir_fp_reduce"}}}
+    )
+    assert selected == package
+    assert sorted(path.name for path in selected.rglob("*.py")) == ["__init__.py", "oracle.py"]
+    (package / "__init__.py").unlink()
+    with pytest.raises(ValueError, match="SpecIR source package is absent"):
+        evidence._reference_inventory_root(
+            "numerical_model", tmp_path, {"numerical_semantics": {"model": {"engine": "specir_fp_reduce"}}}
+        )
 
 
 def _selection(monkeypatch, tmp_path, body=None):
@@ -37,6 +56,115 @@ def _selection(monkeypatch, tmp_path, body=None):
     return evidence.select_evidence("fixture", facts_path=raw), raw, code
 
 
+def test_phase0_accepts_symlink_alias_for_byte_bound_rtl_production(monkeypatch, tmp_path):
+    _, facts_path, _ = _selection(monkeypatch, tmp_path)
+    source_root = tmp_path / "rtl-source"
+    source_root.mkdir()
+    alias = tmp_path / "rtl-alias"
+    alias.symlink_to(source_root, target_is_directory=True)
+    core = source_root / "core.hw.mlir"
+    core.write_text("module {}\n")
+    generic = source_root / "core.generic.mlir"
+    generic.write_text("module {}\n")
+    tool = source_root / "circt-opt"
+    tool.write_text("tool bytes\n")
+
+    def member(path):
+        return {"path": str(path), "sha256": source_selection.digest(path)}
+
+    bundle = source_root / "source-selection.json"
+    bundle.write_text(
+        json.dumps(
+            {
+                "schema": source_selection.SCHEMA,
+                "target": "fixture",
+                "sources": {
+                    role: member(alias / core.name) for role in ("core_hw", "soc_hw", "firrtl", "hierarchy")
+                },
+            }
+        )
+    )
+
+    def production(selected):
+        return {
+            "status": "verified",
+            "sources": [{"role": role, **data} for role, data in sorted(selected["sources"].items())],
+        }
+
+    monkeypatch.setattr(source_selection, "production_consistency", production)
+    selected = source_selection.load_selection(bundle, target="fixture")
+    recorded = production(selected)
+    for source in recorded["sources"]:
+        source["path"] = str(alias / core.name)
+    genericization = {
+        "kind": "circt_generic_serialization",
+        "returncode": 0,
+        "input": member(alias / core.name),
+        "output": member(generic),
+        "tool": member(tool),
+        "command": [str(tool), "--mlir-print-op-generic", str(alias / core.name), "-o", str(generic)],
+    }
+    recorded["genericization"] = genericization
+    recorded["sources"].append({"role": "core_hw_generic", **genericization["output"]})
+    facts_path.write_text(
+        json.dumps(
+            {
+                "inputs": {
+                    "target": "fixture",
+                    "source_bundle_path": str(bundle),
+                    "generic_hw_path": str(generic),
+                    "generic_hw_sha256": source_selection.digest(generic),
+                },
+                "source_consistency": recorded,
+                "facts": {"arrays": [{"rows": 4, "cols": 4}], "memories": []},
+            }
+        )
+    )
+    observed = evidence.select_evidence("fixture", facts_path=facts_path)
+    assert not [row for row in observed.diagnostics if row["component"] == "source-consistency"]
+
+    genericization["input"]["path"] = str(generic)
+    facts_path.write_text(
+        json.dumps(
+            {
+                "inputs": observed.loaded_facts["inputs"],
+                "source_consistency": recorded,
+                "facts": {"arrays": [{"rows": 4, "cols": 4}], "memories": []},
+            }
+        )
+    )
+    altered = evidence.select_evidence("fixture", facts_path=facts_path)
+    assert any(
+        row["component"] == "source-consistency" and row["status"] == "contradiction"
+        for row in altered.diagnostics
+    )
+
+    genericization["input"].pop("path")
+    facts_path.write_text(
+        json.dumps(
+            {
+                "inputs": observed.loaded_facts["inputs"],
+                "source_consistency": recorded,
+                "facts": {"arrays": [{"rows": 4, "cols": 4}], "memories": []},
+            }
+        )
+    )
+    malformed = evidence.select_evidence("fixture", facts_path=facts_path)
+    assert any(
+        row["component"] == "source-consistency" and row["status"] == "contradiction"
+        for row in malformed.diagnostics
+    )
+
+
+def test_rtl_receipt_alias_comparison_refuses_absent_files(tmp_path):
+    missing = {"path": str(tmp_path / "absent"), "sha256": "a" * 64}
+    assert not evidence._same_selected_file(missing, missing)
+    assert not evidence._same_source_consistency(
+        {"sources": [{"role": "core_hw", **missing}]},
+        {"sources": [{"role": "core_hw", **missing}]},
+    )
+
+
 def test_exact_raw_bytes_and_derived_hashes_are_distinct(monkeypatch, tmp_path):
     selected, raw, _ = _selection(monkeypatch, tmp_path)
     assert selected.raw_facts == raw.read_bytes()
@@ -45,6 +173,22 @@ def test_exact_raw_bytes_and_derived_hashes_are_distinct(monkeypatch, tmp_path):
     mutable = selected.loaded_facts
     mutable["facts"]["arrays"][0]["rows"] = 999
     assert selected.loaded_facts["facts"]["arrays"][0]["rows"] == 4
+
+
+def test_explicit_capability_contract_does_not_require_executable_provider(monkeypatch, tmp_path):
+    contract = tmp_path / "selected-contract.yaml"
+    contract.write_text("name: fixture\ncompute_units: []\n")
+    monkeypatch.setattr(target_registry, "resolve", lambda target: (_ for _ in ()).throw(KeyError(target)))
+    monkeypatch.setattr(
+        facts, "find_facts", lambda target, explicit=None: (_ for _ in ()).throw(FileNotFoundError(target))
+    )
+    selected = evidence.select_evidence("fixture", capability_contract_path=contract)
+    assert selected.contract == {"name": "fixture", "compute_units": []}
+    assert any(source.path == contract and source.role == "target-contract" for source in selected.source_snapshots)
+
+    contract.write_text("name: other_target\ncompute_units: []\n")
+    with pytest.raises(ValueError, match="differs from selected target"):
+        evidence.select_evidence("fixture", capability_contract_path=contract)
 
 
 def test_selected_readout_scale_conflict_is_a_bound_diagnostic(monkeypatch, tmp_path):
@@ -115,8 +259,7 @@ def test_derivation_identity_binds_provider_bytes_but_not_checkout_location(monk
         relocated.raw_facts,
     )
     assert (
-        changed.derivation_identity["support_sources_sha256"]
-        != selected.derivation_identity["support_sources_sha256"]
+        changed.derivation_identity["support_sources_sha256"] != selected.derivation_identity["support_sources_sha256"]
     )
 
 
@@ -141,6 +284,52 @@ def test_export_and_reload_never_reopen_original_inputs(monkeypatch, tmp_path):
     assert manifest["raw_facts_sha256"] == selected.raw_facts_sha256
     assert (output / "hardware/circt/facts.json").read_bytes() == selected.raw_facts
     assert evidence.export_evidence(restored, output) == manifest
+
+
+def test_selected_instruction_semantics_are_frozen_with_the_phase0_inputs(monkeypatch, tmp_path):
+    selected, raw, code = _selection(monkeypatch, tmp_path)
+    from merlin.targetgen import instruction_semantics
+
+    contract = code.parent / "contracts/target_contract.yaml"
+    contract.write_text("name: fixture\ncompute_units: []\ninstruction_semantics: contracts/instructions.yaml\n")
+    authored = code.parent / "contracts/instructions.yaml"
+    authored.write_bytes(b"schema: merlin.instruction_semantics.v1\ntarget: fixture\ninstructions: []\n")
+    calls = []
+
+    def normalize(document, *, software_spec, rtl_facts, target, source_bytes, software_source_bytes, rtl_source_bytes):
+        calls.append(
+            (document, software_spec, rtl_facts, target, source_bytes, software_source_bytes, rtl_source_bytes)
+        )
+        return {
+            "schema": "merlin.instruction_semantics.v1",
+            "target": target,
+            "status": "UNKNOWN",
+            "instructions": [],
+            "unknowns": [{"reason": "no reviewed instruction semantics"}],
+        }
+
+    monkeypatch.setattr(instruction_semantics, "normalize_instruction_semantics", normalize)
+    selected = evidence.select_evidence("fixture", facts_path=raw)
+    assert calls[0][3] == "fixture"
+    assert calls[0][4] == authored.read_bytes()
+    assert calls[0][6] == raw.read_bytes()
+    output = tmp_path / "run-with-instructions"
+    manifest = evidence.export_evidence(selected, output)
+    assert (output / "software/instruction-semantics-authored.yaml").read_bytes() == authored.read_bytes()
+    assert "software/instruction-semantics.json" in manifest["consumers"]["instruction_selection"]
+    authored.unlink()
+    restored = evidence.load_exported_evidence(output)
+    assert restored.derivation_identity == selected.derivation_identity
+    assert evidence.export_evidence(restored, output) == manifest
+
+
+def test_selected_instruction_semantics_cannot_escape_provider(monkeypatch, tmp_path):
+    _, raw, code = _selection(monkeypatch, tmp_path)
+    contract = code.parent / "contracts/target_contract.yaml"
+    contract.write_text("name: fixture\ncompute_units: []\ninstruction_semantics: ../foreign.yaml\n")
+    (tmp_path / "foreign.yaml").write_text("target: foreign\n")
+    with pytest.raises(ValueError, match="escapes provider root|resource is not a file"):
+        evidence.select_evidence("fixture", facts_path=raw)
 
 
 def test_selected_application_accounting_is_digest_bound_and_replayed_without_framework_queries(monkeypatch, tmp_path):
@@ -196,6 +385,7 @@ def test_selected_application_accounting_is_digest_bound_and_replayed_without_fr
     assert "hardware/effective-views/isa-taxonomy.json" in manifest["consumers"]["corpus_binding"]
     coverage_readme = (output / "coverage/README.md").read_text()
     assert "unreviewed inputs remain unknown" in coverage_readme
+    assert "## Normalized-IR operations by partition" in coverage_readme
     assert "reviewed declaration screens" not in coverage_readme
     sidecar.write_text("{}")
     with pytest.raises(ValueError, match="inventory differs"):

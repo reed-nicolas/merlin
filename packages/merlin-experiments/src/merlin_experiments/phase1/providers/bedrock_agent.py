@@ -284,10 +284,22 @@ def _extract_output(
     return body
 
 
-def _bash_in_sandbox(te, ws: Path, bundle: dict, command: str, sandbox: str, timeout: int) -> str:
+def _bash_in_sandbox(
+    te, ws: Path, bundle: dict, command: str, sandbox: str, timeout: int, *, private_run_dir: Path | None
+) -> str:
     from merlin.targetgen.sandbox import bwrap as _BW
 
-    cmd = _BW.wrap(te, ws, command, bundle) if sandbox == "bwrap" else f"cd {ws} && {command}"
+    if sandbox == "bwrap":
+        if private_run_dir is None:
+            raise RuntimeError("Phase 1 agent tool has no host-private run boundary")
+        from merlin_experiments.phase1.semantic_diagnostics import assert_private_mounts
+
+        cmd = _BW.wrap(
+            te, ws, command, bundle,
+            argv_guard=lambda argv: assert_private_mounts(argv, private_run_dir),
+        )
+    else:
+        cmd = f"cd {ws} && {command}"
     try:
         r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=timeout, cwd=str(ws))
         return _extract_output(r.stdout or "", r.stderr or "")
@@ -323,6 +335,7 @@ def _run_subagent(
     cmd_timeout: int,
     deadline: float,
     *,
+    private_run_dir: Path | None = None,
     max_iters: int = 15,
     max_tokens: int = 6000,
 ) -> str:
@@ -406,9 +419,15 @@ def _run_subagent(
             if name == "write_file":
                 output = _write_file(ws, inp.get("path", ""), inp.get("content", ""))
             elif name == "read_file":
-                output = _bash_in_sandbox(te, ws, bundle, f'cat "{inp.get("path", "")}"', sandbox, cmd_timeout)
+                output = _bash_in_sandbox(
+                    te, ws, bundle, f'cat "{inp.get("path", "")}"', sandbox, cmd_timeout,
+                    private_run_dir=private_run_dir,
+                )
             else:
-                output = _bash_in_sandbox(te, ws, bundle, inp.get("command", ""), sandbox, cmd_timeout)
+                output = _bash_in_sandbox(
+                    te, ws, bundle, inp.get("command", ""), sandbox, cmd_timeout,
+                    private_run_dir=private_run_dir,
+                )
             results.append(
                 {"toolResult": {"toolUseId": tu["toolUseId"], "content": [{"text": output or "(no output)"}]}}
             )
@@ -673,7 +692,10 @@ def run_round(
                 if name == "write_file":
                     output = _write_file(ws, inp.get("path", ""), inp.get("content", ""))
                 elif name == "read_file":
-                    output = _bash_in_sandbox(te, ws, bundle, f'cat "{inp.get("path", "")}"', sandbox, cmd_timeout)
+                    output = _bash_in_sandbox(
+                        te, ws, bundle, f'cat "{inp.get("path", "")}"', sandbox, cmd_timeout,
+                        private_run_dir=run_dir,
+                    )
                 elif name == "self_check":
                     caps = (inp.get("capsules") or "all").strip() or "all"
                     output = _bash_in_sandbox(
@@ -684,6 +706,7 @@ def run_round(
                         f'--capsules "{caps}" --timeout 600',
                         sandbox,
                         max(cmd_timeout, 700),
+                        private_run_dir=run_dir,
                     )
                 elif name == "delegate":
                     output = _run_subagent(
@@ -700,9 +723,13 @@ def run_round(
                         f"{it}_deleg",
                         cmd_timeout,
                         deadline,
+                        private_run_dir=run_dir,
                     )
                 else:
-                    output = _bash_in_sandbox(te, ws, bundle, inp.get("command", ""), sandbox, cmd_timeout)
+                    output = _bash_in_sandbox(
+                        te, ws, bundle, inp.get("command", ""), sandbox, cmd_timeout,
+                        private_run_dir=run_dir,
+                    )
                 results.append(
                     {"toolResult": {"toolUseId": tu["toolUseId"], "content": [{"text": output or "(no output)"}]}}
                 )

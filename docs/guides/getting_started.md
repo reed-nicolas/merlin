@@ -3,7 +3,7 @@ title: Getting started — the setup and prerequisites reference
 kind: guide
 status: current
 owner: core
-last_verified: 2026-09-20
+last_verified: 2026-09-29
 related: [reproducibility, architecture, repo_structure, integrations, model2mlir, rvv_e2e,
           beam_search, gemmini_experiment, zephyr, dse, dse_guidance, targetgen, adding_a_target]
 code_refs:
@@ -121,7 +121,7 @@ capabilities it reports (key → what it needs):
 | `saturn_vec` | Saturn-vectors RVV spike cert | `MERLIN_CHIPYARD`, `MERLIN_SPIKE` |
 | `k1_board` | SpacemiT K1 board (real cycles) | `MERLIN_K1_HOST`, `MERLIN_K1_SSH_KEY`, `MERLIN_K1_TOOLCHAIN` |
 | `gemmini_spike` / `gemmini_verilator` | Gemmini functional (L2) / RTL cycle (L3) | `MERLIN_GEMMINI_SPIKE` / `MERLIN_GEMMINI_VERILATOR`, `MERLIN_CHIPYARD` |
-| `gemmini_vcs` / `firesim` | Gemmini VCS (L4) / FireSim (L5) | `MERLIN_GEMMINI_SIMV` / `MERLIN_EXT_FIRESIM_QUEUE`, `FIRESIM_ROOT` |
+| `gemmini_vcs` / `firesim` | Gemmini VCS (L4) / FireSim (L5) | `MERLIN_GEMMINI_SIMV` / `MERLIN_EXT_FIRESIM_QUEUE`, `FIRESIM_ROOT`, installed runner + `MERLIN_FIRESIM_RUNNER` |
 | `zephyr_spike` | Zephyr SW whole-model build_app path | `ZEPHYR_BASE`, `MERLIN_ZEPHYR_SW`, `ZEPHYR_SDK_INSTALL_DIR`, `MERLIN_CHIPYARD` |
 | `circt_firtool` | CIRCT firtool + FileCheck (RTL checks) | `firtool` / `FileCheck` on PATH, `MERLIN_CHIPYARD` |
 | `chia` | Chia public integration API | compatible `merlin-experiments[chia]` in `MERLIN_CHIA_PYTHON` or `out/build/chia-venv` |
@@ -140,7 +140,7 @@ not available on a fresh machine. "board-gated" items are called out in §5.
 | RVV end-to-end ([rvv_e2e](rvv_e2e.md)) | `llvm_m2m_toolchain` (m2m + clang-23) + capture bundles + `spike_rv64gcv` | K1 board is **optional** — spike rv64gcv is the bit-exact fallback |
 | Beam search ([beam_search](beam_search.md)) | frozen `hand_v0` baseline (in-tree) + expert objdump fixtures + a K1 board **or** spike | `spike_rv64gcv` substitutes for the physical K1 (correctness/cycles, no wall-clock); `chia` only for Ray fan-out |
 | Gemmini experiment ([gemmini_experiment](gemmini_experiment.md)) | `packages/merlin-experiments` + `bwrap` on PATH + the sim toolchain (`MERLIN_CHIPYARD` → spike/verilator) + `ANTHROPIC_API_KEY` for real agentic runs + `out/build/chia-venv` for fan-out | mock LLM fallback runs without a key (no real agentic run); VCS/FireSim rungs skip if absent |
-| Zephyr / FireSim / spike ([zephyr](zephyr.md)) | `ZEPHYR_BASE`, `MERLIN_ZEPHYR_SW`, `ZEPHYR_SDK_INSTALL_DIR`, `MERLIN_CHIPYARD` | spike substitutes for 2-tile FireSim |
+| Zephyr / FireSim / spike ([zephyr](zephyr.md)) | `ZEPHYR_BASE`, `MERLIN_ZEPHYR_SW`, `ZEPHYR_SDK_INSTALL_DIR`, `MERLIN_CHIPYARD`; FireSim additionally needs an [installed runner](firesim.md) and `MERLIN_FIRESIM_RUNNER` | spike substitutes for 2-tile FireSim |
 | Target generation ([targetgen](targetgen.md), [adding_a_target](adding_a_target.md)) | base install + extra `.[targetgen]` (jsonschema) | RTL-grounded targets additionally use `circt_firtool` and the sibling `mlc` package (editable-installed from `MERLIN_MLC_DIR`, §5) |
 | External baselines ([integrations](integrations.md)) | `packages/merlin-analysis` + the relevant framework repo/build + its venv by `MERLIN_*` var (§5) | each arm skips independently when its var is unset |
 | Publish a champion (reproducibility §8) | base install; a local `git init --bare` remote | a real GitHub push is human-gated (never automatic) |
@@ -195,7 +195,8 @@ board that pings but hangs on `:22` is not down — use 2222.
 **Gemmini / Saturn / Muon simulators.** Gemmini functional (spike, L2) and RTL-cycle (verilator, L3)
 sims come from chipyard; set `MERLIN_GEMMINI_SPIKE` / `MERLIN_GEMMINI_VERILATOR` (+
 `MERLIN_GEMMINI_HARNESS_DIR`). **VCS (L4, `MERLIN_GEMMINI_SIMV`) needs a Synopsys VCS license** and
-**FireSim (L5, `MERLIN_EXT_FIRESIM_QUEUE` + `FIRESIM_ROOT`) needs an FPGA/manager** — neither is
+**FireSim (L5, `MERLIN_EXT_FIRESIM_QUEUE` + `FIRESIM_ROOT`) needs an FPGA/manager and a
+separately installed, selected runner** — neither hardware nor a runner is bundled in core. It is not
 fresh-machine reproducible; both fail-closed to `not_run`, and spike+verilator cover
 functional+cycle-accurate certification without them. Saturn (`MERLIN_SATURN_*`) and Muon
 (`MERLIN_MUON_*`, `MERLIN_RADIANCE_KERNELS`) sims are analogous opt-ins.

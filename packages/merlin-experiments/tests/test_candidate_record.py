@@ -31,7 +31,7 @@ def _document(tmp_path, version=4):
     if version == 3:
         roles.add("native_controller")
     identity = None
-    if version == 4:
+    if version in (4, 5):
         source = tmp_path / "source"
         source.mkdir(exist_ok=True)
         for name in ("__init__.py", "candidate_record.py", "candidate_verification.py", "telemetry.py", "helper.py"):
@@ -39,6 +39,8 @@ def _document(tmp_path, version=4):
         identity = TEL._package_source_record(source)
         roles.add("python_source_membership")
         roles.update("phase2:" + name for name in identity["members"])
+        if version == 5:
+            roles.update({"historical_target_access_policy", "historical_target_access_data"})
     snapshots = [
         {
             "role": role,
@@ -66,7 +68,7 @@ def _document(tmp_path, version=4):
     return {"agent": {"audit": audit, "rounds": [{"audit": audit}]}, "audit_requalification": evidence}
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
 def test_historical_and_current_roles_decode_without_live_source(tmp_path, version):
     document = _document(tmp_path, version)
     before = copy.deepcopy(document)
@@ -89,7 +91,7 @@ def test_current_role_and_closure_corruption_refuses(tmp_path, mutation):
     elif mutation == "old_role":
         rows[0]["role"] = "native_controller"
     elif mutation == "unknown_version":
-        evidence["schema_version"] = 5
+        evidence["schema_version"] = 6
     elif mutation == "bool_version":
         evidence["schema_version"] = True
     elif mutation == "member_missing":

@@ -26,7 +26,7 @@ from typing import Any
 
 from ..common import paths
 from ..common.artifacts import git_sha7, new_product, utc_stamp
-from ..common.jsonio import write_pretty_json
+from ..common.jsonio import canonical_sha256, write_pretty_json
 from ..common.yaml import dump_yaml, load_yaml
 from . import package_records
 
@@ -166,7 +166,7 @@ class _InvStr:
 
     value: str
 
-    def __lt__(self, other: "_InvStr") -> bool:
+    def __lt__(self, other: _InvStr) -> bool:
         return self.value > other.value
 
 
@@ -304,7 +304,7 @@ def resolve_remote(target: str, *, config: str | Path | None = None, override: s
     return str(remote)
 
 
-def _is_baseline(sel: "ChampionSelection") -> bool:
+def _is_baseline(sel: ChampionSelection) -> bool:
     """The frozen unoptimized control (by known package_id or a manifest opt-in flag)."""
     if sel.package_id in _BASELINE_PACKAGE_IDS:
         return True
@@ -312,7 +312,7 @@ def _is_baseline(sel: "ChampionSelection") -> bool:
     return isinstance(pub, dict) and pub.get("role") == "baseline"
 
 
-def resolve_branch(sel: "ChampionSelection", *, override: str | None = None, config: str | Path | None = None) -> str:
+def resolve_branch(sel: ChampionSelection, *, override: str | None = None, config: str | Path | None = None) -> str:
     """Resolve the publish BRANCH for a package (BB0 branch-per-version). Precedence, highest first:
     ``override`` (``--branch``) > env ``MERLIN_PUBLISH_BRANCH_<TARGET>`` > ``publish.yaml``
     ``branches.<target>.<package_id>`` > the default policy.
@@ -651,7 +651,7 @@ def index_entries(target: str, *, artifacts_root: str | Path | None = None) -> l
 
 
 def assemble_index_tree(
-    target: str, dest: str | Path, *, artifacts_root: str | Path | None = None, only_branches: "set[str] | None" = None
+    target: str, dest: str | Path, *, artifacts_root: str | Path | None = None, only_branches: set[str] | None = None
 ) -> dict[str, Any]:
     """Assemble the default-branch landing page (README + LICENSE) into ``dest``.
 
@@ -731,8 +731,17 @@ def _cert_run_id(sel: ChampionSelection) -> str:
     return sel.cert_run or f"recorded-{sel.status or 'unknown'}"
 
 
-def _fingerprint(package_id: str, merlin_sha: str, cert_run_id: str, payload_sha256: str) -> str:
-    payload = f"{package_id}\n{merlin_sha}\n{cert_run_id}\n{payload_sha256}".encode("utf-8")
+def _fingerprint(
+    package_id: str,
+    merlin_sha: str,
+    cert_run_id: str,
+    payload_sha256: str,
+    *,
+    publication_record: dict[str, Any] | None = None,
+) -> str:
+    payload = f"{package_id}\n{merlin_sha}\n{cert_run_id}\n{payload_sha256}".encode()
+    if publication_record is not None:
+        payload += f"\npublication-record:{canonical_sha256(publication_record)}".encode("ascii")
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -761,7 +770,11 @@ def embed_provenance(dest: str | Path, sel: ChampionSelection) -> None:
     sha7 = git_sha7()
     cert_run = _cert_run_id(sel)
     fp = _fingerprint(
-        sel.package_id, merlin_sha, cert_run, package_records.payload_inventory(sel.package_dir)["sha256"]
+        sel.package_id,
+        merlin_sha,
+        cert_run,
+        package_records.payload_inventory(sel.package_dir)["sha256"],
+        publication_record=sel.publication_record,
     )
 
     # 1) manifest copy (provenance record; identical to the root build manifest)
@@ -790,6 +803,7 @@ def embed_provenance(dest: str | Path, sel: ChampionSelection) -> None:
         "lineage_depth": sel.lineage_depth,
         "run_refs": [cert_run],
         "fingerprint": fp,
+        "publication_record_sha256": canonical_sha256(sel.publication_record) if sel.publication_record else None,
         "certification_scope": "package-payload",
         "external_dependency_closure": "not-attested",
         "exported_payload_certification": "unverified",
@@ -865,7 +879,7 @@ def _check_gate(sel: ChampionSelection) -> tuple[bool, str]:
 
 
 def record_certification(
-    target: str, package_id: str, results: "list[str | Path]", *, artifacts_root: str | Path | None = None
+    target: str, package_id: str, results: list[str | Path], *, artifacts_root: str | Path | None = None
 ) -> dict[str, Any]:
     """Record historical verdicts outside the immutable package payload.
 
@@ -1221,7 +1235,8 @@ def _git_publish(
     branch-tip fingerprint is a no-op. Returns (commit_sha, tag, noop).
 
     An existing TAG is deliberately not a veto. The tag names a package *version*, but the
-    fingerprint covers package ID, Merlin revision, cert run and source payload inventory — so re-certifying an unchanged
+    fingerprint covers package ID, Merlin revision, cert run, source payload inventory and
+    the selected external publication record — so re-certifying an unchanged
     payload (``spike_verified`` -> ``k1_verified`` after a board campaign) produces new provenance
     at the same version. Letting the tag veto that meant the published ``.merlin/certification.yaml``
     kept the WEAKER status forever, silently understating the certification to every consumer. The
@@ -1450,8 +1465,9 @@ def _require_push_confirmation(
     remote: str, repo_dir: Path, branch: str, fingerprint: str, confirm_push: str | None
 ) -> None:
     """Human gate before a real GitHub/network push: refuse unless ``confirm_push`` equals THIS publish's
-    content fingerprint. Because the fingerprint is content-derived, a blind constant cannot pass — the
-    operator must have seen the assembled artifact. On refusal, print the assembled repo tree (what would
+    stable release fingerprint. Because the fingerprint is derived from the selected payload and
+    publication record, a blind constant cannot pass — the operator must have seen the assembled
+    artifact. The generated timestamp is not covered. On refusal, print the assembled repo tree (what would
     be pushed) so it can be inspected, then raise. Local/file remotes are exempt (see
     :func:`_needs_push_confirmation`)."""
     if not _needs_push_confirmation(remote) or confirm_push == fingerprint:
@@ -1556,7 +1572,13 @@ def publish(
 
     merlin_sha = _git_sha_full()
     cert_run = _cert_run_id(sel)
-    fingerprint = _fingerprint(sel.package_id, merlin_sha, cert_run, source_payload["sha256"])
+    fingerprint = _fingerprint(
+        sel.package_id,
+        merlin_sha,
+        cert_run,
+        source_payload["sha256"],
+        publication_record=sel.publication_record,
+    )
     version = int(manifest.get("version", sel.version) or 0)
     tag = f"v{version}-{sel.package_id}"
 
@@ -1617,6 +1639,17 @@ def publish(
             },
         )
 
+    # A build check can take a long time. Its selected input record and payload
+    # must still be the bytes named by the confirmation token before any push.
+    try:
+        if (
+            package_records.payload_inventory(sel.package_dir) != source_payload
+            or package_records.read_record(sel.package_dir) != sel.publication_record
+        ):
+            raise PublishError("selected publication inputs changed before push")
+    except (OSError, ValueError) as exc:
+        raise PublishError(f"selected publication inputs became invalid before push: {exc}") from exc
+
     # human diff-confirm gate before any real network push (local/file remotes are exempt).
     _require_push_confirmation(resolved_remote, repo_dir, resolved_branch, fingerprint, confirm_push)
     result.actions.append(
@@ -1670,7 +1703,7 @@ def publish(
 # ---------------------------------------------------------------------------- CLI
 
 
-def _print_result(res: "PublishResult | dict[str, Any]") -> None:
+def _print_result(res: PublishResult | dict[str, Any]) -> None:
     # `index` returns a plain dict (it publishes a landing page, not a champion package), so it
     # has no package_id/tag. Print the fields it does carry instead of crashing on the ones it
     # does not -- the push had already succeeded when this raised, which is the worst kind of

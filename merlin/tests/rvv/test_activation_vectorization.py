@@ -291,7 +291,12 @@ def test_activation_accurate_on_spike(op):
     bundle = _gens()[op](tempfile.mkdtemp(), N=1024)
     _, build, _ = _build([FEATURE], bundle)
     refs = {"fp32": np.load(bundle / "golden.npy")}
-    run = zm.run_on_spike(build["elf"], harts=1, mem_bytes=build.get("ram_bytes", 1 << 31), timeout=900)
+    from merlin.runtime.boards import board as selected_board
+
+    run = zm.run_on_spike(
+        build["elf"], dram_base=selected_board(build["board"]).dram_base,
+        harts=1, mem_bytes=build["ram_bytes"], timeout=900,
+    )
     gate = zm._gate(run["prefix"], refs)
     assert gate.get("ok") is True
     assert gate.get("fp32_cos") is not None and gate["fp32_cos"] > 0.9999

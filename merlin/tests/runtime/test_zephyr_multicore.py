@@ -79,7 +79,7 @@ def test_multicore_image_links_the_shim_and_sizes_the_soc():
     assert "libomp_zephyr.c" in cmake
     # the DT overlay must enable exactly the harts the SoC has: the 2-tile sample overlay
     # hard-disabled cpu@2..7 and silently capped every image at 2 harts.
-    ov = zm._chipyard_cpu_overlay(4)
+    ov = zm._cpu_disable_overlay(4, 8)
     assert 'cpu@4 { status = "disabled"; }' in ov
     assert "cpu@3" not in ov and "cpu@1" not in ov
 

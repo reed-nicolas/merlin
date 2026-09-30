@@ -8,9 +8,17 @@ from __future__ import annotations
 
 import pytest
 
-from merlin.baselines import BaselineResult, RegionProfile, ScalarFallback
-from merlin.baselines import aggregate, bundle, profile, rvv_audit
-
+from merlin.baselines import (
+    BaselineResult,
+    RegionProfile,
+    ScalarFallback,
+    aggregate,
+    bundle,
+    k1_exec,
+    k1_workload_policy,
+    profile,
+    rvv_audit,
+)
 
 # --- RVV coverage classifier ------------------------------------------------------------------
 
@@ -185,13 +193,29 @@ def test_parse_profile_markers():
         "MERLIN_REGION name=attention ticks=400\n"
         "DONE\n"
     )
-    e2e, regions = profile.parse_profile(stdout)
+    k1_clock = k1_exec.MEASUREMENT_CLOCK
+    assert k1_clock == profile.MeasurementClock(timebase_hz=24_000_000, estimated_core_hz=1_600_000_000)
+    e2e, regions = profile.parse_profile(stdout, clock=k1_clock)
     assert e2e.rdtime_ticks == 2400
     assert e2e.wall_ns == 100000
     # 2400 ticks * (1.6e9/24e6) = 160000 cycles
-    assert e2e.cycles == profile.ticks_to_cycles(2400) == 160000
+    assert e2e.cycles == profile.ticks_to_cycles(2400, clock=k1_clock) == 160000
     assert [r.name for r in regions] == ["gemm", "attention"]
     assert regions[0].calls == 7
+
+
+def test_profile_clock_is_runner_supplied_not_a_board_default():
+    stdout = "MERLIN_E2E ticks=2400 wall_ns=100000\nMERLIN_REGION name=gemm ticks=1200\n"
+    no_clock, no_clock_regions = profile.parse_profile(stdout, clock=None)
+    assert no_clock.rdtime_ticks == 2400 and no_clock.cycles is None
+    assert no_clock_regions[0].rdtime_ticks == 1200 and no_clock_regions[0].cycles is None
+
+    other_clock = profile.MeasurementClock(timebase_hz=10_000_000, estimated_core_hz=1_000_000_000)
+    other, other_regions = profile.parse_profile(stdout, clock=other_clock)
+    assert other.cycles == 240000 and other_regions[0].cycles == 120000
+    assert profile.ticks_to_cycles(None, clock=other_clock) is None
+    with pytest.raises(ValueError):
+        profile.MeasurementClock(timebase_hz=0, estimated_core_hz=1_000_000_000)
 
 
 # --- bundle resolution ------------------------------------------------------------------------
@@ -206,8 +230,12 @@ def test_bundle_resolve_paths():
 
 
 def test_k1_runnable_and_full_env():
-    assert "tiny_llama" in bundle.K1_RUNNABLE and "openvla" not in bundle.K1_RUNNABLE
-    assert bundle.K1_RUNNABLE.isdisjoint(bundle.K1_RAM_INFEASIBLE)
+    assert k1_workload_policy.K1_RUNNABLE == frozenset(
+        {"tiny_llama", "smolvla", "bitvla", "groot_n1d7", "rdt", "rdt2", "xr0", "small_llama"}
+    )
+    assert k1_workload_policy.K1_RAM_INFEASIBLE == frozenset({"openvla", "molmoact", "pi05"})
+    assert k1_workload_policy.K1_RUNNABLE.isdisjoint(k1_workload_policy.K1_RAM_INFEASIBLE)
+    assert not hasattr(bundle, "K1_RUNNABLE") and not hasattr(bundle, "K1_RAM_INFEASIBLE")
     assert bundle.full_env("bitvla") == {"BITVLA_LLM_LAYERS": "30"}
     assert bundle.full_env("tiny_llama") == {}
 

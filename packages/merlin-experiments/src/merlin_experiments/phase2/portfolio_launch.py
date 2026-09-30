@@ -21,6 +21,7 @@ from merlin.perf.host_resources import (
 )
 from merlin_experiments import frozen_python
 from merlin_experiments import source_snapshot as perf_snapshot
+from merlin_experiments.measured_launch import without_unsealed_board_catalog
 from merlin_experiments.phase2 import contracts as P2_CONTRACTS
 from merlin_experiments.phase2.portfolio_options import PortfolioInvocation, worker_arguments
 
@@ -246,14 +247,14 @@ def launch(invocation: PortfolioInvocation, *, deployment: PortfolioDeployment) 
                 or receipt.get("files", {}).get(declared.get("snapshot")) != digest
             ):
                 raise ValueError(f"portfolio declared input changed after admission: {name}")
-        environment = {
+        environment = without_unsealed_board_catalog({
             **deployment.inherited_environment,
             **perf_snapshot.provider_environment(snapshot, receipt),
             "MERLIN_REPO_ROOT": str(snapshot),
             "MERLIN_OUT_ROOT": str(deployment.output_root),
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPATH": os.pathsep.join(str(snapshot / item) for item in deployment.worker_python_roots),
-        }
+        })
         command = [*deployment.worker_entrypoint, *worker_arguments(args)]
         transport = frozen_python.python_command(snapshot, command, verifier_source=Path(perf_snapshot.__file__))
         transport_root = args.output.resolve().with_name(args.output.name + ".transport")

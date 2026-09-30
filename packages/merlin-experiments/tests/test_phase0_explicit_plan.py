@@ -135,6 +135,30 @@ def test_versioned_phase0_artifacts_can_be_selected_without_editing_definition(a
         )
 
 
+def test_explicit_capability_contract_is_bound_and_rechecked(authored):
+    make, root, config = authored
+    contract = root / "capability.yaml"
+    contract.write_text("name: fixture\ncompute_units: []\n")
+    plan = make({**config, "capability_contract": "capability.yaml"})
+    command = plan["phases"]["0"]
+    assert command["inputs"]["capability_contract"] == str(contract)
+    assert plan["phase0_operator_inputs"]["phase0:operator:capability_contract"]["present"]
+    frozen = freeze(plan)
+    contract.write_text("name: fixture\ncompute_units: [{name: changed}]\n")
+    with pytest.raises(SpecError, match="frozen input changed"):
+        runner._verify_inputs(frozen)
+    replacement = root / "replacement-capability.yaml"
+    replacement.write_text("name: fixture\ncompute_units: []\n")
+    replaced = runner.resolve_plan(
+        load_spec(root / "experiment.yaml"),
+        phase="0",
+        phase0_capability_contract=replacement,
+    )
+    assert replaced["phases"]["0"]["inputs"]["capability_contract"] == str(replacement)
+    with pytest.raises(SpecError, match="requires --phase 0"):
+        runner.resolve_plan(load_spec(root / "experiment.yaml"), phase0_capability_contract=replacement)
+
+
 @pytest.mark.parametrize("changed", ["recipe", "conformance", "descriptor"])
 def test_preflight_rejects_stale_selected_synthesis(authored, changed):
     make, root, _ = authored

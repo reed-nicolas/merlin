@@ -19,6 +19,20 @@
     "backend": {
       "type": "string"
     },
+    "compiler_pointer_abi": {
+      "type": "object",
+      "description": "The compiler's assertion of pointer argument order for the lowered kernel, not proof of its emitted pointer uses. Numerical qualification compares this assertion with the selected runner's independently derived harness order and still requires the executable oracle to match the independent reference. Omission remains valid for diagnostic compilation but cannot qualify an accelerator verdict.",
+      "required": ["version", "arguments"],
+      "properties": {
+        "version": {"const": 1},
+        "arguments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "additionalProperties": false
+    },
     "kernel_abi": {
       "type": "object",
       "description": "Explicit pointer boundary for one submitted whole-program kernel. The runner only allocates these buffers, performs an unmeasured warm call, measures one call, and reads the named outputs; all computation remains in the submitted artifact.",

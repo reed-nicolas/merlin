@@ -23,6 +23,74 @@ from . import package_runtime as _runtime
 from .package_records import payload_inventory
 
 
+def _qualifying_pointer_abi(command_buffer: dict, backend: Any) -> dict[str, Any]:
+    """Bind the compiler's pointer order to the selected runner before numerical grading.
+
+    The command buffer is emitted by the compiler; its ABI statement is an
+    assertion, NOT proof that the lowered LLVM uses those pointers correctly.
+    The runner independently derives its harness order from selected support.
+    Agreement is a structural prerequisite only: the executable oracle and
+    independent reference comparison below remain mandatory to qualify
+    numerics. Neither interface order nor tensor extents are a safe fallback.
+    Older packages may still be inspected/compiled but cannot earn a new
+    accelerator certificate without this explicit boundary.
+    """
+    declaration = command_buffer.get("compiler_pointer_abi")
+    if not isinstance(declaration, dict):
+        raise _runtime.CertFailure(
+            "pointer_abi", _runtime.FailureCategory.PROTOCOL_VIOLATION,
+            "compiler command buffer declares no compiler_pointer_abi; numerical accelerator "
+            "qualification requires its exact ordered pointer arguments",
+        )
+    compiler_order = declaration.get("arguments")
+    if declaration.get("version") != 1 or not isinstance(compiler_order, list) or not compiler_order or any(
+        not isinstance(name, str) or not name for name in compiler_order
+    ):
+        raise _runtime.CertFailure(
+            "pointer_abi", _runtime.FailureCategory.PROTOCOL_VIOLATION,
+            "compiler_pointer_abi must declare version 1 and nonempty ordered tensor names",
+        )
+    tensors = command_buffer.get("tensors")
+    if not isinstance(tensors, dict) or any(name not in tensors for name in compiler_order):
+        raise _runtime.CertFailure(
+            "pointer_abi", _runtime.FailureCategory.PROTOCOL_VIOLATION,
+            "compiler_pointer_abi names a tensor absent from the emitted command buffer",
+        )
+    resolver = getattr(backend, "kernel_abi_from_commands", None)
+    if not callable(resolver):
+        raise _runtime.CertFailure(
+            "pointer_abi", _runtime.FailureCategory.PROTOCOL_VIOLATION,
+            "selected runner provides no kernel_abi_from_commands pointer-order capability",
+        )
+    try:
+        harness_abi = resolver(command_buffer)
+    except Exception as exc:  # noqa: BLE001 -- an unresolvable ABI cannot qualify numerics
+        raise _runtime.CertFailure(
+            "pointer_abi", _runtime.FailureCategory.PROTOCOL_VIOLATION,
+            f"selected runner could not derive its pointer order: {type(exc).__name__}: {exc}",
+        ) from exc
+    arguments = harness_abi.get("args") if isinstance(harness_abi, dict) else None
+    if not isinstance(arguments, list) or not arguments or any(
+        not isinstance(arg, dict) or not isinstance(arg.get("tensor"), str) or not arg["tensor"]
+        for arg in arguments
+    ):
+        raise _runtime.CertFailure(
+            "pointer_abi", _runtime.FailureCategory.PROTOCOL_VIOLATION,
+            "selected runner returned no explicit ordered kernel-ABI tensor arguments",
+        )
+    harness_order = [arg["tensor"] for arg in arguments]
+    if compiler_order != harness_order:
+        raise _runtime.CertFailure(
+            "pointer_abi", _runtime.FailureCategory.PROTOCOL_VIOLATION,
+            f"compiler pointer order {compiler_order} differs from selected runner harness order "
+            f"{harness_order}; refuse numerical accelerator qualification before execution",
+        )
+    return {
+        "status": "pass", "version": 1, "arguments": list(compiler_order),
+        "scope": "declaration_agreement_only",
+    }
+
+
 def _cert_artifact_identity(paths: _runtime.RunPaths, run_id: str) -> dict[str, Any]:
     """Content-address the exact compiler/oracle artifacts produced by one certification.
 
@@ -89,10 +157,11 @@ def certify(
     rung = interface_mlir.stem.split(".")[0]
     if target is None:
         target = _runtime._package_target(package_dir)
+    suite = _runtime.certification_suite(target)
 
     spec = _runtime.RunSpec(
         project="merlin",
-        suite=_runtime.SUITE,
+        suite=suite,
         method=f"{run_id}",
         seed=seed,
         run_id=run_id,
@@ -115,6 +184,7 @@ def certify(
         "lower_target_to_llvm": "skipped",
     }
     semantic = {"reference_outputs_vs_simulate": "skipped"}
+    pointer_abi: dict[str, Any] = {"status": "not_checked"}
     oracle = {
         "kind": "none",
         "engine": simulator,
@@ -329,6 +399,7 @@ def certify(
 
         # K7/K8: oracle (skip-if-unavailable)
         if gem.available(simulator):
+            pointer_abi = _qualifying_pointer_abi(cb, gem)
             try:
                 # The SAME operands the reference and the simulator were given. Without this the
                 # device materialized every leaf from its name while K5 above compared reference and
@@ -413,6 +484,8 @@ def certify(
     except _runtime.CertFailure as cf:
         status = "fail"
         failure = {"plane": cf.plane, "category": cf.category.value, "detail": cf.detail}
+        if cf.plane == "pointer_abi":
+            pointer_abi = {"status": "fail", "reason": cf.detail}
     except Exception as e:  # pragma: no cover - internal harness bug
         status = "error"
         failure = {
@@ -453,6 +526,7 @@ def certify(
         },
         "entrypoints": entry,
         "semantic_checks": semantic,
+        "pointer_abi": pointer_abi,
         "oracle": oracle,
         "trace_check": trace_check,
         "artifact_identity": artifact_identity,
@@ -488,11 +562,12 @@ def _record(
     target: str,
 ) -> None:
     """Write the run_manifest + artifact records + FailureRecord (the attributable ledger)."""
+    suite = _runtime.certification_suite(target)
     cycle_accurate = simulator in _runtime._CYCLE_ACCURATE_SIMULATORS and oracle.get("result") == "pass"
     manifest = {
         "schema_version": "1.0",
         "project": "merlin",
-        "suite": _runtime.SUITE,
+        "suite": suite,
         "method": run_id,
         "seed": seed,
         "run_id": run_id,
@@ -515,7 +590,7 @@ def _record(
 
     logger = _runtime.EvalRunLogger.start(
         project="merlin",
-        suite=_runtime.SUITE,
+        suite=suite,
         target=target,
         method=run_id,
         seed=seed,

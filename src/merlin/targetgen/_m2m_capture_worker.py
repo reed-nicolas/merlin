@@ -27,6 +27,7 @@ import json
 import math
 import os
 import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -45,6 +46,80 @@ _SCHEME = {
 }
 
 _CAPTURE_ABI_VERSION = 6
+
+
+def _capture_api_report(m2m) -> dict[str, list[str]]:
+    """Report selected runtime API gaps; a signature check is not capture qualification."""
+    from m2m.capture.bundle import write_bundle
+
+    bundle_args = set(inspect.signature(write_bundle).parameters)
+    convert_args = set(inspect.signature(m2m.convert).parameters)
+    same_conversion_missing = [
+        f"m2m/capture/bundle.py:write_bundle({name})"
+        for name in sorted({"source_path", "capture_trace", "conversion_result"} - bundle_args)
+    ]
+    if importlib.util.find_spec("m2m.capture.provenance") is None:
+        same_conversion_missing.append("m2m/capture/provenance.py")
+    frontend_trace_missing = [
+        f"m2m/api.py:convert({name})"
+        for name in sorted({"capture_trace", "original_frontend_snapshot"} - convert_args)
+    ]
+    if importlib.util.find_spec("m2m.capture.trace") is None:
+        frontend_trace_missing.append("m2m/capture/trace.py")
+    static_integerization_missing = [
+        member for module, member in (
+            ("m2m.capture.pt2e_integerize", "m2m/capture/pt2e_integerize.py"),
+            ("m2m.capture.pt2e_integer_reference", "m2m/capture/pt2e_integer_reference.py"),
+        ) if importlib.util.find_spec(module) is None
+    ]
+    return {
+        "same_conversion_missing": same_conversion_missing,
+        "frontend_trace_missing": frontend_trace_missing,
+        "static_integerization_missing": static_integerization_missing,
+    }
+
+
+def _diagnostic_model_copy(out: Path, loader: Path, *, capture_api: dict[str, list[str]]) -> None:
+    """Expose the exact converted MLIR for inventory, never as an admitted bundle.
+
+    This deliberately omits the capture receipt and runtime input/golden ABI. An
+    older Model2MLIR may have converted the model but cannot provide the modern
+    same-conversion materialization contract.
+    """
+    def digest(path: Path) -> str:
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+
+    if (out / "capture_receipt.json").exists() or (out / "model.mlir").exists():
+        raise ValueError("diagnostic copy cannot reuse a materialized capture directory")
+    shutil.copyfile(out / "linalg.mlir", out / "model.mlir")
+    names = (
+        "model.mlir",
+        "linalg.mlir",
+        "weights.safetensors",
+        "weights.safetensors.manifest.json",
+        "inputs.json",
+        "golden.json",
+        "frontend-trace.json",
+        "pytorch-opset.json",
+        "meta.json",
+    )
+    artifacts = {
+        name: {"bytes": (out / name).stat().st_size, "sha256": digest(out / name)}
+        for name in names
+    }
+    record = {
+        "schema": "merlin.diagnostic_m2m_model.v1",
+        "status": "diagnostic_raw_conversion",
+        "phase0_admission": "not_granted",
+        "source_closure_verified": False,
+        "materialized_abi": False,
+        "reason": "raw conversion has no same-conversion Model2MLIR bundle or producer capture receipt",
+        "capture_api": capture_api,
+        "loader": {"path": str(loader.absolute()), "sha256": digest(loader)},
+        "artifacts": artifacts,
+    }
+    (out / "diagnostic-capture.json").write_text(json.dumps(record, sort_keys=True, indent=2) + "\n")
 
 
 def _seed_capture(seed: int, torch) -> dict:
@@ -494,7 +569,14 @@ def main(argv=None) -> int:
         action="store_true",
         help="also emit the full model2MLIR runtime bundle from this exact conversion and model instance",
     )
+    ap.add_argument(
+        "--diagnostic-model-copy",
+        action="store_true",
+        help="copy raw converted MLIR for inventory with byte hashes, without a capture receipt or Phase 0 admission",
+    )
     a = ap.parse_args(argv)
+    if a.materialize_bundle and a.diagnostic_model_copy:
+        ap.error("--materialize-bundle and --diagnostic-model-copy are mutually exclusive")
     if not 0 <= a.seed < 2**32:
         ap.error("--seed must be an unsigned 32-bit integer")
     if not all(math.isfinite(value) and value >= 0 for value in (a.agreement_atol, a.agreement_rtol)):
@@ -512,8 +594,21 @@ def main(argv=None) -> int:
     import m2m
     import torch
     from m2m.coverage import opaque_report
+    capture_api = _capture_api_report(m2m)
 
-    out = Path(a.out)
+    if a.materialize_bundle and capture_api["same_conversion_missing"]:
+        raise RuntimeError(
+            "selected Model2MLIR lacks same-conversion bundle/receipt APIs: "
+            f"{capture_api['same_conversion_missing']}; "
+            "use --diagnostic-model-copy only for unadmitted raw-model inventory"
+        )
+
+    # Model2MLIR embeds this path in prov.weights_file. A relative --out would
+    # otherwise leave a CWD-relative reference in the saved MLIR, which a
+    # relocated/frozen corpus cannot safely resolve against its selected bytes.
+    out = Path(a.out).absolute()
+    if a.diagnostic_model_copy and out.exists() and any(out.iterdir()):
+        raise ValueError("diagnostic model copy requires a fresh output directory")
     out.mkdir(parents=True, exist_ok=True)
     determinism = _seed_capture(a.seed, torch)
     modules_before_loader = set(sys.modules)
@@ -651,11 +746,14 @@ def main(argv=None) -> int:
             # public model2MLIR apply_quantization(model, config) API does not
             # derive.  The recipe path above performs calibrated PT2E instead.
             raise RuntimeError("named static W8A8 requires a calibrated --recipe")
-        quant_trace_options = (
-            {"original_frontend_snapshot": original_snapshot}
-            if "original_frontend_snapshot" in inspect.signature(apply_quantization).parameters
-            else {}
-        )
+        quant_parameters = inspect.signature(apply_quantization).parameters
+        quant_trace_options = {}
+        if "original_frontend_snapshot" in quant_parameters:
+            quant_trace_options["original_frontend_snapshot"] = original_snapshot
+        if "example_inputs" in quant_parameters:
+            # Whole-graph transforms need the same concrete inputs as conversion
+            # to discover functional contractions and their tensor shapes.
+            quant_trace_options["example_inputs"] = tuple(inputs)
         mdl = apply_quantization(mdl, q, **quant_trace_options)
         quant_stats = getattr(mdl, "_m2m_quantization_stats", None)
     integerization_receipt = None
@@ -882,6 +980,8 @@ def main(argv=None) -> int:
         **provenance,
     }
     (out / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    if a.diagnostic_model_copy:
+        _diagnostic_model_copy(out, Path(a.loader), capture_api=capture_api)
     if a.materialize_bundle:
         from m2m.capture.bundle import write_bundle
 

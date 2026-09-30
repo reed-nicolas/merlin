@@ -11,6 +11,7 @@ Phase 1 develops the functional compiler; Phase 2 uses a separate performance co
 | --- | --- |
 | [Software spec](../target/software-spec.yaml) | Operation signatures, numerical semantics, placement/transfers and quantization eligibility |
 | [Hardware selection](../target/hardware.yaml) | Source-production requirements and direct RTL audit questions |
+| [Capability contract](../target/contracts/target_contract.yaml) | Prototype ISA/runner intent that RTL facts cannot supply; selected and frozen by the experiment, not a support certificate |
 | [Host capabilities](../target/host-capabilities.yaml) | Separately pinned host compiler and reviewed operation/precision support |
 | [Recipe](recipe.yaml) | Derived-only policy, comparison tolerances and oracle tiers; no authored capsule list |
 | [Descriptor](../target/descriptor.yaml) | Independent iteration roster, held-out validation roster and experiment resources |
@@ -108,7 +109,14 @@ and derive again from those exact bytes before generating a realized corpus.
 Select the newly derived requirement/profile together for inspect, preflight and run:
 Pin the same OOT support and independent SpecIR oracle selected for derivation.
 The NPU model selection is required for an established ISA taxonomy; leaving it
-unset produces a diagnostic unknown, not a silently inferred command contract.
+unset produces a diagnostic unknown and stops capsule materialization. Atlas is a
+self-hosted ISA target: do not add a command-ISA `corpus_issue_order` to bypass a
+missing model environment. Select and pin the model's Python environment, then
+rerun from a new artifact root; the failed frozen run remains diagnostic evidence.
+The frozen runner does not inherit an ambient Model2MLIR interpreter.
+PyTorch-sourced capsules requiring on-demand capture are reported as omissions
+until their tool/runtime has an explicit frozen selection; the four
+already-materialized iteration captures remain exact Phase 0 inputs.
 
 ```sh
 MERLIN_TARGET_PATH="$ATLAS_SUPPORT_ROOT" SPECIR_ROOT="$SPECIR_ROOT" \
@@ -133,6 +141,11 @@ cohort cannot borrow functional source coverage or claim whole-model validation.
 
 Review coverage, placement and independent numerical checks before preparing
 [the reviewed Phase 0 handoff](../../../experiments/README.md#reviewed-phase-0-handoff).
+For a new Atlas release, use that handoff's `--generated-only` mode; the
+descriptor's retained BF16 corpus is historical input, not proof that this
+FP8 selection can execute those members. Supply any required hidden cohort as
+a separate private baseline. Do not seal a run with omitted source capsules or
+missing L2/L3 oracles.
 Changing a status field cannot qualify old artifacts. New inputs require newly
 frozen runs; preserve old outputs unchanged. See [the artifact map](../artifacts/README.md)
 and [whole-model walkthrough](../whole-model/README.md) for member MLIR, external

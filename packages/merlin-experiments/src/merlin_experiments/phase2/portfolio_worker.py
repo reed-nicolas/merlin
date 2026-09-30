@@ -27,6 +27,7 @@ from merlin_experiments.phase2 import corpus as P2_CORPUS
 from merlin_experiments.phase2 import emission_analysis as EA
 from merlin_experiments.phase2 import functional_inputs as FI
 from merlin_experiments.phase2 import portfolio_resume as RESUME
+from merlin_experiments.phase2 import semantic_diagnostic as SD
 from merlin_experiments.phase2 import stage_inputs as INPUTS
 from merlin_experiments.phase2 import telemetry as TEL
 from merlin_experiments.phase2.fast_evaluation_installation import prepare as _prepare_fast_evaluator_installation
@@ -280,7 +281,9 @@ def run(invocation: PortfolioInvocation, config: Mapping[str, Any], *, context: 
     stage_root = args.output.resolve()
     stage_root.mkdir(parents=True)
     base = PC.materialize_perf_workspace(functional, stage_root / "_frozen_functional")
-    frozen_functional = FI.load_frozen_functional_inputs(functional)
+    frozen_functional = FI.load_frozen_functional_inputs(
+        functional, public_manifest_path=stage_root / "_public_functional_snapshot.json"
+    )
     from merlin.perf.external_objective import load_external_objective
 
     primary_external = (
@@ -331,6 +334,16 @@ def run(invocation: PortfolioInvocation, config: Mapping[str, Any], *, context: 
     )
     portfolio_identity = full_model_portfolio_identity((sentinel, *portfolio_sentinels))
     portfolio_sha256 = P2_CONTRACTS.document_sha256(portfolio_identity)
+    SD.write_portfolio_receipt(
+        stage_root,
+        target=target.target,
+        frozen_grants=tuple(grant.source for grant in frozen_functional.grants),
+        members=(
+            (sentinel, primary_external is None),
+            *((member, True) for member in portfolio_sentinels[: len(args.portfolio_capsule)]),
+            *((member, False) for member in portfolio_sentinels[len(args.portfolio_capsule) :]),
+        ),
+    )
     fast_installation, fast_installation_receipt = _prepare_fast_evaluator_installation(
         sentinels=(sentinel, *portfolio_sentinels),
         target_sha256=target.descriptor_sha256,
