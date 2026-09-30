@@ -31,10 +31,13 @@ from merlin.targetgen import corpus_spec as SPEC
 _GEN = merlin_dir() / "contract" / "capsules"
 
 
-def test_mx_recipe_authors_a_future_acceleration_witness_without_rewriting_legacy_capsules():
-    """The source recipe can demand offload; the retained corpus remains historical input."""
+def test_mx_recipe_derives_capsules_without_rewriting_legacy_witnesses():
+    """Active MX membership is derived; historical authored stimuli remain inspectable."""
     recipe = yaml.safe_load((repo_root() / "examples/mx_gemmini/phase0/recipe.yaml").read_text())
-    witnesses = [entry for entry in recipe["capsules"] if entry.get("name") == "M0_mxfp8_single_tile"]
+    assert recipe["capsule_policy"] == "derived_only"
+    assert recipe["capsules"] == []
+    legacy = yaml.safe_load((repo_root() / "examples/mx_gemmini/phase0/recipe-legacy.yaml").read_text())
+    witnesses = [entry for entry in legacy["capsules"] if entry.get("name") == "M0_mxfp8_single_tile"]
     assert len(witnesses) == 1
     witness = witnesses[0]
     assert witness["generalization"]["must_accelerate"] is True
@@ -757,7 +760,13 @@ def test_shipped_targets_all_consume_the_same_claim_separated_perf_template():
         assert declaration.performance_template == for_target("gemmini").performance_template
         target_doc = yaml.safe_load(declaration.recipe.read_text(encoding="utf-8")) or {}
         assert PROFILES._target_local_perf_declarations(target_doc) == []
-        merged = PROFILES.load_profile(declaration.profile, include_holdouts=False, **declaration.profile_inputs())
+        try:
+            merged = PROFILES.load_profile(declaration.profile, include_holdouts=False, **declaration.profile_inputs())
+        except ValueError as exc:
+            selected = target_doc.get("software_spec")
+            assert isinstance(selected, dict) and selected.get("provider") == declaration.target
+            assert "requires an explicitly selected OOT support provider" in str(exc)
+            continue
         assert [s["id"] for s in merged["sweeps"][-len(shared_ids) :]] == shared_ids
 
 
