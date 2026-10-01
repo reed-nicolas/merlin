@@ -300,11 +300,21 @@ def derive(
         software_spec_sha256=hashlib.sha256(software.read_bytes()).hexdigest(),
         policy_selections=quantization_policies,
     )
+    policy_outputs = {}
     if selected_policies:
+        policy_members = {}
+        for label, expected in sorted(selected_policies.items()):
+            source = quantization_policies[label][0]
+            raw = source.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != expected:
+                raise ValueError(f"{label}: selected quantization policy changed during derivation")
+            member = f"selected-quantization-policies/{label}.input"
+            policy_outputs[member] = raw
+            policy_members[label] = {"artifact": member, "sha256": expected}
         requirement["quantization_policy_selections"] = {
             "schema": "merlin.phase0.quantization_policy_selections.v1",
             "status": "byte_selected_not_numerically_reviewed",
-            "applications": selected_policies,
+            "applications": policy_members,
         }
     requirement["application_demands"]["sidecar"] = "application-demands.json"
     if selected_capture_evidence:
@@ -346,6 +356,7 @@ def derive(
     outputs = {
         "requirements.yaml": yaml.safe_dump(requirement, sort_keys=False).encode(),
         "application-demands.json": _json(full),
+        **policy_outputs,
     }
     if selected_capture_evidence:
         outputs["capture-preselections.json"] = _json(requirement["capture_execution_preselections"])

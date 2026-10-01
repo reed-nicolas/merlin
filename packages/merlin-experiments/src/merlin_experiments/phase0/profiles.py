@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from merlin.common.paths import repo_root  # noqa: E402
+from merlin.common.digest import is_sha256
 from merlin.perf.profile import TRAITS  # noqa: E402
 from merlin.runtime.backends.base import EXECUTION_CAPABILITIES  # noqa: E402
 from merlin.targetgen.software_spec import (
@@ -75,8 +76,31 @@ def synthesis_input_identity(
     source = yaml.safe_load(Path(descriptor).read_text(encoding="utf-8")) or {}
     if not isinstance(source, dict) or not isinstance(source.get("workload_spec") or {}, dict):
         raise ValueError(f"{descriptor}: workload_spec must be a mapping")
+    requirement_path = Path(conformance_spec)
+    requirement_raw = requirement_path.read_bytes()
+    requirement = yaml.safe_load(requirement_raw) or {}
+    if not isinstance(requirement, dict):
+        raise ValueError(f"{requirement_path}: conformance spec must be a mapping")
+    selected_policies = requirement.get("quantization_policy_selections")
+    if selected_policies is not None:
+        if (not isinstance(selected_policies, dict)
+                or selected_policies.get("schema") != "merlin.phase0.quantization_policy_selections.v1"
+                or selected_policies.get("status") != "byte_selected_not_numerically_reviewed"
+                or not isinstance(selected_policies.get("applications"), dict)):
+            raise ValueError("selected quantization policy sidecars are malformed")
+        for label, record in sorted(selected_policies["applications"].items()):
+            member = f"selected-quantization-policies/{label}.input"
+            if (not isinstance(label, str) or not label or Path(label).name != label
+                    or not isinstance(record, dict) or record.get("artifact") != member
+                    or not is_sha256(record.get("sha256"))):
+                raise ValueError("selected quantization policy identity is malformed")
+            path = requirement_path.parent / member
+            if (path.is_symlink() or any(parent.is_symlink() for parent in path.parents)
+                    or not path.is_file()
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]):
+                raise ValueError(f"{label}: selected quantization policy sidecar differs")
     identity = {
-        "conformance_spec_sha256": hashlib.sha256(Path(conformance_spec).read_bytes()).hexdigest(),
+        "conformance_spec_sha256": hashlib.sha256(requirement_raw).hexdigest(),
         "recipe_sha256": hashlib.sha256(Path(recipe).read_bytes()).hexdigest(),
         "workload_spec_sha256": _document_digest(source.get("workload_spec") or {}),
     }

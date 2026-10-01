@@ -12,6 +12,7 @@ from merlin_experiments.phase0 import writer
 from merlin_experiments.phase0.evidence import _materialize_evidence
 from merlin_experiments.phase0.provenance import _scrub_capsule_dir
 from merlin_experiments.phase0.requirements import _materialized_iteration_capsules, _validate_capture_recipes
+from merlin_experiments.phase0.profiles import synthesis_input_identity
 from merlin_experiments.phase0.writer import _integer_reference_bound, _source_integer_reference_bound, _write_capsule
 
 from merlin.targetgen import capsule_source as source
@@ -258,6 +259,29 @@ def test_external_capture_contract_must_match_selected_spec(tmp_path):
     with pytest.raises(ValueError, match="selected quantization policy differs"):
         _validate_capture_recipes(captures, set(), software_spec_sha256=contract_sha,
                                   policy_selections={"iteration": (policy_path, "0" * 64)})
+
+
+def test_selected_policy_sidecar_is_rechecked_for_synthesis(tmp_path):
+    member = "selected-quantization-policies/iteration.input"
+    sidecar = tmp_path / member
+    sidecar.parent.mkdir()
+    sidecar.write_bytes(b"selected policy\n")
+    digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    requirement = tmp_path / "requirements.yaml"
+    requirement.write_text(yaml.safe_dump({"quantization_policy_selections": {
+        "schema": "merlin.phase0.quantization_policy_selections.v1",
+        "status": "byte_selected_not_numerically_reviewed",
+        "applications": {"iteration": {"artifact": member, "sha256": digest}},
+    }}))
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text("capsules: []\n")
+    descriptor = tmp_path / "descriptor.yaml"
+    descriptor.write_text("workload_spec: {applications: [iteration]}\n")
+    selected = dict(conformance_spec=requirement, recipe=recipe, descriptor=descriptor)
+    assert synthesis_input_identity(**selected)["conformance_spec_sha256"]
+    sidecar.write_bytes(b"changed\n")
+    with pytest.raises(ValueError, match="selected quantization policy sidecar differs"):
+        synthesis_input_identity(**selected)
 
 
 def test_integer_golden_bound_uses_concrete_reduction_and_internal_width():

@@ -279,7 +279,9 @@ An external quantization adapter also requires one independently selected
 `--application-quant-policy LABEL=PATH@SHA256` per quantized capture. Derivation
 checks the exact policy bytes against the capture's manifest and checks that
 the manifest names the selected software spec. This binds the operator's
-choice; it does not review its numerical accuracy.
+choice. The derived artifact root retains those policy bytes and rechecks
+their digest when selecting a synthesis profile. This does not review numerical
+accuracy.
 
 Derivation writes a complete demand census, requirements, a candidate synthesis
 plan/profile and an exact evidence export. It neither constructs an agent nor
