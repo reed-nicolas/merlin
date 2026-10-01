@@ -357,8 +357,10 @@ those cells conflict with the selected three-format software spec. Synthesis
 now rejects such conflicting cells before producing a profile. The old
 generated residual also lists BF16/int8 compute and FP32 accumulation outside
 the selected software contract; it cannot be promoted without RTL review.
-The isolated checkout has no declared application-capture roster, so a fresh
-conformance diagnostic derives no requirement. Select and verify exact MX
-application captures before replacing either historical input. A source-bound
+The descriptor now declares four candidate iteration applications. Their OOT
+materialized captures can be selected explicitly for requirement derivation;
+their receipts bind the quantization manifest, but source closure and the
+numerical policy remain unreviewed. Select and verify exact MX captures before
+replacing either historical input. A source-bound
 fact bundle and simulator binary now exist for the selected elaboration, but
 they have not qualified a Merlin compiler or the full numerical contract.

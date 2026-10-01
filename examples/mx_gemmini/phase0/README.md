@@ -36,12 +36,19 @@ verified MX application captures, derive a new requirement, and review a new
 digest-bound sidecar under the artifact root before running Phase 0. Preserve
 the historical inputs.
 
-The OOT package's `docs/iteration_roster_candidate.md` gives the current
-model/input materializer, RTL source check, derived site inventory, and
-per-model policy selection workflow. The model/operator chooses the exact
-FP8, FP6, FP4, or host assignment after inventory derivation. Its frozen
-selection is a capture diagnostic; it is not yet a reviewed Merlin Phase 0
-application-demand sidecar or admitted capsule corpus.
+The descriptor declares four candidate iteration applications from the OOT
+package's `docs/iteration_roster_candidate.md`; the held-out model names are
+separate. That guide defines the model/input materializer, RTL source check,
+derived site inventory, and per-model policy selection workflow. The
+model/operator chooses the exact FP8, FP6, FP4, or host assignment after
+inventory derivation. OOT replay writes a materialized model2MLIR bundle for
+each case, including weights, inputs, goldens, a quantization manifest, and a
+capture receipt. Merlin verifies the receipt and manifest binding when it
+inventories a selected `model.mlir`; requirement derivation also checks that
+the manifest names the recipe's selected software spec bytes. The frozen
+selection remains a capture
+diagnostic; its source closure and numerical policy are not reviewed, and it
+is not an admitted capsule corpus.
 
 [The MX Phase 0 guide](../../../docs/guides/mx_gemmini_phase0.md) records the
 format rules, supported operation boundary, capture policy, and evidence gates.

@@ -34,6 +34,12 @@ capsule_corpus: merlin/contract/capsules/mx_gemmini/isa
 toolchain:
   sim_via: chipyard
 
+# Candidate Phase 0 iteration roster. Capture bytes and site policies are selected
+# separately; these names do not admit a corpus or approve numerical choices.
+workload_spec:
+  applications: [linear_seam, decoder_block, vision_patches, policy_fusion]
+  models: [resnet50, tiny_llama, smolvla]
+
 answer_surfaces:
   prior_backends: []
 
