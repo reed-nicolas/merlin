@@ -130,7 +130,9 @@ def capture_selection_specs(selections: list[str]) -> dict[str, tuple[Path, str]
     return result
 
 
-def _validate_capture_recipes(captures: dict[str, Path], selected_recipe_hashes: set[str]) -> None:
+def _validate_capture_recipes(
+    captures: dict[str, Path], selected_recipe_hashes: set[str], *, software_spec_sha256: str | None = None,
+) -> None:
     """A realized quantized graph must use a recipe this provider actually derived."""
     for label, path in sorted(captures.items()):
         meta_path = path.with_name("meta.json")
@@ -153,6 +155,16 @@ def _validate_capture_recipes(captures: dict[str, Path], selected_recipe_hashes:
                 f"{label}: capture used a different quantization recipe from the selected provider; "
                 "regenerate the capture from its selected Phase 0 recipe"
             )
+        manifest_path = path.with_name("quantization-manifest.json")
+        if manifest_path.exists() or meta.get("quantization_manifest") is not None or (
+            b"prov.quantization_manifest_sha256" in path.read_bytes()
+        ):
+            verified = application_inventory.verify_capture_receipt(path)
+            if verified["status"] != "verified_materialized":
+                raise ValueError(f"{label}: external quantization manifest is not byte-bound to the capture")
+            manifest = json.loads(manifest_path.read_bytes())
+            if software_spec_sha256 is None or manifest.get("contract_sha256") != software_spec_sha256:
+                raise ValueError(f"{label}: external quantization contract differs from selected software spec")
 
 
 def derive(
@@ -257,7 +269,10 @@ def derive(
         },
     )
     selected_recipes = capture_recipe_candidates(selected.software_spec, quantization)
-    _validate_capture_recipes(captures, {row["recipe"]["recipe_sha256"] for row in selected_recipes})
+    _validate_capture_recipes(
+        captures, {row["recipe"]["recipe_sha256"] for row in selected_recipes},
+        software_spec_sha256=hashlib.sha256(software.read_bytes()).hexdigest(),
+    )
     requirement["application_demands"]["sidecar"] = "application-demands.json"
     if selected_capture_evidence:
         requirement["capture_execution_preselections"] = {

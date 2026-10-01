@@ -213,6 +213,42 @@ def test_quantized_capture_recipe_must_match_selected_provider(tmp_path):
         _validate_capture_recipes(captures, {"a" * 64})
 
 
+def test_external_capture_contract_must_match_selected_spec(tmp_path):
+    bundle = tmp_path / "capture"
+    _bundle(bundle)
+    contract_sha = "a" * 64
+    manifest = {"schema": "m2m.quantization_manifest.v1", "contract_sha256": contract_sha,
+                "sites": [{"site_id": "one", "status": "host"}]}
+    manifest_sha = hashlib.sha256(json.dumps(
+        manifest, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    manifest_path = bundle / "quantization-manifest.json"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+    mlir_path = bundle / "model.mlir"
+    mlir_path.write_text(mlir_path.read_text().replace(
+        "prov.weights_file =", f'prov.quantization_manifest_sha256 = "{manifest_sha}", prov.weights_file =',
+    ))
+    meta_path = bundle / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["quantization_manifest"] = {
+        "path": manifest_path.name,
+        "sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "manifest_sha256": manifest_sha,
+    }
+    meta_path.write_text(json.dumps(meta))
+    receipt_path = bundle / "capture_receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    for path in (mlir_path, meta_path, manifest_path):
+        receipt["artifacts"][path.name] = {
+            "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    receipt_path.write_text(json.dumps(receipt))
+    captures = {"iteration": mlir_path}
+    _validate_capture_recipes(captures, set(), software_spec_sha256=contract_sha)
+    with pytest.raises(ValueError, match="external quantization contract differs"):
+        _validate_capture_recipes(captures, set(), software_spec_sha256="b" * 64)
+
+
 def test_integer_golden_bound_uses_concrete_reduction_and_internal_width():
     semantics = {
         "internal_arithmetic": {

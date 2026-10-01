@@ -153,6 +153,43 @@ def verify_capture_receipt(path: str | Path) -> dict:
                     metadata_identity = {"sha256": expected, "bytes": size}
                 except (ValueError, UnicodeDecodeError):
                     pass
+    manifest_record = artifacts.get("quantization-manifest.json")
+    manifest_pointer = metadata.get("quantization_manifest") if isinstance(metadata, dict) else None
+    if manifest_record is not None or manifest_pointer is not None:
+        if not isinstance(manifest_record, dict) or not isinstance(manifest_pointer, dict):
+            errors.append("quantization manifest and metadata pointer must both be receipt artifacts")
+        else:
+            manifest_path = capture.parent / "quantization-manifest.json"
+            try:
+                manifest_bytes = manifest_path.read_bytes()
+                if (manifest_path.is_symlink()
+                        or hashlib.sha256(manifest_bytes).hexdigest() != manifest_record.get("sha256")):
+                    raise ValueError("manifest bytes differ from receipt")
+                manifest = json.loads(manifest_bytes)
+                if not isinstance(manifest, dict) or manifest.get("schema") != "m2m.quantization_manifest.v1":
+                    raise ValueError("unsupported manifest schema")
+                manifest_sha = hashlib.sha256(json.dumps(
+                    manifest, sort_keys=True, separators=(",", ":"), allow_nan=False,
+                ).encode()).hexdigest()
+                if manifest_pointer != {
+                    "path": "quantization-manifest.json",
+                    "sha256": manifest_record["sha256"],
+                    "manifest_sha256": manifest_sha,
+                }:
+                    raise ValueError("metadata pointer differs from manifest")
+                mlir_bytes = capture.read_bytes()
+                if (capture.is_symlink()
+                        or hashlib.sha256(mlir_bytes).hexdigest() != artifacts["model.mlir"]["sha256"]):
+                    raise ValueError("model MLIR bytes differ from receipt")
+                from merlin.common import mlir_query
+
+                module = mlir_query.parse(mlir_bytes.decode("utf-8"))
+                if mlir_query.attr_str(module, "prov.quantization_manifest_sha256") != manifest_sha:
+                    raise ValueError("model MLIR does not bind manifest")
+            except Exception as exc:  # Malformed producer bytes and parser refusals fail closed.
+                errors.append(f"quantization manifest binding is invalid: {exc}")
+    elif capture.is_file() and b"prov.quantization_manifest_sha256" in capture.read_bytes():
+        errors.append("model MLIR names a quantization manifest absent from the receipt")
     recipe = metadata.get("recipe") if isinstance(metadata, dict) else None
     engine = recipe.get("software_numerical_engine") if isinstance(recipe, dict) else None
     if engine == "integer_reference":
