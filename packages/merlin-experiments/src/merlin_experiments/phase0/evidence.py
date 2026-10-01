@@ -89,6 +89,28 @@ def _reference_inventory_root(role: str, root: Path, software_doc: Mapping) -> P
     return root
 
 
+def _reference_inventory_members(
+    role: str, root: Path, software_doc: Mapping, extensions: set[str], excluded: set[str]
+) -> tuple[Path, ...]:
+    """Inventory the files loaded by a numerical engine, preserving owner-relative paths."""
+    model = (software_doc.get("numerical_semantics") or {}).get("model") or {}
+    if role == "numerical_model" and model.get("engine") == "mx_block_reference":
+        # Both MX numerical consumers load this file directly by path. Keeping
+        # its owner-relative location lets the frozen launcher replay that load.
+        reference = root / "mlc" / "validate" / "mx_ref.py"
+        if not reference.is_file():
+            raise ValueError(f"selected MX numerical reference is absent: {reference}")
+        return (reference,)
+    inventory_root = _reference_inventory_root(role, root, software_doc)
+    return tuple(
+        leaf
+        for leaf in sorted(inventory_root.rglob("*"))
+        if leaf.is_file()
+        and leaf.suffix in extensions
+        and not excluded.intersection(leaf.relative_to(inventory_root).parts)
+    )
+
+
 def _native_baseline_observations(selections, applications, observe) -> dict:
     """Select exact generated host checks, never generalize them into host admission."""
     import numpy as np
@@ -537,14 +559,8 @@ def select_evidence(
                 diagnostics.append({"component": "numerical-model", "status": "unknown", "reason": str(exc)})
             for role, path in references.items():
                 if path.is_dir():
-                    inventory_root = _reference_inventory_root(role, path, software_doc)
-                    for leaf in sorted(inventory_root.rglob("*")):
-                        if (
-                            leaf.is_file()
-                            and leaf.suffix in extensions
-                            and not excluded.intersection(leaf.relative_to(inventory_root).parts)
-                        ):
-                            observe(leaf, f"software-reference:{role}")
+                    for leaf in _reference_inventory_members(role, path, software_doc, extensions, excluded):
+                        observe(leaf, f"software-reference:{role}")
                 else:
                     observe(path, f"software-reference:{role}", required=True)
         contract = capability_contract(software_doc, base_contract=contract)

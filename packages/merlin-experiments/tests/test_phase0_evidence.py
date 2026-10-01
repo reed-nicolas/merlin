@@ -35,6 +35,28 @@ def test_specir_source_inventory_excludes_unrelated_generated_project_files(tmp_
         )
 
 
+def test_mx_reference_inventory_selects_only_loaded_file(tmp_path, monkeypatch):
+    reference = tmp_path / "mlc" / "validate" / "mx_ref.py"
+    reference.parent.mkdir(parents=True)
+    reference.write_text("VALUE = 1\n")
+    unrelated = tmp_path / "runs" / "generated.py"
+    unrelated.parent.mkdir()
+    unrelated.write_text("VALUE = 2\n")
+    document = {"numerical_semantics": {"model": {"engine": "mx_block_reference"}}}
+    assert evidence._reference_inventory_members(
+        "numerical_model", tmp_path, document, {".py"}, {"runs"}
+    ) == (reference,)
+    monkeypatch.setenv("MERLIN_MLC_DIR", str(tmp_path))
+    from merlin.targetgen.mx_oracle import mx_reference
+    from merlin_experiments.phase0.numerics import _mx_ref
+
+    assert _mx_ref().VALUE == 1
+    assert mx_reference().VALUE == 1
+    reference.unlink()
+    with pytest.raises(ValueError, match="MX numerical reference is absent"):
+        evidence._reference_inventory_members("numerical_model", tmp_path, document, {".py"}, set())
+
+
 def _selection(monkeypatch, tmp_path, body=None):
     provider = tmp_path / "support"
     contract = provider / "contracts" / "target_contract.yaml"
