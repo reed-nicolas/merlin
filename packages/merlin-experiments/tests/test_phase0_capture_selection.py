@@ -12,7 +12,7 @@ from merlin_experiments import cli
 from merlin_experiments.capture_execution import sealed_m2m
 from merlin_experiments.capture_execution.sealed_static import _file_digest
 from merlin_experiments.phase0 import capture_selection as selected
-from merlin_experiments.phase0.requirements import capture_selection_specs
+from merlin_experiments.phase0.requirements import capture_selection_specs, quantization_policy_specs
 
 
 def _fixture(tmp_path, monkeypatch):
@@ -163,10 +163,16 @@ def test_derivation_cli_forwards_complete_preselection_without_upgrading_legacy(
     ]
     assert cli.main(argv) == 0
     assert received[-1][1]["capture_preselections"] == {}
+    assert received[-1][1]["quantization_policies"] == {}
     assert "not_granted" in capsys.readouterr().out
     digest = "a" * 64
     assert cli.main([*argv, "--application-capture-selection", f"iteration={manifest}@{digest}"]) == 0
     assert received[-1][1]["capture_preselections"] == {"iteration": (manifest, digest)}
+    assert cli.main([*argv, "--application-quant-policy", f"iteration={manifest}@{digest}"]) == 0
+    assert received[-1][1]["quantization_policies"] == {"iteration": (manifest, digest)}
+    assert quantization_policy_specs([f"iteration={manifest}@{digest}"]) == {
+        "iteration": (manifest, digest)
+    }
 
     monkeypatch.undo()
     monkeypatch.setattr(requirements, "from_definition", lambda _: SimpleNamespace(descriptor=definition))

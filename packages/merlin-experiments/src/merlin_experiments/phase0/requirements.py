@@ -112,8 +112,7 @@ def capture_selections(selections: list[str]) -> dict[str, Path]:
     return result
 
 
-def capture_selection_specs(selections: list[str]) -> dict[str, tuple[Path, str]]:
-    """Parse independent pre-execution selection paths and exact byte digests."""
+def _selected_file_specs(selections: list[str], role: str) -> dict[str, tuple[Path, str]]:
     result = {}
     for item in selections:
         label, separator, location = item.partition("=")
@@ -122,18 +121,31 @@ def capture_selection_specs(selections: list[str]) -> dict[str, tuple[Path, str]
             not separator or not digest_separator or not label or not name or label in result
             or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest)
         ):
-            raise ValueError(f"invalid/duplicate capture preselection {item!r}; use LABEL=PATH@SHA256")
+            raise ValueError(f"invalid/duplicate {role} {item!r}; use LABEL=PATH@SHA256")
         path = Path(name).expanduser().absolute()
         if path.is_symlink() or any(parent.is_symlink() for parent in path.parents) or not path.is_file():
-            raise ValueError(f"capture preselection is absent or indirect: {path}")
+            raise ValueError(f"{role} is absent or indirect: {path}")
         result[label] = (path, digest)
     return result
 
 
+def capture_selection_specs(selections: list[str]) -> dict[str, tuple[Path, str]]:
+    """Parse independent pre-execution capture selections and byte digests."""
+    return _selected_file_specs(selections, "capture preselection")
+
+
+def quantization_policy_specs(selections: list[str]) -> dict[str, tuple[Path, str]]:
+    """Parse operator-selected external quantization policies and byte digests."""
+    return _selected_file_specs(selections, "quantization policy")
+
+
 def _validate_capture_recipes(
     captures: dict[str, Path], selected_recipe_hashes: set[str], *, software_spec_sha256: str | None = None,
-) -> None:
+    policy_selections: dict[str, tuple[Path, str]] | None = None,
+) -> dict[str, str]:
     """A realized quantized graph must use a recipe this provider actually derived."""
+    selected_policies = {}
+    policy_selections = policy_selections or {}
     for label, path in sorted(captures.items()):
         meta_path = path.with_name("meta.json")
         if meta_path.is_symlink():
@@ -165,6 +177,19 @@ def _validate_capture_recipes(
             manifest = json.loads(manifest_path.read_bytes())
             if software_spec_sha256 is None or manifest.get("contract_sha256") != software_spec_sha256:
                 raise ValueError(f"{label}: external quantization contract differs from selected software spec")
+            selected_policy = policy_selections.get(label)
+            if selected_policy is None:
+                raise ValueError(f"{label}: external quantization requires an independent policy selection")
+            policy_path, policy_sha256 = selected_policy
+            if (policy_path.is_symlink() or any(parent.is_symlink() for parent in policy_path.parents)
+                    or not policy_path.is_file()
+                    or hashlib.sha256(policy_path.read_bytes()).hexdigest() != policy_sha256
+                    or manifest.get("policy_sha256") != policy_sha256):
+                raise ValueError(f"{label}: selected quantization policy differs from capture manifest")
+            selected_policies[label] = policy_sha256
+    if set(policy_selections) != set(selected_policies):
+        raise ValueError("quantization policy selections must name exactly the external captures")
+    return selected_policies
 
 
 def derive(
@@ -175,6 +200,7 @@ def derive(
     output_root: str | Path,
     native_qualifications: dict[str, Path] | None = None,
     capture_preselections: dict[str, tuple[Path, str]] | None = None,
+    quantization_policies: dict[str, tuple[Path, str]] | None = None,
 ) -> dict:
     """Write a byte-bound requirement, complete census and diagnostic candidate plan.
 
@@ -269,10 +295,17 @@ def derive(
         },
     )
     selected_recipes = capture_recipe_candidates(selected.software_spec, quantization)
-    _validate_capture_recipes(
+    selected_policies = _validate_capture_recipes(
         captures, {row["recipe"]["recipe_sha256"] for row in selected_recipes},
         software_spec_sha256=hashlib.sha256(software.read_bytes()).hexdigest(),
+        policy_selections=quantization_policies,
     )
+    if selected_policies:
+        requirement["quantization_policy_selections"] = {
+            "schema": "merlin.phase0.quantization_policy_selections.v1",
+            "status": "byte_selected_not_numerically_reviewed",
+            "applications": selected_policies,
+        }
     requirement["application_demands"]["sidecar"] = "application-demands.json"
     if selected_capture_evidence:
         requirement["capture_execution_preselections"] = {

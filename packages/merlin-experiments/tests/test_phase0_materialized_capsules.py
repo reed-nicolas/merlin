@@ -217,8 +217,11 @@ def test_external_capture_contract_must_match_selected_spec(tmp_path):
     bundle = tmp_path / "capture"
     _bundle(bundle)
     contract_sha = "a" * 64
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text("selected: host\n")
+    policy_sha = hashlib.sha256(policy_path.read_bytes()).hexdigest()
     manifest = {"schema": "m2m.quantization_manifest.v1", "contract_sha256": contract_sha,
-                "sites": [{"site_id": "one", "status": "host"}]}
+                "policy_sha256": policy_sha, "sites": [{"site_id": "one", "status": "host"}]}
     manifest_sha = hashlib.sha256(json.dumps(
         manifest, sort_keys=True, separators=(",", ":"),
     ).encode()).hexdigest()
@@ -244,9 +247,17 @@ def test_external_capture_contract_must_match_selected_spec(tmp_path):
         }
     receipt_path.write_text(json.dumps(receipt))
     captures = {"iteration": mlir_path}
-    _validate_capture_recipes(captures, set(), software_spec_sha256=contract_sha)
+    selections = {"iteration": (policy_path, policy_sha)}
+    assert _validate_capture_recipes(captures, set(), software_spec_sha256=contract_sha,
+                                     policy_selections=selections) == {"iteration": policy_sha}
     with pytest.raises(ValueError, match="external quantization contract differs"):
-        _validate_capture_recipes(captures, set(), software_spec_sha256="b" * 64)
+        _validate_capture_recipes(captures, set(), software_spec_sha256="b" * 64,
+                                  policy_selections=selections)
+    with pytest.raises(ValueError, match="independent policy selection"):
+        _validate_capture_recipes(captures, set(), software_spec_sha256=contract_sha)
+    with pytest.raises(ValueError, match="selected quantization policy differs"):
+        _validate_capture_recipes(captures, set(), software_spec_sha256=contract_sha,
+                                  policy_selections={"iteration": (policy_path, "0" * 64)})
 
 
 def test_integer_golden_bound_uses_concrete_reduction_and_internal_width():

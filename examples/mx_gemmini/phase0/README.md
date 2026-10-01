@@ -45,10 +45,12 @@ inventory derivation. OOT replay writes a materialized model2MLIR bundle for
 each case, including weights, inputs, goldens, a quantization manifest, and a
 capture receipt. Merlin verifies the receipt and manifest binding when it
 inventories a selected `model.mlir`; requirement derivation also checks that
-the manifest names the recipe's selected software spec bytes. The frozen
-selection remains a capture
-diagnostic; its source closure and numerical policy are not reviewed, and it
-is not an admitted capsule corpus.
+the manifest names the recipe's selected software spec bytes and the exact
+independently supplied policy file. Pass one
+`--application-quant-policy LABEL=PATH@SHA256` for every externally quantized
+`--application-capture LABEL=PATH` when running `merlin experiment corpus
+derive`. The frozen selection remains a capture diagnostic; its source closure
+and numerical policy are not reviewed, and it is not an admitted capsule corpus.
 
 [The MX Phase 0 guide](../../../docs/guides/mx_gemmini_phase0.md) records the
 format rules, supported operation boundary, capture policy, and evidence gates.

@@ -85,6 +85,10 @@ def main(argv: list[str] | None = None) -> int:
         help="pre-execution selection for each selected capture; omitted legacy captures remain diagnostic",
     )
     derive.add_argument(
+        "--application-quant-policy", action="append", default=[], metavar="LABEL=PATH@SHA256",
+        help="independently selected policy bytes for each externally quantized capture",
+    )
+    derive.add_argument(
         "--native-qualification",
         action="append",
         default=[],
@@ -177,7 +181,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(result, indent=2))
                 return 0
             elif args.operation == "derive":
-                from .phase0.requirements import capture_selection_specs, capture_selections, derive
+                from .phase0.requirements import (
+                    capture_selection_specs, capture_selections, derive, quantization_policy_specs,
+                )
 
                 try:
                     result = derive(
@@ -187,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
                         output_root=args.output,
                         native_qualifications=capture_selections(args.native_qualification),
                         capture_preselections=capture_selection_specs(args.application_capture_selection),
+                        quantization_policies=quantization_policy_specs(args.application_quant_policy),
                     )
                 except ValueError as exc:
                     raise SpecError(str(exc)) from exc
