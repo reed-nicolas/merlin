@@ -486,7 +486,7 @@ def _from_rtl_facts(facts: dict, out: DerivedCapabilities) -> None:
             dtypes = (str(dp["dtype"]),)
             break
     for arr in body.get("arrays") or ():
-        if isinstance(arr, dict) and arr.get("rows") and arr.get("cols"):
+        if isinstance(arr, dict) and arr.get("corroborated") is True and arr.get("rows") and arr.get("cols"):
             _record(
                 out,
                 FamilyEvidence(
