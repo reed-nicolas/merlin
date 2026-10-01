@@ -469,10 +469,10 @@ def boundaries(target: str) -> Boundaries:
     # falls back to a constant -- so "did it come from hardware" is decidable by asking for the fact
     # sources directly rather than by trusting the number.
     try:
-        from merlin.targetgen.corpus_spec import _DEFAULT_SW_TILE, _tile_dim
-        from merlin.targetgen.target_experiment import load_capability_manifest
+        from merlin.targetgen.corpus_spec import _DEFAULT_SW_TILE, _structural_mesh_rows, _tile_dim
+        from merlin.targetgen.target_registry import load_contract
 
-        contract = load_capability_manifest(target).contract
+        contract = load_contract(target)
         edge = int(_tile_dim(target, contract) or 0) or None
         b.tile_edge = edge
         caps = contract.get("capabilities") or {}
@@ -484,23 +484,31 @@ def boundaries(target: str) -> Boundaries:
         # below cannot tell them apart either. The value already comes from the RTL fact; the PROVENANCE
         # has to come from the same place or the two disagree about what is known.
         rtl_rows = None
+        structural_rows = None
         if not hw:
             try:
                 from merlin.targetgen.rtl.facts import load_facts
 
-                arrays = ((load_facts(target) or {}).get("facts") or {}).get("arrays") or []
+                selected_facts = load_facts(target) or {}
+                arrays = (selected_facts.get("facts") or {}).get("arrays") or []
                 mesh = next((a for a in arrays if a.get("rows") and a.get("cols")), None)
                 rtl_rows = int(mesh["rows"]) if mesh else None
+                if rtl_rows is None:
+                    structural_rows = _structural_mesh_rows(selected_facts)
             except Exception:  # noqa: BLE001 — absent facts: not a hardware fact
                 rtl_rows = None
         from_rtl = rtl_rows is not None and edge is not None and int(rtl_rows) == int(edge)
-        b.tile_edge_is_hardware_fact = hw or from_rtl or (edge is not None and edge != _DEFAULT_SW_TILE)
+        from_structure = structural_rows is not None and edge is not None and structural_rows == edge
+        b.tile_edge_is_hardware_fact = hw or from_rtl or from_structure or (edge is not None and edge != _DEFAULT_SW_TILE)
         b.tile_edge_source = (
             "capability manifest (declared mesh/tile rows)"
             if hw
             else "RTL facts arrays[].rows (the target leaves geometry to discovery rather "
             "than restating it in the contract)"
             if from_rtl
+            else "RTL facts structural_observations[].rows (source-bound grid geometry only; "
+            "compute capability uncorroborated)"
+            if from_structure
             else f"software-tiling default ({_DEFAULT_SW_TILE}); this target declares no "
             f"fixed hardware mesh, so it is NOT a hardware boundary"
         )

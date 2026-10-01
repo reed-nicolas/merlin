@@ -176,10 +176,37 @@ def _scale_block_elems(contract: dict) -> int | None:
     return _group(contract)
 
 
+def _structural_mesh_rows(facts: dict) -> int | None:
+    """Read source-bound grid geometry without treating it as a compute array."""
+    body = facts.get("facts") or {}
+    observations = [o for o in body.get("structural_observations") or []
+                    if isinstance(o, dict) and o.get("kind") == "mesh_tile_grid"]
+    if not observations:
+        return None
+    consistency = facts.get("source_consistency") or {}
+    fir_sha = (facts.get("inputs") or {}).get("fir_sha256")
+    production = consistency.get("production") or {}
+    if (consistency.get("status") != "verified" or not isinstance(fir_sha, str)
+            or len(fir_sha) != 64 or production.get("firrtl_sha256") != fir_sha
+            or (body.get("source") or {}).get("fir_sha256") != fir_sha):
+        raise ValueError("structural mesh lacks a matching verified FIRRTL source")
+    if len(observations) != 1:
+        raise ValueError("structural mesh geometry is ambiguous")
+    observation = observations[0]
+    rows, cols, instances = (observation.get(k) for k in ("rows", "cols", "instances"))
+    if (observation.get("source") != "selected_firrtl"
+            or observation.get("firrtl_sha256") != fir_sha
+            or any(type(v) is not int or v < 1 for v in (rows, cols, instances))
+            or rows * cols != instances):
+        raise ValueError("structural mesh geometry does not match its selected FIRRTL")
+    return rows
+
+
 def _tile_dim(target: str, contract: dict, *, operand: str | None = None, facts: dict | None = None) -> int:
     """Tile dim for sizing capsule shapes. When the target has a FIXED HARDWARE mesh, it is DERIVED
     (``capabilities.mesh.rows`` / ``.tile.rows`` from the manifest, else the CIRCT ``arrays[mesh].rows``
-    fact) — so gemmini's 16 comes from its RTL facts, never a literal. A target with NO fixed hardware
+    fact or a source-bound structural mesh observation) — so gemmini's 16 comes from its RTL facts,
+    never a literal. A target with NO fixed hardware
     mesh (a SIMT / vector target such as radiance, whose matmul tiling is a SOFTWARE choice, not a
     hardware dimension) has nothing to derive; it uses ``_DEFAULT_SW_TILE`` — a compiler software-tiling
     default, NOT a per-target hardware fact. Both derivation sources are keyed on ``target``."""
@@ -211,10 +238,12 @@ def _tile_dim(target: str, contract: dict, *, operand: str | None = None, facts:
     for geom in (caps.get("mesh") or {}, caps.get("tile") or {}):  # systolic mesh OR spatial tile
         if geom.get("rows"):
             return int(geom["rows"])
+    selected_facts = None
     try:
         from merlin.targetgen.rtl.facts import load_facts
 
-        body = (load_facts(target) if facts is None else facts).get("facts") or {}
+        selected_facts = load_facts(target) if facts is None else facts
+        body = selected_facts.get("facts") or {}
         arrays = body.get("arrays") or []
         m = next((a for a in arrays if a.get("name") == "mesh"), {})
         if m.get("rows"):
@@ -226,6 +255,10 @@ def _tile_dim(target: str, contract: dict, *, operand: str | None = None, facts:
             return int(spatial_rows)
     except Exception:  # noqa: BLE001 — handled below according to the declared compute-unit kind
         pass
+    if selected_facts is not None:
+        structural_rows = _structural_mesh_rows(selected_facts)
+        if structural_rows is not None:
+            return structural_rows
     # A software tile is legitimate only when no unit selected by the operand
     # is fixed. A missing RTL array is missing evidence, not evidence for a
     # 16-wide array. This also covers single-unit

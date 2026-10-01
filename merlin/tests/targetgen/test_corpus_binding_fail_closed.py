@@ -37,6 +37,43 @@ def test_fixed_array_geometry_requires_a_fact(monkeypatch):
     assert CS._tile_dim("synthetic", software, operand="f32") == CS._DEFAULT_SW_TILE
 
 
+def test_source_bound_structural_grid_supplies_geometry_only(monkeypatch):
+    from copy import deepcopy
+    from merlin.targetgen import capability_derive, conformance, target_registry
+    from merlin.targetgen.rtl import facts
+
+    sha = "a" * 64
+    bundle = {
+        "inputs": {"fir_sha256": sha},
+        "source_consistency": {"status": "verified", "production": {"firrtl_sha256": sha}},
+        "facts": {
+            "source": {"fir_sha256": sha},
+            "arrays": [],
+            "structural_observations": [{"kind": "mesh_tile_grid", "source": "selected_firrtl",
+                                         "firrtl_sha256": sha, "rows": 12, "cols": 8, "instances": 96,
+                                         "compute_engine_established": False}],
+        },
+    }
+    contract = {"compute_units": [{"name": "array", "kind": "systolic", "dtypes": ["int8"]}]}
+    assert CS._tile_dim("synthetic", contract, operand="int8", facts=bundle) == 12
+    assert "contraction" not in capability_derive.derive("synthetic", contract, bundle).supported
+
+    monkeypatch.setattr(facts, "load_facts", lambda _target: bundle)
+    with target_registry.observed_contract("synthetic", contract):
+        b = conformance.boundaries("synthetic")
+    assert b.tile_edge == 12 and b.tile_edge_is_hardware_fact
+    assert "geometry only" in b.tile_edge_source
+
+    corrupted = deepcopy(bundle)
+    corrupted["facts"]["structural_observations"][0]["instances"] = 95
+    with pytest.raises(ValueError, match="geometry does not match"):
+        CS._tile_dim("synthetic", contract, operand="int8", facts=corrupted)
+    corrupted = deepcopy(bundle)
+    corrupted["facts"]["structural_observations"][0]["firrtl_sha256"] = "b" * 64
+    with pytest.raises(ValueError, match="geometry does not match"):
+        CS._tile_dim("synthetic", contract, operand="int8", facts=corrupted)
+
+
 def test_binding_refuses_missing_and_unsupported_datapath(monkeypatch):
     from merlin.targetgen import oracle_policy, target_experiment
     from merlin.targetgen.rtl import facts
@@ -56,7 +93,7 @@ def test_binding_refuses_missing_and_unsupported_datapath(monkeypatch):
     with pytest.raises(ValueError, match="not admitted"):
         CS.derive_binding(te, {"operand_dtype": "int8"})
 
-    monkeypatch.setattr(CS, "_classes_source", lambda *_: lambda **_: [])
+    monkeypatch.setattr(CS, "_classes_source", lambda *_, **__: lambda **_: [])
     with pytest.raises(ValueError, match="no derived tile geometry"):
         CS.derive_binding(te, {})
 
