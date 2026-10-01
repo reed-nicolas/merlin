@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 import yaml
@@ -430,6 +431,7 @@ def derive(
         _materialize_evidence(root, {"synthesis.yaml": yaml.safe_dump(profile, sort_keys=False).encode()})
     accounting = json.loads((root / "evidence/coverage/operation-accounting.json").read_bytes())
     operation_plan = plan.get("provenance", {}).get("application_operation_plan") or {}
+    capsules = plan.get("capsules") or []
     report = {
         "schema": "merlin.phase0_derivation.v1",
         "target": te.target,
@@ -453,7 +455,15 @@ def derive(
             label: app.get("pytorch_provenance", {}).get("source_trace_status", "unknown")
             for label, app in accounting.get("applications", {}).items()
         },
-        "candidate_capsules": len(plan.get("capsules", [])),
+        "admitted_cells": len(requirement.get("cells") or []),
+        "declared_compute_units": len(selected.contract.get("compute_units") or []),
+        "candidate_capsules": len(capsules),
+        "candidate_capsules_by_source_role": dict(sorted(Counter(
+            str(entry.get("source_role") or "unspecified") for entry in capsules
+        ).items())),
+        "candidate_screen_statuses": dict(sorted(Counter(
+            str(screen.get("status") or "unknown") for screen in screens
+        ).items())),
         "synthesis_profile": "synthesis.yaml" if plan.get("status") != "blocked" else None,
         "application_operation_plan": {
             key: value for key, value in operation_plan.items() if key not in {"obligations", "missing_mapping"}
