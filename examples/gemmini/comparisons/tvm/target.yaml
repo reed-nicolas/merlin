@@ -1,0 +1,36 @@
+kind: comparison_plan
+status: planning
+executable: false
+target: gemmini
+descriptor_reference: examples/gemmini/target/descriptor.yaml
+source:
+  checkout: third_party/baselines/tvm-gemmini
+  fork: git@github.com:reed-nicolas/tvm.git
+  work_branch: gemmini/bringup
+  initial_commit: fb78e0e3adcee44948a1542cd394710b3a6f9dba
+  apache_release: v0.19.0
+  apache_commit: c4dc0c29ff81ddae688da24625a603da3b4a2c0e
+  frontend_fixes:
+    repository: https://github.com/ucb-bar/tvm.git
+    branch: merlin/relax-onnx-fixes
+    commit: fb78e0e3adcee44948a1542cd394710b3a6f9dba
+    count: 5
+handwritten_reference:
+  checkout: ${ATLAS_COMPILER_ROOT}/other_projects/gemmini-mlir
+  branch: handwritten-implementation
+  full_commit: 42098bf7ec10da441f4a71bf0a44f9ca1ba83db3
+recommendation:
+  status: proposed
+  hardware: stock_int8_gemmini
+  host_runtime: linux_relax_vm
+selection:
+  lowering_route: null # C library integration versus handwritten xDSL route.
+  hardware_variant: null # Stock versus MX.
+  hardware_revision: null
+  hardware_configuration: null
+  loop_policy: null
+  runtime: null
+  quantization: null
+  host_fallback_policy: null
+  numerical_acceptance: null
+  measurement_boundary: null
