@@ -78,3 +78,30 @@ python "$tvm_source/apps/gemmini/verify_host.py" --output "$build_root/host-smok
 The existing local environment can be restored with `source "$build_root/activate.sh"`. This generated helper contains machine-specific paths; use the commands above to reproduce the setup elsewhere.
 
 Keep `host-smoke.json`, `host-manifest.json`, `tvm-host.patch` and build logs under the build root. The receipt records the loaded library, LLVM support, guard mode and numerical/rejection checks; the manifest and patch identify the tested compiler beyond its base Git SHA. Local progress notes retain machine-specific setup history.
+
+## ONNX frontend verification
+
+Install [frontend-requirements.txt](frontend-requirements.txt) into the host environment. The verified combination is Python 3.10.14, PyTorch 2.10.0+cu128 executing on CPU, ONNX 1.17.0, protobuf 5.29.5 and NumPy 1.26.4. ONNX 1.17 retains the `onnx.mapping` API used by this TVM revision. The verifier explicitly uses the legacy exporter (`dynamo=False`), matching the existing Merlin runner's primary path; it does not require ONNXScript, ONNX Runtime or torchvision.
+
+```bash
+python -m pip install -r "$setup_dir/frontend-requirements.txt"
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 TVM_NUM_THREADS=1
+python "$tvm_source/apps/gemmini/verify_onnx.py" --output-dir "$build_root/frontend/current"
+```
+
+The current machine reuses an existing PyTorch installation because the CPU wheel download domain is blocked. Its generated `$build_root/local-torch/` overlay contains symlinks to only `torch`, `torchgen`, `functorch`, `nvidia` and `torch-2.10.0.dist-info` from Chipyard's `.conda-env/lib/python3.10/site-packages/`. The remaining packages are pinned and installed in the isolated host environment. After sourcing `activate.sh`, add the existing overlay with `export PYTHONPATH="$PYTHONPATH:$build_root/local-torch"`. This overlay is machine-specific and is not part of a fresh installation recipe; the report records the resolved package locations. No GPU is used.
+
+All ten cases passed locally: matmul, batched matmul, convolution, LayerNorm and RMSNorm at opsets 17 and 18. Each compares PyTorch, ONNX ReferenceEvaluator and Relax LLVM CPU results, requiring equal output shapes/dtypes and `rtol=1e-4, atol=1e-5`. Maximum absolute Relax-versus-PyTorch error was `2.40e-5` (LayerNorm). These are small synthetic frontend checks, not full-model or Gemmini results.
+
+The verifier writes `results.json` plus each case's ONNX graph, imported Relax IR and numerical arrays beneath its required output directory. It records exporter/importer identity, dependency locations, loaded TVM library and LLVM/guard metadata. The loaded library still reports its original build revision `fb78e0e...`; later source commits do not relabel that build.
+
+For a focused importer ablation, retrieve only the exact Python importer and load it through `--importer-source`; keep the current runtime and branch unchanged:
+
+```bash
+git -C "$tvm_source" show c4dc0c29ff81ddae688da24625a603da3b4a2c0e:python/tvm/relax/frontend/onnx/onnx_frontend.py > "$build_root/frontend/apache-importer.py"
+python "$tvm_source/apps/gemmini/verify_onnx.py" --output-dir "$build_root/frontend/apache-importer" --importer-source "$build_root/frontend/apache-importer.py"
+git -C "$tvm_source" show d608061677e535f12b64c072d7a109a645bcca73:python/tvm/relax/frontend/onnx/onnx_frontend.py > "$build_root/frontend/reduction-fix-importer.py"
+python "$tvm_source/apps/gemmini/verify_onnx.py" --output-dir "$build_root/frontend/reduction-fix-importer" --importer-source "$build_root/frontend/reduction-fix-importer.py" --case rms_norm
+```
+
+The Apache importer run is expected to exit nonzero: nine cases passed, but opset-18 RMSNorm produced incorrect values (maximum absolute error `1.19899`). Both RMSNorm opsets passed with just `d608061`, confirming the reduction-axis fix is required for this graph. This compares historical Python importers on the current runtime, not complete historical TVM builds. The other four inherited patches and the reported BF16 sigmoid issue need separate probes; these cases do not establish their necessity or resolution. Preserve each variant's results in its own directory.

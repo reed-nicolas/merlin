@@ -24,7 +24,7 @@ recommendation:
   hardware: stock_int8_gemmini
   host_runtime: linux_relax_vm
 selection:
-  lowering_route: null # C library integration versus handwritten xDSL route.
+  lowering_route: gemmini_c_library # Selected by Jack for baseline fairness.
   hardware_variant: null # Stock versus MX.
   hardware_revision: null
   hardware_configuration: null
@@ -34,3 +34,10 @@ selection:
   host_fallback_policy: null
   numerical_acceptance: null
   measurement_boundary: null
+measurement:
+  final_substrate: firesim
+  coordination: Agustin/Jack # Platform access and timing/capture procedure still pending.
+workload_order:
+  - resnet50 # Canonical model; exact variant/checkpoint still pending.
+  - tiny_llama # TinyLlama 1B; exact checkpoint/session still pending.
+  - smolvla
