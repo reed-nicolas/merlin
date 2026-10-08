@@ -122,3 +122,29 @@ This suite constructs schema-checked ONNX graphs independently of the exporter a
 | `fb78e0e`: Expand/ConstantOfShape | Lower-rank Expand and scalar ConstantOfShape fail import immediately before this patch and pass with it. |
 
 The dtype comparison uses identical saved ONNX graphs against the inherited and fixed importers. Reports remain under distinct `frontend/` subdirectories, including `inherited-large-shape`, `importer-dtype-fixed` and `torch-after-dtype-fix`. The BF16 sigmoid limitation and broader model coverage remain untested. The local Python importer fix changes source identity without rebuilding the C++ library.
+
+## ResNet50 host structural diagnostic
+
+`verify_resnet.py` exercises the full existing torchvision ResNet50 v1.5 architecture with seeded random weights and two distinct synthetic images. It makes no pretrained-accuracy, final paper-variant, quantization or accelerator claim. The loader comes from model2MLIR revision `7915e23475c6db446a3c404847b11e8bc72c8a27`; the verified environment adds torchvision 0.25.0+cu128 and Pillow 12.1.0 to the frontend pins above. Both CUDA-enabled framework distributions execute on CPU here. The standalone diagnostic uses the host Python 3.10 environment; it does not invoke model2MLIR's separate Python 3.12 capture pipeline.
+
+```bash
+model2mlir_source=/absolute/path/to/model2MLIR
+export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 TVM_NUM_THREADS=4
+python "$setup_dir/verify_resnet.py" --model2mlir-root "$model2mlir_source" --tvm-source "$tvm_source" --output-dir "$build_root/resnet50-v1_5"
+```
+
+Restore the local PyTorch overlay as described above when using this machine's existing environment. The verifier clears inherited ResNet dataset/calibration settings during loader construction and sets `RANDOM=1`, `PRETRAINED=0`, `PAPER_READY=0` and two session steps through the loader's named environment variables. Model initialization uses seed 194; images use the loader's independent seed 20260830. It preserves zero-valued parameters, checks the state hash before/after, and verifies the [3,4,6,3] stage depths and v1.5 downsampling strides.
+
+The checked model has 25,557,032 parameters and 53 convolution modules, takes float32 NCHW `[1,3,224,224]` input and produces float32 `[1,1000]` logits. It exports legacy ONNX opset 17, runs strict ONNX checking and shape inference, imports frozen parameters into Relax, builds LLVM once, and checks both images against PyTorch. Both passed with preselected `rtol=1e-4, atol=1e-4`; maximum absolute errors were `8.39234e-5` and `9.15527e-5`.
+
+| Exported ONNX operation | Count |
+| --- | ---: |
+| Conv | 53 (36 × 1×1, 16 × 3×3, 1 × 7×7) |
+| Add | 16 |
+| Relu | 49 |
+| MaxPool / GlobalAveragePool / Flatten / Gemm | 1 each |
+| Identity | 47 |
+
+All inferred tensor shapes/dtypes are concrete. Convolutions use NCHW/OIHW and the classifier's stored weight uses OI with `transB=1`. Evaluation-mode BatchNorm is folded into convolution; this explains its absence from the exported graph. Relax contains 53 conv2d, one matmul, 70 adds (including biases), 49 ReLUs, one max pool, one mean, 54 reshapes and one permutation; ONNX Identity nodes disappear. This inventory identifies integration work without asserting Gemmini eligibility for any operation.
+
+The output directory retains `results.json`, the exported and shape-inferred ONNX graphs, `onnx_inventory.json`, `relax_inventory.json`, imported Relax IR and two input/reference/output archives. Reports bind the verifier, loader, torchvision source, input/model hashes, frontend source and loaded TVM library. These are full-architecture compiler diagnostics; pretrained checkpoint fidelity, real-image quality, the intended multi-image paper session and Gemmini execution remain separate gates.
