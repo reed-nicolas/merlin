@@ -20,12 +20,12 @@ handwritten_reference:
   branch: handwritten-implementation
   full_commit: 42098bf7ec10da441f4a71bf0a44f9ca1ba83db3
 recommendation:
-  status: proposed
+  status: awaiting_platform_confirmation
   hardware: stock_int8_gemmini
-  host_runtime: linux_relax_vm
+  host_runtime: null # Inspected reference is baremetal; TVM deployment is unconfirmed.
 selection:
   lowering_route: gemmini_c_library # Selected for baseline fairness.
-  hardware_variant: null # Stock versus MX.
+  hardware_variant: gemmini # Regular Gemmini is selected; not MX.
   hardware_revision: null
   hardware_configuration: null
   loop_policy: null
