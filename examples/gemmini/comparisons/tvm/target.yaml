@@ -15,21 +15,47 @@ source:
     branch: merlin/relax-onnx-fixes
     commit: fb78e0e3adcee44948a1542cd394710b3a6f9dba
     count: 5
-handwritten_reference:
-  checkout: ${ATLAS_COMPILER_ROOT}/other_projects/gemmini-mlir
-  branch: handwritten-implementation
-  full_commit: 42098bf7ec10da441f4a71bf0a44f9ca1ba83db3
 recommendation:
-  status: awaiting_platform_confirmation
-  hardware: stock_int8_gemmini
-  host_runtime: null # Inspected reference is baremetal; TVM deployment is unconfirmed.
+  status: provisional_development
+  hardware: int8_gemmini
+  host_runtime: baremetal # Candidate for development; final deployment is unconfirmed.
+# This profile authorizes local development assumptions, not paper qualification.
+development:
+  sources:
+    gemmini_commit: 6ad65b90b1eb270c20ce4f04109e3dde0180b36f
+    rocc_tests_commit: 7c540b3adf1b86ad93d07f893abe3a73489b568e
+    libgemmini_commit: ea8f7ed7afd68e001fb06ddccad9a023c990961d
+    params_sha256: 3758ae967af3a179497660970201093a7fb624be00173990ce33d3f5c38da924
+    operators_sha256: 18801f4eab0cd2e81e25a6c2aa97c7ed644b693e8d2c24cdeb41ab3a7208336d
+  arithmetic:
+    input_dtype: int8
+    output_dtype: int32
+    full_accumulator_readout: true
+    dim: 16
+    pe_output_bits: 20 # Provisional Scala configuration; absent from the C parameter header.
+    scratchpad_bytes: 262144
+    accumulator_bytes: 65536
+  runtime:
+    kind: baremetal
+    isa: rv64gc
+    abi: lp64d
+  instructions:
+    dataflow: OS
+    hardware_loops: forbid # Agustin requires no FSM instructions for any implementation.
+    paper_confirmed: true
+  memory:
+    base_address: 0x80000000
+    requested_size_bytes: 8589934592 # Hypothetical 8 GiB planning map, not observed capacity.
+    confirmed_size_bytes: null # Do not infer capacity from Spike -m or host AXI width.
 selection:
   lowering_route: gemmini_c_library # Selected for baseline fairness.
   hardware_variant: gemmini # Regular Gemmini is selected; not MX.
+  host: rocket # Jack confirms default Gemmini + Rocket; exact FireSim build remains unbound.
+  hardware_family: default_gemmini
   hardware_revision: null
   hardware_configuration: null
-  loop_policy: null
-  runtime: null
+  loop_policy: primitive_only
+  runtime: baremetal # Agustin permits baremetal or RTOS; this integration chooses baremetal.
   quantization: null
   host_fallback_policy: null
   numerical_acceptance: null
