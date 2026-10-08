@@ -1,15 +1,34 @@
 # TVM host setup
 
-This recipe builds the [pinned TVM checkout](../../../../third_party/baselines/README.md) with host LLVM support on Linux. Checks recorded on 2026-10-07 passed CPU matmul, eight guard-rejection cases, twenty synthetic frontend cases and a full ResNet50 v1.5 random-weight host diagnostic. Pretrained/full-session qualification and Gemmini deployment remain pending.
+This recipe builds the [pinned independent TVM checkout](target.yaml) with host LLVM support on Linux. Checks recorded on 2026-10-07 passed CPU matmul, eight guard-rejection cases, twenty synthetic frontend cases and a full ResNet50 v1.5 random-weight host diagnostic. Pretrained/full-session qualification and Gemmini deployment remain pending.
 
 The host cache enables the local `USE_HOST_ONLY_AUTO_COPY_GUARD` patch because this restricted checkout lacks `LowerAutoCopy`. The guard preserves unannotated IR and rejects automatic-copy annotations; it does not implement their optimization. This option defaults to OFF and must not coexist with the full implementation. Record the local patch and enabled mode with the base commit.
 
-Run from the Merlin comparison checkout. All generated files use the configured build root, honoring `MERLIN_OUT_ROOT`. The verified tool versions are Python 3.10.14, GCC 11.5, CMake 3.26.5 and Ninja 1.13.2. Select Python 3.10 and the host tools from your own installation; a Chipyard Conda environment is not required. The commands resolve tools from `PATH` before cleaning inherited build settings. Set `TVM_HOST_PYTHON`, `TVM_HOST_CMAKE`, `TVM_HOST_CC` or `TVM_HOST_CXX` to absolute executable paths to override discovery, and `TVM_BUILD_JOBS` to control parallelism (default 4; the recorded build used 16). Do not source Chipyard's environment for this host build.
+Run from the Merlin comparison checkout. Select absolute `TVM_ROOT` and `TVM_BUILD` paths for the independent source checkout and host library build. Merlin does not track or initialize this baseline as a submodule. Support artifacts use the configured Merlin build root, honoring `MERLIN_OUT_ROOT`; the TVM host build uses `TVM_BUILD`. The verified tool versions are Python 3.10.14, GCC 11.5, CMake 3.26.5 and Ninja 1.13.2. Select Python 3.10 and the host tools from your own installation; a Chipyard Conda environment is not required. The commands resolve tools from `PATH` before cleaning inherited build settings. Set `TVM_HOST_PYTHON`, `TVM_HOST_CMAKE`, `TVM_HOST_CC` or `TVM_HOST_CXX` to absolute executable paths to override discovery, and `TVM_BUILD_JOBS` to control parallelism (default 4; the recorded build used 16). Do not source Chipyard's environment for this host build.
+
+For a new TVM checkout, clone without checkout and apply the mandatory name exclusions before materializing files. These commands select the published source commit recorded in `target.yaml`; they do not switch an existing checkout. If you already have that commit checked out, retain it and set the same two paths instead.
 
 ```bash
+export TVM_ROOT=/absolute/path/to/tvm-gemmini
+export TVM_BUILD=/absolute/path/to/tvm-host-build
+tvm_commit=58bad17e55c8bab37db2126acbe286cb08480a5f
+git clone --filter=blob:none --no-checkout https://github.com/reed-nicolas/tvm.git "$TVM_ROOT"
+git -C "$TVM_ROOT" sparse-checkout set --no-cone --stdin <<'PATTERNS'
+/*
+!*[hH][aA][mM][mM][eE][rR]*
+!*[vV][lL][sS][iI]*
+PATTERNS
+git -C "$TVM_ROOT" checkout --detach "$tvm_commit"
+```
+
+In the same shell, verify the selected source pin and prepare the host environment:
+
+```bash
+: "${TVM_ROOT:?Set TVM_ROOT to the independent TVM checkout}"
+: "${TVM_BUILD:?Set TVM_BUILD to the TVM host build directory}"
+test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = 58bad17e55c8bab37db2126acbe286cb08480a5f || { echo 'TVM source pin mismatch' >&2; exit 1; }
 merlin_root="$PWD"
 setup_dir="$merlin_root/examples/gemmini/comparisons/tvm"
-tvm_source="$merlin_root/third_party/baselines/tvm-gemmini"
 host_python="${TVM_HOST_PYTHON:-$(command -v python3.10)}"
 host_cmake="${TVM_HOST_CMAKE:-$(command -v cmake)}"
 host_cc="${TVM_HOST_CC:-$(command -v gcc)}"
@@ -36,10 +55,30 @@ export PATH="$build_root/venv/bin:$host_tools_path"
 The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. Initialize them at the recorded gitlinks with the workspace's required sparse exclusions, or preserve existing matching checkouts. Verify them before building:
 
 ```bash
-git -C "$tvm_source" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
+git -C "$TVM_ROOT" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
 ```
 
-A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies using the [recorded pins](../../../../third_party/baselines/README.md), with `--no-checkout` and equivalent sparse exclusions established before checkout. Do not initialize optional dependencies recursively.
+A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `58bad17e55c8bab37db2126acbe286cb08480a5f`. Clone each dependency without checkout and apply the same exclusions before checkout:
+
+```bash
+git -C "$TVM_ROOT" submodule init -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
+while read -r dependency revision repository; do
+  git clone --no-checkout "$repository" "$TVM_ROOT/3rdparty/$dependency"
+  git -C "$TVM_ROOT/3rdparty/$dependency" sparse-checkout set --no-cone --stdin <<'PATTERNS'
+/*
+!*[hH][aA][mM][mM][eE][rR]*
+!*[vV][lL][sS][iI]*
+PATTERNS
+  git -C "$TVM_ROOT/3rdparty/$dependency" checkout --detach "$revision"
+done <<'DEPENDENCIES'
+dmlc-core 3031e4a61a98f49f07a42cfdec6242340fb2fd8c https://github.com/dmlc/dmlc-core.git
+dlpack e2bdd3bee8cb6501558042633fa59144cc8b7f5f https://github.com/dmlc/dlpack.git
+rang cabe04d6d6b05356fa8f9741704924788f0dd762 https://github.com/agauniyal/rang.git
+DEPENDENCIES
+git -C "$TVM_ROOT" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
+```
+
+Preserve existing matching dependency checkouts. Do not initialize optional dependencies recursively.
 
 A compatible complete LLVM 18 SDK can replace the source build below. Clone LLVM 18.1.8 (`3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff`) without checkout, then select only `llvm`, `cmake`, and `third-party`, excluding forbidden names before materializing files. Reuse the existing checkout when present rather than cloning over it.
 
@@ -72,18 +111,17 @@ git -C "$llvm_source" checkout --detach llvmorg-18.1.8
 Consume the LLVM build tree directly, retaining its source and generated include directories. `LLVM_INCLUDE_TOOLS=ON` is required for the shared-library target; requesting only `LLVM` and `llvm-config` avoids unrelated tools. Configure TVM with the checked-in host cache and an RPATH to this LLVM library directory.
 
 ```bash
-tvm_build="$build_root/host"
-"$host_cmake" -S "$tvm_source" -B "$tvm_build" -G Ninja -C "$setup_dir/host-config.cmake" -DCMAKE_MAKE_PROGRAM="$host_ninja" -DCMAKE_C_COMPILER="$host_cc" -DCMAKE_CXX_COMPILER="$host_cxx" -DUSE_LLVM="$llvm_build/bin/llvm-config --link-shared" -DCMAKE_BUILD_RPATH="$llvm_build/lib"
-"$host_cmake" --build "$tvm_build" --parallel "$build_jobs"
-export PYTHONPATH="$tvm_source/python"
-export TVM_LIBRARY_PATH="$tvm_build"
+"$host_cmake" -S "$TVM_ROOT" -B "$TVM_BUILD" -G Ninja -C "$setup_dir/host-config.cmake" -DCMAKE_MAKE_PROGRAM="$host_ninja" -DCMAKE_C_COMPILER="$host_cc" -DCMAKE_CXX_COMPILER="$host_cxx" -DUSE_LLVM="$llvm_build/bin/llvm-config --link-shared" -DCMAKE_BUILD_RPATH="$llvm_build/lib"
+"$host_cmake" --build "$TVM_BUILD" --parallel "$build_jobs"
+export PYTHONPATH="$TVM_ROOT/python"
+export TVM_LIBRARY_PATH="$TVM_BUILD"
 export TVM_FFI=ctypes
 export PYTHONDONTWRITEBYTECODE=1
 export TEST_DATA_ROOT_PATH="$build_root/cache/tvm-test-data"
-python "$tvm_source/apps/gemmini/verify_host.py" --output "$build_root/host-smoke.json"
+python "$TVM_ROOT/apps/gemmini/verify_host.py" --output "$build_root/host-smoke.json"
 ```
 
-To reuse a build in another shell, restore `merlin_root`, `setup_dir`, `build_root`, `tvm_source` and `tvm_build` for that checkout, activate `"$build_root/venv/bin/activate"`, and reapply the TVM environment exports above. A locally generated activation helper is optional and must match the current filesystem layout; this recipe does not require one.
+To reuse a build in another shell, restore `merlin_root`, `setup_dir`, `build_root`, `TVM_ROOT` and `TVM_BUILD` for that checkout, activate `"$build_root/venv/bin/activate"`, and reapply the TVM environment exports above. A locally generated activation helper is optional and must match the current filesystem layout; this recipe does not require one.
 
 Keep `host-smoke.json`, `host-manifest.json`, `tvm-host.patch` and build logs under the build root. The receipt records the loaded library, LLVM support, guard mode and numerical/rejection checks; the manifest and patch identify the tested compiler beyond its base Git SHA. Local progress notes retain machine-specific setup history.
 
@@ -94,7 +132,7 @@ Install [frontend-requirements.txt](frontend-requirements.txt) into the host env
 ```bash
 python -m pip install -r "$setup_dir/frontend-requirements.txt"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 TVM_NUM_THREADS=1
-python "$tvm_source/apps/gemmini/verify_onnx.py" --output-dir "$build_root/frontend/current"
+python "$TVM_ROOT/apps/gemmini/verify_onnx.py" --output-dir "$build_root/frontend/current"
 ```
 
 A fresh setup installs the pinned packages into its own host environment. The recorded verification reused an existing PyTorch installation because of a local download restriction; that workaround is not a prerequisite. Reports record the actual dependency versions and resolved package locations. All checks execute on CPU, including when the installed framework distribution contains CUDA support.
@@ -106,10 +144,10 @@ The verifier writes `results.json` plus each case's ONNX graph, imported Relax I
 For a focused importer ablation, retrieve only the exact Python importer and load it through `--importer-source`; keep the current runtime and branch unchanged:
 
 ```bash
-git -C "$tvm_source" show c4dc0c29ff81ddae688da24625a603da3b4a2c0e:python/tvm/relax/frontend/onnx/onnx_frontend.py > "$build_root/frontend/apache-importer.py"
-python "$tvm_source/apps/gemmini/verify_onnx.py" --output-dir "$build_root/frontend/apache-importer" --importer-source "$build_root/frontend/apache-importer.py"
-git -C "$tvm_source" show d608061677e535f12b64c072d7a109a645bcca73:python/tvm/relax/frontend/onnx/onnx_frontend.py > "$build_root/frontend/reduction-fix-importer.py"
-python "$tvm_source/apps/gemmini/verify_onnx.py" --output-dir "$build_root/frontend/reduction-fix-importer" --importer-source "$build_root/frontend/reduction-fix-importer.py" --case rms_norm
+git -C "$TVM_ROOT" show c4dc0c29ff81ddae688da24625a603da3b4a2c0e:python/tvm/relax/frontend/onnx/onnx_frontend.py > "$build_root/frontend/apache-importer.py"
+python "$TVM_ROOT/apps/gemmini/verify_onnx.py" --output-dir "$build_root/frontend/apache-importer" --importer-source "$build_root/frontend/apache-importer.py"
+git -C "$TVM_ROOT" show d608061677e535f12b64c072d7a109a645bcca73:python/tvm/relax/frontend/onnx/onnx_frontend.py > "$build_root/frontend/reduction-fix-importer.py"
+python "$TVM_ROOT/apps/gemmini/verify_onnx.py" --output-dir "$build_root/frontend/reduction-fix-importer" --importer-source "$build_root/frontend/reduction-fix-importer.py" --case rms_norm
 ```
 
 The Apache importer run is expected to exit nonzero: nine cases passed, but opset-18 RMSNorm produced incorrect values (maximum absolute error `1.19899`). Both RMSNorm opsets passed with just `d608061`, confirming the reduction-axis fix is required for this graph. This compares historical Python importers on the current runtime, not complete historical TVM builds. Preserve each variant's results in its own directory.
@@ -117,7 +155,7 @@ The Apache importer run is expected to exit nonzero: nine cases passed, but opse
 ## Focused importer regressions
 
 ```bash
-python "$tvm_source/apps/gemmini/verify_onnx.py" --suite importer --output-dir "$build_root/frontend/importer-dtype-fixed"
+python "$TVM_ROOT/apps/gemmini/verify_onnx.py" --suite importer --output-dir "$build_root/frontend/importer-dtype-fixed"
 ```
 
 This suite constructs schema-checked ONNX graphs independently of the exporter and compares NumPy expectations, ONNX ReferenceEvaluator and Relax execution. It covers shape-array arithmetic, negative Gather indices as runtime inputs and constants, lower-rank Expand, and scalar ConstantOfShape at both opsets. All ten importer cases and all ten exporter cases passed after the dtype fix below. Integer results require exact dtype, shape and value equality.
@@ -138,7 +176,7 @@ The dtype comparison uses identical saved ONNX graphs against the inherited and 
 ```bash
 model2mlir_source=/absolute/path/to/model2MLIR
 export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 TVM_NUM_THREADS=4
-python "$setup_dir/verify_resnet.py" --model2mlir-root "$model2mlir_source" --tvm-source "$tvm_source" --output-dir "$build_root/resnet50-v1_5"
+python "$setup_dir/verify_resnet.py" --model2mlir-root "$model2mlir_source" --tvm-source "$TVM_ROOT" --output-dir "$build_root/resnet50-v1_5"
 ```
 
 The verifier clears inherited ResNet dataset/calibration settings during loader construction and sets `RANDOM=1`, `PRETRAINED=0`, `PAPER_READY=0` and two session steps through the loader's named environment variables. Model initialization uses seed 194; images use the loader's independent seed 20260830. It preserves zero-valued parameters, checks the state hash before/after, and verifies the [3,4,6,3] stage depths and v1.5 downsampling strides.
@@ -163,7 +201,7 @@ Supply all four options below together to compare a local checkpoint against eve
 
 ```bash
 python "$setup_dir/verify_resnet.py" \
-  --model2mlir-root /absolute/path/to/model2MLIR --tvm-source "$tvm_source" \
+  --model2mlir-root /absolute/path/to/model2MLIR --tvm-source "$TVM_ROOT" \
   --checkpoint /absolute/path/to/resnet50-state-dict.pt \
   --inputs /absolute/path/to/images.npz \
   --input-source 'declared dataset/split/sample-list identifier' \
