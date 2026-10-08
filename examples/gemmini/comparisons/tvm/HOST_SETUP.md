@@ -1,16 +1,27 @@
 # TVM host setup
 
-This recipe builds the [pinned TVM checkout](../../../../third_party/baselines/README.md) with host LLVM support. Verified locally on 2026-10-07: a synthetic Relax CPU matmul matched NumPy within `7.5e-9` absolute error, and all eight guard-rejection checks passed. Model and Gemmini deployment validation remain pending.
+This recipe builds the [pinned TVM checkout](../../../../third_party/baselines/README.md) with host LLVM support on Linux. Checks recorded on 2026-10-07 passed CPU matmul, eight guard-rejection cases, twenty synthetic frontend cases and a full ResNet50 v1.5 random-weight host diagnostic. Pretrained/full-session qualification and Gemmini deployment remain pending.
 
 The host cache enables the local `USE_HOST_ONLY_AUTO_COPY_GUARD` patch because this restricted checkout lacks `LowerAutoCopy`. The guard preserves unannotated IR and rejects automatic-copy annotations; it does not implement their optimization. This option defaults to OFF and must not coexist with the full implementation. Record the local patch and enabled mode with the base commit.
 
-Run from the Merlin comparison checkout. All generated files use the configured build root. This setup uses Python 3.10.14, GCC 11.5, CMake 3.26.5, and Ninja 1.13.2; use their explicit paths without sourcing Chipyard's environment.
+Run from the Merlin comparison checkout. All generated files use the configured build root, honoring `MERLIN_OUT_ROOT`. The verified tool versions are Python 3.10.14, GCC 11.5, CMake 3.26.5 and Ninja 1.13.2. Select Python 3.10 and the host tools from your own installation; a Chipyard Conda environment is not required. The commands resolve tools from `PATH` before cleaning inherited build settings. Set `TVM_HOST_PYTHON`, `TVM_HOST_CMAKE`, `TVM_HOST_CC` or `TVM_HOST_CXX` to absolute executable paths to override discovery, and `TVM_BUILD_JOBS` to control parallelism (default 4; the recorded build used 16). Do not source Chipyard's environment for this host build.
 
 ```bash
 merlin_root="$PWD"
 setup_dir="$merlin_root/examples/gemmini/comparisons/tvm"
 tvm_source="$merlin_root/third_party/baselines/tvm-gemmini"
-host_python=/bwrcq/C/reednicolas/ee194-sp26-chipyard/.conda-env/bin/python3.10
+host_python="${TVM_HOST_PYTHON:-$(command -v python3.10)}"
+host_cmake="${TVM_HOST_CMAKE:-$(command -v cmake)}"
+host_cc="${TVM_HOST_CC:-$(command -v gcc)}"
+host_cxx="${TVM_HOST_CXX:-$(command -v g++)}"
+: "${host_python:?Set TVM_HOST_PYTHON to a Python 3.10 executable}"
+: "${host_cmake:?Set TVM_HOST_CMAKE to a CMake executable}"
+: "${host_cc:?Set TVM_HOST_CC to a GCC executable}"
+: "${host_cxx:?Set TVM_HOST_CXX to a G++ executable}"
+build_jobs="${TVM_BUILD_JOBS:-4}"
+host_tools_path="$(dirname "$host_cmake"):$(dirname "$host_cc"):$(dirname "$host_cxx"):/usr/bin:/bin"
+unset LD_LIBRARY_PATH LIBRARY_PATH CPATH CPLUS_INCLUDE_PATH C_INCLUDE_PATH
+unset CMAKE_PREFIX_PATH PYTHONPATH PYTHONHOME CC CXX CFLAGS CXXFLAGS LDFLAGS
 export PYTHONDONTWRITEBYTECODE=1
 build_root="$(PYTHONPATH="$merlin_root/src" "$host_python" -c 'from merlin.common.paths import build_dir; print(build_dir() / "baselines" / "tvm-gemmini")')"
 mkdir -p "$build_root"/{cache/pip,tmp,logs}
@@ -19,12 +30,10 @@ export PIP_CACHE_DIR="$build_root/cache/pip" TMPDIR="$build_root/tmp"
 source "$build_root/venv/bin/activate"
 python -m pip install -r "$setup_dir/host-requirements.txt"
 host_ninja="$build_root/venv/bin/ninja"
-export PATH="$build_root/venv/bin:/usr/bin:/bin"
-unset LD_LIBRARY_PATH LIBRARY_PATH CPATH CPLUS_INCLUDE_PATH C_INCLUDE_PATH
-unset CMAKE_PREFIX_PATH PYTHONPATH PYTHONHOME CC CXX CFLAGS CXXFLAGS LDFLAGS
+export PATH="$build_root/venv/bin:$host_tools_path"
 ```
 
-The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. They are initialized in this checkout at the recorded gitlinks with forbidden-name sparse exclusions. Preserve those checkouts and verify them before building:
+The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. Initialize them at the recorded gitlinks with the workspace's required sparse exclusions, or preserve existing matching checkouts. Verify them before building:
 
 ```bash
 git -C "$tvm_source" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
@@ -50,13 +59,13 @@ git -C "$llvm_source" sparse-checkout set --no-cone --stdin <<'PATTERNS'
 !*[vV][lL][sS][iI]*
 PATTERNS
 git -C "$llvm_source" checkout --detach llvmorg-18.1.8
-/usr/bin/cmake -S "$llvm_source/llvm" -B "$llvm_build" -G Ninja -DCMAKE_MAKE_PROGRAM="$host_ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=/usr/bin/gcc -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
+"$host_cmake" -S "$llvm_source/llvm" -B "$llvm_build" -G Ninja -DCMAKE_MAKE_PROGRAM="$host_ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="$host_cc" -DCMAKE_CXX_COMPILER="$host_cxx" \
   '-DLLVM_TARGETS_TO_BUILD=X86;RISCV' -DLLVM_ENABLE_PROJECTS= -DLLVM_BUILD_LLVM_DYLIB=ON -DLLVM_LINK_LLVM_DYLIB=ON -DLLVM_DYLIB_COMPONENTS=all -DBUILD_SHARED_LIBS=OFF \
   -DLLVM_INCLUDE_TOOLS=ON -DLLVM_BUILD_TOOLS=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_ENABLE_ASSERTIONS=OFF \
   -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_ZLIB=OFF
-/usr/bin/cmake --build "$llvm_build" --target LLVM llvm-config --parallel 16
+"$host_cmake" --build "$llvm_build" --target LLVM llvm-config --parallel "$build_jobs"
 # LLVM 18 creates this compatibility name during installation, but not in its build tree.
-/usr/bin/cmake -E create_symlink libLLVM.so.18.1 "$llvm_build/lib/libLLVM-18.so"
+"$host_cmake" -E create_symlink libLLVM.so.18.1 "$llvm_build/lib/libLLVM-18.so"
 "$llvm_build/bin/llvm-config" --version --targets-built --shared-mode --link-shared
 ```
 
@@ -64,9 +73,8 @@ Consume the LLVM build tree directly, retaining its source and generated include
 
 ```bash
 tvm_build="$build_root/host"
-/usr/bin/cmake -S "$tvm_source" -B "$tvm_build" -G Ninja -C "$setup_dir/host-config.cmake" -DCMAKE_MAKE_PROGRAM="$host_ninja" \
-  -DCMAKE_C_COMPILER=/usr/bin/gcc -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DUSE_LLVM="$llvm_build/bin/llvm-config --link-shared" -DCMAKE_BUILD_RPATH="$llvm_build/lib"
-/usr/bin/cmake --build "$tvm_build" --parallel 16
+"$host_cmake" -S "$tvm_source" -B "$tvm_build" -G Ninja -C "$setup_dir/host-config.cmake" -DCMAKE_MAKE_PROGRAM="$host_ninja" -DCMAKE_C_COMPILER="$host_cc" -DCMAKE_CXX_COMPILER="$host_cxx" -DUSE_LLVM="$llvm_build/bin/llvm-config --link-shared" -DCMAKE_BUILD_RPATH="$llvm_build/lib"
+"$host_cmake" --build "$tvm_build" --parallel "$build_jobs"
 export PYTHONPATH="$tvm_source/python"
 export TVM_LIBRARY_PATH="$tvm_build"
 export TVM_FFI=ctypes
@@ -75,7 +83,7 @@ export TEST_DATA_ROOT_PATH="$build_root/cache/tvm-test-data"
 python "$tvm_source/apps/gemmini/verify_host.py" --output "$build_root/host-smoke.json"
 ```
 
-The existing local environment can be restored with `source "$build_root/activate.sh"`. This generated helper contains machine-specific paths; use the commands above to reproduce the setup elsewhere.
+To reuse a build in another shell, restore `merlin_root`, `setup_dir`, `build_root`, `tvm_source` and `tvm_build` for that checkout, activate `"$build_root/venv/bin/activate"`, and reapply the TVM environment exports above. A locally generated activation helper is optional and must match the current filesystem layout; this recipe does not require one.
 
 Keep `host-smoke.json`, `host-manifest.json`, `tvm-host.patch` and build logs under the build root. The receipt records the loaded library, LLVM support, guard mode and numerical/rejection checks; the manifest and patch identify the tested compiler beyond its base Git SHA. Local progress notes retain machine-specific setup history.
 
@@ -89,7 +97,7 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 TVM_NUM_THREADS=1
 python "$tvm_source/apps/gemmini/verify_onnx.py" --output-dir "$build_root/frontend/current"
 ```
 
-The current machine reuses an existing PyTorch installation because the CPU wheel download domain is blocked. Its generated `$build_root/local-torch/` overlay contains symlinks to only `torch`, `torchgen`, `functorch`, `nvidia` and `torch-2.10.0.dist-info` from Chipyard's `.conda-env/lib/python3.10/site-packages/`. The remaining packages are pinned and installed in the isolated host environment. After sourcing `activate.sh`, add the existing overlay with `export PYTHONPATH="$PYTHONPATH:$build_root/local-torch"`. This overlay is machine-specific and is not part of a fresh installation recipe; the report records the resolved package locations. No GPU is used.
+A fresh setup installs the pinned packages into its own host environment. The recorded verification reused an existing PyTorch installation because of a local download restriction; that workaround is not a prerequisite. Reports record the actual dependency versions and resolved package locations. All checks execute on CPU, including when the installed framework distribution contains CUDA support.
 
 All ten cases passed locally: matmul, batched matmul, convolution, LayerNorm and RMSNorm at opsets 17 and 18. Each compares PyTorch, ONNX ReferenceEvaluator and Relax LLVM CPU results, requiring equal output shapes/dtypes and `rtol=1e-4, atol=1e-5`. Maximum absolute Relax-versus-PyTorch error was `2.40e-5` (LayerNorm). These are small synthetic frontend checks, not full-model or Gemmini results.
 
@@ -133,7 +141,7 @@ export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 TVM_NUM_THREADS=4
 python "$setup_dir/verify_resnet.py" --model2mlir-root "$model2mlir_source" --tvm-source "$tvm_source" --output-dir "$build_root/resnet50-v1_5"
 ```
 
-Restore the local PyTorch overlay as described above when using this machine's existing environment. The verifier clears inherited ResNet dataset/calibration settings during loader construction and sets `RANDOM=1`, `PRETRAINED=0`, `PAPER_READY=0` and two session steps through the loader's named environment variables. Model initialization uses seed 194; images use the loader's independent seed 20260830. It preserves zero-valued parameters, checks the state hash before/after, and verifies the [3,4,6,3] stage depths and v1.5 downsampling strides.
+The verifier clears inherited ResNet dataset/calibration settings during loader construction and sets `RANDOM=1`, `PRETRAINED=0`, `PAPER_READY=0` and two session steps through the loader's named environment variables. Model initialization uses seed 194; images use the loader's independent seed 20260830. It preserves zero-valued parameters, checks the state hash before/after, and verifies the [3,4,6,3] stage depths and v1.5 downsampling strides.
 
 The checked model has 25,557,032 parameters and 53 convolution modules, takes float32 NCHW `[1,3,224,224]` input and produces float32 `[1,1000]` logits. It exports legacy ONNX opset 17, runs strict ONNX checking and shape inference, imports frozen parameters into Relax, builds LLVM once, and checks both images against PyTorch. Both passed with preselected `rtol=1e-4, atol=1e-4`; maximum absolute errors were `8.39234e-5` and `9.15527e-5`.
 
