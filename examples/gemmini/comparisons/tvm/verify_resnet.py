@@ -1,4 +1,4 @@
-"""RANDOM-INITIALIZED STRUCTURAL DIAGNOSTIC: ResNet50 v1.5 FP32 on the host CPU."""
+"""Verify ResNet50 v1.5 FP32 on host CPU using random diagnostics or supplied local artifacts."""
 
 import argparse
 from collections import Counter
@@ -42,6 +42,74 @@ def file_identity(path, allowed_path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return {"path": str(path), "sha256": digest.hexdigest()}
+
+
+def load_images(path, np):
+    identity = file_identity(path, safe_path)
+    with np.load(identity["path"], allow_pickle=False) as data:
+        if "images" not in data.files:
+            raise ValueError("Input NPZ must contain an images array")
+        images = data["images"]
+    if images.dtype != np.float32:
+        raise ValueError("Input images must be float32; preprocessing and dtype conversion must be explicit")
+    if images.ndim == 4:
+        images = images[:, None, :, :, :]
+    if images.ndim != 5 or images.shape[0] < 1 or images.shape[1:] != (1, 3, 224, 224):
+        raise ValueError("Expected images shaped [N,3,224,224] or [N,1,3,224,224], with N positive")
+    if not np.isfinite(images).all():
+        raise ValueError("Input images contain nonfinite values")
+    return np.ascontiguousarray(images), identity
+
+
+def load_checkpoint(model, path, torch):
+    identity = file_identity(path, safe_path)
+    with Path(identity["path"]).open("rb") as stream:
+        state = torch.load(stream, map_location="cpu", weights_only=True)
+    expected = model.state_dict()
+    if not isinstance(state, dict) or set(state) != set(expected):
+        raise ValueError("Checkpoint must be a plain state_dict with exactly the model's parameter and buffer keys")
+    for name, value in state.items():
+        if not isinstance(value, torch.Tensor) or value.layout != torch.strided:
+            raise ValueError(f"Checkpoint entry {name} must be a dense tensor")
+        if value.shape != expected[name].shape or value.dtype != expected[name].dtype:
+            raise ValueError(f"Checkpoint shape or dtype mismatch for {name}; implicit conversion is not permitted")
+        if not torch.isfinite(value).all():
+            raise ValueError(f"Checkpoint entry {name} contains nonfinite values")
+    model.load_state_dict(state, strict=True)
+    loaded = model.state_dict()
+    if any(not torch.equal(loaded[name], value) for name, value in state.items()):
+        raise AssertionError("Loaded model does not preserve the supplied state_dict")
+    if file_identity(identity["path"], safe_path) != identity:
+        raise ValueError("Checkpoint file changed while loading")
+    return identity
+
+
+def load_model(loader, args, torch, np):
+    supplied, artifacts = None, {}
+    if args.inputs is not None:
+        supplied, artifacts["inputs"] = load_images(args.inputs, np)
+    isolated = {"M2M_RESNET_RANDOM": "1", "M2M_RESNET_PRETRAINED": "0", "M2M_RESNET_PAPER_READY": "0", "M2M_SESSION_STEPS": str(len(supplied) if supplied is not None else 2)}
+    if supplied is not None:
+        isolated.update({"M2M_RESNET_INPUT_NPZ": artifacts["inputs"]["path"], "M2M_RESNET_INPUT_SOURCE": args.input_source, "M2M_RESNET_PREPROCESSING": args.preprocessing})
+    inherited = {key: value for key, value in os.environ.items() if key.startswith("M2M_RESNET_") or key == "M2M_SESSION_STEPS"}
+    for key in inherited:
+        os.environ.pop(key)
+    os.environ.update(isolated)
+    try:
+        model, _ = loader.get_model_and_inputs()
+    finally:
+        for key in isolated:
+            os.environ.pop(key, None)
+        os.environ.update(inherited)
+    model = model.cpu().eval()
+    if supplied is not None:
+        if not np.array_equal(model.session_images.numpy(), supplied):
+            raise AssertionError("Loader changed the supplied image stream")
+        artifacts["checkpoint"] = load_checkpoint(model.model, args.checkpoint, torch)
+        model.session_provenance.update({"checkpoint": "supplied_state_dict", "checkpoint_sha256": loader._state_dict_sha256(model.model), "checkpoint_file_sha256": artifacts["checkpoint"]["sha256"], "full_checkpoint": True, "training_provenance": "unverified", "synthetic_inputs": None, "input_declarations_verified": False, "calibration_source": "not_used"})
+    if model.paper_ready:
+        raise AssertionError("Frontend verification must not claim paper qualification")
+    return model, {"artifacts": artifacts, "loader_environment": isolated}
 
 
 def onnx_inventory(model, onnx):
@@ -97,12 +165,22 @@ def main():
     parser.add_argument("--model2mlir-root", required=True, type=Path)
     parser.add_argument("--tvm-source", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--checkpoint", type=Path, help="Local plain torchvision ResNet50 state_dict; no download")
+    parser.add_argument("--inputs", type=Path, help="NPZ with an images array; every supplied image is checked")
+    parser.add_argument("--input-source", help="Declared origin of the supplied image stream")
+    parser.add_argument("--preprocessing", help="Declared preprocessing already applied to the images")
     args = parser.parse_args()
+    supplied = (args.checkpoint, args.inputs, args.input_source, args.preprocessing)
+    if any(value is not None for value in supplied) and not all(value is not None and str(value).strip() for value in supplied):
+        parser.error("Supplied-artifact mode requires --checkpoint, --inputs, --input-source and --preprocessing together")
     sys.dont_write_bytecode = True
     output = safe_path(args.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
+    try:
+        output.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        parser.error("--output-dir must be a new directory to preserve existing artifacts")
     allowed_path = safe_path
-    report = {"status": "failed", "stage": "initialization", "scope": __doc__, "trained_model": False, "paper_validation": False, "seed": 194, "rtol": RTOL, "atol": ATOL, "images": [], "verifier_source": file_identity(__file__, allowed_path)}
+    report = {"status": "failed", "stage": "initialization", "scope": __doc__, "mode": "supplied_artifacts" if args.checkpoint else "random_diagnostic", "trained_model": None if args.checkpoint else False, "paper_validation": False, "seed": 194, "rtol": RTOL, "atol": ATOL, "images": [], "verifier_source": file_identity(__file__, allowed_path)}
 
     def write_json(name, data):
         allowed_path(output / name).write_text(json.dumps(data, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
@@ -133,25 +211,16 @@ def main():
         report["torchvision_resnet_source"] = helper.identity(resnet_source.__file__)
         loader_path = allowed_path(allowed_path(args.model2mlir_root) / "workloads/resnet50_v1_5/loader.py")
         report["loader_source"] = helper.identity(loader_path)
-        stage("load_random_initialized_model")
-        inherited = {key: value for key, value in os.environ.items() if key.startswith("M2M_RESNET_") or key == "M2M_SESSION_STEPS"}
-        for key in inherited:
-            os.environ.pop(key)
-        isolated = {"M2M_RESNET_RANDOM": "1", "M2M_RESNET_PRETRAINED": "0", "M2M_RESNET_PAPER_READY": "0", "M2M_SESSION_STEPS": "2"}
-        os.environ.update(isolated)
-        try:
-            loader = load_module("resnet_structural_loader", loader_path)
-            model, _ = loader.get_model_and_inputs()
-        finally:
-            for key in isolated:
-                os.environ.pop(key, None)
-            os.environ.update(inherited)
-        model = model.cpu().eval()
+        stage("load_supplied_artifacts" if args.checkpoint else "load_random_initialized_model")
+        loader = load_module("resnet_structural_loader", loader_path)
+        model, loaded = load_model(loader, args, torch, np)
+        report["artifacts"] = loaded["artifacts"]
         images = model.session_images
-        if images.dtype != torch.float32 or tuple(images.shape) != (2, 1, 3, 224, 224) or torch.equal(images[0], images[1]) or not torch.isfinite(images).all():
-            raise AssertionError("Expected two distinct finite FP32 NCHW loader images")
-        if model.paper_ready or model.session_provenance["checkpoint"] != "random_init":
-            raise AssertionError("Expected explicit random initialization without paper-ready attribution")
+        if images.dtype != torch.float32 or images.ndim != 5 or tuple(images.shape[1:]) != (1, 3, 224, 224) or len(images) < 1 or not torch.isfinite(images).all():
+            raise AssertionError("Expected a nonempty finite FP32 NCHW image stream")
+        if args.checkpoint is None and (len(images) != 2 or torch.equal(images[0], images[1]) or model.session_provenance["checkpoint"] != "random_init"):
+            raise AssertionError("Expected random initialization and two distinct diagnostic images")
+        report["session"] = {"declared_images": len(images), "checked_images": 0, "complete": False}
         backbone = model.model
         blocks = [len(getattr(backbone, f"layer{i}")) for i in range(1, 5)]
         strides = {name: {"stride": list(module.stride), "weight_shape": list(module.weight.shape), "weight_dtype": str(module.weight.dtype), "input_layout": "NCHW", "weight_layout": "OIHW"} for name, module in backbone.named_modules() if isinstance(module, torch.nn.Conv2d)}
@@ -160,7 +229,7 @@ def main():
         if any(value.dtype != torch.float32 for value in model.parameters()):
             raise AssertionError("Expected original full FP32 model parameters")
         state_hash = loader._state_dict_sha256(backbone)
-        report["model"] = {"architecture": "ResNet50 v1.5", "state_dict_sha256": state_hash, "parameter_count": sum(value.numel() for value in backbone.parameters()), "module_count": sum(1 for _ in backbone.modules()), "stage_blocks": blocks, "conv_modules": strides, "loader_provenance": model.session_provenance, "loader_environment": isolated, "input_layout": "NCHW", "parameter_perturbation": False}
+        report["model"] = {"architecture": "ResNet50 v1.5", "state_dict_sha256": state_hash, "parameter_count": sum(value.numel() for value in backbone.parameters()), "module_count": sum(1 for _ in backbone.modules()), "stage_blocks": blocks, "conv_modules": strides, "loader_provenance": model.session_provenance, "loader_environment": loaded["loader_environment"], "input_layout": "NCHW", "parameter_perturbation": False}
         expected_outputs = []
         for index, image in enumerate(images):
             stage(f"torch_execute_image_{index}")
@@ -209,11 +278,18 @@ def main():
             delta = np.abs(actual - expected)
             comparison = {"max_absolute_error": float(delta.max()), "max_relative_error": float((delta / np.maximum(np.abs(expected), ATOL)).max()), "passed": bool(np.allclose(actual, expected, rtol=RTOL, atol=ATOL, equal_nan=False))}
             report["images"].append({"index": index, "input_sha256": hashlib.sha256(image.numpy().tobytes()).hexdigest(), "torch_output": helper.tensors([expected])[0], "relax_output": helper.tensors([actual])[0], "finite": True, "relax_vs_torch": comparison})
+            report["session"]["checked_images"] = len(report["images"])
             write_json("results.json", report)
         if loader._state_dict_sha256(backbone) != state_hash:
             raise AssertionError("Model parameters or buffers changed during verification")
         if not all(record["relax_vs_torch"]["passed"] for record in report["images"]):
             raise AssertionError("Relax/PyTorch output mismatch at fixed thresholds")
+        for identity in report["artifacts"].values():
+            if file_identity(identity["path"], allowed_path) != identity:
+                raise AssertionError("Supplied artifact changed during verification")
+        report["session"]["complete"] = len(report["images"]) == len(images)
+        if not report["session"]["complete"]:
+            raise AssertionError("Verification did not cover the entire image stream")
         report["status"] = "passed"
         stage("complete")
     except Exception as error:
