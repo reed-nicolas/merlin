@@ -1,6 +1,6 @@
 # Gemmini: TVM comparison plan
 
-The [isolated host setup](HOST_SETUP.md) builds LLVM 18.1.8 and the pinned TVM checkout with an explicit guard for unavailable automatic-copy lowering. The host/guard checks and ten synthetic PyTorch → ONNX → Relax CPU cases passed. The importer ablation confirms the inherited opset-18 reduction-axis fix is needed for RMSNorm. Full-model and Gemmini execution work remain pending.
+The [isolated host setup](HOST_SETUP.md) builds LLVM 18.1.8 and the pinned TVM checkout with an explicit guard for unavailable automatic-copy lowering. The host/guard checks and twenty synthetic frontend CPU cases passed. Importer ablations establish several inherited fixes and exposed an int64-narrowing bug now corrected locally. Full-model and Gemmini execution work remain pending.
 
 The YAML files and model selections below are planning inputs, with no executable schema or runner. They do not establish compilation, numerical correctness, hardware execution or timing. Paths in YAML use the Merlin checkout as the base unless an explicit environment reference is present; environment references are documentation, not automatically expanded inputs.
 
@@ -13,6 +13,10 @@ The YAML files and model selections below are planning inputs, with no executabl
 | SmolVLA (`smolvla`) | Full application | Prefix, denoising, action decode |
 
 For every model, source, checkpoint, input dataset, capture, quantization, calibration, host partition, numerical acceptance and measurement boundary remain unselected.
+
+The existing ResNet loader is `model2MLIR/workloads/resnet50_v1_5/loader.py`, inspected at model2MLIR revision `7915e23475c6db446a3c404847b11e8bc72c8a27`. It constructs torchvision ResNet50 with `IMAGENET1K_V2` weights and consumes float32 NCHW `[1,3,224,224]` images. This identifies an available implementation; “canonical ResNet50” still needs an explicit variant before the paper workload is frozen.
+
+The loader distinguishes attributed preprocessed image streams from seeded Gaussian diagnostic inputs, and records checkpoint/input hashes when executed. It defaults to a 256-image session; the current TVM driver exports a single forward. Neither a stored `_full` directory name nor that forward alone establishes the desired benchmark session. The old TVM/K1 driver also perturbs all-zero parameter tensors; reusing that behavior would change checkpoint identity. A new Gemmini adapter must preserve the selected checkpoint and record actual inputs, preprocessing and any quantization.
 
 The repository starting point is Apache TVM v0.19.0 plus the five UCB frontend fixes retained on `ucb-bar/tvm` branch `merlin/relax-onnx-fixes`. The independent fork checkout is `third_party/baselines/tvm-gemmini`, with `gemmini/bringup` for new work. See the [dependency setup](../../../../third_party/baselines/README.md) for remotes and pins. Jack selected Gemmini's C operator library for baseline fairness. Stock int8 Gemmini with a Linux host and Relax VM remains a proposal pending platform verification. Hardware revision/configuration, generated headers, host runtime and instruction-loop policy remain explicit inputs.
 

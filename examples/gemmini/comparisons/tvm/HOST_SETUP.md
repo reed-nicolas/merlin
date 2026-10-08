@@ -104,4 +104,21 @@ git -C "$tvm_source" show d608061677e535f12b64c072d7a109a645bcca73:python/tvm/re
 python "$tvm_source/apps/gemmini/verify_onnx.py" --output-dir "$build_root/frontend/reduction-fix-importer" --importer-source "$build_root/frontend/reduction-fix-importer.py" --case rms_norm
 ```
 
-The Apache importer run is expected to exit nonzero: nine cases passed, but opset-18 RMSNorm produced incorrect values (maximum absolute error `1.19899`). Both RMSNorm opsets passed with just `d608061`, confirming the reduction-axis fix is required for this graph. This compares historical Python importers on the current runtime, not complete historical TVM builds. The other four inherited patches and the reported BF16 sigmoid issue need separate probes; these cases do not establish their necessity or resolution. Preserve each variant's results in its own directory.
+The Apache importer run is expected to exit nonzero: nine cases passed, but opset-18 RMSNorm produced incorrect values (maximum absolute error `1.19899`). Both RMSNorm opsets passed with just `d608061`, confirming the reduction-axis fix is required for this graph. This compares historical Python importers on the current runtime, not complete historical TVM builds. Preserve each variant's results in its own directory.
+
+## Focused importer regressions
+
+```bash
+python "$tvm_source/apps/gemmini/verify_onnx.py" --suite importer --output-dir "$build_root/frontend/importer-dtype-fixed"
+```
+
+This suite constructs schema-checked ONNX graphs independently of the exporter and compares NumPy expectations, ONNX ReferenceEvaluator and Relax execution. It covers shape-array arithmetic, negative Gather indices as runtime inputs and constants, lower-rank Expand, and scalar ConstantOfShape at both opsets. All ten importer cases and all ten exporter cases passed after the dtype fix below. Integer results require exact dtype, shape and value equality.
+
+| Inherited change | Evidence and remaining limit |
+| --- | --- |
+| `537a5e0`: binary scalar/tensor folding | Apache's importer fails the valid Shape → Gather → Add graph. The inherited fix imports it but silently narrows int64 arrays to int32. The local follow-up passes `arr.dtype` explicitly to `relax.const`; the regression preserves `1099511627785`, previously truncated to `9`. |
+| `75791d9`: negative Gather | Current constant/runtime integer-index cases pass. Historical importer overrides retain IR without executing unchecked negative indices. Mixed-dtype ScatterND was not tested because that case violates the ONNX schema. |
+| `db359fe`: Gather casts/normalization | Valid runtime integer Gather passes, but its imported IR is identical with `75791d9` alone, so this case does not establish a need for the later normalization change. Float-index Gather is outside the valid ONNX gate. |
+| `fb78e0e`: Expand/ConstantOfShape | Lower-rank Expand and scalar ConstantOfShape fail import immediately before this patch and pass with it. |
+
+The dtype comparison uses identical saved ONNX graphs against the inherited and fixed importers. Reports remain under distinct `frontend/` subdirectories, including `inherited-large-shape`, `importer-dtype-fixed` and `torch-after-dtype-fix`. The BF16 sigmoid limitation and broader model coverage remain untested. The local Python importer fix changes source identity without rebuilding the C++ library.
