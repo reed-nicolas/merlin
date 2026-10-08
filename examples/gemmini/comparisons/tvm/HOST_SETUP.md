@@ -156,3 +156,29 @@ The checked model has 25,557,032 parameters and 53 convolution modules, takes fl
 All inferred tensor shapes/dtypes are concrete. Convolutions use NCHW/OIHW and the classifier's stored weight uses OI with `transB=1`. Evaluation-mode BatchNorm is folded into convolution; this explains its absence from the exported graph. Relax contains 53 conv2d, one matmul, 70 adds (including biases), 49 ReLUs, one max pool, one mean, 54 reshapes and one permutation; ONNX Identity nodes disappear. This inventory identifies integration work without asserting Gemmini eligibility for any operation.
 
 The output directory retains `results.json`, the exported and shape-inferred ONNX graphs, `onnx_inventory.json`, `relax_inventory.json`, imported Relax IR and two input/reference/output archives. Reports bind the verifier, loader, torchvision source, input/model hashes, frontend source and loaded TVM library. These are full-architecture compiler diagnostics; pretrained checkpoint fidelity, real-image quality, the intended multi-image paper session and Gemmini execution remain separate gates.
+
+## Supplied ResNet50 artifacts
+
+Supply all four options below together to compare a local checkpoint against every supplied image. Omitting them retains the two-image random diagnostic. This mode uses the same host dependencies and never downloads weights.
+
+```bash
+python "$setup_dir/verify_resnet.py" \
+  --model2mlir-root /absolute/path/to/model2MLIR --tvm-source "$tvm_source" \
+  --checkpoint /absolute/path/to/resnet50-state-dict.pt \
+  --inputs /absolute/path/to/images.npz \
+  --input-source 'declared dataset/split/sample-list identifier' \
+  --preprocessing 'declared preprocessing already applied' \
+  --output-dir "$build_root/resnet50-supplied-new-run"
+```
+
+Use a new output directory for each invocation; an existing directory is rejected to preserve prior evidence. The checkpoint must be a plain torchvision ResNet50 state dict, loaded on CPU with `weights_only=True`; keys, tensor dtypes and shapes must match exactly, and all values must be finite. Nested training checkpoints and implicit conversion are rejected.
+
+The NPZ must contain an `images` array of float32 values shaped `[N,3,224,224]` or `[N,1,3,224,224]`, with positive N and finite values. No dtype conversion or preprocessing is applied. One LLVM build checks every image against PyTorch at the same fixed tolerances as the diagnostic.
+
+Reports record SHA-256 digests of both artifact files and the loaded model state. Source and preprocessing labels are declarations, not independently verified facts; supplying a complete checkpoint does not establish pretrained status or training provenance. This mode provides no calibration or accuracy claim, and the verifier always records `paper_validation: false`. External qualification criteria remain to be selected and satisfied.
+
+The supplied-file path passed a three-image CPU regression using a synthetic checkpoint distinct from the default initialization, including a repeated image to check stream preservation. Maximum absolute error was `9.16e-5` at `rtol=atol=1e-4`; this remains a synthetic regression. Five focused tests cover artifact preservation, invalid checkpoints/images and environment isolation:
+
+```bash
+PYTHONPATH="$merlin_root/src:$PYTHONPATH" python "$merlin_root/merlin/tests/gemmini/test_tvm_resnet_artifacts.py"
+```
