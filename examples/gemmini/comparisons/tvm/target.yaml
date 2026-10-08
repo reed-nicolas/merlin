@@ -24,7 +24,7 @@ recommendation:
   hardware: stock_int8_gemmini
   host_runtime: linux_relax_vm
 selection:
-  lowering_route: gemmini_c_library # Selected by Jack for baseline fairness.
+  lowering_route: gemmini_c_library # Selected for baseline fairness.
   hardware_variant: null # Stock versus MX.
   hardware_revision: null
   hardware_configuration: null
@@ -36,7 +36,7 @@ selection:
   measurement_boundary: null
 measurement:
   final_substrate: firesim
-  coordination: Agustin/Jack # Platform access and timing/capture procedure still pending.
+  coordination: platform_owners # Platform access and timing/capture procedure still pending.
 workload_order:
   - resnet50 # Canonical model; exact variant/checkpoint still pending.
   - tiny_llama # TinyLlama 1B; exact checkpoint/session still pending.
