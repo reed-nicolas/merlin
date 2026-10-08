@@ -84,10 +84,68 @@ def load_checkpoint(model, path, torch):
     return identity
 
 
+def load_labels(path, input_identity, count):
+    identity = file_identity(path, safe_path)
+
+    def unique_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate manifest key: {key}")
+            result[key] = value
+        return result
+
+    with Path(identity["path"]).open(encoding="utf-8") as stream:
+        manifest = json.load(stream, object_pairs_hook=unique_keys)
+    if not isinstance(manifest, dict) or set(manifest) != {"input_sha256", "class_ids", "samples"}:
+        raise ValueError("Labels manifest must contain input_sha256, class_ids and samples")
+    if not isinstance(manifest["input_sha256"], str) or manifest["input_sha256"] != input_identity["sha256"]:
+        raise ValueError("Labels input_sha256 must match the supplied NPZ file")
+    class_ids = manifest["class_ids"]
+    if not isinstance(class_ids, list) or len(class_ids) != 1000:
+        raise ValueError("class_ids must list 1000 class identifiers in logit order")
+    if any(not isinstance(value, str) or not value.strip() for value in class_ids) or len(set(class_ids)) != 1000:
+        raise ValueError("class_ids must be unique nonempty strings")
+    samples = manifest["samples"]
+    if not isinstance(samples, list) or len(samples) != count:
+        raise ValueError("Labels samples must match the complete image stream in order")
+    for sample in samples:
+        if not isinstance(sample, dict) or set(sample) != {"id", "label"}:
+            raise ValueError("Each sample must contain id and label")
+        if not isinstance(sample["id"], str) or not sample["id"].strip():
+            raise ValueError("Sample id must be a nonempty string")
+        if type(sample["label"]) is not int or not 0 <= sample["label"] < 1000:
+            raise ValueError("Sample label must be an integer class index from 0 to 999")
+    if file_identity(identity["path"], safe_path) != identity:
+        raise ValueError("Labels file changed while loading")
+    return manifest, identity
+
+
+def classify_logits(logits, label, np):
+    if logits.shape != (1, 1000) or not np.isfinite(logits).all():
+        raise ValueError("Classification requires finite logits shaped [1,1000]")
+    ranking = np.lexsort((np.arange(1000), -logits[0]))[:5].tolist()
+    return {"top5": ranking, "top1_hit": ranking[0] == label, "top5_hit": label in ranking}
+
+
+def accuracy_counts(classifications):
+    count = len(classifications)
+    if count < 1:
+        raise ValueError("Accuracy requires a nonempty complete stream")
+    result = {"samples": count, "top1_disagreements": sum(row["torch"]["top5"][0] != row["relax"]["top5"][0] for row in classifications)}
+    for backend in ("torch", "relax"):
+        hits = {key: sum(row[backend][key + "_hit"] for row in classifications) for key in ("top1", "top5")}
+        result[backend] = {key: {"correct": value, "rate": value / count} for key, value in hits.items()}
+    return result
+
+
 def load_model(loader, args, torch, np):
     supplied, artifacts = None, {}
     if args.inputs is not None:
         supplied, artifacts["inputs"] = load_images(args.inputs, np)
+    labels = None
+    if getattr(args, "labels", None) is not None:
+        labels, artifacts["labels"] = load_labels(args.labels, artifacts["inputs"], len(supplied))
     isolated = {"M2M_RESNET_RANDOM": "1", "M2M_RESNET_PRETRAINED": "0", "M2M_RESNET_PAPER_READY": "0", "M2M_SESSION_STEPS": str(len(supplied) if supplied is not None else 2)}
     if supplied is not None:
         isolated.update({"M2M_RESNET_INPUT_NPZ": artifacts["inputs"]["path"], "M2M_RESNET_INPUT_SOURCE": args.input_source, "M2M_RESNET_PREPROCESSING": args.preprocessing})
@@ -109,7 +167,7 @@ def load_model(loader, args, torch, np):
         model.session_provenance.update({"checkpoint": "supplied_state_dict", "checkpoint_sha256": loader._state_dict_sha256(model.model), "checkpoint_file_sha256": artifacts["checkpoint"]["sha256"], "full_checkpoint": True, "training_provenance": "unverified", "synthetic_inputs": None, "input_declarations_verified": False, "calibration_source": "not_used"})
     if model.paper_ready:
         raise AssertionError("Frontend verification must not claim paper qualification")
-    return model, {"artifacts": artifacts, "loader_environment": isolated}
+    return model, {"artifacts": artifacts, "loader_environment": isolated, "labels": labels}
 
 
 def onnx_inventory(model, onnx):
@@ -169,10 +227,13 @@ def main():
     parser.add_argument("--inputs", type=Path, help="NPZ with an images array; every supplied image is checked")
     parser.add_argument("--input-source", help="Declared origin of the supplied image stream")
     parser.add_argument("--preprocessing", help="Declared preprocessing already applied to the images")
+    parser.add_argument("--labels", type=Path, help="Optional JSON class order and labels bound to the supplied NPZ")
     args = parser.parse_args()
     supplied = (args.checkpoint, args.inputs, args.input_source, args.preprocessing)
     if any(value is not None for value in supplied) and not all(value is not None and str(value).strip() for value in supplied):
         parser.error("Supplied-artifact mode requires --checkpoint, --inputs, --input-source and --preprocessing together")
+    if args.labels is not None and args.inputs is None:
+        parser.error("--labels requires supplied-artifact mode with all four artifact options")
     sys.dont_write_bytecode = True
     output = safe_path(args.output_dir)
     try:
@@ -215,6 +276,9 @@ def main():
         loader = load_module("resnet_structural_loader", loader_path)
         model, loaded = load_model(loader, args, torch, np)
         report["artifacts"] = loaded["artifacts"]
+        labels = loaded["labels"]
+        if labels is not None:
+            report["label_declarations"] = {"input_sha256": labels["input_sha256"], "class_ids": labels["class_ids"], "samples": labels["samples"], "dataset_truth_verified": False, "checkpoint_class_mapping_verified": False, "tie_order": "ascending_class_index", "accuracy_threshold": None}
         images = model.session_images
         if images.dtype != torch.float32 or images.ndim != 5 or tuple(images.shape[1:]) != (1, 3, 224, 224) or len(images) < 1 or not torch.isfinite(images).all():
             raise AssertionError("Expected a nonempty finite FP32 NCHW image stream")
@@ -278,8 +342,13 @@ def main():
             delta = np.abs(actual - expected)
             comparison = {"max_absolute_error": float(delta.max()), "max_relative_error": float((delta / np.maximum(np.abs(expected), ATOL)).max()), "passed": bool(np.allclose(actual, expected, rtol=RTOL, atol=ATOL, equal_nan=False))}
             report["images"].append({"index": index, "input_sha256": hashlib.sha256(image.numpy().tobytes()).hexdigest(), "torch_output": helper.tensors([expected])[0], "relax_output": helper.tensors([actual])[0], "finite": True, "relax_vs_torch": comparison})
+            if labels is not None:
+                sample = labels["samples"][index]
+                report["images"][-1]["classification"] = {"sample_id": sample["id"], "label": sample["label"], "torch": classify_logits(expected, sample["label"], np), "relax": classify_logits(actual, sample["label"], np)}
             report["session"]["checked_images"] = len(report["images"])
             write_json("results.json", report)
+        if labels is not None:
+            report["descriptive_accuracy"] = accuracy_counts([row["classification"] for row in report["images"]])
         if loader._state_dict_sha256(backbone) != state_hash:
             raise AssertionError("Model parameters or buffers changed during verification")
         if not all(record["relax_vs_torch"]["passed"] for record in report["images"]):

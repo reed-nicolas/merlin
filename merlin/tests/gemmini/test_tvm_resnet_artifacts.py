@@ -2,7 +2,9 @@
 
 import hashlib
 import importlib.util
+import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -141,6 +143,95 @@ class ResNetArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "loader failed"):
                 self.verifier.load_model(SimpleNamespace(get_model_and_inputs=fail), SimpleNamespace(inputs=None), self.torch, self.np)
             self.assertEqual(dict(os.environ), before)
+
+    def labels_manifest(self):
+        return {"input_sha256": "a" * 64, "class_ids": [f"class-{i}" for i in range(1000)], "samples": [{"id": "duplicate", "label": 7}, {"id": "duplicate", "label": 2}]}
+
+    def test_labels_preserve_declared_class_order_and_duplicate_sample_ids(self):
+        manifest = self.labels_manifest()
+        manifest["class_ids"][0], manifest["class_ids"][1] = manifest["class_ids"][1], manifest["class_ids"][0]
+        path = self.root / "labels.json"
+        path.write_text(json.dumps(manifest))
+        actual, identity = self.verifier.load_labels(path, {"sha256": "a" * 64}, 2)
+        self.assertEqual(actual, manifest)
+        self.assert_identity(identity, path)
+
+    def test_invalid_labels_are_rejected(self):
+        valid = self.labels_manifest()
+        cases = {
+            "root_list": [],
+            "missing_mapping": {key: value for key, value in valid.items() if key != "class_ids"},
+            "extra_field": {**valid, "extra": None},
+            "hash_mismatch": {**valid, "input_sha256": "b" * 64},
+            "hash_type": {**valid, "input_sha256": 1},
+            "short_mapping": {**valid, "class_ids": valid["class_ids"][:-1]},
+            "mapping_type": {**valid, "class_ids": {}},
+            "duplicate_class": {**valid, "class_ids": ["same"] * 1000},
+            "empty_class": {**valid, "class_ids": [" "] + valid["class_ids"][1:]},
+            "class_type": {**valid, "class_ids": [None] + valid["class_ids"][1:]},
+            "sample_count": {**valid, "samples": valid["samples"][:1]},
+            "samples_type": {**valid, "samples": {}},
+        }
+        for name, sample in {"bool": {"id": "x", "label": True}, "negative": {"id": "x", "label": -1}, "too_large": {"id": "x", "label": 1000}, "float": {"id": "x", "label": 2.0}, "string": {"id": "x", "label": "2"}, "empty_id": {"id": " ", "label": 2}, "id_type": {"id": 3, "label": 2}, "missing_id": {"label": 2}, "extra_sample_field": {"id": "x", "label": 2, "extra": 0}, "sample_type": []}.items():
+            cases[name] = {**valid, "samples": [sample, valid["samples"][1]]}
+        path = self.root / "labels.json"
+        for name, manifest in cases.items():
+            with self.subTest(case=name):
+                path.write_text(json.dumps(manifest))
+                with self.assertRaises(ValueError):
+                    self.verifier.load_labels(path, {"sha256": "a" * 64}, 2)
+        for text in ('{"input_sha256": 1, "input_sha256": 2}', '{invalid', '{"samples": [{"id": "a", "id": "b"}]}'):
+            with self.subTest(text=text):
+                path.write_text(text)
+                with self.assertRaises(ValueError):
+                    self.verifier.load_labels(path, {"sha256": "a" * 64}, 2)
+
+    def test_ranking_ties_and_complete_stream_counts(self):
+        np = self.np
+        logits = np.zeros((1, 1000), dtype=np.float32)
+        logits[0, [9, 7, 2]] = 1
+        first = self.verifier.classify_logits(logits, 7, np)
+        self.assertEqual(first, {"top5": [2, 7, 9, 0, 1], "top1_hit": False, "top5_hit": True})
+        changed = logits.copy()
+        changed[0, 7] = 2
+        second = self.verifier.classify_logits(changed, 7, np)
+        miss = self.verifier.classify_logits(logits, 999, np)
+        rows = [{"torch": first, "relax": second}, {"torch": second, "relax": second}, {"torch": miss, "relax": miss}]
+        counts = self.verifier.accuracy_counts(rows)
+        self.assertEqual(counts["samples"], 3)
+        self.assertEqual(counts["top1_disagreements"], 1)
+        self.assertEqual(counts["torch"]["top1"], {"correct": 1, "rate": 1 / 3})
+        self.assertEqual(counts["relax"]["top1"], {"correct": 2, "rate": 2 / 3})
+        self.assertEqual(counts["torch"]["top5"], {"correct": 2, "rate": 2 / 3})
+        with self.assertRaises(ValueError):
+            self.verifier.accuracy_counts([])
+        for invalid in (logits[0], np.full_like(logits, np.nan)):
+            with self.assertRaises(ValueError):
+                self.verifier.classify_logits(invalid, 0, np)
+
+    def test_default_loader_has_no_label_artifact(self):
+        model = SimpleNamespace(cpu=lambda: model, eval=lambda: model, paper_ready=False)
+        loaded_model, loaded = self.verifier.load_model(SimpleNamespace(get_model_and_inputs=lambda: (model, ())), SimpleNamespace(inputs=None, labels=None), self.torch, self.np)
+        self.assertIs(loaded_model, model)
+        self.assertIsNone(loaded["labels"])
+        self.assertEqual(loaded["artifacts"], {})
+
+    def test_labels_reject_changes_during_loading(self):
+        path = self.root / "labels.json"
+        path.write_text(json.dumps(self.labels_manifest()))
+        identity = {"path": str(path), "sha256": "before"}
+        with mock.patch.object(self.verifier, "file_identity", side_effect=[identity, {**identity, "sha256": "after"}]):
+            with self.assertRaisesRegex(ValueError, "changed while loading"):
+                self.verifier.load_labels(path, {"sha256": "a" * 64}, 2)
+
+    def test_labels_require_supplied_mode_before_output_creation(self):
+        output = self.root / "output"
+        argv = ["verify_resnet.py", "--model2mlir-root", str(self.root), "--tvm-source", str(self.root), "--output-dir", str(output), "--labels", str(self.root / "labels.json")]
+        with mock.patch.object(sys, "argv", argv), mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as error:
+                self.verifier.main()
+        self.assertEqual(error.exception.code, 2)
+        self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

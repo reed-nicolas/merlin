@@ -175,9 +175,17 @@ Use a new output directory for each invocation; an existing directory is rejecte
 
 The NPZ must contain an `images` array of float32 values shaped `[N,3,224,224]` or `[N,1,3,224,224]`, with positive N and finite values. No dtype conversion or preprocessing is applied. One LLVM build checks every image against PyTorch at the same fixed tolerances as the diagnostic.
 
-Reports record SHA-256 digests of both artifact files and the loaded model state. Source and preprocessing labels are declarations, not independently verified facts; supplying a complete checkpoint does not establish pretrained status or training provenance. This mode provides no calibration or accuracy claim, and the verifier always records `paper_validation: false`. External qualification criteria remain to be selected and satisfied.
+Optionally add `--labels /absolute/path/to/labels.json` in supplied-artifact mode for descriptive classification accuracy. The JSON must contain exactly `input_sha256`, `class_ids` and `samples`. `input_sha256` binds the complete supplied NPZ file. `class_ids` lists 1000 unique nonempty strings in classifier logit order. `samples` lists one object per image in NPZ order, each with exactly a nonempty string `id` and integer `label` from 0 to 999; Boolean labels are rejected. Duplicate sample IDs and repeated images are allowed because the image index identifies each occurrence. For example, a two-image stream uses this structure (replace the abbreviated class list with all 1000 identifiers):
 
-The supplied-file path passed a three-image CPU regression using a synthetic checkpoint distinct from the default initialization, including a repeated image to check stream preservation. Maximum absolute error was `9.16e-5` at `rtol=atol=1e-4`; this remains a synthetic regression. Five focused tests cover artifact preservation, invalid checkpoints/images and environment isolation:
+```json
+{"input_sha256": "<images.npz SHA-256>", "class_ids": ["class-0", "class-1", "...", "class-999"], "samples": [{"id": "sample-a", "label": 7}, {"id": "sample-a", "label": 2}]}
+```
+
+Reports record file hashes and the declared class mapping/sample order, plus per-image PyTorch and Relax top-five indices and top-one/top-five hits. Equal logits rank by ascending class index. Complete-stream counts and rates appear in `descriptive_accuracy`, including top-one disagreements. These metrics have no accuracy acceptance threshold; numerical comparison remains the pass/fail gate. The labels file is rehashed with the other supplied artifacts at the end.
+
+Reports record SHA-256 digests of supplied artifact files and the loaded model state. Source, preprocessing, class order and labels are declarations, not independently verified facts; supplying a complete checkpoint does not establish pretrained status, training provenance or agreement between its classes and the manifest. The verifier performs no calibration, always records `paper_validation: false`, and does not qualify dataset truth or paper accuracy. Omitting `--labels` performs the existing numerical comparison without classification metrics. External qualification criteria remain to be selected and satisfied.
+
+The supplied-file path passed a three-image CPU regression using a synthetic checkpoint distinct from the default initialization, including a repeated image to check stream preservation. Maximum absolute error was `9.16e-5` at `rtol=atol=1e-4`; this remains a synthetic regression. Focused tests cover artifact preservation, invalid checkpoints/images, environment isolation, label validation, ranking ties and count aggregation:
 
 ```bash
 PYTHONPATH="$merlin_root/src:$PYTHONPATH" python "$merlin_root/merlin/tests/gemmini/test_tvm_resnet_artifacts.py"
