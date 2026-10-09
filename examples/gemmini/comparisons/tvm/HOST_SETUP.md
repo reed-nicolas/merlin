@@ -13,7 +13,7 @@ For a new TVM checkout, clone without checkout and apply the mandatory name excl
 ```bash
 export TVM_ROOT=/absolute/path/to/tvm-gemmini
 export TVM_BUILD=/absolute/path/to/tvm-host-build
-tvm_commit=e6dc747ee3fa614c0cea3e9c242698af2c22c1fd
+tvm_commit=aace50b4637a1f60dd66c8cd8d505f0f684a5000
 git clone --filter=blob:none --no-checkout https://github.com/reed-nicolas/tvm.git "$TVM_ROOT"
 git -C "$TVM_ROOT" sparse-checkout set --no-cone --stdin <<'PATTERNS'
 /*
@@ -28,7 +28,7 @@ In the same shell, verify the selected source pin and prepare the host environme
 ```bash
 : "${TVM_ROOT:?Set TVM_ROOT to the independent TVM checkout}"
 : "${TVM_BUILD:?Set TVM_BUILD to the TVM host build directory}"
-test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = e6dc747ee3fa614c0cea3e9c242698af2c22c1fd || { echo 'TVM source pin mismatch' >&2; exit 1; }
+test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = aace50b4637a1f60dd66c8cd8d505f0f684a5000 || { echo 'TVM source pin mismatch' >&2; exit 1; }
 merlin_root="$PWD"
 setup_dir="$merlin_root/examples/gemmini/comparisons/tvm"
 host_python="${TVM_HOST_PYTHON:-$(command -v python3.10)}"
@@ -60,7 +60,7 @@ The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. Initial
 git -C "$TVM_ROOT" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
 ```
 
-A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `e6dc747ee3fa614c0cea3e9c242698af2c22c1fd`. Clone each dependency without checkout and apply the same exclusions before checkout:
+A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `aace50b4637a1f60dd66c8cd8d505f0f684a5000`. Clone each dependency without checkout and apply the same exclusions before checkout:
 
 ```bash
 git -C "$TVM_ROOT" submodule init -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
@@ -271,3 +271,5 @@ python -m pytest -c /dev/null -p no:cacheprovider "$TVM_ROOT/tests/python/relax/
 These packages are optional for ordinary host compilation and untrained candidate generation. Synthetic labels exercise the search machinery only. Actual timing records require consistent workload, compiler, adapter, platform and measurement-protocol bindings plus separate semantic/device correctness gates; these declarations do not authenticate the supplied evidence. Functional Spike execution supplies no timing labels. Record real target measurements separately before selecting a performance result.
 
 The generated graph verifier passes both `--graph-mode baseline` and `--graph-mode optimized`, including final ELF no-FSM and intentional-failure checks. Add `--graph-mode optimized` to the TVM guide's existing command; replace its two tile options with `--search-seed 7` to verify an untrained proposal and record its candidate-specific simulator correctness. Use a fresh output directory for each mode. This is a bounded matmul/bias/ReLU fixture, not a full-model or performance qualification.
+
+Use the same verifier with `--workload conv-residual --conv-kernel 3` for a bounded convolution/residual/requantization graph; kernels 1 and 7 are also checked. Baseline and optimized kernel-3 runs preserve exact raw convolution and final int8 outputs. A fresh `--search-seed 7` run also verifies an untrained convolution schedule proposal. Packing and restoration are TVM graph operations around the existing primitive matmul schedule. The tensor-memory preflight reports liveness, resident storage and caller outputs separately; final ELF/stack checks remain additional evidence. No selected quantized ResNet or deployment-memory claim follows.

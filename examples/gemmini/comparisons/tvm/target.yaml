@@ -7,7 +7,7 @@ source:
   checkout_env: TVM_ROOT
   work_branch: gemmini/bringup
   fork: git@github.com:reed-nicolas/tvm.git
-  commit: e6dc747ee3fa614c0cea3e9c242698af2c22c1fd
+  commit: aace50b4637a1f60dd66c8cd8d505f0f684a5000
   initial_commit: fb78e0e3adcee44948a1542cd394710b3a6f9dba
   apache_release: v0.19.0
   apache_commit: c4dc0c29ff81ddae688da24625a603da3b4a2c0e
