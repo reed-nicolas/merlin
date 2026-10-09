@@ -1,6 +1,6 @@
 # TVM host setup
 
-This recipe builds the [pinned independent TVM checkout](target.yaml) with host LLVM support on Linux. Checks recorded on 2026-10-07 passed CPU matmul, eight guard-rejection cases, twenty synthetic frontend cases and a full ResNet50 v1.5 random-weight host diagnostic. Pretrained/full-session qualification and actual-platform deployment remain pending; bounded generated graphs now pass matched Gemmini functional simulation.
+This recipe builds the [pinned independent TVM checkout](target.yaml) with host LLVM support on Linux. Checks recorded on 2026-10-07 passed CPU matmul, eight guard-rejection cases, twenty synthetic frontend cases and a full ResNet50 v1.5 random-weight host diagnostic. Pretrained quality and actual-platform deployment remain pending; the complete random integer ResNet graph also passes matched Gemmini functional simulation.
 
 The host cache enables the local `USE_HOST_ONLY_AUTO_COPY_GUARD` patch because this restricted checkout lacks `LowerAutoCopy`. The guard preserves unannotated IR and rejects automatic-copy annotations; it does not implement their optimization. This option defaults to OFF and must not coexist with the full implementation. Record the local patch and enabled mode with the base commit.
 
@@ -227,12 +227,35 @@ Optionally add `--labels /absolute/path/to/labels.json` in supplied-artifact mod
 
 Reports record file hashes and the declared class mapping/sample order, plus per-image PyTorch and Relax top-five indices and top-one/top-five hits. Equal logits rank by ascending class index. Complete-stream counts and rates appear in `descriptive_accuracy`, including top-one disagreements. These metrics have no accuracy acceptance threshold; numerical comparison remains the pass/fail gate. The labels file is rehashed with the other supplied artifacts at the end.
 
-Reports record SHA-256 digests of supplied artifact files and the loaded model state. Source, preprocessing, class order and labels are declarations, not independently verified facts; supplying a complete checkpoint does not establish pretrained status, training provenance or agreement between its classes and the manifest. The verifier performs no calibration, always records `paper_validation: false`, and does not qualify dataset truth or paper accuracy. Omitting `--labels` performs the existing numerical comparison without classification metrics. External qualification criteria remain to be selected and satisfied.
+Reports record SHA-256 digests of supplied artifact files and the loaded model state. Source, preprocessing, class order and labels are declarations, not independently verified facts; supplying a complete checkpoint does not establish pretrained status, training provenance or agreement between its classes and the manifest. The default FP32 mode performs no calibration and always records `paper_validation: false`, and does not qualify dataset truth or paper accuracy. Omitting `--labels` performs the existing numerical comparison without classification metrics. External qualification criteria remain to be selected and satisfied.
 
 The supplied-file path passed a three-image CPU regression using a synthetic checkpoint distinct from the default initialization, including a repeated image to check stream preservation. Maximum absolute error was `9.16e-5` at `rtol=atol=1e-4`; this remains a synthetic regression. Focused tests cover artifact preservation, invalid checkpoints/images, environment isolation, label validation, ranking ties and count aggregation:
 
 ```bash
 PYTHONPATH="$merlin_root/src:$PYTHONPATH" python "$merlin_root/merlin/tests/gemmini/test_tvm_resnet_artifacts.py"
+```
+
+## Integer ResNet development recipe
+
+[resnet_quantized.py](resnet_quantized.py) preserves the complete v1.5 classifier and supplies an independent integer reference plus semantic Relax export. Its proposed recipe uses signed symmetric int8, power-of-two per-channel weight/per-tensor activation scales, checked int32 contractions/bias, ties-away-from-zero requantization, explicit residual scale alignment and integer pooling. Gemmini executes all 53 convolutions and the classifier; packing, requantization, residuals, pooling and final FP32 logit dequantization remain declared host work. Calibration must differ from every evaluated tensor by content. The unchanged FP32 checkpoint remains the quality reference.
+
+Use the supplied-artifact command above with these additional options:
+
+```bash
+python "$setup_dir/verify_resnet.py" --model2mlir-root "$model2mlir_source" --tvm-source "$TVM_ROOT" \
+  --checkpoint /absolute/path/to/resnet50-state-dict.pt --inputs /absolute/path/to/evaluation.npz \
+  --input-source 'declared evaluation split/sample list' --preprocessing 'declared resize/crop/normalization' \
+  --labels /absolute/path/to/labels.json --quantized --calibration-inputs /absolute/path/to/calibration.npz \
+  --calibration-source 'distinct calibration split/sample list' --graph-mode both --export-baremetal \
+  --max-top1-drop 0.02 --memory-limit-bytes 268435456 --output-dir "$build_root/resnet50-integer-new-run"
+```
+
+Every supplied image is checked for exact raw int32 and dequantized FP32 agreement. Labels add a development top-one rate-loss gate versus the original FP32 model; the default 0.02 is a proposed development threshold, not approved paper accuracy. Dataset/class declarations and pretrained status remain unqualified by this generic verifier. Tensor-budget admission excludes executable/stack/platform reservations. The optional RV64 export does not execute or measure the model.
+
+The full random 224×224 model passes both host modes and static exports. Its optimized graph also passes matched functional Gemmini Spike for two distinct images repeated twice, with exact outputs, primitive counts, storage/state guards and no-FSM/failure controls. Optimized explicit tensor storage is 34,679,680 bytes; the linked diagnostic image reserves 35,065,808 bytes in a requested generic 256-MiB map. These establish functional feasibility, not deployed capacity, trained quality or timing. Reproduce the numerical admission checks directly:
+
+```bash
+PYTHONPATH="$merlin_root/src:$PYTHONPATH" python "$merlin_root/merlin/tests/gemmini/test_tvm_resnet_quantized.py"
 ```
 
 ## Stateful host sessions
