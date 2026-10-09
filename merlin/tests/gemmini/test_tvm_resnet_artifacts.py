@@ -127,6 +127,115 @@ class ResNetArtifactTests(unittest.TestCase):
                 for key, expected in before.items():
                     self.assertTrue(torch.equal(model.state_dict()[key], expected), key)
 
+    def state_hash(self, model):
+        digest = hashlib.sha256()
+        for name, value in model.state_dict().items():
+            digest.update(name.encode())
+            digest.update(str(value.dtype).encode())
+            digest.update(str(tuple(value.shape)).encode())
+            digest.update(value.detach().cpu().numpy().tobytes())
+        return digest.hexdigest()
+
+    def batchnorm_block(self, bias):
+        torch = self.torch
+
+        class Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv1 = torch.nn.Conv2d(2, 3, 3, padding=1, bias=bias)
+                self.bn1 = torch.nn.BatchNorm2d(3, eps=0.125)
+
+            def forward(self, value):
+                return self.bn1(self.conv1(value))
+
+        model = Block().eval()
+        with torch.no_grad():
+            model.conv1.weight.copy_(torch.arange(54).reshape(3, 2, 3, 3) / 64 - 0.5)
+            model.conv1.weight[1].zero_()
+            if bias:
+                model.conv1.bias.copy_(torch.tensor([0.5, 0.0, -0.25]))
+            model.bn1.weight.copy_(torch.tensor([-2.0, 0.0, 3.0]))
+            model.bn1.bias.copy_(torch.tensor([0.75, 0.0, -1.0]))
+            model.bn1.running_mean.copy_(torch.tensor([0.25, 0.0, -0.5]))
+            model.bn1.running_var.copy_(torch.tensor([0.0, 0.25, 16.0]))
+        return model
+
+    def test_batchnorm_folding_preserves_source_and_matches_independent_formula(self):
+        torch, np = self.torch, self.np
+        for has_bias in (False, True):
+            with self.subTest(bias=has_bias):
+                model = self.batchnorm_block(has_bias)
+                before = {name: value.clone() for name, value in model.state_dict().items()}
+                folded, report = self.verifier.fold_resnet_batchnorm(model, torch, self.state_hash)
+                self.assertEqual(report["source_state_dict_sha256"], self.state_hash(model))
+                self.assertEqual(report["derived_state_dict_sha256"], self.state_hash(folded))
+                self.assertEqual(report["sites"][0]["epsilon"], 0.125)
+                self.assertEqual(report["sites"][0]["conv"], "conv1")
+                self.assertEqual(report["sites"][0]["batchnorm"], "bn1")
+                self.assertIsInstance(folded.bn1, torch.nn.Identity)
+                self.assertIsNot(folded.conv1, model.conv1)
+                self.assertNotEqual(folded.conv1.weight.data_ptr(), model.conv1.weight.data_ptr())
+                # Float64 scalar channel arithmetic is independent of the FP32 folding helper.
+                bn = model.bn1
+                scale = bn.weight.detach().numpy().astype(np.float64) / np.sqrt(bn.running_var.numpy().astype(np.float64) + bn.eps)
+                expected_weight = model.conv1.weight.detach().numpy().astype(np.float64) * scale[:, None, None, None]
+                bias = model.conv1.bias.detach().numpy() if has_bias else np.zeros(3)
+                expected_bias = bn.bias.detach().numpy() + scale * (bias - bn.running_mean.numpy())
+                np.testing.assert_allclose(folded.conv1.weight.detach().numpy(), expected_weight, rtol=1e-6, atol=1e-7)
+                np.testing.assert_allclose(folded.conv1.bias.detach().numpy(), expected_bias, rtol=1e-6, atol=1e-7)
+                for key in ("weight", "bias"):
+                    value = getattr(folded.conv1, key).detach().numpy()
+                    self.assertEqual(report["sites"][0][key + "_sha256"], hashlib.sha256(value.tobytes()).hexdigest())
+                for magnitude in (0.0, 1.0, 1024.0):
+                    data = (torch.arange(40).reshape(1, 2, 4, 5) - 20).float() * magnitude
+                    with torch.no_grad():
+                        actual, expected = folded(data).numpy(), model(data).numpy()
+                    self.assertTrue(self.verifier.compare_output(actual, expected, np)["passed"])
+                for name, value in before.items():
+                    self.assertTrue(torch.equal(model.state_dict()[name], value), name)
+                self.assertTrue(torch.equal(folded.conv1.weight[1], torch.zeros_like(folded.conv1.weight[1])))
+                folded.conv1.weight.data.zero_()
+                self.assertTrue(torch.equal(model.conv1.weight, before["conv1.weight"]))
+
+    def test_batchnorm_folding_rejects_incompatible_sites_without_source_mutation(self):
+        torch = self.torch
+        mutations = {
+            "training": lambda model: model.train(),
+            "child_training": lambda model: model.bn1.train(),
+            "missing_mean": lambda model: setattr(model.bn1, "running_mean", None),
+            "missing_variance": lambda model: setattr(model.bn1, "running_var", None),
+            "no_running_statistics": lambda model: setattr(model.bn1, "track_running_stats", False),
+            "no_affine": lambda model: setattr(model.bn1, "affine", False),
+            "different_channels": lambda model: setattr(model.bn1, "num_features", 4),
+            "zero_epsilon": lambda model: setattr(model.bn1, "eps", 0.0),
+            "nonfinite_epsilon": lambda model: setattr(model.bn1, "eps", float("nan")),
+            "negative_variance": lambda model: model.bn1.running_var.fill_(-1),
+            "nonfinite_variance": lambda model: model.bn1.running_var.fill_(float("inf")),
+            "float64": lambda model: model.double(),
+            "missing_conv": lambda model: setattr(model, "conv1", torch.nn.Identity()),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(case=name):
+                model = self.batchnorm_block(True)
+                mutate(model)
+                before = self.state_hash(model)
+                with self.assertRaises(ValueError):
+                    self.verifier.fold_resnet_batchnorm(model, torch, self.state_hash)
+                self.assertEqual(self.state_hash(model), before)
+        for model in (torch.nn.Identity().eval(), torch.nn.Sequential(torch.nn.BatchNorm2d(3)).eval()):
+            with self.assertRaises(ValueError):
+                self.verifier.fold_resnet_batchnorm(model, torch, self.state_hash)
+
+    def test_batchnorm_folding_supports_resnet_downsample_pair(self):
+        torch = self.torch
+        model = torch.nn.Module()
+        model.downsample = torch.nn.Sequential(torch.nn.Conv2d(2, 3, 1, bias=False), torch.nn.BatchNorm2d(3))
+        model.eval()
+        folded, report = self.verifier.fold_resnet_batchnorm(model, torch, self.state_hash)
+        self.assertEqual(report["sites"][0]["conv"], "downsample.0")
+        self.assertEqual(report["sites"][0]["batchnorm"], "downsample.1")
+        self.assertIsInstance(folded.downsample[1], torch.nn.Identity)
+
     def test_loader_environment_is_isolated_and_restored_on_failure(self):
         inherited = {"M2M_RESNET_INPUT_NPZ": "/unused/images.npz", "M2M_RESNET_CALIBRATION_NPZ": "/unused/calibration.npz", "M2M_RESNET_PRETRAINED": "1", "M2M_RESNET_PAPER_READY": "1", "M2M_SESSION_STEPS": "700"}
 

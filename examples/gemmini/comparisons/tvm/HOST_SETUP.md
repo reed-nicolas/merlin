@@ -199,6 +199,8 @@ All inferred tensor shapes/dtypes are concrete. Convolutions use NCHW/OIHW and t
 
 The output directory retains `results.json`, the exported and shape-inferred ONNX graphs, `onnx_inventory.json`, `relax_inventory.json`, imported Relax IR and two input/reference/output archives. Reports bind the verifier, loader, torchvision source, input/model hashes, frontend source and loaded TVM library. These are full-architecture compiler diagnostics; pretrained checkpoint fidelity, real-image quality, the intended multi-image paper session and Gemmini execution remain separate gates.
 
+Add `--batchnorm-folding --graph-mode both` to validate an explicitly derived FP32 evaluation model. The verifier folds supported Conv/BatchNorm pairs into a separate copy, records each epsilon and derived weight/bias hashes, and compares folded PyTorch and both Relax modes against the unchanged original model. Training mode, missing running statistics and incompatible/nonfinite parameters are rejected. The full random-weight diagnostic passes all 53 sites and both images at the existing tolerances. This isolates folding error before quantization; no calibration, precision policy or pretrained-quality gate is selected.
+
 ## Supplied ResNet50 artifacts
 
 Supply all four options below together to compare a local checkpoint against every supplied image. Omitting them retains the two-image random diagnostic. This mode uses the same host dependencies and never downloads weights.
