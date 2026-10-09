@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Verify a supplied model2MLIR semantic session through ONNX and Relax LLVM on CPU.
+
+The selected local factory owns model and workload choices. This verifier follows
+the existing ExternalRuntimeSession protocol; it never selects a paper checkpoint,
+casts weights, quantizes, downloads models, or qualifies device timing/model quality.
+"""
+import argparse
+from contextlib import contextmanager
+from dataclasses import asdict
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+import traceback
+from unittest import mock
+
+from verify_resnet import file_identity, prepare_graph, relax_inventory, safe_path
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, safe_path(path))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_protocol(root):
+    """Load the actual pure protocol without the unrelated MLIR capture initializer."""
+    path = safe_path(root / "m2m/capture/external_runtime.py")
+    name = "m2m.capture.external_runtime"
+    if name in sys.modules:
+        module = sys.modules[name]
+        if safe_path(module.__file__) != path:
+            raise ValueError("A different model2MLIR session protocol is already loaded")
+        return module
+    return load_module(name, path)
+
+
+@contextmanager
+def offline():
+    settings = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"}
+    def reject(*args, **kwargs):
+        raise RuntimeError("Session verification requires local artifacts; network connections are disabled")
+    with mock.patch.dict(os.environ, settings), mock.patch.object(socket.socket, "connect", reject), \
+            mock.patch.object(socket.socket, "connect_ex", reject), mock.patch.object(socket, "create_connection", reject):
+        yield
+
+
+def array(value, np, torch):
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu" or value.layout != torch.strided:
+            raise ValueError("Session tensors must be dense CPU tensors")
+        try:
+            value = value.detach().numpy()
+        except TypeError as error:
+            raise ValueError("Unsupported tensor dtype; implicit precision conversion is forbidden") from error
+    value = np.asarray(value)
+    if value.dtype.name not in ("float16", "float32", "float64", "int8", "int16", "int32", "int64", "uint8", "bool"):
+        raise ValueError("Unsupported session dtype: " + str(value.dtype))
+    if any(extent <= 0 for extent in value.shape) or not np.isfinite(value).all():
+        raise ValueError("Session tensors require positive extents and finite values")
+    return np.array(value, copy=True, order="C")
+
+
+def tensor_identity(value):
+    return {"shape": list(value.shape), "dtype": str(value.dtype), "bytes": int(value.nbytes),
+            "sha256": hashlib.sha256(value.tobytes()).hexdigest()}
+
+
+def normalize(value, np, torch):
+    if isinstance(value, (torch.Tensor, np.ndarray)):
+        return tensor_identity(array(value, np, torch))
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, dict) or hasattr(value, "items"):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("Session metadata keys must be strings")
+        return {key: normalize(item, np, torch) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [normalize(item, np, torch) for item in value]
+    raise ValueError("Unsupported session metadata type: " + type(value).__name__)
+
+
+def parameter_digest(module, torch):
+    digest = hashlib.sha256()
+    for name, value in sorted(module.state_dict().items()):
+        if value.device.type != "cpu" or value.layout != torch.strided:
+            raise ValueError("Stage parameters must be dense CPU tensors")
+        digest.update(json.dumps([name, str(value.dtype), list(value.shape)]).encode())
+        digest.update(value.detach().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def endpoint(value):
+    return value.program, value.input_index
+
+
+def outputs(value, np, torch):
+    if isinstance(value, torch.Tensor) or hasattr(value, "numpy"):
+        return [array(value.numpy() if not isinstance(value, torch.Tensor) else value, np, torch)]
+    if isinstance(value, (tuple, list)) or hasattr(value, "__getitem__"):
+        result = list(value)
+        if result and all(isinstance(item, torch.Tensor) or hasattr(item, "numpy") for item in result):
+            return [array(item.numpy() if not isinstance(item, torch.Tensor) else item, np, torch) for item in result]
+    raise ValueError("Stages must return a tensor or flat nonempty tensor tuple")
+
+
+def compare(actual, expected, np, rtol, atol):
+    if actual.shape != expected.shape or actual.dtype != expected.dtype or not np.isfinite(actual).all():
+        raise AssertionError("Session tensor shape/dtype/finite-value mismatch")
+    floating = np.issubdtype(actual.dtype, np.floating)
+    passed = np.allclose(actual, expected, rtol=rtol, atol=atol, equal_nan=False) if floating else np.array_equal(actual, expected)
+    if not passed:
+        raise AssertionError("Session numerical comparison failed")
+    error = float(np.max(np.abs(actual.astype(np.float64) - expected.astype(np.float64)))) if floating and actual.size else 0.0
+    return {"passed": True, "max_absolute_error": error, "actual": tensor_identity(actual), "reference": tensor_identity(expected)}
+
+
+def describe_session(session, np, torch):
+    phases = {"once_before_observations": 0, "per_observation": 1, "once_after_observations": 2}
+    order = [phases.get(invocation.cadence, -1) for invocation in session.execution_schedule]
+    if session.reset != "restore_initial_inputs" or -1 in order or order != sorted(order):
+        raise ValueError("Unsupported session reset or interleaved/unknown cadence")
+    names = [program.name for program in session.programs]
+    scheduled = [invocation.program for invocation in session.execution_schedule]
+    if len(set(scheduled)) != len(scheduled) or set(scheduled) != set(names):
+        raise ValueError("Schedule must declare each program exactly once")
+    initial = {endpoint(binding.target): array(binding.initial, np, torch) for binding in session.input_bindings}
+    kinds = {endpoint(binding.target): binding.kind for binding in session.input_bindings}
+    streams = {endpoint(stream.target) for stream in session.streams}
+    if len(streams) != len(session.streams):
+        raise ValueError("Duplicate session stream target")
+    cadences = {item.program: item.cadence for item in session.execution_schedule}
+    if any(cadences[stream.target.program] != "per_observation" for stream in session.streams):
+        raise ValueError("Streams require a per-observation stage")
+    assigned = set()
+    for route in session.routes:
+        key = route.source.program, endpoint(route.target)
+        if route.update != "after_source" or key in assigned or kinds[endpoint(route.target)] != "state":
+            raise ValueError("Unsupported or ambiguous state route")
+        assigned.add(key)
+    for binding in session.input_bindings:
+        if binding.kind not in ("static", "stream", "state"):
+            raise ValueError("Unsupported input binding kind")
+        if (endpoint(binding.target) in streams) != (binding.kind == "stream"):
+            raise ValueError("Stream binding kind differs from declared stream")
+    for program in session.programs:
+        if program.module.training or any(module.training for module in program.module.modules()):
+            raise ValueError("Session stages must already be in evaluation mode")
+        for index, value in enumerate(program.inputs):
+            expected = array(value, np, torch)
+            actual = initial[(program.name, index)]
+            if actual.dtype != expected.dtype or actual.shape != expected.shape:
+                raise ValueError("Initial binding differs from stage input ABI")
+    record = {"version": session.version, "kind": session.kind, "observations": session.observations, "reset": session.reset,
+              "programs": [{"name": program.name, "class": type(program.module).__module__ + "." + type(program.module).__qualname__,
+                            "steps": program.steps} for program in session.programs],
+              "metadata": normalize(session.metadata, np, torch), "schedule": [asdict(item) for item in session.execution_schedule],
+              "routes": [asdict(item) for item in session.routes], "observation_output": asdict(session.observation_output),
+              "final_output": asdict(session.final_output),
+              "inputs": [{"target": asdict(item.target), "kind": item.kind, "value": tensor_identity(initial[endpoint(item.target)])}
+                         for item in session.input_bindings],
+              "streams": [{"target": asdict(item.target), "values": tensor_identity(array(item.values, np, torch))} for item in session.streams]}
+    record["sha256"] = hashlib.sha256(json.dumps(record, sort_keys=True, allow_nan=False).encode()).hexdigest()
+    return record, initial
+
+
+def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, atol=1e-4, max_signatures=64):
+    if not 2 <= repeats <= 10 or not 1 <= max_signatures <= 128:
+        raise ValueError("Invalid session repeat/signature budget")
+    description, initial = describe_session(session, np, torch)
+    programs = {program.name: program for program in session.programs}
+    parameter_hashes = {name: parameter_digest(program.module, torch) for name, program in programs.items()}
+    compiled, checks, previous = {}, [], None
+    high_water = 0
+    for repeat in range(repeats):
+        reference = {key: value.copy() for key, value in initial.items()}
+        candidate = {key: value.copy() for key, value in initial.items()}
+        last, fingerprints = {}, []
+
+        def invoke(invocation, observation):
+            nonlocal high_water
+            program = programs[invocation.program]
+            if observation is not None:
+                for stream in session.streams:
+                    if stream.target.program == program.name:
+                        value = array(stream.values[observation], np, torch)
+                        reference[endpoint(stream.target)] = value.copy()
+                        candidate[endpoint(stream.target)] = value.copy()
+            keys = [(program.name, index) for index in range(len(program.inputs))]
+            expected_args, actual_args = [reference[key] for key in keys], [candidate[key] for key in keys]
+            for actual, expected in zip(actual_args, expected_args):
+                compare(actual, expected, np, rtol, atol)
+            signature = tuple((str(value.dtype), tuple(value.shape)) for value in actual_args)
+            key = program.name, signature
+            tensors = [torch.from_numpy(value.copy()) for value in expected_args]
+            with torch.no_grad():
+                expected = outputs(program.module(*tensors), np, torch)
+            if any(not np.array_equal(value.numpy(), original) for value, original in zip(tensors, expected_args)):
+                raise AssertionError("Reference stage mutated caller inputs")
+            if key not in compiled:
+                if len(compiled) >= max_signatures:
+                    raise ValueError("Session exceeds the explicit compilation-signature budget")
+                compiled[key] = compile_stage(program, tuple(actual_args), len(expected))
+            copied = [value.copy() for value in actual_args]
+            actual = outputs(compiled[key](tuple(copied)), np, torch)
+            if any(not np.array_equal(value, original) for value, original in zip(copied, actual_args)):
+                raise AssertionError("Compiled stage mutated caller inputs")
+            if len(actual) != len(expected):
+                raise AssertionError("Stage output count differs from reference")
+            values = [compare(a, b, np, rtol, atol) for a, b in zip(actual, expected)]
+            last[program.name] = actual
+            routes = []
+            for route in session.routes:
+                if route.source.program != program.name:
+                    continue
+                index, target = route.source.output_index, endpoint(route.target)
+                if not 0 <= index < len(actual):
+                    raise ValueError("State route selects an absent output")
+                value = actual[index]
+                if value.dtype != initial[target].dtype or value.ndim != initial[target].ndim:
+                    raise ValueError("State route changes the declared dtype or rank")
+                reference[target], candidate[target] = expected[index].copy(), value.copy()
+                routes.append({"name": route.name, "target": asdict(route.target), "comparison": compare(candidate[target], reference[target], np, rtol, atol)})
+            high_water = max(high_water, sum(value.nbytes for value in candidate.values()))
+            fingerprints.append([tensor_identity(value) for value in actual])
+            checks.append({"repeat": repeat, "observation": observation, "program": program.name, "outputs": values, "routed_states": routes})
+
+        def phase(cadence, observation=None):
+            for invocation in session.execution_schedule:
+                if invocation.cadence == cadence:
+                    count = 1 if cadence == "per_observation" else invocation.repeats
+                    for _ in range(count):
+                        invoke(invocation, observation)
+
+        phase("once_before_observations")
+        observations = []
+        for observation in range(session.observations):
+            phase("per_observation", observation)
+            selector = session.observation_output
+            if selector.program not in last or not 0 <= selector.output_index < len(last[selector.program]):
+                raise ValueError("Observation selector is unavailable at its declared cadence")
+            observations.append(tensor_identity(last[selector.program][selector.output_index]))
+        phase("once_after_observations")
+        selector = session.final_output
+        if selector.program not in last or not 0 <= selector.output_index < len(last[selector.program]):
+            raise ValueError("Final output selector is unavailable")
+        fingerprints.append([tensor_identity(last[selector.program][selector.output_index]), observations])
+        if previous is not None and fingerprints != previous:
+            raise AssertionError("Session outputs differ after restoring initial inputs")
+        previous = fingerprints
+    for name, program in programs.items():
+        if parameter_digest(program.module, torch) != parameter_hashes[name]:
+            raise AssertionError("Stage parameters or registered buffers changed")
+    return {"session": description, "checks": checks, "repeats": repeats, "reset_verified": True,
+            "compilation_signatures": len(compiled), "parameter_sha256": parameter_hashes, "retained_stage_input_high_water_bytes": high_water}
+
+
+class StageCompiler:
+    def __init__(self, out, mode, np, torch, onnx, tvm):
+        self.out, self.mode, self.np, self.torch, self.onnx, self.tvm = out, mode, np, torch, onnx, tvm
+        self.records = []
+
+    def __call__(self, program, inputs, output_count):
+        folder = self.out / ("stage_" + str(len(self.records)))
+        folder.mkdir()
+        graph_path = folder / "model.onnx"
+        names = ["input_" + str(index) for index in range(len(inputs))]
+        tensors = tuple(self.torch.from_numpy(value.copy()) for value in inputs)
+        self.torch.onnx.export(program.module, tensors, str(graph_path), input_names=names,
+                              output_names=["output_" + str(index) for index in range(output_count)],
+                              opset_version=17, dynamo=False, do_constant_folding=True)
+        graph = self.onnx.load(str(graph_path))
+        self.onnx.checker.check_model(graph, full_check=True)
+        from tvm.relax.frontend.onnx import from_onnx
+        mod = from_onnx(graph, shape_dict={name: list(value.shape) for name, value in zip(names, inputs)}, keep_params_in_input=False)
+        transformed, lowered = prepare_graph(mod, self.mode, self.tvm)
+        record = {"program": program.name, "inputs": [tensor_identity(value) for value in inputs], "onnx": file_identity(graph_path, safe_path),
+                  "pipelines": ["zero", "default_build"] if self.mode == "optimized" else ["default_build"]}
+        for name, value in (("imported", mod), ("graph", transformed), ("vm", lowered)):
+            path = folder / (name + ".relax.py")
+            path.write_text(value.script())
+            record[name] = {"ir": file_identity(path, safe_path), "inventory": relax_inventory(value, self.tvm)}
+        vm = self.tvm.relax.VirtualMachine(self.tvm.relax.build(lowered, "llvm", pipeline=None), self.tvm.cpu())
+        self.records.append(record)
+
+        def run(values):
+            arguments = [self.tvm.nd.array(value.copy(), self.tvm.cpu()) for value in values]
+            result = vm["main"](*arguments)
+            if any(not self.np.array_equal(value.numpy(), before) for value, before in zip(arguments, values)):
+                raise AssertionError("TVM stage mutated caller inputs")
+            return result
+        return run
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("model2mlir-root", "tvm-source", "tvm-build", "factory", "output-dir"):
+        parser.add_argument("--" + name, required=True, type=Path)
+    parser.add_argument("--factory-name", default="get_model_and_inputs")
+    parser.add_argument("--factory-arguments", type=Path, help="Local JSON keyword arguments passed unchanged to the selected factory")
+    parser.add_argument("--artifact", type=Path, action="append", default=[], help="Explicit local checkpoint/input/config artifacts to hash")
+    parser.add_argument("--graph-mode", choices=("baseline", "optimized"), default="optimized")
+    parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--max-signatures", type=int, default=64)
+    parser.add_argument("--rtol", type=float, default=1e-4)
+    parser.add_argument("--atol", type=float, default=1e-4)
+    args = parser.parse_args()
+    if not 2 <= args.repeats <= 10 or not 1 <= args.max_signatures <= 128 or not 0 <= args.rtol <= 0.1 or not 0 <= args.atol <= 0.1:
+        parser.error("Invalid repeat/signature budget or numerical tolerances")
+    sys.dont_write_bytecode = True
+    out = safe_path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=False)
+    report = {"status": "running", "invocation": [sys.executable, *sys.argv], "host_session_verified": False,
+              "model_quality_qualified": False, "paper_validation": False, "timing_qualified": False, "device_execution": False}
+    try:
+        report["verifier_source"] = file_identity(__file__, safe_path)
+        report["graph_helper_source"] = file_identity(prepare_graph.__code__.co_filename, safe_path)
+        source, build, model_root = safe_path(args.tvm_source), safe_path(args.tvm_build), safe_path(args.model2mlir_root)
+        os.environ.update(TVM_LIBRARY_PATH=str(build), TVM_FFI="ctypes")
+        sys.path[:0] = [str(safe_path(source / "python")), str(model_root)]
+        import numpy as np
+        import torch
+        import onnx
+        import tvm
+        from tvm._ffi.base import _LIB
+        protocol = load_protocol(model_root)
+        if safe_path(protocol.__file__) != model_root / "m2m/capture/external_runtime.py":
+            raise ValueError("Imported session protocol differs from selected model2MLIR source")
+        if not safe_path(tvm.__file__).is_relative_to(source / "python") or safe_path(_LIB._name).parent != build:
+            raise ValueError("Imported TVM source/library differs from the explicit selection")
+        report["protocol_source"] = file_identity(protocol.__file__, safe_path)
+        report["compiler_library"] = file_identity(_LIB._name, safe_path)
+        report["versions"] = {"python": sys.version, "torch": torch.__version__, "onnx": onnx.__version__, "numpy": np.__version__, "tvm": tvm.__version__}
+        report["build_info"] = dict(tvm.support.libinfo())
+        report["graph_mode"], report["rtol"], report["atol"] = args.graph_mode, args.rtol, args.atol
+        report["factory_source"] = file_identity(args.factory, safe_path)
+        report["factory_name"] = args.factory_name
+        report["factory_environment"] = {name: value for name, value in os.environ.items() if name.startswith("M2M_")}
+        report["declared_artifacts"] = [file_identity(path, safe_path) for path in args.artifact]
+        arguments = {}
+        if args.factory_arguments:
+            report["factory_arguments"] = file_identity(args.factory_arguments, safe_path)
+            arguments = json.loads(safe_path(args.factory_arguments).read_text())
+            if not isinstance(arguments, dict):
+                raise ValueError("Factory arguments must be a JSON object")
+        with offline():
+            factory = load_module("tvm_session_factory", args.factory)
+            model, inputs = getattr(factory, args.factory_name)(**arguments)
+            metadata = factory.get_session_spec(model, inputs) if callable(getattr(factory, "get_session_spec", None)) else None
+            session = protocol.external_runtime_session(model, tuple(inputs), session=metadata)
+            compiler = StageCompiler(out, args.graph_mode, np, torch, onnx, tvm)
+            report.update(verify_session(session, compiler, np, torch, repeats=args.repeats, rtol=args.rtol, atol=args.atol, max_signatures=args.max_signatures))
+            report["compiled_stages"] = compiler.records
+        infos = [report["verifier_source"], report["graph_helper_source"], report["protocol_source"], report["factory_source"],
+                 report["compiler_library"], *report["declared_artifacts"]]
+        if "factory_arguments" in report:
+            infos.append(report["factory_arguments"])
+        for info in infos:
+            if file_identity(info["path"], safe_path) != info:
+                raise AssertionError("Selected source or declared artifact changed")
+        report["limitations"] = ["Host frontend/session routing only; no selected paper checkpoint, application-quality or device/timing qualification",
+                                 "Explicit artifact/source hashes are not a complete runtime source closure",
+                                 "Python network connections and HuggingFace downloads disabled; this is not a hermetic process sandbox",
+                                 "Input-state high-water describes diagnostic retained arrays, not deployed allocator peak or model fit"]
+        report.update(status="passed", host_session_verified=True)
+    except Exception as error:
+        report.update(status="failed", error=str(error), traceback=traceback.format_exc())
+    finally:
+        (out / "results.json").write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
+    print(json.dumps({"status": report["status"], "output": str(out)}))
+    return 0 if report["status"] == "passed" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
