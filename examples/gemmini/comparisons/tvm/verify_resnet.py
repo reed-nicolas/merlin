@@ -1,4 +1,4 @@
-"""Verify ResNet50 v1.5 FP32 on host CPU using random diagnostics or supplied local artifacts."""
+"""Verify complete FP32 or explicit integer ResNet50 v1.5 development sessions."""
 
 import argparse
 from collections import Counter
@@ -335,7 +335,11 @@ def verify_integer_resnet(args, model, expected_outputs, labels, report, output,
             tile_i=args.tile_i, tile_j=args.tile_j, return_integer_logits=True)
         row = report["graph_modes"][mode]
         row["device_coverage"] = coverage
-        row["memory_preflight"] = exporter.preflight_graph(prepared, memory_limit_bytes=args.memory_limit_bytes)
+        memory = exporter.preflight_graph(prepared, memory_limit_bytes=args.memory_limit_bytes)
+        memory_name = f"memory_{mode}.json"
+        write_json(memory_name, memory)
+        row["memory_preflight"] = {key: value for key, value in memory.items() if not isinstance(value, (dict, list))}
+        row["memory_preflight"].update(allocated=memory["allocated"], artifact=file_identity(output / memory_name, safe_path))
         row["memory_scope"] = "explicit tensors only; executable, stack and platform reservations additional"
         semantic_path, prepared_path = output / "integer_semantic.relax.py", output / f"integer_{mode}.relax.py"
         semantic_path.write_text(semantic.script())
@@ -378,9 +382,14 @@ def verify_integer_resnet(args, model, expected_outputs, labels, report, output,
                 raise AssertionError("Quantized model exceeds the declared development top-1 loss gate")
         if args.export_baremetal:
             stage(f"integer_export_baremetal_{mode}")
-            row["baremetal_export"] = exporter.export_graph(prepared, output / f"baremetal_{mode}", memory_limit_bytes=args.memory_limit_bytes)
+            directory = output / f"baremetal_{mode}"
+            manifest = exporter.export_graph(prepared, directory, memory_limit_bytes=args.memory_limit_bytes)
+            row["baremetal_export"] = {key: value for key, value in manifest.items() if not isinstance(value, (dict, list))}
+            row["baremetal_export"]["manifest"] = file_identity(directory / "graph.json", safe_path)
         write_json("results.json", report)
-    for identity in [*report["artifacts"].values(), report["integer_recipe_source"], report["baremetal_exporter_source"]]:
+    references = [report[key] for key in ("verifier_source", "integer_recipe_source", "loader_source", "torchvision_resnet_source")]
+    references.extend(report["artifacts"].values())
+    for identity in [*references, report["baremetal_exporter_source"]]:
         if file_identity(identity["path"], safe_path) != identity:
             raise AssertionError("Selected integer source or supplied artifact changed")
     if state_hash(model.model) != report["model"]["state_dict_sha256"]:
@@ -388,6 +397,15 @@ def verify_integer_resnet(args, model, expected_outputs, labels, report, output,
     report["session"]["complete"] = all(value["checked_images"] == len(model.session_images) for value in report["graph_modes"].values())
     if not report["session"]["complete"]:
         raise AssertionError("Integer verification omitted declared images")
+    if args.export_baremetal:
+        fixture = output / "reference.npz"
+        np.savez(fixture, input_0=np.stack([recipe.quantize(image.numpy(), plan.input_exponent) for image in model.session_images]), output_0=np.stack([value[0] for value in expected]), output_1=np.stack([value[1] for value in expected]))
+        identity = file_identity(fixture, safe_path)
+        sample_ids = [f"{index}:{labels['samples'][index]['id'] if labels else recipe.array_digest(image.numpy())}" for index, image in enumerate(model.session_images)]
+        provenance = {"fixture_sha256": identity["sha256"], "sample_ids": sample_ids, "reference_sources": references,
+            "reference_contract": report["quantization"]["recipe"], "oracle": "independent integer reference; no exported or accelerated contraction", "paper_quality_approved": False}
+        write_json("reference.json", provenance)
+        report["device_fixture"] = {"fixture": identity, "provenance": file_identity(output / "reference.json", safe_path), "samples": len(expected)}
     report.update(status="passed", integer_reference_verified=True)
     stage("complete")
     return 0

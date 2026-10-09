@@ -258,6 +258,31 @@ The full random 224×224 model passes both host modes and static exports. Its op
 PYTHONPATH="$merlin_root/src:$PYTHONPATH" python "$merlin_root/merlin/tests/gemmini/test_tvm_resnet_quantized.py"
 ```
 
+## Local Imagenette development inputs
+
+[prepare_resnet_inputs.py](prepare_resnet_inputs.py) reads a local [Imagenette320 archive](https://github.com/fastai/imagenette) without extraction or downloads. It uses the installed [ResNet50 V2 transform](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.resnet50.html), selects sorted train images for calibration and validation images for evaluation, and retains the full 1000-class head. Defaults are one calibration and two evaluation images per each of ten classes. Counts are explicit; no selected image is dropped during verification. Archive/member, RGB/tensor, category/transform and selected source hashes are recorded; duplicate/overlapping content and unsafe archive entries are refused. The ten-class subset is a development check, not canonical held-out ImageNet accuracy.
+
+From the activated comparison checkout, the artifact cache resolves through the existing `artifacts_dir` helper:
+
+```bash
+model_cache="$(PYTHONPATH="$merlin_root/src:$PYTHONPATH" python -c 'from merlin.common.paths import artifacts_dir; print(artifacts_dir() / "cache")')"
+: "${model_cache:?Could not resolve the artifact cache}"
+mkdir -p "$model_cache/resnet50"
+curl --fail --location --retry 3 --continue-at - --output "$model_cache/resnet50/resnet50-11ad3fa6.pth" https://download.pytorch.org/models/resnet50-11ad3fa6.pth
+curl --fail --location --retry 3 --continue-at - --output "$model_cache/resnet50/imagenette2-320.tgz" https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-320.tgz
+input_run="$model_cache/resnet50/imagenette-v2-development"
+python "$setup_dir/prepare_resnet_inputs.py" --archive "$model_cache/resnet50/imagenette2-320.tgz" --output-dir "$input_run"
+python "$setup_dir/verify_resnet.py" --model2mlir-root "$model2mlir_source" --tvm-source "$TVM_ROOT" \
+  --checkpoint "$model_cache/resnet50/resnet50-11ad3fa6.pth" --inputs "$input_run/evaluation.npz" --labels "$input_run/labels.json" \
+  --input-source 'Imagenette320 val; ordered samples in preparation.json' --preprocessing 'torchvision V2 RGB/resize232/crop224/normalization' \
+  --quantized --calibration-inputs "$input_run/calibration.npz" --calibration-source 'Imagenette320 train; ordered samples in preparation.json' \
+  --graph-mode both --export-baremetal --output-dir "$build_root/resnet50-v2-integer-development"
+```
+
+Both preparation and verification require new output directories. The preparer binds the supplied archive; it does not authenticate an official archive digest or prove checkpoint training provenance. The verification command enforces the unchanged development quality threshold and reports failure if quantization exceeds it. Twenty focused artifact tests pass, including exact V2 transforms, existing NPZ/label admission, archive bounds, content separation and source-mutation controls.
+
+Integer exports also emit `reference.npz` and `reference.json` from the separate integer oracle for every selected image. Use these with the TVM fork's [complete exported-graph simulator recipe](https://github.com/reed-nicolas/tvm/blob/b66f54206cf9d58db0f08f32012bbd52f40c198e/apps/gemmini/README.md#complete-exported-graphs-in-gemmini-spike); select the matching `baremetal_baseline` or `baremetal_optimized` directory. Each mode's detailed memory/export records stay in separate hashed artifacts, while `results.json` summarizes their storage. Export alone is not device execution. The recorded full random-model session passes both modes and fixture admission; pretrained quality/device execution still require the supplied weights/data.
+
 ## Stateful host sessions
 
 [verify_session.py](verify_session.py) consumes a local factory's `get_model_and_inputs` and model2MLIR's `ExternalRuntimeSession` protocol. An optional `get_session_spec(model, inputs)` supplies single-program metadata; multi-program models expose their existing session capability. Stage order, streams, state routes and reset behavior come from that protocol. The verifier compiles separate static signatures when state shapes change and reuses them across repeats.
