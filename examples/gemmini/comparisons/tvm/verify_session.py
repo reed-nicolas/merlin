@@ -60,7 +60,7 @@ def bfloat16_dtype():
     return ml_dtypes.bfloat16
 
 
-def array(value, np, torch):
+def array(value, np, torch, *, require_finite=True):
     if isinstance(value, torch.Tensor):
         if value.device.type != "cpu" or value.layout != torch.strided:
             raise ValueError("Session tensors must be dense CPU tensors")
@@ -81,7 +81,7 @@ def array(value, np, torch):
     value = np.asarray(value)
     if value.dtype.name not in ("bfloat16", "float16", "float32", "float64", "int8", "int16", "int32", "int64", "uint8", "bool"):
         raise ValueError("Unsupported session dtype: " + str(value.dtype))
-    if any(extent <= 0 for extent in value.shape) or not np.isfinite(value).all():
+    if any(extent <= 0 for extent in value.shape) or require_finite and not np.isfinite(value).all():
         raise ValueError("Session tensors require positive extents and finite values")
     return np.array(value, copy=True, order="C")
 
@@ -176,25 +176,52 @@ def endpoint(value):
     return value.program, value.input_index
 
 
-def outputs(value, np, torch):
+def outputs(value, np, torch, *, require_finite=True):
     if isinstance(value, torch.Tensor) or hasattr(value, "numpy"):
-        return [array(value, np, torch)]
+        return [array(value, np, torch, require_finite=require_finite)]
     if isinstance(value, (tuple, list)) or hasattr(value, "__getitem__"):
         result = list(value)
         if result and all(isinstance(item, torch.Tensor) or hasattr(item, "numpy") for item in result):
-            return [array(item, np, torch) for item in result]
+            return [array(item, np, torch, require_finite=require_finite) for item in result]
     raise ValueError("Stages must return a tensor or flat nonempty tensor tuple")
 
 
-def compare(actual, expected, np, rtol, atol):
-    if actual.shape != expected.shape or actual.dtype != expected.dtype or not np.isfinite(actual).all():
-        raise AssertionError("Session tensor shape/dtype/finite-value mismatch")
+class SessionComparisonError(AssertionError):
+    def __init__(self, message, diagnostics):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def compare(actual, expected, np, rtol, atol, *, context=None):
+    def summary(value):
+        finite = bool(np.isfinite(value).all())
+        return {"shape": list(value.shape), "dtype": str(value.dtype), "finite": finite,
+                "identity": tensor_identity(value) if finite else None}
+
+    diagnostics = {**(context or {}), "actual": summary(actual), "reference": summary(expected),
+                   "rtol": rtol if np.isfinite(rtol) else str(rtol), "atol": atol if np.isfinite(atol) else str(atol),
+                   "max_absolute_error": None, "mismatch_count": None}
+    if actual.shape != expected.shape or actual.dtype != expected.dtype or not diagnostics["actual"]["finite"] or not diagnostics["reference"]["finite"]:
+        diagnostics["reason"] = "shape/dtype/finite-value mismatch"
+        raise SessionComparisonError("Session tensor shape/dtype/finite-value mismatch", diagnostics)
     floating = np.issubdtype(actual.dtype, np.floating) or actual.dtype.name == "bfloat16"
-    passed = np.allclose(actual.astype(np.float64), expected.astype(np.float64), rtol=rtol, atol=atol, equal_nan=False) if floating else np.array_equal(actual, expected)
-    if not passed:
-        raise AssertionError("Session numerical comparison failed")
-    error = float(np.max(np.abs(actual.astype(np.float64) - expected.astype(np.float64)))) if floating and actual.size else 0.0
-    return {"passed": True, "max_absolute_error": error, "actual": tensor_identity(actual), "reference": tensor_identity(expected)}
+    if floating:
+        with np.errstate(over="ignore", invalid="ignore"):
+            left, right = actual.astype(np.float64), expected.astype(np.float64)
+            matched = np.isclose(left, right, rtol=rtol, atol=atol, equal_nan=False)
+            error = float(np.max(np.abs(left - right))) if actual.size else 0.0
+        diagnostics["max_absolute_error"] = error if np.isfinite(error) else None
+        if not np.isfinite(error):
+            diagnostics["metric_unavailable"] = "absolute difference exceeds float64 range"
+    else:
+        matched = actual == expected
+        # Python integers preserve differences beyond float64's exact integer range.
+        diagnostics["max_absolute_error"] = max((abs(int(a) - int(b)) for a, b in zip(actual[~matched], expected[~matched])), default=0)
+    diagnostics["mismatch_count"] = int(np.count_nonzero(~matched))
+    if diagnostics["mismatch_count"]:
+        diagnostics["reason"] = "numerical comparison failed"
+        raise SessionComparisonError("Session numerical comparison failed", diagnostics)
+    return {"passed": True, "max_absolute_error": diagnostics["max_absolute_error"], "actual": diagnostics["actual"]["identity"], "reference": diagnostics["reference"]["identity"]}
 
 
 def describe_session(session, np, torch):
@@ -270,8 +297,9 @@ def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, a
                         candidate[endpoint(stream.target)] = value.copy()
             keys = [(program.name, index) for index in range(len(program.inputs))]
             expected_args, actual_args = [reference[key] for key in keys], [candidate[key] for key in keys]
-            for actual, expected in zip(actual_args, expected_args):
-                compare(actual, expected, np, rtol, atol)
+            context = {"stage": invocation.cadence, "program": program.name, "repeat": repeat, "observation": observation}
+            for index, (actual, expected) in enumerate(zip(actual_args, expected_args)):
+                compare(actual, expected, np, rtol, atol, context={**context, "tensor": "input", "input_index": index})
             signature = tuple((str(value.dtype), tuple(value.shape)) for value in actual_args)
             key = program.name, signature
             tensors = [torch_array(value, np, torch) for value in expected_args]
@@ -284,12 +312,13 @@ def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, a
                     raise ValueError("Session exceeds the explicit compilation-signature budget")
                 compiled[key] = compile_stage(program, tuple(actual_args), len(expected))
             copied = [value.copy() for value in actual_args]
-            actual = outputs(compiled[key](tuple(copied)), np, torch)
+            actual = outputs(compiled[key](tuple(copied)), np, torch, require_finite=False)
             if any(not np.array_equal(value, original) for value, original in zip(copied, actual_args)):
                 raise AssertionError("Compiled stage mutated caller inputs")
             if len(actual) != len(expected):
                 raise AssertionError("Stage output count differs from reference")
-            values = [compare(a, b, np, rtol, atol) for a, b in zip(actual, expected)]
+            values = [compare(a, b, np, rtol, atol, context={**context, "tensor": "output", "output_index": index})
+                      for index, (a, b) in enumerate(zip(actual, expected))]
             last[program.name] = actual
             routes = []
             for route in session.routes:
@@ -464,6 +493,8 @@ def main():
         report.update(status="passed", host_session_verified=True)
     except Exception as error:
         report.update(status="failed", error=str(error), traceback=traceback.format_exc())
+        if isinstance(error, SessionComparisonError):
+            report["failure_diagnostics"] = error.diagnostics
     finally:
         (out / "results.json").write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
     print(json.dumps({"status": report["status"], "output": str(out)}))
