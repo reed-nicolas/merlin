@@ -265,11 +265,11 @@ PYTHONPATH="$merlin_root/src:$PYTHONPATH" python "$merlin_root/merlin/tests/gemm
 From the activated comparison checkout, the artifact cache resolves through the existing `artifacts_dir` helper:
 
 ```bash
-model_cache="$(PYTHONPATH="$merlin_root/src:$PYTHONPATH" python -c 'from merlin.common.paths import artifacts_dir; print(artifacts_dir() / "cache")')"
-: "${model_cache:?Could not resolve the artifact cache}"
-mkdir -p "$model_cache/resnet50"
-curl --fail --location --retry 3 --continue-at - --output "$model_cache/resnet50/resnet50-11ad3fa6.pth" https://download.pytorch.org/models/resnet50-11ad3fa6.pth
-curl --fail --location --retry 3 --continue-at - --output "$model_cache/resnet50/imagenette2-320.tgz" https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-320.tgz
+if model_cache="$(PYTHONPATH="$merlin_root/src:$PYTHONPATH" python -c 'from merlin.common.paths import artifacts_dir; print(artifacts_dir() / "cache")')" && [ -n "$model_cache" ]; then
+  mkdir -p "$model_cache/resnet50" &&
+  curl --fail --location --retry 3 --continue-at - --output "$model_cache/resnet50/resnet50-11ad3fa6.pth" https://download.pytorch.org/models/resnet50-11ad3fa6.pth &&
+  curl --fail --location --retry 3 --continue-at - --output "$model_cache/resnet50/imagenette2-320.tgz" https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-320.tgz
+fi
 input_run="$model_cache/resnet50/imagenette-v2-development"
 python "$setup_dir/prepare_resnet_inputs.py" --archive "$model_cache/resnet50/imagenette2-320.tgz" --output-dir "$input_run"
 python "$setup_dir/verify_resnet.py" --model2mlir-root "$model2mlir_source" --tvm-source "$TVM_ROOT" \
@@ -296,7 +296,7 @@ python "$setup_dir/verify_session.py" --model2mlir-root "$model2mlir_source" \
 
 Use a fresh output directory. Factory arguments are a JSON object of keyword arguments; omit the option if unnecessary. Each `--artifact` names a local file to hash and may be repeated. Supply the chosen factory's own dependencies and complete local checkpoints/inputs. Python network connections and HuggingFace downloads are disabled during factory loading and verification; this is not a process sandbox. No weights are downloaded, cast or quantized by the verifier.
 
-PyTorch and TVM maintain independent routed state. Every stage output and state update must agree, and restoring initial inputs must reproduce the full session. Reports retain source/artifact hashes, loaded parameter digests, input identities, per-stage IR, compilation signatures and comparisons. The input-state byte count is diagnostic accounting, not deployed peak memory. Quality, paper, device and timing qualification remain false.
+PyTorch and TVM maintain independent routed state. Every stage output and state update must agree, and restoring initial inputs must reproduce the full session. Reports retain source/artifact hashes, loaded parameter digests, input identities, per-stage IR, compilation signatures and comparisons. Failed tensor comparisons also record stage/index, dtype/shape, configured tolerances, mismatch count and maximum absolute error without accepting the session; invalid tensors have no numerical metrics. The input-state byte count is diagnostic accounting, not deployed peak memory. Quality, paper, device and timing qualification remain false.
 
 Original BF16 tensors use exact uint16 payload views through the optional `ml_dtypes` dependency; comparison casts do not alter their stored dtype or bits. Export runs on a deep copy of each source stage because modern tracing mutates ordinary runtime cache attributes into FakeTensor objects. The independent source stage and its reset behavior remain intact. These host export/VM copies consume additional memory; retained input-state bytes are not an allocation peak or target-fit claim.
 
@@ -308,7 +308,7 @@ python -m pip install 'ml_dtypes==0.5.4' 'onnxscript==0.5.6' 'onnx_ir==0.1.12'
 
 Factories can expose `get_verification_artifacts(model, inputs)` to bind the checkpoint, tokenizer, input and supporting source files they actually select. Those files are hashed before session execution and checked again afterward. ONNX external tensor files are validated before loading, included in each stage's `onnx_artifacts` and rechecked after execution. The verifier uses the path-based ONNX checker to support external-weight models beyond the in-memory protobuf limit; the focused tests exercise smaller external-weight graphs, invalid locations/ranges/metadata and mutation rejection. These identities do not establish complete runtime source closure.
 
-Thirteen focused tests pass, including real LLVM execution of recurrence/growing-state stages, exact BF16 payloads/state routing, explicit schema admission, external weights and a modern-export cache/reset regression. The modern case requires optional onnxscript and `TVM_SESSION_MODERN_ONNX=1`; these diagnostic fixtures contain no model checkpoints. In the activated host environment:
+Sixteen focused tests pass, including real LLVM execution of recurrence/growing-state stages, exact BF16 payloads/state routing, explicit schema admission, external weights, a modern-export cache/reset regression and failed numerical receipts. The modern case requires optional onnxscript and `TVM_SESSION_MODERN_ONNX=1`; these diagnostic fixtures contain no model checkpoints. In the activated host environment:
 
 ```bash
 TVM_SESSION_MODEL2MLIR="$model2mlir_source" PYTHONPATH="$merlin_root/src:$PYTHONPATH" \
@@ -388,7 +388,7 @@ PYTHONPATH="$merlin_root/src" "$build_root/smolvla-venv/bin/python" "$merlin_roo
 
 Eight focused staging/routing tests pass. The actual full eager session agrees exactly with unchanged upstream `sample_actions`, including `[1,50,6]` actions and the BF16 cache. Synthetic observations establish complete checkpoint/reference staging, not robot quality. For attributed data, supply `fixture_kind: dataset`, `input_npz` and `input_source`; the factory validates every selected input tensor and camera.
 
-The full compiled policy remains under qualification. Legacy export fails on a complex intermediate; newer modern-export dependencies fix an invalid position-indexing Where, and original-BF16 vision embedding/operator probes pass. BF16 softmax/GELU/sigmoid corrections are committed and eleven native operator probes pass; the complete prefix passes import/lowering, with full compiled comparison still running. Do not label these small probes as full compiled or Gemmini execution. Target numerical policy, application-quality acceptance and timing remain pending.
+The full compiled policy remains under qualification. Legacy export fails on a complex intermediate; newer modern-export dependencies fix an invalid position-indexing Where, and original-BF16 vision embedding/operator probes pass. BF16 softmax/GELU/sigmoid corrections are committed and eleven native operator probes pass. The complete prefix exports, imports, builds and runs, but its first compiled output fails the unchanged numerical gate before denoising/action stages. The discrepancy is being characterized; no tolerance or checkpoint precision has been changed. Target numerical policy, application-quality acceptance and timing remain pending.
 
 ## Scheduled graph and learned-search checks
 

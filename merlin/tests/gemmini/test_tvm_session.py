@@ -1,6 +1,7 @@
 """State routing and real LLVM frontend checks over a diagnostic two-stage session."""
 from dataclasses import replace
 import importlib.util
+import json
 import os
 from pathlib import Path
 import socket
@@ -165,6 +166,68 @@ class SessionTests(unittest.TestCase):
         session = replace(session, routes=(*session.routes[:-1], corrupted))
         with self.assertRaisesRegex(ValueError, "absent output"):
             self.verifier.verify_session(session, self.reference_compiler, self.np, self.torch)
+
+    def test_biased_stage_has_structured_failure_and_failed_receipt(self):
+        from unittest.mock import patch
+        def biased(program, inputs, output_count):
+            run = self.reference_compiler(program, inputs, output_count)
+            return lambda values: tuple(value + 0.5 for value in run(values)) if program.name == "decode" else run(values)
+        with self.assertRaisesRegex(AssertionError, "numerical comparison") as caught:
+            self.verifier.verify_session(self.session(), biased, self.np, self.torch)
+        failure = caught.exception.diagnostics
+        self.assertEqual({key: failure[key] for key in ("stage", "program", "repeat", "observation", "tensor", "output_index")},
+                         {"stage": "per_observation", "program": "decode", "repeat": 0, "observation": 0, "tensor": "output", "output_index": 0})
+        self.assertEqual(failure["max_absolute_error"], 0.5)
+        self.assertEqual(failure["mismatch_count"], 2)
+        self.assertEqual((failure["rtol"], failure["atol"]), (1e-4, 1e-4))
+        self.assertEqual(failure["actual"]["shape"], [2])
+        self.assertEqual(failure["actual"]["dtype"], "float32")
+        self.assertIn("sha256", failure["actual"]["identity"])
+        json.dumps(failure, allow_nan=False)
+        with tempfile.TemporaryDirectory(prefix="tvm-session-failure-") as temp:
+            folder = Path(temp) / "receipt"
+            argv = ["verify_session.py", "--output-dir", str(folder)]
+            for name in ("model2mlir-root", "tvm-source", "tvm-build", "factory"):
+                argv.extend(("--" + name, str(Path(temp) / name)))
+            with patch.object(sys, "argv", argv), patch.object(self.verifier, "file_identity", side_effect=caught.exception):
+                self.assertEqual(self.verifier.main(), 1)
+            receipt = json.loads((folder / "results.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertFalse(receipt["host_session_verified"])
+            self.assertEqual(receipt["failure_diagnostics"], failure)
+            self.assertIn("SessionComparisonError", receipt["traceback"])
+            self.assertEqual([path.name for path in folder.iterdir()], ["results.json"])
+
+    def test_invalid_tensor_diagnostics_do_not_claim_numerical_metrics(self):
+        np = self.np
+        reference = np.ones(2, dtype="float32")
+        for actual in (np.ones(3, dtype="float32"), np.ones(2, dtype="float64"), np.array([np.nan, np.inf], dtype="float32")):
+            with self.subTest(dtype=actual.dtype, shape=actual.shape), self.assertRaisesRegex(AssertionError, "shape/dtype/finite") as caught:
+                self.verifier.compare(actual, reference, np, 1e-4, 1e-4)
+            failure = caught.exception.diagnostics
+            self.assertIsNone(failure["max_absolute_error"])
+            self.assertIsNone(failure["mismatch_count"])
+            json.dumps(failure, allow_nan=False)
+        self.assertIsNone(failure["actual"]["identity"])
+        def nonfinite(program, inputs, output_count):
+            return lambda values: self.torch.full((2,), float("nan"))
+        with self.assertRaisesRegex(AssertionError, "finite") as caught:
+            self.verifier.verify_session(self.session(), nonfinite, np, self.torch)
+        self.assertEqual(caught.exception.diagnostics["program"], "prefill")
+        self.assertEqual(caught.exception.diagnostics["output_index"], 0)
+        self.assertFalse(caught.exception.diagnostics["actual"]["finite"])
+        json.dumps(caught.exception.diagnostics, allow_nan=False)
+
+    def test_difference_metrics_preserve_large_integers_and_handle_overflow(self):
+        np = self.np
+        for actual, expected, delta in ((np.array([2 ** 63 - 1], dtype="int64"), np.array([-2 ** 63], dtype="int64"), 2 ** 64 - 1),
+                                        (np.array([np.finfo("float64").max]), np.array([-np.finfo("float64").max]), None)):
+            with self.assertRaisesRegex(AssertionError, "numerical comparison") as caught:
+                self.verifier.compare(actual, expected, np, 0, 0)
+            failure = caught.exception.diagnostics
+            self.assertEqual(failure["mismatch_count"], 1)
+            self.assertEqual(failure["max_absolute_error"], delta)
+            json.dumps(failure, allow_nan=False)
 
     def test_unknown_cadence_route_update_and_dtype_are_rejected(self):
         session = self.session()
