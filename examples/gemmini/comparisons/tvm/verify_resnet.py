@@ -2,9 +2,11 @@
 
 import argparse
 from collections import Counter
+import copy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -243,6 +245,68 @@ def compare_output(actual, expected, np):
             "passed": bool(np.allclose(actual, expected, rtol=RTOL, atol=ATOL, equal_nan=False))}
 
 
+def fold_resnet_batchnorm(model, torch, state_hash):
+    """Derive an FP32 evaluation copy for explicitly paired ResNet Conv/BN sites."""
+    if any(module.training for module in model.modules()):
+        raise ValueError("BatchNorm folding requires every module in evaluation mode")
+    modules = dict(model.named_modules())
+    pairs = []
+    for name, bn in modules.items():
+        if not isinstance(bn, torch.nn.modules.batchnorm._BatchNorm):
+            continue
+        parent, _, leaf = name.rpartition(".")
+        if leaf.startswith("bn") and leaf[2:].isdigit():
+            conv_name = ".".join(filter(None, (parent, "conv" + leaf[2:])))
+        elif leaf == "1" and parent.endswith("downsample") and type(modules[parent]) is torch.nn.Sequential:
+            conv_name = parent + ".0"
+        else:
+            raise ValueError(f"Unsupported BatchNorm pairing: {name}")
+        conv = modules.get(conv_name)
+        if type(conv) is not torch.nn.Conv2d or type(bn) is not torch.nn.BatchNorm2d:
+            raise ValueError(f"BatchNorm folding requires standard Conv2d/BatchNorm2d: {name}")
+        if not bn.affine or not bn.track_running_stats or bn.running_mean is None or bn.running_var is None:
+            raise ValueError(f"BatchNorm folding requires affine parameters and running statistics: {name}")
+        if conv.out_channels != bn.num_features or not math.isfinite(bn.eps) or bn.eps <= 0:
+            raise ValueError(f"Incompatible BatchNorm channels or epsilon: {name}")
+        tensors = [conv.weight, bn.weight, bn.bias, bn.running_mean, bn.running_var]
+        if conv.bias is not None:
+            tensors.append(conv.bias)
+        if any(value.dtype != torch.float32 or value.device.type != "cpu" or not torch.isfinite(value).all() for value in tensors):
+            raise ValueError(f"BatchNorm folding requires finite CPU FP32 parameters: {name}")
+        if (bn.running_var < 0).any():
+            raise ValueError(f"BatchNorm variance must be nonnegative: {name}")
+        pairs.append((conv_name, name, bn.eps))
+    if not pairs:
+        raise ValueError("BatchNorm folding requires at least one supported pair")
+    original_hash = state_hash(model)
+    derived = copy.deepcopy(model)
+    sites = []
+    with torch.no_grad():
+        for conv_name, bn_name, epsilon in pairs:
+            conv, bn = derived.get_submodule(conv_name), derived.get_submodule(bn_name)
+            scale = bn.weight / torch.sqrt(bn.running_var + epsilon)
+            bias = conv.bias if conv.bias is not None else torch.zeros_like(bn.running_mean)
+            weight = conv.weight * scale[:, None, None, None]
+            bias = bn.bias + scale * (bias - bn.running_mean)
+            if not torch.isfinite(weight).all() or not torch.isfinite(bias).all():
+                raise ValueError(f"BatchNorm folding produced nonfinite parameters: {bn_name}")
+            conv.weight = torch.nn.Parameter(weight, requires_grad=False)
+            conv.bias = torch.nn.Parameter(bias, requires_grad=False)
+            parent, _, leaf = bn_name.rpartition(".")
+            derived.get_submodule(parent)._modules[leaf] = torch.nn.Identity().eval()
+            sites.append({"conv": conv_name, "batchnorm": bn_name, "epsilon": epsilon,
+                          "weight_sha256": hashlib.sha256(weight.numpy().tobytes()).hexdigest(),
+                          "bias_sha256": hashlib.sha256(bias.numpy().tobytes()).hexdigest()})
+    if state_hash(model) != original_hash:
+        raise AssertionError("BatchNorm folding changed the source model")
+    return derived, {"source_state_dict_sha256": original_hash, "derived_state_dict_sha256": state_hash(derived),
+                     "contract": {"mode": "evaluation", "dtype": "float32", "device": "cpu",
+                                  "scale": "gamma / sqrt(running_var + epsilon)",
+                                  "weight": "weight * scale", "bias": "beta + scale * (bias - running_mean)",
+                                  "missing_conv_bias": "zero", "rtol": RTOL, "atol": ATOL},
+                     "sites": sites, "images": []}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model2mlir-root", required=True, type=Path)
@@ -253,6 +317,8 @@ def main():
     parser.add_argument("--input-source", help="Declared origin of the supplied image stream")
     parser.add_argument("--preprocessing", help="Declared preprocessing already applied to the images")
     parser.add_argument("--labels", type=Path, help="Optional JSON class order and labels bound to the supplied NPZ")
+    parser.add_argument("--batchnorm-folding", action="store_true",
+                        help="Validate an evaluation-only FP32 folded copy against the unchanged reference, then export that copy")
     parser.add_argument("--graph-mode", choices=("baseline", "optimized", "both"), default="baseline",
                         help="Opt-in graph diagnostic: optimized runs zero_pipeline before the ordinary VM build; default preserves the baseline")
     args = parser.parse_args()
@@ -323,6 +389,11 @@ def main():
             raise AssertionError("Expected original full FP32 model parameters")
         state_hash = loader._state_dict_sha256(backbone)
         report["model"] = {"architecture": "ResNet50 v1.5", "state_dict_sha256": state_hash, "parameter_count": sum(value.numel() for value in backbone.parameters()), "module_count": sum(1 for _ in backbone.modules()), "stage_blocks": blocks, "conv_modules": strides, "loader_provenance": model.session_provenance, "loader_environment": loaded["loader_environment"], "input_layout": "NCHW", "parameter_perturbation": False}
+        export_model = model
+        if args.batchnorm_folding:
+            stage("derive_batchnorm_folded_model")
+            export_model = copy.deepcopy(model)
+            export_model.model, report["batchnorm_folding"] = fold_resnet_batchnorm(backbone, torch, loader._state_dict_sha256)
         expected_outputs = []
         for index, image in enumerate(images):
             stage(f"torch_execute_image_{index}")
@@ -331,10 +402,19 @@ def main():
             if expected.dtype != np.float32 or expected.shape != (1, 1000) or not np.isfinite(expected).all():
                 raise AssertionError("Expected finite FP32 classifier logits [1,1000]")
             expected_outputs.append(expected)
-            np.savez(allowed_path(output / f"image_{index}.npz"), image=image.numpy(), torch=expected)
+            values = {"image": image.numpy(), "torch": expected}
+            if args.batchnorm_folding:
+                with torch.no_grad():
+                    folded = export_model(image).numpy()
+                comparison = compare_output(folded, expected, np)
+                report["batchnorm_folding"]["images"].append({"index": index, "folded_vs_torch": comparison})
+                values["torch_folded"] = folded
+                if not comparison["passed"]:
+                    raise AssertionError(f"BatchNorm-folded PyTorch mismatch for image {index}")
+            np.savez(allowed_path(output / f"image_{index}.npz"), **values)
         stage("torch_legacy_onnx_export")
         graph_path = allowed_path(output / "model.onnx")
-        torch.onnx.export(model, (images[0],), str(graph_path), input_names=["image"], output_names=["logits"], opset_version=17, dynamo=False, do_constant_folding=True)
+        torch.onnx.export(export_model, (images[0],), str(graph_path), input_names=["image"], output_names=["logits"], opset_version=17, dynamo=False, do_constant_folding=True)
         report["onnx_graph"] = file_identity(graph_path, allowed_path)
         stage("onnx_check_and_shape_inference")
         graph = onnx.load(str(graph_path))
@@ -356,6 +436,10 @@ def main():
         write_json("relax_inventory.json", inventory)
         report["relax_operator_counts"] = inventory["operator_counts"]
         image_arrays = [{"image": image.numpy(), "torch": expected} for image, expected in zip(images, expected_outputs)]
+        if args.batchnorm_folding:
+            for index, values in enumerate(image_arrays):
+                with np.load(allowed_path(output / f"image_{index}.npz"), allow_pickle=False) as saved:
+                    values["torch_folded"] = saved["torch_folded"]
         for mode in modes:
             stage(f"relax_prepare_{mode}")
             graph_mod, vm_mod = prepare_graph(mod, mode, tvm)
@@ -404,6 +488,8 @@ def main():
             report["descriptive_accuracy"] = report["graph_modes"][modes[0]]["descriptive_accuracy"]
         if loader._state_dict_sha256(backbone) != state_hash:
             raise AssertionError("Model parameters or buffers changed during verification")
+        if args.batchnorm_folding and loader._state_dict_sha256(export_model.model) != report["batchnorm_folding"]["derived_state_dict_sha256"]:
+            raise AssertionError("BatchNorm-folded parameters changed during verification")
         if not all(row["graph_mode_comparisons"][mode]["relax_vs_torch"]["passed"] for row in report["images"] for mode in modes):
             raise AssertionError("Relax/PyTorch output mismatch at fixed thresholds")
         for identity in report["artifacts"].values():
