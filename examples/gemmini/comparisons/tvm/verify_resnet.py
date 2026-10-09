@@ -307,6 +307,92 @@ def fold_resnet_batchnorm(model, torch, state_hash):
                      "sites": sites, "images": []}
 
 
+def verify_integer_resnet(args, model, expected_outputs, labels, report, output, stage, write_json, np, torch, tvm, state_hash):
+    """Qualify the complete development integer graph and optional static export."""
+    import resnet_quantized as recipe
+    from verify_session import load_module as load_registered_module
+
+    report.update(integer_reference_verified=False, device_execution=False, timing_qualified=False, model_quality_qualified=False)
+    report["integer_recipe_source"] = file_identity(recipe.__file__, safe_path)
+    stage("load_distinct_calibration_stream")
+    calibration, identity = load_images(args.calibration_inputs, np)
+    report["artifacts"]["calibration_inputs"] = identity
+    ids = [f"{identity['sha256']}:{index}" for index in range(len(calibration))]
+    plan = recipe.calibrate_resnet50(model.model, calibration, calibration_ids=ids,
+        checkpoint_declaration="local supplied state_dict" if args.checkpoint else "random diagnostic; not pretrained")
+    report["quantization"] = plan.manifest()
+    report["quantization"]["calibration_source"] = args.calibration_source
+    write_json("quantization.json", report["quantization"])
+    expected = [recipe.reference(plan, image.numpy(), return_integer_logits=True) for image in model.session_images]
+    modes = list(report["graph_modes"])
+    exporter_dir = safe_path(args.tvm_source) / "apps/gemmini"
+    sys.path.insert(0, str(exporter_dir))
+    exporter = load_registered_module("tvm_resnet_baremetal_exporter", exporter_dir / "baremetal.py")
+    report["baremetal_exporter_source"] = file_identity(exporter.__file__, safe_path)
+    for mode in modes:
+        stage(f"integer_prepare_{mode}")
+        semantic, prepared, coverage = recipe.prepare_device_graph(plan, optimize=mode == "optimized",
+            tile_i=args.tile_i, tile_j=args.tile_j, return_integer_logits=True)
+        row = report["graph_modes"][mode]
+        row["device_coverage"] = coverage
+        row["memory_preflight"] = exporter.preflight_graph(prepared, memory_limit_bytes=args.memory_limit_bytes)
+        row["memory_scope"] = "explicit tensors only; executable, stack and platform reservations additional"
+        semantic_path, prepared_path = output / "integer_semantic.relax.py", output / f"integer_{mode}.relax.py"
+        semantic_path.write_text(semantic.script())
+        prepared_path.write_text(prepared.script())
+        row["semantic_ir"], row["device_ir"] = file_identity(semantic_path, safe_path), file_identity(prepared_path, safe_path)
+        stage(f"integer_build_cpu_{mode}")
+        _, lowered = prepare_graph(semantic, mode, tvm)
+        vm = tvm.relax.VirtualMachine(tvm.relax.build(lowered, "llvm", pipeline=None), tvm.cpu())
+        for index, image in enumerate(model.session_images):
+            stage(f"integer_execute_{mode}_image_{index}")
+            image_array = image.numpy()
+            result = vm["main"](tvm.nd.array(recipe.quantize(image_array, plan.input_exponent), tvm.cpu()))
+            integer_actual, actual = result[0].numpy(), result[1].numpy()
+            integer_expected, expected_logits = expected[index]
+            for candidate, reference in ((integer_actual, integer_expected), (actual, expected_logits)):
+                if candidate.dtype != reference.dtype or candidate.shape != reference.shape or not np.array_equal(candidate, reference):
+                    raise AssertionError(f"Integer recipe/CPU disagreement for image {index}")
+            if mode == modes[0]:
+                report["images"].append({"index": index, "input_sha256": recipe.array_digest(image_array), "graph_mode_comparisons": {}})
+            comparison = {"integer_exact": True, "dequantized_exact": True,
+                "integer_sha256": recipe.array_digest(integer_actual), "dequantized_sha256": recipe.array_digest(actual),
+                "versus_original_fp32_max_absolute_error": float(np.max(np.abs(actual.astype(np.float64) - expected_outputs[index])))}
+            if labels is not None:
+                sample = labels["samples"][index]
+                comparison["classification"] = {"sample_id": sample["id"], "label": sample["label"],
+                    "torch": classify_logits(expected_outputs[index], sample["label"], np), "relax": classify_logits(actual, sample["label"], np)}
+            report["images"][index]["graph_mode_comparisons"][mode] = comparison
+            np.savez(output / f"integer_{mode}_image_{index}.npz", integer_reference=integer_expected,
+                integer_actual=integer_actual, dequantized_reference=expected_logits, dequantized_actual=actual)
+            row["checked_images"] = index + 1
+            report["session"]["checked_images"] = min(value["checked_images"] for value in report["graph_modes"].values())
+        if labels is not None:
+            row["descriptive_accuracy"] = accuracy_counts([image["graph_mode_comparisons"][mode]["classification"] for image in report["images"]])
+            rates = row["descriptive_accuracy"]
+            row["development_accuracy_gate"] = {"maximum_top1_rate_drop": args.max_top1_drop,
+                "observed_top1_rate_drop": rates["torch"]["top1"]["rate"] - rates["relax"]["top1"]["rate"],
+                "paper_approved": False, "dataset_truth_verified": False}
+            row["development_accuracy_gate"]["passed"] = row["development_accuracy_gate"]["observed_top1_rate_drop"] <= args.max_top1_drop
+            if not row["development_accuracy_gate"]["passed"]:
+                raise AssertionError("Quantized model exceeds the declared development top-1 loss gate")
+        if args.export_baremetal:
+            stage(f"integer_export_baremetal_{mode}")
+            row["baremetal_export"] = exporter.export_graph(prepared, output / f"baremetal_{mode}", memory_limit_bytes=args.memory_limit_bytes)
+        write_json("results.json", report)
+    for identity in [*report["artifacts"].values(), report["integer_recipe_source"], report["baremetal_exporter_source"]]:
+        if file_identity(identity["path"], safe_path) != identity:
+            raise AssertionError("Selected integer source or supplied artifact changed")
+    if state_hash(model.model) != report["model"]["state_dict_sha256"]:
+        raise AssertionError("Quantization changed original FP32 checkpoint parameters")
+    report["session"]["complete"] = all(value["checked_images"] == len(model.session_images) for value in report["graph_modes"].values())
+    if not report["session"]["complete"]:
+        raise AssertionError("Integer verification omitted declared images")
+    report.update(status="passed", integer_reference_verified=True)
+    stage("complete")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model2mlir-root", required=True, type=Path)
@@ -317,6 +403,14 @@ def main():
     parser.add_argument("--input-source", help="Declared origin of the supplied image stream")
     parser.add_argument("--preprocessing", help="Declared preprocessing already applied to the images")
     parser.add_argument("--labels", type=Path, help="Optional JSON class order and labels bound to the supplied NPZ")
+    parser.add_argument("--quantized", action="store_true", help="Verify the explicit full integer development recipe; no automatic paper qualification")
+    parser.add_argument("--calibration-inputs", type=Path, help="Distinct FP32 NPZ stream required by --quantized")
+    parser.add_argument("--calibration-source", help="Declared origin of the distinct calibration stream")
+    parser.add_argument("--max-top1-drop", type=float, default=0.02, help="Development top-1 rate-loss gate versus unchanged FP32 on supplied labels (default 0.02)")
+    parser.add_argument("--export-baremetal", action="store_true", help="Export complete integer device graph; does not execute or time it")
+    parser.add_argument("--memory-limit-bytes", type=int, default=256 * 1024 * 1024, help="Explicit tensor-storage budget; additional platform reservations are required")
+    parser.add_argument("--tile-i", type=int, choices=(1, 2, 4), default=1)
+    parser.add_argument("--tile-j", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--batchnorm-folding", action="store_true",
                         help="Validate an evaluation-only FP32 folded copy against the unchanged reference, then export that copy")
     parser.add_argument("--graph-mode", choices=("baseline", "optimized", "both"), default="baseline",
@@ -327,6 +421,12 @@ def main():
         parser.error("Supplied-artifact mode requires --checkpoint, --inputs, --input-source and --preprocessing together")
     if args.labels is not None and args.inputs is None:
         parser.error("--labels requires supplied-artifact mode with all four artifact options")
+    if args.quantized and (not args.calibration_inputs or not args.calibration_source or args.batchnorm_folding):
+        parser.error("--quantized requires distinct --calibration-inputs and --calibration-source and performs its own BatchNorm folding")
+    if not args.quantized and (args.calibration_inputs or args.calibration_source or args.export_baremetal):
+        parser.error("Calibration and baremetal export options require --quantized")
+    if not 0 <= args.max_top1_drop <= 1 or args.memory_limit_bytes <= 0:
+        parser.error("Invalid accuracy loss or tensor-memory budget")
     sys.dont_write_bytecode = True
     output = safe_path(args.output_dir)
     try:
@@ -412,6 +512,8 @@ def main():
                 if not comparison["passed"]:
                     raise AssertionError(f"BatchNorm-folded PyTorch mismatch for image {index}")
             np.savez(allowed_path(output / f"image_{index}.npz"), **values)
+        if args.quantized:
+            return verify_integer_resnet(args, model, expected_outputs, labels, report, output, stage, write_json, np, torch, tvm, loader._state_dict_sha256)
         stage("torch_legacy_onnx_export")
         graph_path = allowed_path(output / "model.onnx")
         torch.onnx.export(export_model, (images[0],), str(graph_path), input_names=["image"], output_names=["logits"], opset_version=17, dynamo=False, do_constant_folding=True)
