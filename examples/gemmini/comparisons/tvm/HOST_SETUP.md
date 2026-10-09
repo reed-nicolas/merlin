@@ -250,6 +250,8 @@ Use a fresh output directory. Factory arguments are a JSON object of keyword arg
 
 PyTorch and TVM maintain independent routed state. Every stage output and state update must agree, and restoring initial inputs must reproduce the full session. Reports retain source/artifact hashes, loaded parameter digests, input identities, per-stage IR, compilation signatures and comparisons. The input-state byte count is diagnostic accounting, not deployed peak memory. Quality, paper, device and timing qualification remain false.
 
+Factories can expose `get_verification_artifacts(model, inputs)` to bind the checkpoint, tokenizer, input and supporting source files they actually select. Those files are hashed before session execution and checked again afterward. ONNX external tensor files are validated before loading, included in each stage's `onnx_artifacts` and rechecked after execution. The verifier uses the path-based ONNX checker to support external-weight models beyond the in-memory protobuf limit; the focused tests exercise smaller external-weight graphs, invalid locations/ranges/metadata and mutation rejection. These identities do not establish complete runtime source closure.
+
 Six focused tests pass, including real LLVM execution of a two-stage recurrence and three growing-cache shapes, plus failure controls. These fixtures contain no paper checkpoints; passing them does not establish full TinyLlama or SmolVLA execution. In the activated host environment:
 
 ```bash

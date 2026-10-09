@@ -148,6 +148,73 @@ class SessionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "signature budget"):
             self.verifier.verify_session(self.session(), self.reference_compiler, self.np, self.torch, max_signatures=1)
 
+    def external_graph(self, folder):
+        import onnx
+        value = self.np.array([[1., -2.], [3., 4.]], dtype="float32")
+        weight = onnx.numpy_helper.from_array(value, name="weight")
+        graph = onnx.helper.make_graph([onnx.helper.make_node("Add", ["input", "weight"], ["output"])], "external",
+            [onnx.helper.make_tensor_value_info("input", onnx.TensorProto.FLOAT, [2, 2])],
+            [onnx.helper.make_tensor_value_info("output", onnx.TensorProto.FLOAT, [2, 2])], [weight])
+        model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 17)])
+        path = folder / "model.onnx"
+        onnx.save_model(model, str(path), save_as_external_data=True, all_tensors_to_one_file=True, location="weights.bin", size_threshold=0)
+        return path, value
+
+    def test_external_weights_are_loaded_and_content_bound(self):
+        import onnx
+        with tempfile.TemporaryDirectory(prefix="tvm-session-external-") as temp:
+            path, value = self.external_graph(Path(temp))
+            graph, identities = self.verifier.load_onnx_graph(path, onnx)
+            self.assertEqual(len(identities), 2)
+            self.assertEqual({Path(item["path"]).name for item in identities}, {"model.onnx", "weights.bin"})
+            self.np.testing.assert_array_equal(onnx.numpy_helper.to_array(graph.graph.initializer[0]), value)
+            self.assertEqual(graph.graph.initializer[0].data_location, onnx.TensorProto.DEFAULT)
+
+    def test_external_paths_metadata_and_ranges_are_checked_before_loading(self):
+        import onnx
+        with tempfile.TemporaryDirectory(prefix="tvm-session-external-") as temp:
+            folder = Path(temp)
+            path, _ = self.external_graph(folder)
+            original = onnx.load(str(path), load_external_data=False)
+            for location in ("../outside.bin", "/outside.bin"):
+                malformed = onnx.ModelProto()
+                malformed.CopyFrom(original)
+                malformed.graph.initializer[0].external_data[0].value = location
+                path.write_bytes(malformed.SerializeToString())
+                with self.assertRaisesRegex(ValueError, "stage directory"):
+                    self.verifier.load_onnx_graph(path, onnx)
+            for key, value, expected in (("offset", "-1", "nonnegative"), ("length", "17", "range exceeds"), ("basepath", "elsewhere", "metadata")):
+                malformed = onnx.ModelProto()
+                malformed.CopyFrom(original)
+                entries = malformed.graph.initializer[0].external_data
+                matches = [entry for entry in entries if entry.key == key]
+                entry = matches[0] if matches else entries.add()
+                entry.key, entry.value = key, value
+                path.write_bytes(malformed.SerializeToString())
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.verifier.load_onnx_graph(path, onnx)
+            malformed = onnx.ModelProto()
+            malformed.CopyFrom(original)
+            entry = malformed.graph.initializer[0].external_data.add()
+            entry.key, entry.value = "location", "weights.bin"
+            path.write_bytes(malformed.SerializeToString())
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                self.verifier.load_onnx_graph(path, onnx)
+
+    def test_external_weight_changes_during_check_are_rejected(self):
+        import onnx
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix="tvm-session-external-") as temp:
+            folder = Path(temp)
+            path, _ = self.external_graph(folder)
+            check = onnx.checker.check_model
+            def mutate(*args, **kwargs):
+                check(*args, **kwargs)
+                weights = folder / "weights.bin"
+                weights.write_bytes(bytes([weights.read_bytes()[0] ^ 1]) + weights.read_bytes()[1:])
+            with patch.object(onnx.checker, "check_model", mutate), self.assertRaisesRegex(AssertionError, "changed"):
+                self.verifier.load_onnx_graph(path, onnx)
+
     @unittest.skipUnless(os.environ.get("TVM_LIBRARY_PATH"), "Requires explicit LLVM-enabled TVM host build")
     def test_real_onnx_relax_pipeline_verifies_every_stage(self):
         import onnx

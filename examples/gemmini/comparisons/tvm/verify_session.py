@@ -72,6 +72,57 @@ def tensor_identity(value):
             "sha256": hashlib.sha256(value.tobytes()).hexdigest()}
 
 
+def onnx_tensors(message, onnx):
+    if isinstance(message, onnx.TensorProto):
+        yield message
+        return
+    for field, value in message.ListFields():
+        if field.message_type is not None:
+            for child in value if field.label == field.LABEL_REPEATED else (value,):
+                yield from onnx_tensors(child, onnx)
+
+
+def load_onnx_graph(path, onnx):
+    """Validate and bind external tensor files before ONNX opens them."""
+    path = safe_path(path)
+    identities = [file_identity(path, safe_path)]
+    graph = onnx.load(str(path), load_external_data=False)
+    external = {}
+    tensors = list(onnx_tensors(graph, onnx))
+    for tensor in tensors:
+        if tensor.data_location != onnx.TensorProto.EXTERNAL:
+            continue
+        fields = {entry.key: entry.value for entry in tensor.external_data}
+        if len(fields) != len(tensor.external_data) or set(fields) - {"location", "offset", "length", "checksum"}:
+            raise ValueError("Unsupported or duplicate ONNX external-data metadata")
+        location = Path(fields.get("location", ""))
+        if not fields.get("location") or location.is_absolute() or ".." in location.parts:
+            raise ValueError("ONNX external weights must stay within their stage directory")
+        artifact = safe_path(path.parent / location)
+        if not artifact.is_relative_to(path.parent) or not artifact.is_file():
+            raise ValueError("ONNX external weights must be local regular files")
+        if artifact not in external:
+            external[artifact] = file_identity(artifact, safe_path)
+        offset, length = fields.get("offset", "0"), fields.get("length")
+        if not offset.isdecimal() or length is not None and not length.isdecimal():
+            raise ValueError("ONNX external-data ranges must be nonnegative integers")
+        size = artifact.stat().st_size
+        if int(offset) > size or length is not None and (int(length) < 1 or int(offset) + int(length) > size):
+            raise ValueError("ONNX external-data range exceeds its weight file")
+    # Path checking supports >2-GiB external-weight models without serializing them.
+    onnx.checker.check_model(str(path), full_check=True)
+    for tensor in tensors:
+        if tensor.data_location == onnx.TensorProto.EXTERNAL:
+            onnx.external_data_helper.load_external_data_for_tensor(tensor, str(path.parent))
+            tensor.data_location = onnx.TensorProto.DEFAULT
+            del tensor.external_data[:]
+    identities.extend(external.values())
+    for identity in identities:
+        if file_identity(identity["path"], safe_path) != identity:
+            raise AssertionError("ONNX model or external weights changed while loading")
+    return graph, identities
+
+
 def normalize(value, np, torch):
     if isinstance(value, (torch.Tensor, np.ndarray)):
         return tensor_identity(array(value, np, torch))
@@ -275,12 +326,11 @@ class StageCompiler:
         self.torch.onnx.export(program.module, tensors, str(graph_path), input_names=names,
                               output_names=["output_" + str(index) for index in range(output_count)],
                               opset_version=17, dynamo=False, do_constant_folding=True)
-        graph = self.onnx.load(str(graph_path))
-        self.onnx.checker.check_model(graph, full_check=True)
+        graph, artifacts = load_onnx_graph(graph_path, self.onnx)
         from tvm.relax.frontend.onnx import from_onnx
         mod = from_onnx(graph, shape_dict={name: list(value.shape) for name, value in zip(names, inputs)}, keep_params_in_input=False)
         transformed, lowered = prepare_graph(mod, self.mode, self.tvm)
-        record = {"program": program.name, "inputs": [tensor_identity(value) for value in inputs], "onnx": file_identity(graph_path, safe_path),
+        record = {"program": program.name, "inputs": [tensor_identity(value) for value in inputs], "onnx": artifacts[0], "onnx_artifacts": artifacts,
                   "pipelines": ["zero", "default_build"] if self.mode == "optimized" else ["default_build"]}
         for name, value in (("imported", mod), ("graph", transformed), ("vm", lowered)):
             path = folder / (name + ".relax.py")
@@ -352,15 +402,18 @@ def main():
         with offline():
             factory = load_module("tvm_session_factory", args.factory)
             model, inputs = getattr(factory, args.factory_name)(**arguments)
+            artifacts = factory.get_verification_artifacts(model, inputs) if callable(getattr(factory, "get_verification_artifacts", None)) else ()
+            report["factory_artifacts"] = [file_identity(path, safe_path) for path in artifacts]
             metadata = factory.get_session_spec(model, inputs) if callable(getattr(factory, "get_session_spec", None)) else None
             session = protocol.external_runtime_session(model, tuple(inputs), session=metadata)
             compiler = StageCompiler(out, args.graph_mode, np, torch, onnx, tvm)
-            report.update(verify_session(session, compiler, np, torch, repeats=args.repeats, rtol=args.rtol, atol=args.atol, max_signatures=args.max_signatures))
             report["compiled_stages"] = compiler.records
+            report.update(verify_session(session, compiler, np, torch, repeats=args.repeats, rtol=args.rtol, atol=args.atol, max_signatures=args.max_signatures))
         infos = [report["verifier_source"], report["graph_helper_source"], report["protocol_source"], report["factory_source"],
-                 report["compiler_library"], *report["declared_artifacts"]]
+                 report["compiler_library"], *report["declared_artifacts"], *report["factory_artifacts"]]
         if "factory_arguments" in report:
             infos.append(report["factory_arguments"])
+        infos.extend(artifact for stage in report["compiled_stages"] for artifact in stage["onnx_artifacts"])
         for info in infos:
             if file_identity(info["path"], safe_path) != info:
                 raise AssertionError("Selected source or declared artifact changed")
