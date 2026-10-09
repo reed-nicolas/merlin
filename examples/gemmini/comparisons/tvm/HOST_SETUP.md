@@ -13,7 +13,7 @@ For a new TVM checkout, clone without checkout and apply the mandatory name excl
 ```bash
 export TVM_ROOT=/absolute/path/to/tvm-gemmini
 export TVM_BUILD=/absolute/path/to/tvm-host-build
-tvm_commit=aace50b4637a1f60dd66c8cd8d505f0f684a5000
+tvm_commit=b66f54206cf9d58db0f08f32012bbd52f40c198e
 git clone --filter=blob:none --no-checkout https://github.com/reed-nicolas/tvm.git "$TVM_ROOT"
 git -C "$TVM_ROOT" sparse-checkout set --no-cone --stdin <<'PATTERNS'
 /*
@@ -28,7 +28,7 @@ In the same shell, verify the selected source pin and prepare the host environme
 ```bash
 : "${TVM_ROOT:?Set TVM_ROOT to the independent TVM checkout}"
 : "${TVM_BUILD:?Set TVM_BUILD to the TVM host build directory}"
-test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = aace50b4637a1f60dd66c8cd8d505f0f684a5000 || { echo 'TVM source pin mismatch' >&2; exit 1; }
+test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = b66f54206cf9d58db0f08f32012bbd52f40c198e || { echo 'TVM source pin mismatch' >&2; exit 1; }
 merlin_root="$PWD"
 setup_dir="$merlin_root/examples/gemmini/comparisons/tvm"
 host_python="${TVM_HOST_PYTHON:-$(command -v python3.10)}"
@@ -60,7 +60,7 @@ The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. Initial
 git -C "$TVM_ROOT" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
 ```
 
-A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `aace50b4637a1f60dd66c8cd8d505f0f684a5000`. Clone each dependency without checkout and apply the same exclusions before checkout:
+A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `b66f54206cf9d58db0f08f32012bbd52f40c198e`. Clone each dependency without checkout and apply the same exclusions before checkout:
 
 ```bash
 git -C "$TVM_ROOT" submodule init -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
@@ -273,9 +273,17 @@ Use a fresh output directory. Factory arguments are a JSON object of keyword arg
 
 PyTorch and TVM maintain independent routed state. Every stage output and state update must agree, and restoring initial inputs must reproduce the full session. Reports retain source/artifact hashes, loaded parameter digests, input identities, per-stage IR, compilation signatures and comparisons. The input-state byte count is diagnostic accounting, not deployed peak memory. Quality, paper, device and timing qualification remain false.
 
+Original BF16 tensors use exact uint16 payload views through the optional `ml_dtypes` dependency; comparison casts do not alter their stored dtype or bits. Export runs on a deep copy of each source stage because modern tracing mutates ordinary runtime cache attributes into FakeTensor objects. The independent source stage and its reset behavior remain intact. These host export/VM copies consume additional memory; retained input-state bytes are not an allocation peak or target-fit claim.
+
+`--onnx-exporter dynamo` explicitly selects the modern Torch exporter (default opset 18); the default legacy exporter remains opset 17. `--opset` overrides the schema when supported by the installed ONNX package. Native BF16 convolution requires opset 22. The tested optional host packages for the modern recurrence and TinyLlama path are:
+
+```bash
+python -m pip install 'ml_dtypes==0.5.4' 'onnxscript==0.5.6' 'onnx_ir==0.1.12'
+```
+
 Factories can expose `get_verification_artifacts(model, inputs)` to bind the checkpoint, tokenizer, input and supporting source files they actually select. Those files are hashed before session execution and checked again afterward. ONNX external tensor files are validated before loading, included in each stage's `onnx_artifacts` and rechecked after execution. The verifier uses the path-based ONNX checker to support external-weight models beyond the in-memory protobuf limit; the focused tests exercise smaller external-weight graphs, invalid locations/ranges/metadata and mutation rejection. These identities do not establish complete runtime source closure.
 
-Six focused tests pass, including real LLVM execution of a two-stage recurrence and three growing-cache shapes, plus failure controls. These fixtures contain no paper checkpoints; passing them does not establish full TinyLlama or SmolVLA execution. In the activated host environment:
+Thirteen focused tests pass, including real LLVM execution of recurrence/growing-state stages, exact BF16 payloads/state routing, explicit schema admission, external weights and a modern-export cache/reset regression. The modern case requires optional onnxscript and `TVM_SESSION_MODERN_ONNX=1`; these diagnostic fixtures contain no model checkpoints. In the activated host environment:
 
 ```bash
 TVM_SESSION_MODEL2MLIR="$model2mlir_source" PYTHONPATH="$merlin_root/src:$PYTHONPATH" \

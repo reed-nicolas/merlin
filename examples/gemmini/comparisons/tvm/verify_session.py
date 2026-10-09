@@ -6,6 +6,7 @@ the existing ExternalRuntimeSession protocol; it never selects a paper checkpoin
 casts weights, quantizes, downloads models, or qualifies device timing/model quality.
 """
 import argparse
+import copy
 from contextlib import contextmanager
 from dataclasses import asdict
 import hashlib
@@ -51,20 +52,44 @@ def offline():
         yield
 
 
+def bfloat16_dtype():
+    try:
+        import ml_dtypes
+    except ImportError as error:
+        raise ValueError("Original BF16 verification requires the optional ml_dtypes dependency") from error
+    return ml_dtypes.bfloat16
+
+
 def array(value, np, torch):
     if isinstance(value, torch.Tensor):
         if value.device.type != "cpu" or value.layout != torch.strided:
             raise ValueError("Session tensors must be dense CPU tensors")
-        try:
-            value = value.detach().numpy()
-        except TypeError as error:
-            raise ValueError("Unsupported tensor dtype; implicit precision conversion is forbidden") from error
+        if value.dtype == torch.bfloat16:
+            value = value.detach().contiguous().view(torch.uint16).numpy().view(bfloat16_dtype())
+        else:
+            try:
+                value = value.detach().numpy()
+            except TypeError as error:
+                raise ValueError("Unsupported tensor dtype; implicit precision conversion is forbidden") from error
+    elif hasattr(value, "numpy"):
+        dtype = str(value.dtype)
+        value = value.numpy()
+        if dtype == "bfloat16":
+            if value.dtype != np.uint16:
+                raise ValueError("Expected raw uint16 storage from TVM's BF16 NumPy interface")
+            value = value.view(bfloat16_dtype())
     value = np.asarray(value)
-    if value.dtype.name not in ("float16", "float32", "float64", "int8", "int16", "int32", "int64", "uint8", "bool"):
+    if value.dtype.name not in ("bfloat16", "float16", "float32", "float64", "int8", "int16", "int32", "int64", "uint8", "bool"):
         raise ValueError("Unsupported session dtype: " + str(value.dtype))
     if any(extent <= 0 for extent in value.shape) or not np.isfinite(value).all():
         raise ValueError("Session tensors require positive extents and finite values")
     return np.array(value, copy=True, order="C")
+
+
+def torch_array(value, np, torch):
+    if value.dtype.name == "bfloat16":
+        return torch.from_numpy(value.copy().view(np.uint16)).view(torch.bfloat16)
+    return torch.from_numpy(value.copy())
 
 
 def tensor_identity(value):
@@ -153,19 +178,19 @@ def endpoint(value):
 
 def outputs(value, np, torch):
     if isinstance(value, torch.Tensor) or hasattr(value, "numpy"):
-        return [array(value.numpy() if not isinstance(value, torch.Tensor) else value, np, torch)]
+        return [array(value, np, torch)]
     if isinstance(value, (tuple, list)) or hasattr(value, "__getitem__"):
         result = list(value)
         if result and all(isinstance(item, torch.Tensor) or hasattr(item, "numpy") for item in result):
-            return [array(item.numpy() if not isinstance(item, torch.Tensor) else item, np, torch) for item in result]
+            return [array(item, np, torch) for item in result]
     raise ValueError("Stages must return a tensor or flat nonempty tensor tuple")
 
 
 def compare(actual, expected, np, rtol, atol):
     if actual.shape != expected.shape or actual.dtype != expected.dtype or not np.isfinite(actual).all():
         raise AssertionError("Session tensor shape/dtype/finite-value mismatch")
-    floating = np.issubdtype(actual.dtype, np.floating)
-    passed = np.allclose(actual, expected, rtol=rtol, atol=atol, equal_nan=False) if floating else np.array_equal(actual, expected)
+    floating = np.issubdtype(actual.dtype, np.floating) or actual.dtype.name == "bfloat16"
+    passed = np.allclose(actual.astype(np.float64), expected.astype(np.float64), rtol=rtol, atol=atol, equal_nan=False) if floating else np.array_equal(actual, expected)
     if not passed:
         raise AssertionError("Session numerical comparison failed")
     error = float(np.max(np.abs(actual.astype(np.float64) - expected.astype(np.float64)))) if floating and actual.size else 0.0
@@ -249,10 +274,10 @@ def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, a
                 compare(actual, expected, np, rtol, atol)
             signature = tuple((str(value.dtype), tuple(value.shape)) for value in actual_args)
             key = program.name, signature
-            tensors = [torch.from_numpy(value.copy()) for value in expected_args]
+            tensors = [torch_array(value, np, torch) for value in expected_args]
             with torch.no_grad():
                 expected = outputs(program.module(*tensors), np, torch)
-            if any(not np.array_equal(value.numpy(), original) for value, original in zip(tensors, expected_args)):
+            if any(not np.array_equal(array(value, np, torch), original) for value, original in zip(tensors, expected_args)):
                 raise AssertionError("Reference stage mutated caller inputs")
             if key not in compiled:
                 if len(compiled) >= max_signatures:
@@ -313,8 +338,14 @@ def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, a
 
 
 class StageCompiler:
-    def __init__(self, out, mode, np, torch, onnx, tvm):
+    def __init__(self, out, mode, np, torch, onnx, tvm, exporter="legacy", opset=None):
+        if exporter not in ("legacy", "dynamo"):
+            raise ValueError("Unsupported ONNX exporter selection")
+        if opset is not None and (type(opset) is not int or not 1 <= opset <= onnx.defs.onnx_opset_version()):
+            raise ValueError("ONNX opset must be an integer supported by the selected ONNX dependency")
         self.out, self.mode, self.np, self.torch, self.onnx, self.tvm = out, mode, np, torch, onnx, tvm
+        self.exporter = exporter
+        self.opset = opset if opset is not None else (18 if exporter == "dynamo" else 17)
         self.records = []
 
     def __call__(self, program, inputs, output_count):
@@ -322,15 +353,20 @@ class StageCompiler:
         folder.mkdir()
         graph_path = folder / "model.onnx"
         names = ["input_" + str(index) for index in range(len(inputs))]
-        tensors = tuple(self.torch.from_numpy(value.copy()) for value in inputs)
-        self.torch.onnx.export(program.module, tensors, str(graph_path), input_names=names,
+        tensors = tuple(torch_array(value, self.np, self.torch) for value in inputs)
+        # Tracing mutates plain Python cache attributes into FakeTensor objects.
+        # Export an isolated stage so subsequent source calls and resets remain real.
+        export_module = copy.deepcopy(program.module)
+        self.torch.onnx.export(export_module, tensors, str(graph_path), input_names=names,
                               output_names=["output_" + str(index) for index in range(output_count)],
-                              opset_version=17, dynamo=False, do_constant_folding=True)
+                              opset_version=self.opset, dynamo=self.exporter == "dynamo", external_data=True, do_constant_folding=True)
+        del export_module
         graph, artifacts = load_onnx_graph(graph_path, self.onnx)
         from tvm.relax.frontend.onnx import from_onnx
         mod = from_onnx(graph, shape_dict={name: list(value.shape) for name, value in zip(names, inputs)}, keep_params_in_input=False)
         transformed, lowered = prepare_graph(mod, self.mode, self.tvm)
         record = {"program": program.name, "inputs": [tensor_identity(value) for value in inputs], "onnx": artifacts[0], "onnx_artifacts": artifacts,
+                  "exporter": self.exporter, "opset": self.opset, "export_source_isolation": "deepcopy",
                   "pipelines": ["zero", "default_build"] if self.mode == "optimized" else ["default_build"]}
         for name, value in (("imported", mod), ("graph", transformed), ("vm", lowered)):
             path = folder / (name + ".relax.py")
@@ -342,7 +378,7 @@ class StageCompiler:
         def run(values):
             arguments = [self.tvm.nd.array(value.copy(), self.tvm.cpu()) for value in values]
             result = vm["main"](*arguments)
-            if any(not self.np.array_equal(value.numpy(), before) for value, before in zip(arguments, values)):
+            if any(not self.np.array_equal(array(value, self.np, self.torch), before) for value, before in zip(arguments, values)):
                 raise AssertionError("TVM stage mutated caller inputs")
             return result
         return run
@@ -356,6 +392,8 @@ def main():
     parser.add_argument("--factory-arguments", type=Path, help="Local JSON keyword arguments passed unchanged to the selected factory")
     parser.add_argument("--artifact", type=Path, action="append", default=[], help="Explicit local checkpoint/input/config artifacts to hash")
     parser.add_argument("--graph-mode", choices=("baseline", "optimized"), default="optimized")
+    parser.add_argument("--onnx-exporter", choices=("legacy", "dynamo"), default="legacy", help="Explicit modern exporter for compatible source models; dynamo defaults to opset18 and needs onnxscript")
+    parser.add_argument("--opset", type=int, help="Explicit ONNX schema version; defaults to17 legacy or18 dynamo; native BF16 Conv requires22")
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--max-signatures", type=int, default=64)
     parser.add_argument("--rtol", type=float, default=1e-4)
@@ -406,7 +444,9 @@ def main():
             report["factory_artifacts"] = [file_identity(path, safe_path) for path in artifacts]
             metadata = factory.get_session_spec(model, inputs) if callable(getattr(factory, "get_session_spec", None)) else None
             session = protocol.external_runtime_session(model, tuple(inputs), session=metadata)
-            compiler = StageCompiler(out, args.graph_mode, np, torch, onnx, tvm)
+            report["session"] = describe_session(session, np, torch)[0]
+            report["onnx_exporter"] = args.onnx_exporter
+            compiler = StageCompiler(out, args.graph_mode, np, torch, onnx, tvm, exporter=args.onnx_exporter, opset=args.opset)
             report["compiled_stages"] = compiler.records
             report.update(verify_session(session, compiler, np, torch, repeats=args.repeats, rtol=args.rtol, atol=args.atol, max_signatures=args.max_signatures))
         infos = [report["verifier_source"], report["graph_helper_source"], report["protocol_source"], report["factory_source"],

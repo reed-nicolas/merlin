@@ -65,8 +65,50 @@ class SessionTests(unittest.TestCase):
 
     def reference_compiler(self, program, inputs, output_count):
         def run(values):
-            return program.module(*(self.torch.from_numpy(value.copy()) for value in values))
+            return program.module(*(self.verifier.torch_array(value, self.np, self.torch) for value in values))
         return run
+
+    def test_exporter_and_schema_selection_are_explicit(self):
+        import onnx
+        compiler = self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None)
+        self.assertEqual(compiler.opset, 17)
+        compiler = self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, exporter="dynamo")
+        self.assertEqual(compiler.opset, 18)
+        compiler = self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, opset=22)
+        self.assertEqual(compiler.opset, 22)
+        for value in (0, True, "22", onnx.defs.onnx_opset_version() + 1):
+            with self.subTest(opset=value), self.assertRaisesRegex(ValueError, "opset"):
+                self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, opset=value)
+        with self.assertRaisesRegex(ValueError, "exporter"):
+            self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, exporter="unknown")
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
+    def test_modern_export_preserves_source_cache_across_repeats(self):
+        import onnx
+        import tvm
+        torch = self.torch
+
+        class CachedPrefix(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.cache = SimpleNamespace(length=torch.zeros((), dtype=torch.int64))
+
+            def forward(self, value):
+                self.cache.length = torch.zeros_like(self.cache.length)
+                self.cache.length += value.numel()
+                return value + self.cache.length.to(value.dtype)
+
+        session = self.session()
+        prefix = CachedPrefix().eval()
+        session = replace(session, programs=(replace(session.programs[0], module=prefix), session.programs[1]))
+        with tempfile.TemporaryDirectory(prefix="tvm-session-modern-cache-") as temp:
+            compiler = self.verifier.StageCompiler(Path(temp), "optimized", self.np, torch, onnx, tvm, exporter="dynamo", opset=22)
+            result = self.verifier.verify_session(session, compiler, self.np, torch)
+            self.assertTrue(result["reset_verified"])
+            self.assertEqual(len(result["checks"]), 8)
+            self.assertEqual(type(prefix.cache.length), torch.Tensor)
+            self.assertEqual(prefix.cache.length.numpy().item(), 2)
+            self.assertTrue(all(record["opset"] == 22 and record["exporter"] == "dynamo" for record in compiler.records))
 
     def growing_session(self):
         torch, protocol = self.torch, self.protocol
@@ -139,8 +181,42 @@ class SessionTests(unittest.TestCase):
             self.verifier.verify_session(malformed, self.reference_compiler, self.np, self.torch)
         with self.assertRaisesRegex(AssertionError, "dtype"):
             self.verifier.compare(self.np.ones(2, dtype="int32"), self.np.ones(2, dtype="int64"), self.np, 1e-4, 1e-4)
-        with self.assertRaisesRegex(ValueError, "precision conversion"):
-            self.verifier.array(self.torch.ones(2, dtype=self.torch.bfloat16), self.np, self.torch)
+        with self.assertRaisesRegex(ValueError, "Unsupported session dtype"):
+            self.verifier.array(self.torch.ones(2, dtype=self.torch.complex64), self.np, self.torch)
+
+    @unittest.skipUnless(importlib.util.find_spec("ml_dtypes"), "Original BF16 verification needs ml_dtypes")
+    def test_bfloat16_torch_numpy_tvm_round_trip_preserves_bits(self):
+        words = self.np.array([0, 0x8000, 0x3F81, 0xBFC1, 0x0080, 0x7F7F], dtype="uint16")
+        tensor = self.torch.from_numpy(words.copy()).view(self.torch.bfloat16)
+        value = self.verifier.array(tensor, self.np, self.torch)
+        self.assertEqual(value.dtype.name, "bfloat16")
+        self.np.testing.assert_array_equal(value.view(self.np.uint16), words)
+        restored = self.verifier.torch_array(value, self.np, self.torch)
+        self.assertTrue(self.torch.equal(restored.view(self.torch.uint16), tensor.view(self.torch.uint16)))
+        self.assertEqual(self.verifier.tensor_identity(value)["bytes"], 12)
+        if os.environ.get("TVM_LIBRARY_PATH"):
+            import tvm
+            candidate = self.verifier.outputs(tvm.nd.array(value), self.np, self.torch)[0]
+            self.np.testing.assert_array_equal(candidate.view(self.np.uint16), words)
+        with self.assertRaisesRegex(ValueError, "finite"):
+            self.verifier.array(self.torch.tensor([float("nan")], dtype=self.torch.bfloat16), self.np, self.torch)
+
+    @unittest.skipUnless(importlib.util.find_spec("ml_dtypes") and os.environ.get("TVM_LIBRARY_PATH"), "Needs BF16 dependency and TVM")
+    def test_original_bfloat16_session_compiles_and_routes_without_casts(self):
+        import onnx
+        import tvm
+        session = self.session()
+        bf16 = self.torch.bfloat16
+        session = replace(session,
+            programs=tuple(replace(program, inputs=tuple(value.to(bf16) for value in program.inputs)) for program in session.programs),
+            input_bindings=tuple(replace(binding, initial=binding.initial.to(bf16)) for binding in session.input_bindings),
+            streams=tuple(replace(stream, values=stream.values.to(bf16)) for stream in session.streams))
+        with tempfile.TemporaryDirectory(prefix="tvm-session-bfloat16-") as temp:
+            compiler = self.verifier.StageCompiler(Path(temp), "optimized", self.np, self.torch, onnx, tvm)
+            result = self.verifier.verify_session(session, compiler, self.np, self.torch, rtol=0, atol=0)
+        self.assertEqual(len(result["checks"]), 8)
+        self.assertTrue(result["reset_verified"])
+        self.assertTrue(all(row["outputs"][0]["actual"]["dtype"] == "bfloat16" for row in result["checks"]))
 
     def test_network_and_signature_budget_are_enforced(self):
         with self.verifier.offline(), self.assertRaisesRegex(RuntimeError, "network"):
