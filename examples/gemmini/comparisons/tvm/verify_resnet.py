@@ -205,6 +205,7 @@ def onnx_inventory(model, onnx):
 
 def relax_inventory(mod, tvm):
     calls, counts = [], Counter()
+    functions, function_counts = [], Counter()
 
     def visit(expr):
         if isinstance(expr, tvm.relax.Call):
@@ -212,10 +213,34 @@ def relax_inventory(mod, tvm):
             counts[op] += 1
             calls.append({"operator": op, "inputs": [str(arg.struct_info) for arg in expr.args], "output": str(expr.struct_info), "attributes": str(expr.attrs)})
 
-    for function in mod.functions.values():
+    for name, function in mod.functions.items():
+        kind = "relax" if isinstance(function, tvm.relax.Function) else "tir" if isinstance(function, tvm.tir.PrimFunc) else type(function).__name__
+        function_counts[kind] += 1
+        functions.append({"name": name.name_hint, "kind": kind, "parameters": len(function.params), "attributes": str(function.attrs)})
         if isinstance(function, tvm.relax.Function):
             tvm.relax.analysis.post_order_visit(function.body, visit)
-    return {"operator_counts": dict(sorted(counts.items())), "calls": calls}
+    return {"operator_counts": dict(sorted(counts.items())), "calls": calls,
+            "function_counts": dict(sorted(function_counts.items())), "functions": sorted(functions, key=lambda item: item["name"])}
+
+
+def prepare_graph(mod, mode, tvm):
+    """Apply the selected graph passes, then expose the actual VM build IR."""
+    if mode not in ("baseline", "optimized"):
+        raise ValueError("Expected baseline or optimized graph mode")
+    with tvm.target.Target("llvm"):
+        graph = tvm.relax.get_pipeline("zero")(mod) if mode == "optimized" else mod
+        lowered = tvm.relax.get_pipeline("default_build")(graph)
+    return graph, lowered
+
+
+def compare_output(actual, expected, np):
+    if not np.isfinite(actual).all():
+        raise AssertionError("Relax output contains nonfinite values")
+    if actual.shape != expected.shape or actual.dtype != expected.dtype:
+        raise AssertionError(f"Output mismatch: {actual.shape}/{actual.dtype} versus {expected.shape}/{expected.dtype}")
+    delta = np.abs(actual - expected)
+    return {"max_absolute_error": float(delta.max()), "max_relative_error": float((delta / np.maximum(np.abs(expected), ATOL)).max()),
+            "passed": bool(np.allclose(actual, expected, rtol=RTOL, atol=ATOL, equal_nan=False))}
 
 
 def main():
@@ -228,6 +253,8 @@ def main():
     parser.add_argument("--input-source", help="Declared origin of the supplied image stream")
     parser.add_argument("--preprocessing", help="Declared preprocessing already applied to the images")
     parser.add_argument("--labels", type=Path, help="Optional JSON class order and labels bound to the supplied NPZ")
+    parser.add_argument("--graph-mode", choices=("baseline", "optimized", "both"), default="baseline",
+                        help="Opt-in graph diagnostic: optimized runs zero_pipeline before the ordinary VM build; default preserves the baseline")
     args = parser.parse_args()
     supplied = (args.checkpoint, args.inputs, args.input_source, args.preprocessing)
     if any(value is not None for value in supplied) and not all(value is not None and str(value).strip() for value in supplied):
@@ -242,6 +269,8 @@ def main():
         parser.error("--output-dir must be a new directory to preserve existing artifacts")
     allowed_path = safe_path
     report = {"status": "failed", "stage": "initialization", "scope": __doc__, "mode": "supplied_artifacts" if args.checkpoint else "random_diagnostic", "trained_model": None if args.checkpoint else False, "paper_validation": False, "seed": 194, "rtol": RTOL, "atol": ATOL, "images": [], "verifier_source": file_identity(__file__, allowed_path)}
+    modes = ("baseline", "optimized") if args.graph_mode == "both" else (args.graph_mode,)
+    report.update(graph_mode=args.graph_mode, primary_graph_mode=modes[0], graph_modes={mode: {"checked_images": 0} for mode in modes})
 
     def write_json(name, data):
         allowed_path(output / name).write_text(json.dumps(data, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
@@ -326,37 +355,61 @@ def main():
         inventory = relax_inventory(mod, tvm)
         write_json("relax_inventory.json", inventory)
         report["relax_operator_counts"] = inventory["operator_counts"]
-        stage("relax_build_llvm")
-        executable = tvm.relax.build(mod, target="llvm")
-        vm = tvm.relax.VirtualMachine(executable, tvm.cpu())
-        for index, image in enumerate(images):
-            stage(f"relax_execute_image_{index}")
-            result = vm["main"](tvm.nd.array(image.numpy(), tvm.cpu()))
-            actual = result.numpy() if hasattr(result, "numpy") else result[0].numpy()
-            expected = expected_outputs[index]
-            np.savez(allowed_path(output / f"image_{index}.npz"), image=image.numpy(), torch=expected, relax=actual)
-            if not np.isfinite(actual).all():
-                raise AssertionError("Relax output contains nonfinite values")
-            if actual.shape != expected.shape or actual.dtype != expected.dtype:
-                raise AssertionError(f"Output mismatch: {actual.shape}/{actual.dtype} versus {expected.shape}/{expected.dtype}")
-            delta = np.abs(actual - expected)
-            comparison = {"max_absolute_error": float(delta.max()), "max_relative_error": float((delta / np.maximum(np.abs(expected), ATOL)).max()), "passed": bool(np.allclose(actual, expected, rtol=RTOL, atol=ATOL, equal_nan=False))}
-            report["images"].append({"index": index, "input_sha256": hashlib.sha256(image.numpy().tobytes()).hexdigest(), "torch_output": helper.tensors([expected])[0], "relax_output": helper.tensors([actual])[0], "finite": True, "relax_vs_torch": comparison})
+        image_arrays = [{"image": image.numpy(), "torch": expected} for image, expected in zip(images, expected_outputs)]
+        for mode in modes:
+            stage(f"relax_prepare_{mode}")
+            graph_mod, vm_mod = prepare_graph(mod, mode, tvm)
+            mode_report = report["graph_modes"][mode]
+            mode_report["pipelines"] = ["zero", "default_build"] if mode == "optimized" else ["default_build"]
+            for phase, phase_mod in (("graph", graph_mod), ("vm", vm_mod)):
+                path = allowed_path(output / f"{mode}_{phase}.relax.py")
+                path.write_text(phase_mod.script(), encoding="utf-8")
+                phase_inventory = relax_inventory(phase_mod, tvm)
+                inventory_name = f"{mode}_{phase}_inventory.json"
+                write_json(inventory_name, phase_inventory)
+                mode_report[phase] = {"ir": file_identity(path, allowed_path), "inventory": inventory_name,
+                                      "operator_counts": phase_inventory["operator_counts"], "function_counts": phase_inventory["function_counts"]}
+            stage(f"relax_build_llvm_{mode}")
+            # The recorded default_build IR is already lowered; do not apply it twice.
+            executable = tvm.relax.build(vm_mod, target="llvm", pipeline=None)
+            vm = tvm.relax.VirtualMachine(executable, tvm.cpu())
+            for index, image in enumerate(images):
+                stage(f"relax_execute_{mode}_image_{index}")
+                result = vm["main"](tvm.nd.array(image.numpy(), tvm.cpu()))
+                actual = result.numpy() if hasattr(result, "numpy") else result[0].numpy()
+                expected = expected_outputs[index]
+                image_arrays[index]["relax_" + mode] = actual
+                if mode == modes[0]:
+                    image_arrays[index]["relax"] = actual
+                np.savez(allowed_path(output / f"image_{index}.npz"), **image_arrays[index])
+                comparison = compare_output(actual, expected, np)
+                mode_values = {"relax_output": helper.tensors([actual])[0], "relax_vs_torch": comparison}
+                if mode == modes[0]:
+                    report["images"].append({"index": index, "input_sha256": hashlib.sha256(image.numpy().tobytes()).hexdigest(),
+                                             "torch_output": helper.tensors([expected])[0], "finite": True, "graph_mode_comparisons": {}})
+                    report["images"][index].update(mode_values)
+                if labels is not None:
+                    sample = labels["samples"][index]
+                    mode_values["classification"] = {"sample_id": sample["id"], "label": sample["label"],
+                                                       "torch": classify_logits(expected, sample["label"], np), "relax": classify_logits(actual, sample["label"], np)}
+                    if mode == modes[0]:
+                        report["images"][index]["classification"] = mode_values["classification"]
+                report["images"][index]["graph_mode_comparisons"][mode] = mode_values
+                mode_report["checked_images"] = index + 1
+                report["session"]["checked_images"] = min(row["checked_images"] for row in report["graph_modes"].values())
+                write_json("results.json", report)
             if labels is not None:
-                sample = labels["samples"][index]
-                report["images"][-1]["classification"] = {"sample_id": sample["id"], "label": sample["label"], "torch": classify_logits(expected, sample["label"], np), "relax": classify_logits(actual, sample["label"], np)}
-            report["session"]["checked_images"] = len(report["images"])
-            write_json("results.json", report)
+                mode_report["descriptive_accuracy"] = accuracy_counts([row["graph_mode_comparisons"][mode]["classification"] for row in report["images"]])
         if labels is not None:
-            report["descriptive_accuracy"] = accuracy_counts([row["classification"] for row in report["images"]])
+            report["descriptive_accuracy"] = report["graph_modes"][modes[0]]["descriptive_accuracy"]
         if loader._state_dict_sha256(backbone) != state_hash:
             raise AssertionError("Model parameters or buffers changed during verification")
-        if not all(record["relax_vs_torch"]["passed"] for record in report["images"]):
+        if not all(row["graph_mode_comparisons"][mode]["relax_vs_torch"]["passed"] for row in report["images"] for mode in modes):
             raise AssertionError("Relax/PyTorch output mismatch at fixed thresholds")
         for identity in report["artifacts"].values():
             if file_identity(identity["path"], allowed_path) != identity:
                 raise AssertionError("Supplied artifact changed during verification")
-        report["session"]["complete"] = len(report["images"]) == len(images)
+        report["session"]["complete"] = all(row["checked_images"] == len(images) for row in report["graph_modes"].values())
         if not report["session"]["complete"]:
             raise AssertionError("Verification did not cover the entire image stream")
         report["status"] = "passed"

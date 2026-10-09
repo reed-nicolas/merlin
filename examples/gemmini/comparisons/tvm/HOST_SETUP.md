@@ -173,6 +173,8 @@ The dtype comparison uses identical saved ONNX graphs against the inherited and 
 
 ## ResNet50 host structural diagnostic
 
+Use `--graph-mode both` to compare the ordinary build with explicit graph optimization on identical weights and images. The optimized path runs TVM's `zero` pipeline (legalization, pattern annotation, constant folding and fusion), then records and compiles the actual `default_build` IR. `--graph-mode optimized` runs only that path; omitting the option preserves the baseline behavior. Each mode saves its IR, function/operator inventory and per-image comparisons. The full random-weight diagnostic passes both modes with reduced TIR function count after fusion. These are semantic checks, not performance measurements or pretrained-model qualification; Gemmini operator scheduling is separate.
+
 `verify_resnet.py` exercises the full existing torchvision ResNet50 v1.5 architecture with seeded random weights and two distinct synthetic images. It makes no pretrained-accuracy, final paper-variant, quantization or accelerator claim. The loader comes from model2MLIR revision `7915e23475c6db446a3c404847b11e8bc72c8a27`; the verified environment adds torchvision 0.25.0+cu128 and Pillow 12.1.0 to the frontend pins above. Both CUDA-enabled framework distributions execute on CPU here. The standalone diagnostic uses the host Python 3.10 environment; it does not invoke model2MLIR's separate Python 3.12 capture pipeline.
 
 ```bash
