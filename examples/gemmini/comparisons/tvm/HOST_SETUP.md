@@ -232,3 +232,25 @@ The supplied-file path passed a three-image CPU regression using a synthetic che
 ```bash
 PYTHONPATH="$merlin_root/src:$PYTHONPATH" python "$merlin_root/merlin/tests/gemmini/test_tvm_resnet_artifacts.py"
 ```
+
+## Stateful host sessions
+
+[verify_session.py](verify_session.py) consumes a local factory's `get_model_and_inputs` and model2MLIR's `ExternalRuntimeSession` protocol. An optional `get_session_spec(model, inputs)` supplies single-program metadata; multi-program models expose their existing session capability. Stage order, streams, state routes and reset behavior come from that protocol. The verifier compiles separate static signatures when state shapes change and reuses them across repeats.
+
+```bash
+python "$setup_dir/verify_session.py" --model2mlir-root "$model2mlir_source" \
+  --tvm-source "$TVM_ROOT" --tvm-build "$TVM_BUILD" \
+  --factory /absolute/path/to/loader.py --factory-arguments /absolute/path/to/arguments.json \
+  --artifact /absolute/path/to/checkpoint --output-dir "$build_root/session-new-run"
+```
+
+Use a fresh output directory. Factory arguments are a JSON object of keyword arguments; omit the option if unnecessary. Each `--artifact` names a local file to hash and may be repeated. Supply the chosen factory's own dependencies and complete local checkpoints/inputs. Python network connections and HuggingFace downloads are disabled during factory loading and verification; this is not a process sandbox. No weights are downloaded, cast or quantized by the verifier.
+
+PyTorch and TVM maintain independent routed state. Every stage output and state update must agree, and restoring initial inputs must reproduce the full session. Reports retain source/artifact hashes, loaded parameter digests, input identities, per-stage IR, compilation signatures and comparisons. The input-state byte count is diagnostic accounting, not deployed peak memory. Quality, paper, device and timing qualification remain false.
+
+Six focused tests pass, including real LLVM execution of a two-stage recurrence and three growing-cache shapes, plus failure controls. These fixtures contain no paper checkpoints; passing them does not establish full TinyLlama or SmolVLA execution. In the activated host environment:
+
+```bash
+TVM_SESSION_MODEL2MLIR="$model2mlir_source" PYTHONPATH="$merlin_root/src:$PYTHONPATH" \
+  python "$merlin_root/merlin/tests/gemmini/test_tvm_session.py"
+```
