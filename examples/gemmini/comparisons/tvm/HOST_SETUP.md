@@ -1,6 +1,6 @@
 # TVM host setup
 
-This recipe builds the [pinned independent TVM checkout](target.yaml) with host LLVM support on Linux. Checks recorded on 2026-10-07 passed CPU matmul, eight guard-rejection cases, twenty synthetic frontend cases and a full ResNet50 v1.5 random-weight host diagnostic. Pretrained/full-session qualification and Gemmini deployment remain pending.
+This recipe builds the [pinned independent TVM checkout](target.yaml) with host LLVM support on Linux. Checks recorded on 2026-10-07 passed CPU matmul, eight guard-rejection cases, twenty synthetic frontend cases and a full ResNet50 v1.5 random-weight host diagnostic. Pretrained/full-session qualification and actual-platform deployment remain pending; bounded generated graphs now pass matched Gemmini functional simulation.
 
 The host cache enables the local `USE_HOST_ONLY_AUTO_COPY_GUARD` patch because this restricted checkout lacks `LowerAutoCopy`. The guard preserves unannotated IR and rejects automatic-copy annotations; it does not implement their optimization. This option defaults to OFF and must not coexist with the full implementation. Record the local patch and enabled mode with the base commit.
 
@@ -8,12 +8,12 @@ Run from the Merlin comparison checkout. Select absolute `TVM_ROOT` and `TVM_BUI
 
 The newest source pin is a local development commit until the fork is published; use the existing checkout or a local clone containing that commit. A fresh remote clone can reproduce the new pin only after publication.
 
-For a new TVM checkout, clone without checkout and apply the mandatory name exclusions before materializing files. These commands select the published source commit recorded in `target.yaml`; they do not switch an existing checkout. If you already have that commit checked out, retain it and set the same two paths instead.
+For a new TVM checkout, clone without checkout and apply the mandatory name exclusions before materializing files. These commands select the source commit recorded in `target.yaml`; they do not switch an existing checkout. If you already have that commit checked out, retain it and set the same two paths instead.
 
 ```bash
 export TVM_ROOT=/absolute/path/to/tvm-gemmini
 export TVM_BUILD=/absolute/path/to/tvm-host-build
-tvm_commit=34821ba0d239f0b04da5ba511d3e61494e7f714c
+tvm_commit=e6dc747ee3fa614c0cea3e9c242698af2c22c1fd
 git clone --filter=blob:none --no-checkout https://github.com/reed-nicolas/tvm.git "$TVM_ROOT"
 git -C "$TVM_ROOT" sparse-checkout set --no-cone --stdin <<'PATTERNS'
 /*
@@ -28,7 +28,7 @@ In the same shell, verify the selected source pin and prepare the host environme
 ```bash
 : "${TVM_ROOT:?Set TVM_ROOT to the independent TVM checkout}"
 : "${TVM_BUILD:?Set TVM_BUILD to the TVM host build directory}"
-test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = 34821ba0d239f0b04da5ba511d3e61494e7f714c || { echo 'TVM source pin mismatch' >&2; exit 1; }
+test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = e6dc747ee3fa614c0cea3e9c242698af2c22c1fd || { echo 'TVM source pin mismatch' >&2; exit 1; }
 merlin_root="$PWD"
 setup_dir="$merlin_root/examples/gemmini/comparisons/tvm"
 host_python="${TVM_HOST_PYTHON:-$(command -v python3.10)}"
@@ -60,7 +60,7 @@ The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. Initial
 git -C "$TVM_ROOT" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
 ```
 
-A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `34821ba0d239f0b04da5ba511d3e61494e7f714c`. Clone each dependency without checkout and apply the same exclusions before checkout:
+A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `e6dc747ee3fa614c0cea3e9c242698af2c22c1fd`. Clone each dependency without checkout and apply the same exclusions before checkout:
 
 ```bash
 git -C "$TVM_ROOT" submodule init -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
@@ -254,3 +254,18 @@ Six focused tests pass, including real LLVM execution of a two-stage recurrence 
 TVM_SESSION_MODEL2MLIR="$model2mlir_source" PYTHONPATH="$merlin_root/src:$PYTHONPATH" \
   python "$merlin_root/merlin/tests/gemmini/test_tvm_session.py"
 ```
+
+## Scheduled graph and learned-search checks
+
+The TVM fork owns graph optimization, primitive scheduling and bounded learned search. Use its `apps/gemmini/README.md` for the graph/simulator recipe and the contracts of `prepare_gemmini_graph` and `BoundedGemminiSearch`. Graph optimization folds mathematical constants before device substitution, fuses surrounding CPU operations and inlines eligible internal pointwise buffers while preserving Gemmini as an explicit boundary. Baremetal export rejects unresolved TVM workspace callbacks. This does not implement fusion through the device kernel.
+
+Learned ranking uses TVM MetaSchedule's `PerStoreFeature` and `XGBModel`. In the isolated host environment, the additional tested dependencies are:
+
+```bash
+python -m pip install 'xgboost==1.7.6' 'pytest==8.3.5'
+python -m pytest -c /dev/null -p no:cacheprovider "$TVM_ROOT/tests/python/relax/test_backend_contrib_gemmini_tuning.py" -q
+```
+
+These packages are optional for ordinary host compilation and untrained candidate generation. Synthetic labels exercise the search machinery only. Actual timing records require consistent workload, compiler, adapter, platform and measurement-protocol bindings plus separate semantic/device correctness gates; these declarations do not authenticate the supplied evidence. Functional Spike execution supplies no timing labels. Record real target measurements separately before selecting a performance result.
+
+The generated graph verifier passes both `--graph-mode baseline` and `--graph-mode optimized`, including final ELF no-FSM and intentional-failure checks. Add `--graph-mode optimized` to the TVM guide's existing command; replace its two tile options with `--search-seed 7` to verify an untrained proposal and record its candidate-specific simulator correctness. Use a fresh output directory for each mode. This is a bounded matmul/bias/ReLU fixture, not a full-model or performance qualification.
