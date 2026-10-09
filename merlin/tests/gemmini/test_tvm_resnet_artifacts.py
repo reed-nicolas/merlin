@@ -377,5 +377,163 @@ class ResNetArtifactTests(unittest.TestCase):
         self.assertFalse(output.exists())
 
 
+class ResNetPreparationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import io
+        import numpy as np
+        from PIL import Image
+        import torch
+
+        cls.np, cls.Image, cls.io = np, Image, io
+        torch.set_num_threads(2)
+        path = repo_root() / "examples/gemmini/comparisons/tvm/prepare_resnet_inputs.py"
+        spec = importlib.util.spec_from_file_location("tvm_resnet_input_preparer", path)
+        cls.preparer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.preparer)
+        cls.entries = []
+        for index, (wnid, _, _) in enumerate(cls.preparer.CLASSES):
+            for split, names in (("train", ("z", "a")), ("val", ("z", "b", "a"))):
+                for ordinal, name in enumerate(names):
+                    rng = np.random.default_rng(index * 10 + ordinal + (3 if split == "val" else 0))
+                    pixels = rng.integers(0, 256, (320, 360, 3), dtype=np.uint8)
+                    stream = io.BytesIO()
+                    Image.fromarray(pixels).save(stream, format="JPEG", quality=75)
+                    cls.entries.append((f"imagenette2-320/{split}/{wnid}/{name}.JPEG", stream.getvalue()))
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="resnet-preparation-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def archive(self, entries=None, special=None):
+        import tarfile
+
+        path = self.root / "images.tgz"
+        with tarfile.open(path, "w:gz") as archive:
+            for name, payload in self.entries if entries is None else entries:
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                archive.addfile(info, self.io.BytesIO(payload))
+            if special is not None:
+                archive.addfile(special)
+        return path
+
+    def test_true_v2_transform_labels_and_source_bindings(self):
+        from torchvision.models import ResNet50_Weights
+
+        archive, output = self.archive(), self.root / "prepared"
+        report = self.preparer.prepare_inputs(archive, output)
+        self.assertFalse(report["paper_quality_approved"])
+        self.assertTrue(report["development_only"])
+        self.assertEqual(report["class_head"]["classes"], 1000)
+        self.assertEqual(len(set(report["class_head"]["class_ids"])), 1000)
+        self.assertEqual(report["class_head"]["categories"], ResNet50_Weights.IMAGENET1K_V2.meta["categories"])
+        self.assertTrue(report["bindings_checked_before_and_after"])
+        self.assertEqual(report["archive"]["sha256"], hashlib.sha256(archive.read_bytes()).hexdigest())
+        for identity in report["source_bindings"]:
+            self.assertEqual(identity, self.preparer.file_identity(identity["path"]))
+        with self.np.load(output / "calibration.npz", allow_pickle=False) as stream:
+            calibration = stream["images"]
+        with self.np.load(output / "evaluation.npz", allow_pickle=False) as stream:
+            evaluation = stream["images"]
+        self.assertEqual(calibration.shape, (10, 1, 3, 224, 224))
+        self.assertEqual(evaluation.shape, (20, 1, 3, 224, 224))
+        payloads = dict(self.entries)
+        for role, values in (("calibration", calibration), ("evaluation", evaluation)):
+            for sample, actual in zip(report["samples"][role], values):
+                with self.Image.open(self.io.BytesIO(payloads[sample["id"]])) as image:
+                    expected = ResNet50_Weights.IMAGENET1K_V2.transforms()(image.convert("RGB")).numpy()
+                self.np.testing.assert_array_equal(actual[0], expected)
+            expected_names = [name for name, _ in sorted(self.entries) if ("/train/" if role == "calibration" else "/val/") in name and not name.endswith("z.JPEG")]
+            self.assertEqual([sample["id"] for sample in report["samples"][role]], expected_names)
+        labels = json.loads((output / "labels.json").read_text())
+        self.assertEqual(set(labels), {"input_sha256", "class_ids", "samples"})
+        self.assertEqual(labels["input_sha256"], hashlib.sha256((output / "evaluation.npz").read_bytes()).hexdigest())
+        self.assertEqual([sample["label"] for sample in labels["samples"]], [index for _, index, _ in self.preparer.CLASSES for _ in range(2)])
+        ResNetArtifactTests.setUpClass()
+        verifier = ResNetArtifactTests.verifier
+        loaded, identity = verifier.load_images(output / "evaluation.npz", self.np)
+        self.np.testing.assert_array_equal(loaded, evaluation)
+        verifier.load_labels(output / "labels.json", identity, len(evaluation))
+        self.assertEqual(json.loads((output / "preparation.json").read_text()), report)
+
+    def test_unsafe_links_duplicate_and_size_headers_rejected_before_payloads(self):
+        import tarfile
+
+        payload = self.entries[0][1]
+        bad_names = ("/imagenette2-320/train/x.JPEG", "imagenette2-320/../x.JPEG", "imagenette2-320/train\\x.JPEG", "imagenette2-320/VlSi/x.JPEG")
+        for name in bad_names:
+            with self.subTest(name=name):
+                archive = self.archive([(name, payload)])
+                with mock.patch.object(tarfile.TarFile, "extractfile", side_effect=AssertionError("payload opened")):
+                    with self.assertRaisesRegex(ValueError, "unsafe"):
+                        self.preparer.prepare_inputs(archive, self.root / "unused")
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE):
+            info = tarfile.TarInfo("imagenette2-320/train/n01440764/link.JPEG")
+            info.type, info.linkname = kind, "target.JPEG"
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(ValueError, "links and special"):
+                    self.preparer.prepare_inputs(self.archive([], info), self.root / "unused")
+        with self.assertRaisesRegex(ValueError, "duplicate archive"):
+            self.preparer.prepare_inputs(self.archive(self.entries[:1] * 2), self.root / "unused")
+        with mock.patch.object(self.preparer, "MAX_IMAGE_BYTES", 1):
+            with self.assertRaisesRegex(ValueError, "image member bytes"):
+                self.preparer.prepare_inputs(self.archive(self.entries[:1]), self.root / "unused")
+        self.assertFalse((self.root / "unused").exists())
+
+    def test_missing_samples_and_content_overlap_rejected(self):
+        entries = [entry for entry in self.entries if "/n03888257/" not in entry[0]]
+        with self.assertRaisesRegex(ValueError, "missing samples"):
+            self.preparer.prepare_inputs(self.archive(entries), self.root / "unused")
+        entries = list(self.entries)
+        train = next(payload for name, payload in entries if name == "imagenette2-320/train/n01440764/a.JPEG")
+        entries = [(name, train if name == "imagenette2-320/val/n01440764/a.JPEG" else payload) for name, payload in entries]
+        with self.assertRaisesRegex(ValueError, "overlapping jpeg"):
+            self.preparer.prepare_inputs(self.archive(entries), self.root / "unused")
+        self.assertFalse((self.root / "unused").exists())
+
+    def test_category_mapping_and_count_admission(self):
+        from torchvision.models import ResNet50_Weights
+
+        weights = ResNet50_Weights.IMAGENET1K_V2
+        categories = list(weights.meta["categories"])
+        categories[217] = "wrong category"
+        with self.assertRaisesRegex(ValueError, "category mapping mismatch"):
+            self.preparer.transform_contract(SimpleNamespace(transforms=weights.transforms, meta={"categories": categories}))
+        for count in (0, -1, True, 1.5, 1000):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(ValueError, "count"):
+                    self.preparer.prepare_inputs(self.root / "missing", self.root / "unused", calibration_per_class=count)
+
+    def test_decoded_content_overlap_and_archive_changes_rejected(self):
+        entries = list(self.entries)
+        train = next(payload for name, payload in entries if name == "imagenette2-320/train/n01440764/a.JPEG")
+        # A JPEG comment changes file bytes while preserving every decoded pixel.
+        variant = train[:2] + b"\xff\xfe\x00\x06test" + train[2:]
+        self.assertNotEqual(hashlib.sha256(train).digest(), hashlib.sha256(variant).digest())
+        entries = [(name, variant if name == "imagenette2-320/val/n01440764/a.JPEG" else payload) for name, payload in entries]
+        with self.assertRaisesRegex(ValueError, "overlapping decoded"):
+            self.preparer.prepare_inputs(self.archive(entries), self.root / "unused")
+        archive = self.archive()
+        original_identity = self.preparer.file_identity
+        for target, message in ((archive, "archive changed"), (Path(self.preparer.__file__), "transform dependency changed")):
+            calls = 0
+
+            def changed_identity(path):
+                nonlocal calls
+                identity = original_identity(path)
+                if Path(path) == target:
+                    calls += 1
+                    if calls > 1:
+                        identity["sha256"] = "0" * 64
+                return identity
+
+            with self.subTest(target=target), mock.patch.object(self.preparer, "file_identity", side_effect=changed_identity):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.preparer.prepare_inputs(archive, self.root / "unused")
+        self.assertFalse((self.root / "unused").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
