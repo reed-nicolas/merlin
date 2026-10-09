@@ -1,4 +1,4 @@
-"""Artifact validation only; these tests do not qualify a backend or build ResNet."""
+"""Artifact and opt-in host graph checks; these tests do not build ResNet or qualify a device."""
 
 import hashlib
 import importlib.util
@@ -143,6 +143,40 @@ class ResNetArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "loader failed"):
                 self.verifier.load_model(SimpleNamespace(get_model_and_inputs=fail), SimpleNamespace(inputs=None), self.torch, self.np)
             self.assertEqual(dict(os.environ), before)
+
+    @unittest.skipUnless(os.environ.get("TVM_LIBRARY_PATH"), "Requires an explicitly selected LLVM-enabled TVM host build")
+    def test_graph_fusion_preserves_two_independent_inputs(self):
+        import tvm
+        from tvm import relax
+
+        np = self.np
+        x = relax.Var("x", relax.TensorStructInfo((2, 6), "float32"))
+        bias = np.arange(6, dtype=np.float32) - 2
+        builder = relax.BlockBuilder()
+        with builder.function("main", [x]):
+            with builder.dataflow():
+                value = builder.emit(relax.op.add(x, relax.const(bias)))
+                value = builder.emit(relax.op.nn.relu(value))
+                value = builder.emit_output(relax.op.multiply(value, relax.const(np.float32(0.5))))
+            builder.emit_func_output(value)
+        original = builder.get()
+        before = original.script()
+        inventories = {}
+        for mode in ("baseline", "optimized"):
+            graph, lowered = self.verifier.prepare_graph(original, mode, tvm)
+            self.assertEqual(original.script(), before, "Pipeline changed its input module")
+            inventories[mode] = self.verifier.relax_inventory(lowered, tvm)
+            vm = relax.VirtualMachine(relax.build(lowered, "llvm", pipeline=None), tvm.cpu())
+            for offset in (0.0, -3.0):
+                data = np.arange(12, dtype=np.float32).reshape(2, 6) - 4 + offset
+                expected = np.maximum(data + bias, 0) * np.float32(0.5)
+                actual = vm["main"](tvm.nd.array(data)).numpy()
+                np.testing.assert_array_equal(actual, expected)
+                self.assertTrue(self.verifier.compare_output(actual, expected, np)["passed"])
+                self.assertFalse(self.verifier.compare_output(actual + 1, expected, np)["passed"])
+        self.assertLess(inventories["optimized"]["function_counts"]["tir"], inventories["baseline"]["function_counts"]["tir"])
+        with self.assertRaises(ValueError):
+            self.verifier.prepare_graph(original, "both", tvm)
 
     def labels_manifest(self):
         return {"input_sha256": "a" * 64, "class_ids": [f"class-{i}" for i in range(1000)], "samples": [{"id": "duplicate", "label": 7}, {"id": "duplicate", "label": 2}]}
