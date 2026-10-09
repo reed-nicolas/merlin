@@ -315,6 +315,42 @@ TVM_SESSION_MODEL2MLIR="$model2mlir_source" PYTHONPATH="$merlin_root/src:$PYTHON
   python "$merlin_root/merlin/tests/gemmini/test_tvm_session.py"
 ```
 
+## Complete TinyLlama host session
+
+[tinyllama_session.py](tinyllama_session.py) requires the full [pinned TinyLlama checkpoint/tokenizer](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/tree/fe8a4ea1ffedaf415f4da2f062534de366a451e6) and a local UTF-8 corpus. It preserves all 22 layers, uses model2MLIR's functional prefill/decode cache stages, and checks those stages against original full-sequence Hugging Face logits before compilation. The development session uses eight prefill tokens plus three teacher-forced decode tokens; capacity/order/IDs and source hashes are recorded. FP32 explicitly converts the official BF16 weights and is a compiler diagnostic, not original-precision quality qualification.
+
+The passing recipe uses Transformers 5.4.0's cache API and the modern exporter; 4.57.1 lacks the required cache state, and legacy tracing fails current attention-mask construction. Keep the additional dependencies isolated from other model environments:
+
+```bash
+python -m pip install --target "$build_root/tinyllama-python-v5" 'transformers==5.4.0' 'huggingface_hub==1.5.0' \
+  'tokenizers==0.22.1' 'safetensors==0.6.2' 'numpy==1.26.4' 'onnx==1.17.0' \
+  'ml_dtypes==0.5.4' 'onnxscript==0.5.6' 'onnx_ir==0.1.12'
+export PYTHONPATH="$build_root/tinyllama-python-v5:$merlin_root/src:$PYTHONPATH"
+```
+
+Prepare a JSON arguments file with paths from your installation:
+
+```json
+{
+  "checkpoint_dir": "/absolute/path/to/TinyLlama-checkpoint",
+  "model2mlir_root": "/absolute/path/to/model2MLIR",
+  "corpus_path": "/absolute/path/to/local-text.txt",
+  "prefill_tokens": 8,
+  "decode_tokens": 3,
+  "precision": "float32",
+  "cpu_threads": 2
+}
+```
+
+```bash
+python "$setup_dir/verify_session.py" --model2mlir-root "$model2mlir_source" --tvm-source "$TVM_ROOT" --tvm-build "$TVM_BUILD" \
+  --factory "$setup_dir/tinyllama_session.py" --factory-arguments /absolute/path/to/tinyllama-arguments.json \
+  --graph-mode baseline --onnx-exporter dynamo --repeats 2 --max-signatures 2 --output-dir "$build_root/tinyllama-new-run"
+PYTHONPATH="$merlin_root/src:$PYTHONPATH" python "$merlin_root/merlin/tests/gemmini/test_tinyllama_session.py"
+```
+
+The complete pretrained model passes both session repeats and reset, comparing every compiled output and KV/position route at `rtol=atol=1e-4`. Maximum logit error is 3.81e-5 and KV error 3.62e-5; positions are exact. The official checkpoint has 1,100,048,384 parameters, with 4,400,193,536 converted FP32 parameter bytes. Large ONNX weights remain external and source/cache state is isolated during export. Five focused factory tests pass. This baseline host recipe neither offloads the transformer to Gemmini nor selects an integer numerical/quality policy or timing result.
+
 ## Scheduled graph and learned-search checks
 
 The TVM fork owns graph optimization, primitive scheduling and bounded learned search. Use its `apps/gemmini/README.md` for the graph/simulator recipe and the contracts of `prepare_gemmini_graph` and `BoundedGemminiSearch`. Graph optimization folds mathematical constants before device substitution, fuses surrounding CPU operations and inlines eligible internal pointwise buffers while preserving Gemmini as an explicit boundary. Baremetal export rejects unresolved TVM workspace callbacks. This does not implement fusion through the device kernel.
