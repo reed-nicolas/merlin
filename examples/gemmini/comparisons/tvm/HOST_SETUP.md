@@ -6,12 +6,14 @@ The host cache enables the local `USE_HOST_ONLY_AUTO_COPY_GUARD` patch because t
 
 Run from the Merlin comparison checkout. Select absolute `TVM_ROOT` and `TVM_BUILD` paths for the independent source checkout and host library build. Merlin does not track or initialize this baseline as a submodule. Support artifacts use the configured Merlin build root, honoring `MERLIN_OUT_ROOT`; the TVM host build uses `TVM_BUILD`. The verified tool versions are Python 3.10.14, GCC 11.5, CMake 3.26.5 and Ninja 1.13.2. Select Python 3.10 and the host tools from your own installation; a Chipyard Conda environment is not required. The commands resolve tools from `PATH` before cleaning inherited build settings. Set `TVM_HOST_PYTHON`, `TVM_HOST_CMAKE`, `TVM_HOST_CC` or `TVM_HOST_CXX` to absolute executable paths to override discovery, and `TVM_BUILD_JOBS` to control parallelism (default 4; the recorded build used 16). Do not source Chipyard's environment for this host build.
 
+The newest source pin is a local development commit until the fork is published; use the existing checkout or a local clone containing that commit. A fresh remote clone can reproduce the new pin only after publication.
+
 For a new TVM checkout, clone without checkout and apply the mandatory name exclusions before materializing files. These commands select the published source commit recorded in `target.yaml`; they do not switch an existing checkout. If you already have that commit checked out, retain it and set the same two paths instead.
 
 ```bash
 export TVM_ROOT=/absolute/path/to/tvm-gemmini
 export TVM_BUILD=/absolute/path/to/tvm-host-build
-tvm_commit=58bad17e55c8bab37db2126acbe286cb08480a5f
+tvm_commit=34821ba0d239f0b04da5ba511d3e61494e7f714c
 git clone --filter=blob:none --no-checkout https://github.com/reed-nicolas/tvm.git "$TVM_ROOT"
 git -C "$TVM_ROOT" sparse-checkout set --no-cone --stdin <<'PATTERNS'
 /*
@@ -26,7 +28,7 @@ In the same shell, verify the selected source pin and prepare the host environme
 ```bash
 : "${TVM_ROOT:?Set TVM_ROOT to the independent TVM checkout}"
 : "${TVM_BUILD:?Set TVM_BUILD to the TVM host build directory}"
-test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = 58bad17e55c8bab37db2126acbe286cb08480a5f || { echo 'TVM source pin mismatch' >&2; exit 1; }
+test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = 34821ba0d239f0b04da5ba511d3e61494e7f714c || { echo 'TVM source pin mismatch' >&2; exit 1; }
 merlin_root="$PWD"
 setup_dir="$merlin_root/examples/gemmini/comparisons/tvm"
 host_python="${TVM_HOST_PYTHON:-$(command -v python3.10)}"
@@ -58,7 +60,7 @@ The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. Initial
 git -C "$TVM_ROOT" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
 ```
 
-A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `58bad17e55c8bab37db2126acbe286cb08480a5f`. Clone each dependency without checkout and apply the same exclusions before checkout:
+A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `34821ba0d239f0b04da5ba511d3e61494e7f714c`. Clone each dependency without checkout and apply the same exclusions before checkout:
 
 ```bash
 git -C "$TVM_ROOT" submodule init -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
