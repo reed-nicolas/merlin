@@ -13,7 +13,7 @@ For a new TVM checkout, clone without checkout and apply the mandatory name excl
 ```bash
 export TVM_ROOT=/absolute/path/to/tvm-gemmini
 export TVM_BUILD=/absolute/path/to/tvm-host-build
-tvm_commit=b66f54206cf9d58db0f08f32012bbd52f40c198e
+tvm_commit=74d669fab5c6f21e14de9f23f28975559b6bd764
 git clone --filter=blob:none --no-checkout https://github.com/reed-nicolas/tvm.git "$TVM_ROOT"
 git -C "$TVM_ROOT" sparse-checkout set --no-cone --stdin <<'PATTERNS'
 /*
@@ -28,7 +28,7 @@ In the same shell, verify the selected source pin and prepare the host environme
 ```bash
 : "${TVM_ROOT:?Set TVM_ROOT to the independent TVM checkout}"
 : "${TVM_BUILD:?Set TVM_BUILD to the TVM host build directory}"
-test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = b66f54206cf9d58db0f08f32012bbd52f40c198e || { echo 'TVM source pin mismatch' >&2; exit 1; }
+test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = 74d669fab5c6f21e14de9f23f28975559b6bd764 || { echo 'TVM source pin mismatch' >&2; exit 1; }
 merlin_root="$PWD"
 setup_dir="$merlin_root/examples/gemmini/comparisons/tvm"
 host_python="${TVM_HOST_PYTHON:-$(command -v python3.10)}"
@@ -60,7 +60,7 @@ The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. Initial
 git -C "$TVM_ROOT" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
 ```
 
-A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `b66f54206cf9d58db0f08f32012bbd52f40c198e`. Clone each dependency without checkout and apply the same exclusions before checkout:
+A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `74d669fab5c6f21e14de9f23f28975559b6bd764`. Clone each dependency without checkout and apply the same exclusions before checkout:
 
 ```bash
 git -C "$TVM_ROOT" submodule init -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
@@ -281,7 +281,7 @@ python "$setup_dir/verify_resnet.py" --model2mlir-root "$model2mlir_source" --tv
 
 Both preparation and verification require new output directories. The preparer binds the supplied archive; it does not authenticate an official archive digest or prove checkpoint training provenance. The verification command enforces the unchanged development quality threshold and reports failure if quantization exceeds it. Twenty focused artifact tests pass, including exact V2 transforms, existing NPZ/label admission, archive bounds, content separation and source-mutation controls.
 
-Integer exports also emit `reference.npz` and `reference.json` from the separate integer oracle for every selected image. Use these with the TVM fork's [complete exported-graph simulator recipe](https://github.com/reed-nicolas/tvm/blob/b66f54206cf9d58db0f08f32012bbd52f40c198e/apps/gemmini/README.md#complete-exported-graphs-in-gemmini-spike); select the matching `baremetal_baseline` or `baremetal_optimized` directory. Each mode's detailed memory/export records stay in separate hashed artifacts, while `results.json` summarizes their storage. Export alone is not device execution. The recorded full random-model session passes both modes and fixture admission; pretrained quality/device execution still require the supplied weights/data.
+Integer exports also emit `reference.npz` and `reference.json` from the separate integer oracle for every selected image. Use these with the TVM fork's [complete exported-graph simulator recipe](https://github.com/reed-nicolas/tvm/blob/74d669fab5c6f21e14de9f23f28975559b6bd764/apps/gemmini/README.md#complete-exported-graphs-in-gemmini-spike); select the matching `baremetal_baseline` or `baremetal_optimized` directory. Each mode's detailed memory/export records stay in separate hashed artifacts, while `results.json` summarizes their storage. Export alone is not device execution. The recorded full random-model session passes both modes and fixture admission; pretrained quality/device execution still require the supplied weights/data.
 
 ## Stateful host sessions
 
@@ -388,7 +388,7 @@ PYTHONPATH="$merlin_root/src" "$build_root/smolvla-venv/bin/python" "$merlin_roo
 
 Eight focused staging/routing tests pass. The actual full eager session agrees exactly with unchanged upstream `sample_actions`, including `[1,50,6]` actions and the BF16 cache. Synthetic observations establish complete checkpoint/reference staging, not robot quality. For attributed data, supply `fixture_kind: dataset`, `input_npz` and `input_source`; the factory validates every selected input tensor and camera.
 
-The full compiled policy remains under qualification. Legacy export fails on a complex intermediate; newer modern-export dependencies fix an invalid position-indexing Where, and original-BF16 vision embedding/operator probes pass. BF16 softmax/GELU/sigmoid support is being integrated against the actual graph before the next complete host retry. Do not label these small probes as full compiled or Gemmini execution. Target numerical policy, application-quality acceptance and timing remain pending.
+The full compiled policy remains under qualification. Legacy export fails on a complex intermediate; newer modern-export dependencies fix an invalid position-indexing Where, and original-BF16 vision embedding/operator probes pass. BF16 softmax/GELU/sigmoid corrections are committed and eleven native operator probes pass; the complete prefix passes import/lowering, with full compiled comparison still running. Do not label these small probes as full compiled or Gemmini execution. Target numerical policy, application-quality acceptance and timing remain pending.
 
 ## Scheduled graph and learned-search checks
 
