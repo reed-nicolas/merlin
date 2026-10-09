@@ -351,6 +351,45 @@ PYTHONPATH="$merlin_root/src:$PYTHONPATH" python "$merlin_root/merlin/tests/gemm
 
 The complete pretrained model passes both session repeats and reset, comparing every compiled output and KV/position route at `rtol=atol=1e-4`. Maximum logit error is 3.81e-5 and KV error 3.62e-5; positions are exact. The official checkpoint has 1,100,048,384 parameters, with 4,400,193,536 converted FP32 parameter bytes. Large ONNX weights remain external and source/cache state is isolated during export. Five focused factory tests pass. This baseline host recipe neither offloads the transformer to Gemmini nor selects an integer numerical/quality policy or timing result.
 
+## Original SmolVLA policy session
+
+[smolvla_session.py](smolvla_session.py) stages the complete [pinned SmolVLA policy](https://huggingface.co/lerobot/smolvla_base/tree/c83c3163b8ca9b7e67c509fffd9121e66cb96205) with a supplied [SmolVLM backbone](https://huggingface.co/HuggingFaceTB/SmolVLM2-500M-Video-Instruct/tree/dc831d5df58eb65ae2fc25b50b7f5a896edec069). Original LeRobot precision is preserved, including BF16 prefix/cache. The selected backbone files are hashed; its training-time revision is unverified. The complete neural session includes all three cameras, prefix/cache construction, ten denoising steps and physical six-dimensional action decoding. Its boundary is preprocessed observations to normalized action chunks; robot execution and unnormalization are outside this declared session.
+
+Keep this model in a separate Python 3.12 environment: LeRobot 0.5.1 requires its original Transformers 4.57.1 stack. The modern source-preserving export probes use Torch 2.10.0, ONNX 1.19.1, onnxscript 0.7.2, NumPy 1.26.4 and ml_dtypes 0.5.4. Do not combine its dependency path with TinyLlama's Transformers 5.4.0 target.
+
+```bash
+python3.12 -m venv "$build_root/smolvla-venv"
+"$build_root/smolvla-venv/bin/python" -m pip install 'lerobot[smolvla]==0.5.1' 'torch==2.10.0' \
+  'transformers==4.57.1' 'onnx==1.19.1' 'onnxscript==0.7.2' 'numpy==1.26.4' 'ml_dtypes==0.5.4' \
+  'pyarrow==21.0.0' 'pandas==2.3.3'
+```
+
+Prepare a JSON arguments file with supplied local snapshots:
+
+```json
+{
+  "checkpoint_dir": "/absolute/path/to/smolvla-policy",
+  "backbone_dir": "/absolute/path/to/smolvlm-backbone",
+  "model2mlir_root": "/absolute/path/to/model2MLIR",
+  "fixture_kind": "synthetic",
+  "seed": 0,
+  "cpu_threads": 1,
+  "precision": "original"
+}
+```
+
+```bash
+PYTHONPATH="$merlin_root/src:$TVM_ROOT/python" TVM_FFI=ctypes "$build_root/smolvla-venv/bin/python" \
+  "$setup_dir/verify_session.py" --model2mlir-root "$model2mlir_source" --tvm-source "$TVM_ROOT" --tvm-build "$TVM_BUILD" \
+  --factory "$setup_dir/smolvla_session.py" --factory-arguments /absolute/path/to/smolvla-arguments.json \
+  --graph-mode baseline --onnx-exporter dynamo --opset 22 --repeats 2 --max-signatures 3 --output-dir "$build_root/smolvla-new-run"
+PYTHONPATH="$merlin_root/src" "$build_root/smolvla-venv/bin/python" "$merlin_root/merlin/tests/gemmini/test_smolvla_session.py"
+```
+
+Eight focused staging/routing tests pass. The actual full eager session agrees exactly with unchanged upstream `sample_actions`, including `[1,50,6]` actions and the BF16 cache. Synthetic observations establish complete checkpoint/reference staging, not robot quality. For attributed data, supply `fixture_kind: dataset`, `input_npz` and `input_source`; the factory validates every selected input tensor and camera.
+
+The full compiled policy remains under qualification. Legacy export fails on a complex intermediate; newer modern-export dependencies fix an invalid position-indexing Where, and original-BF16 vision embedding/operator probes pass. BF16 softmax/GELU/sigmoid support is being integrated against the actual graph before the next complete host retry. Do not label these small probes as full compiled or Gemmini execution. Target numerical policy, application-quality acceptance and timing remain pending.
+
 ## Scheduled graph and learned-search checks
 
 The TVM fork owns graph optimization, primitive scheduling and bounded learned search. Use its `apps/gemmini/README.md` for the graph/simulator recipe and the contracts of `prepare_gemmini_graph` and `BoundedGemminiSearch`. Graph optimization folds mathematical constants before device substitution, fuses surrounding CPU operations and inlines eligible internal pointwise buffers while preserving Gemmini as an explicit boundary. Baremetal export rejects unresolved TVM workspace callbacks. This does not implement fusion through the device kernel.
