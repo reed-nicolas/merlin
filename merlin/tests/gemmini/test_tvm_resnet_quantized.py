@@ -120,6 +120,47 @@ class IntegerPolicies(unittest.TestCase):
             with self.subTest(shape=weight.shape, exponent=exponent), self.assertRaises(ValueError):
                 recipe.quantize_parameters(weight, bias, exponent)
 
+    def test_averagepool_single_rounding_independent_witnesses(self):
+        cases = [
+            ([1, 0, 0], 0, -1, 1),
+            ([-1, 0, 0], 0, -1, -1),
+            ([1, 0, 0, 0], 0, -1, 1),
+            ([-1, 0, 0, 0], 0, -1, -1),
+            ([1, 1, 0], 0, 1, 0),
+            ([-1, -1, 0], 0, 1, 0),
+            ([3, 0, 0], 0, 1, 1),
+            ([-3, 0, 0], 0, 1, -1),
+            ([1, 2, 3], -2, -2, 2),
+            ([127, 127], 0, -1, 127),
+            ([-127, -127], 0, -1, -127),
+        ]
+        for values, input_exponent, output_exponent, expected in cases:
+            with self.subTest(values=values, scales=(input_exponent, output_exponent)):
+                actual = recipe.averagepool(np.array(values, dtype=np.int8).reshape(1, 1, 1, -1), input_exponent, output_exponent)
+                self.assertEqual(actual.dtype, np.int8)
+                self.assertEqual(actual.shape, (1, 1, 1, 1))
+                self.assertEqual(int(actual.item()), expected)
+
+    def test_averagepool_overflow_and_shift_proofs(self):
+        limit64 = int(np.iinfo(np.int64).max)
+        cases = [
+            (limit64 // 128 + 1, 0, 0),
+            (limit64 // (127 * 2 ** 30) + 1, 0, -30),
+            (limit64 // 2 ** 30 + 1, -30, 0),
+            (limit64 // 128, -2, 0),  # Sum and denominator fit; rounded numerator does not.
+            (1, 30, -1),
+            (1, 31, 1),
+            (0, 0, 0),
+        ]
+        for area, input_exponent, output_exponent in cases:
+            with self.subTest(area=area, scales=(input_exponent, output_exponent)), self.assertRaises(ValueError):
+                recipe.averagepool_scale_factors(area, input_exponent, output_exponent)
+        self.assertEqual(recipe.averagepool_scale_factors(3, 0, -1), (2, 3))
+        self.assertEqual(recipe.averagepool_scale_factors(3, 0, 1), (1, 6))
+        self.assertEqual(recipe.averagepool_scale_factors(limit64 // 128, 0, 0), (1, limit64 // 128))
+        with self.assertRaises(ValueError):
+            recipe.averagepool(np.full((1, 1, 1, 1), -128, dtype=np.int8), 0, 0)
+
 
 class FullResNetDiagnostic(unittest.TestCase):
     @classmethod
@@ -139,11 +180,13 @@ class FullResNetDiagnostic(unittest.TestCase):
     def test_complete_inventory_and_source_preserved(self):
         manifest = self.plan.manifest()
         self.assertFalse(manifest["paper_quality_approved"])
-        self.assertEqual(manifest["recipe"], "resnet50-v1.5-symmetric-pow2-development-v2")
+        self.assertEqual(manifest["recipe"], "resnet50-v1.5-symmetric-pow2-development-v3")
         for site in manifest["sites"]:
             if "bound_with_bias" in site:
                 self.assertLessEqual(max(site["bound_with_bias"]), recipe.LIMIT)
                 self.assertLessEqual(site["contraction_dimension_bound"], recipe.LIMIT)
+            if "mean_requantization" in site:
+                self.assertLessEqual(site["mean_requantization"]["rounded_numerator_bound"], np.iinfo(np.int64).max)
         self.assertEqual(sum(site.kind == "conv2d" for site in self.plan.sites), 53)
         self.assertEqual(sum(site.kind == "linear" for site in self.plan.sites), 1)
         self.assertEqual(sum(site.kind == "add" for site in self.plan.sites), 16)
@@ -170,13 +213,17 @@ class FullResNetDiagnostic(unittest.TestCase):
         _, _, coverage = recipe.prepare_device_graph(self.plan, optimize=False)
         self.assertEqual(coverage["device_invocations"], 54)
 
-    def test_averagepool_uses_rounded_spatial_mean(self):
+    def test_averagepool_preserves_fractional_spatial_mean(self):
         _, values = recipe.reference(self.plan, self.evaluation, return_intermediates=True)
         site = next(site for site in self.plan.sites if site.kind == "averagepool")
         data = values[site.inputs[0]]
         self.assertEqual(data.shape[2:], (2, 2))
         self.assertTrue((data >= 0).all())
-        expected = ((data.astype(np.int64).sum(axis=(2, 3), keepdims=True) + 2) // 4).astype(np.int8)
+        source = next(source for source in self.plan.sites if source.name == site.inputs[0])
+        shift = source.exponent - site.exponent
+        numerator = data.astype(np.int64).sum(axis=(2, 3), keepdims=True) * 2 ** max(shift, 0)
+        denominator = 4 * 2 ** max(-shift, 0)
+        expected = np.clip((numerator + denominator // 2) // denominator, -127, 127).astype(np.int8)
         np.testing.assert_array_equal(values[site.name], expected)
 
     def test_unsafe_modified_plan_refused(self):
@@ -215,6 +262,7 @@ class FullResNetDiagnostic(unittest.TestCase):
             ("add", lambda site: setattr(site, "inputs", site.inputs[:1])),
             ("flatten", lambda site: setattr(site, "shape", (1, 1))),
             ("averagepool", lambda site: setattr(site, "shape", (*site.shape[:2], 2, 1))),
+            ("averagepool", lambda site: setattr(site, "exponent", 30)),
             ("maxpool", lambda site: setattr(site, "attrs", {**site.attrs, "padding": [100, 100]})),
             ("linear", lambda site: setattr(site, "shape", (1, 999))),
             ("linear", lambda site: setattr(site, "exponent", 0)),
