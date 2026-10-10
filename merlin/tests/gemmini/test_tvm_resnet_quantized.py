@@ -62,6 +62,64 @@ class IntegerPolicies(unittest.TestCase):
         a, b = x.reshape(1, -1), w.reshape(2, -1)
         np.testing.assert_array_equal(recipe.integer_contraction(a[:, :16], b[:, :16]), a[:, :16].astype(np.int64) @ b[:, :16].astype(np.int64).T)
 
+    def test_bias_aware_scaling_independent_power_of_two_witness(self):
+        # Tiny folded weights can coexist with a substantial folded bias.
+        raw_weight = np.array([[2. ** -24, -2. ** -24], [-2. ** -24, 2. ** -24], [0., 0.], [1., -1.]], dtype=np.float32)
+        raw_bias = np.array([4., -4., 64., 2.], dtype=np.float32)
+        original_weight, original_bias = raw_weight.copy(), raw_bias.copy()
+        weight, exponents, bias, changes = recipe.quantize_parameters(raw_weight, raw_bias, -1)
+        # At e=-28 the first two biases have magnitude 2**31; e=-27 is
+        # the first admissible scale, with exact qweights +/-8 and bias +/-2**30.
+        np.testing.assert_array_equal(exponents, [-27, -27, -23, -6])
+        np.testing.assert_array_equal(weight, [[8, -8], [-8, 8], [0, 0], [64, -64]])
+        np.testing.assert_array_equal(bias, [2 ** 30, -(2 ** 30), 2 ** 30, 256])
+        self.assertEqual([change["channel"] for change in changes], [0, 1, 2])
+        for channel, change in enumerate(changes):
+            self.assertEqual(change["raw_weight_sha256"], recipe.array_digest(raw_weight[channel]))
+            self.assertGreater(change["initial_bound_with_bias"], recipe.LIMIT)
+            self.assertEqual(change["bound_with_bias"], 127 * sum(abs(int(v)) for v in weight[channel]) + abs(int(bias[channel])))
+            self.assertLessEqual(change["bound_with_bias"], recipe.LIMIT)
+        for channel in (0, 1):
+            self.assertEqual(changes[channel]["initial_exponent"], -30)
+            self.assertEqual(changes[channel]["initial_bias"], (1 if channel == 0 else -1) * 2 ** 33)
+            self.assertEqual(changes[channel]["initial_accumulation_bound"], 127 * 128)
+        # Independent Python integer contraction+bias witness at both endpoints.
+        for channel in range(4):
+            for inputs in ((127, -127), (-127, 127)):
+                result = sum(x * int(w) for x, w in zip(inputs, weight[channel])) + int(bias[channel])
+                self.assertLessEqual(abs(result), recipe.LIMIT)
+        np.testing.assert_array_equal(raw_weight, original_weight)
+        np.testing.assert_array_equal(raw_bias, original_bias)
+
+    def test_bias_aware_scaling_exact_int32_boundary(self):
+        for sign in (-1, 1):
+            for extra, expected_exponent in ((0, -24), (1, -23)):
+                with self.subTest(sign=sign, extra=extra):
+                    raw_bias = np.array([sign * (recipe.LIMIT + extra) * 2. ** -24])
+                    weight, exponents, bias, changes = recipe.quantize_parameters(np.zeros((1, 1)), raw_bias, 0)
+                    self.assertEqual(int(exponents[0]), expected_exponent)
+                    self.assertEqual(int(bias[0]), sign * (recipe.LIMIT if extra == 0 else 2 ** 30))
+                    self.assertEqual(len(changes), extra)
+        # A representable bias also needs headroom for the contraction itself.
+        weight, exponents, bias, changes = recipe.quantize_parameters(np.array([[64.]]), np.array([float(recipe.LIMIT - 8127)]), 0)
+        self.assertEqual(int(exponents[0]), 1)
+        self.assertEqual(changes[0]["initial_bound_with_bias"], recipe.LIMIT + 1)
+        self.assertEqual(changes[0]["initial_accumulation_bound"], 8128)
+        self.assertEqual(int(weight[0, 0]), 32)
+
+    def test_bias_aware_scaling_retains_fail_closed_limits(self):
+        cases = [
+            (np.array([[127. * 2. ** 30]]), np.array([float(recipe.LIMIT) * 2. ** 60]), 30),
+            (np.zeros((1, 131072)), np.zeros(1), 0),
+            (np.array([[2. ** -40]]), np.zeros(1), 0),
+            (np.array([[np.nan]]), np.zeros(1), 0),
+            (np.zeros((1, 1)), np.array([np.inf]), 0),
+            (np.zeros((1, 1)), np.zeros(1), 31),
+        ]
+        for weight, bias, exponent in cases:
+            with self.subTest(shape=weight.shape, exponent=exponent), self.assertRaises(ValueError):
+                recipe.quantize_parameters(weight, bias, exponent)
+
 
 class FullResNetDiagnostic(unittest.TestCase):
     @classmethod
@@ -81,6 +139,11 @@ class FullResNetDiagnostic(unittest.TestCase):
     def test_complete_inventory_and_source_preserved(self):
         manifest = self.plan.manifest()
         self.assertFalse(manifest["paper_quality_approved"])
+        self.assertEqual(manifest["recipe"], "resnet50-v1.5-symmetric-pow2-development-v2")
+        for site in manifest["sites"]:
+            if "bound_with_bias" in site:
+                self.assertLessEqual(max(site["bound_with_bias"]), recipe.LIMIT)
+                self.assertLessEqual(site["contraction_dimension_bound"], recipe.LIMIT)
         self.assertEqual(sum(site.kind == "conv2d" for site in self.plan.sites), 53)
         self.assertEqual(sum(site.kind == "linear" for site in self.plan.sites), 1)
         self.assertEqual(sum(site.kind == "add" for site in self.plan.sites), 16)
@@ -147,6 +210,7 @@ class FullResNetDiagnostic(unittest.TestCase):
             ("conv2d", lambda site: setattr(site, "weight", site.weight[:, :2].copy())),
             ("conv2d", lambda site: setattr(site, "shape", (*site.shape[:-1], site.shape[-1] + 1))),
             ("conv2d", lambda site: setattr(site, "attrs", {**site.attrs, "stride": [0, 1]})),
+            ("conv2d", lambda site: setattr(site, "exponent", 30)),
             ("relu", lambda site: setattr(site, "exponent", site.exponent + 1)),
             ("add", lambda site: setattr(site, "inputs", site.inputs[:1])),
             ("flatten", lambda site: setattr(site, "shape", (1, 1))),
