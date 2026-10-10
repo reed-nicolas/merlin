@@ -140,6 +140,29 @@ def saturate(value):
     return np.clip(value, -127, 127).astype(np.int8)
 
 
+def averagepool_scale_factors(area, input_exponent, output_exponent):
+    """Prove a single rounded division of the scaled spatial sum fits int64."""
+    if type(area) is not int or area < 1 or any(type(exponent) is not int or not -30 <= exponent <= 30 for exponent in (input_exponent, output_exponent)):
+        raise ValueError("Invalid averagepool area or scale exponent")
+    shift = input_exponent - output_exponent
+    if not -30 <= shift <= 30:
+        raise ValueError("Averagepool requantization shift exceeds 30 bits")
+    factor, denominator = 1 << max(shift, 0), area * (1 << max(-shift, 0))
+    limit64 = np.iinfo(np.int64).max
+    if 128 * area > limit64 or denominator > limit64 or 127 * area * factor + denominator // 2 > limit64:
+        raise ValueError("Averagepool sum, scaled numerator or rounded division may overflow int64")
+    return factor, denominator
+
+
+def averagepool(data, input_exponent, output_exponent):
+    """Requantize the spatial mean once, preserving fractional mean precision."""
+    if not isinstance(data, np.ndarray) or data.dtype != np.int8 or data.ndim != 4 or min(data.shape) < 1 or np.any(data == -128):
+        raise ValueError("Averagepool requires nonempty symmetric int8 NCHW input")
+    factor, denominator = averagepool_scale_factors(math.prod(data.shape[2:]), input_exponent, output_exponent)
+    total = data.astype(np.int64).sum(axis=(2, 3), keepdims=True)
+    return saturate(round_divide(total * factor, denominator))
+
+
 @dataclass
 class Site:
     name: str
@@ -246,7 +269,7 @@ class QuantizedResNet:
                     raise ValueError("Invalid residual rescale")
                 expected_shape = source_shape
             else:
-                if site.exponent != scales[site.inputs[0]]:
+                if site.kind != "averagepool" and site.exponent != scales[site.inputs[0]]:
                     raise ValueError("Unary integer operations must preserve the input scale")
                 if site.kind != "maxpool" and site.attrs:
                     raise ValueError("Unsupported unary operation attributes")
@@ -258,8 +281,7 @@ class QuantizedResNet:
                     if len(source_shape) != 4:
                         raise ValueError("Pooling requires NCHW input")
                     if site.kind == "averagepool":
-                        if 128 * math.prod(source_shape[2:]) > np.iinfo(np.int64).max:
-                            raise ValueError("Averagepool rounded sum may overflow int64")
+                        averagepool_scale_factors(math.prod(source_shape[2:]), scales[site.inputs[0]], site.exponent)
                         expected_shape = (*source_shape[:2], 1, 1)
                     else:
                         if set(site.attrs) != {"kernel", "stride", "padding"}:
@@ -280,7 +302,7 @@ class QuantizedResNet:
 
     def manifest(self):
         self.validate()
-        sites = []
+        sites, scales, shapes = [], {self.provenance["input_name"]: self.input_exponent}, {self.provenance["input_name"]: self.input_shape}
         for site in self.sites:
             row = {"name": site.name, "kind": site.kind, "inputs": list(site.inputs),
                    "shape": list(site.shape), "activation_exponent": site.exponent, "attributes": site.attrs}
@@ -291,8 +313,13 @@ class QuantizedResNet:
                            accumulation_bound=bound.tolist(),
                            bound_with_bias=(bound + np.abs(site.bias.astype(np.int64))).tolist(),
                            contraction_dimension_bound=math.prod(site.weight.shape[1:]) * 128 * 128)
+            if site.kind == "averagepool":
+                area = math.prod(shapes[site.inputs[0]][2:])
+                factor, denominator = averagepool_scale_factors(area, scales[site.inputs[0]], site.exponent)
+                row["mean_requantization"] = {"area": area, "input_exponent": scales[site.inputs[0]], "output_exponent": site.exponent, "factor": factor, "denominator": denominator, "sum_bound": 127 * area, "scaled_numerator_bound": 127 * area * factor, "rounded_numerator_bound": 127 * area * factor + denominator // 2}
             sites.append(row)
-        return {"recipe": "resnet50-v1.5-symmetric-pow2-development-v2", "paper_quality_approved": False,
+            scales[site.name], shapes[site.name] = site.exponent, site.shape
+        return {"recipe": "resnet50-v1.5-symmetric-pow2-development-v3", "paper_quality_approved": False,
                 "application_quality": "requires_separate_labeled_evaluation_and_approved_thresholds",
                 "input_shape": list(self.input_shape), "input_exponent": self.input_exponent,
                 "calibration_tensor_sha256": list(self.calibration_hashes), "provenance": self.provenance,
@@ -303,7 +330,7 @@ class QuantizedResNet:
                     "bias": "round folded FP32 bias / (input_scale * channel_weight_scale), int32",
                     "requantization": "bounded int64 scale then signed rounded division and saturation",
                     "residual": "rescale each arm to calibrated add scale, int64 add, saturate, then ReLU",
-                    "maxpool": "integer maximum with negative-infinity padding", "averagepool": "int64 sum, rounded divide at unchanged scale",
+                    "maxpool": "integer maximum with negative-infinity padding", "averagepool": "int64 spatial sum, multiply/divide to TRAIN-calibrated output scale, round once and saturate; shift and intermediate overflow bounds checked",
                     "classifier": "int8/int32 contraction plus int32 bias, per-channel FP32 dequantized logits"},
                 "sites": sites}
 
@@ -420,7 +447,7 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
                 attrs = {"kernel": pair(module.kernel_size), "stride": pair(module.stride or module.kernel_size), "padding": pair(module.padding)}
                 output_exponent = scales[inputs[0]]
             elif type(module) is torch.nn.AdaptiveAvgPool2d and module.output_size == (1, 1):
-                kind, output_exponent = "averagepool", scales[inputs[0]]
+                kind, output_exponent = "averagepool", exponent_for(maxima[node.name])
             else:
                 raise ValueError(f"Unsupported module: {node.target}/{type(module).__name__}")
         elif node.op == "call_function" and node.target is operator.add and len(inputs) == 2:
@@ -499,7 +526,7 @@ def reference(plan, image, *, allow_calibration=False, return_intermediates=Fals
         elif site.kind == "flatten":
             result = args[0].reshape(site.shape)
         elif site.kind == "averagepool":
-            result = saturate(round_divide(args[0].astype(np.int64).sum(axis=(2, 3), keepdims=True), math.prod(args[0].shape[2:])))
+            result = averagepool(args[0], scales[site.inputs[0]], site.exponent)
         elif site.kind == "maxpool":
             ph, pw = site.attrs["padding"]
             padded = np.pad(args[0], ((0, 0), (0, 0), (ph, ph), (pw, pw)), constant_values=-128)
@@ -572,8 +599,9 @@ def export_relax(plan, *, return_integer_logits=False):
                 elif site.kind == "flatten":
                     result = emit(relax.op.reshape(args[0], site.shape))
                 elif site.kind == "averagepool":
+                    factor, denominator = averagepool_scale_factors(math.prod(tuple(int(dim) for dim in args[0].struct_info.shape)[2:]), scales[site.inputs[0]], site.exponent)
                     total = emit(relax.op.sum(emit(relax.op.astype(args[0], "int64")), axis=[2, 3], keepdims=True))
-                    result = clipped(rounded(total, math.prod(tuple(int(dim) for dim in args[0].struct_info.shape)[2:])))
+                    result = clipped(rounded(emit(relax.op.multiply(total, c(factor))), denominator))
                 elif site.kind == "maxpool":
                     result = emit(relax.op.nn.max_pool2d(args[0], pool_size=site.attrs["kernel"], strides=site.attrs["stride"], padding=site.attrs["padding"]))
                 else:
