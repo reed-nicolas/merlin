@@ -120,6 +120,57 @@ class IntegerPolicies(unittest.TestCase):
             with self.subTest(shape=weight.shape, exponent=exponent), self.assertRaises(ValueError):
                 recipe.quantize_parameters(weight, bias, exponent)
 
+    def test_finer_activation_scale_recomputes_bias_headroom(self):
+        weight = np.array([[2. ** -24, -2. ** -24]], dtype=np.float32)
+        bias = np.array([4.], dtype=np.float32)
+        coarse = recipe.quantize_parameters(weight, bias, -1)
+        fine = recipe.quantize_parameters(weight, bias, -2)
+        self.assertEqual(int(coarse[1][0]), -27)
+        self.assertEqual(int(fine[1][0]), -26)
+        self.assertEqual(int(fine[2][0]), 2 ** 30)
+        self.assertLessEqual(127 * abs(fine[0].astype(np.int64)).sum() + abs(int(fine[2][0])), recipe.LIMIT)
+        with self.assertRaises(ValueError):
+            recipe.quantize_parameters(np.zeros((1, 1)), np.array([float(recipe.LIMIT) * 2.]), -30)
+
+    def test_post_relu_range_proof_and_signed_residual_cancellation(self):
+        import operator
+        import torch
+
+        modules = torch.nn.Module()
+        modules.add_module("arbitrary_left", torch.nn.Conv2d(1, 1, 1))
+        modules.add_module("arbitrary_right", torch.nn.Conv2d(1, 1, 1))
+        modules.add_module("pass_through", torch.nn.Identity())
+        modules.add_module("discard_negative", torch.nn.ReLU(inplace=True))
+        for branch in ("none", "producer", "identity", "residual"):
+            with self.subTest(branch=branch):
+                graph = torch.fx.Graph()
+                image = graph.placeholder("pixels")
+                left = graph.call_module("arbitrary_left", (image,))
+                producer = left
+                if branch == "residual":
+                    right = graph.call_module("arbitrary_right", (image,))
+                    producer = graph.call_function(operator.add, (left, right))
+                identity = graph.call_module("pass_through", (producer,))
+                relu = graph.call_module("discard_negative", (identity,))
+                extra = producer if branch == "producer" else identity
+                graph.output((relu, extra) if branch in ("producer", "identity") else relu)
+                targets = recipe.post_relu_calibration_targets(torch.fx.GraphModule(modules, graph))
+                if branch in ("producer", "identity"):
+                    self.assertEqual(targets, {})
+                else:
+                    self.assertEqual(targets, {producer.name: {"relu": relu.name, "identities": [identity.name]}})
+        # Signed pre-Add arms must survive unchanged: +128 and -126 cancel
+        # to +2. Clipping the positive arm before addition would give +1.
+        arms = [recipe.rescale(np.array([64], dtype=np.int8), 1),
+                recipe.rescale(np.array([-63], dtype=np.int8), 1)]
+        np.testing.assert_array_equal(recipe.saturate(sum(arms)), [2])
+        # Large discarded negatives cannot consume the positive capacity.
+        values = np.array([-512., -1., 0., .125, 1.], dtype=np.float32)
+        exponent = recipe.exponent_for(float(np.maximum(values, 0).max()))
+        np.testing.assert_array_equal(np.maximum(recipe.quantize(values, exponent), 0),
+                                      recipe.quantize(np.maximum(values, 0), exponent))
+        self.assertEqual(recipe.exponent_for(0.), -24)
+
     def test_averagepool_single_rounding_independent_witnesses(self):
         cases = [
             ([1, 0, 0], 0, -1, 1),
@@ -180,7 +231,7 @@ class FullResNetDiagnostic(unittest.TestCase):
     def test_complete_inventory_and_source_preserved(self):
         manifest = self.plan.manifest()
         self.assertFalse(manifest["paper_quality_approved"])
-        self.assertEqual(manifest["recipe"], "resnet50-v1.5-symmetric-pow2-development-v3")
+        self.assertEqual(manifest["recipe"], "resnet50-v1.5-symmetric-pow2-development-v4")
         for site in manifest["sites"]:
             if "bound_with_bias" in site:
                 self.assertLessEqual(max(site["bound_with_bias"]), recipe.LIMIT)
@@ -196,22 +247,46 @@ class FullResNetDiagnostic(unittest.TestCase):
 
     def test_full_semantic_cpu_graph_matches_independent_reference(self):
         import tvm
+        from verify_resnet import prepare_graph
         mod = recipe.export_relax(self.plan, return_integer_logits=True)
-        executable = tvm.relax.build(mod, target="llvm")
-        vm = tvm.relax.VirtualMachine(executable, tvm.cpu())
         image = recipe.quantize(self.evaluation, self.plan.input_exponent)
-        outputs = vm["main"](tvm.nd.array(image))
-        integer_actual, actual = outputs[0].numpy(), outputs[1].numpy()
         integer_expected, expected = recipe.reference(self.plan, self.evaluation, return_integer_logits=True)
-        self.assertEqual(integer_actual.dtype, np.int32)
-        np.testing.assert_array_equal(integer_actual, integer_expected)
-        np.testing.assert_array_equal(actual, expected)
-        self.assertEqual(actual.dtype, np.float32)
-        self.assertEqual(actual.shape, (1, 1000))
+        for mode in ("baseline", "optimized"):
+            with self.subTest(mode=mode):
+                _, lowered = prepare_graph(mod, mode, tvm)
+                executable = tvm.relax.build(lowered, target="llvm", pipeline=None)
+                vm = tvm.relax.VirtualMachine(executable, tvm.cpu())
+                outputs = vm["main"](tvm.nd.array(image))
+                integer_actual, actual = outputs[0].numpy(), outputs[1].numpy()
+                self.assertEqual(integer_actual.dtype, np.int32)
+                np.testing.assert_array_equal(integer_actual, integer_expected)
+                np.testing.assert_array_equal(actual, expected)
+                self.assertEqual(actual.dtype, np.float32)
+                self.assertEqual(actual.shape, (1, 1000))
 
     def test_all_contractions_reach_device_graph(self):
-        _, _, coverage = recipe.prepare_device_graph(self.plan, optimize=False)
-        self.assertEqual(coverage["device_invocations"], 54)
+        for optimize in (False, True):
+            with self.subTest(optimize=optimize):
+                _, _, coverage = recipe.prepare_device_graph(self.plan, optimize=optimize)
+                self.assertEqual(coverage["device_invocations"], 54)
+
+    def test_zero_positive_range_preserves_source_and_rebuilds_biases(self):
+        import copy
+        import torch
+        model = copy.deepcopy(self.model)
+        with torch.no_grad():
+            model.conv1.weight.zero_()
+            model.bn1.bias.fill_(-64.)
+        source_hash = recipe.state_digest(model)
+        plan = recipe.calibrate_resnet50(model, [self.calibration], calibration_ids=["negative-stem"], input_shape=self.calibration.shape)
+        projection = next(row for row in plan.provenance["post_relu_calibration"] if row["site"] == plan.sites[0].name)
+        self.assertEqual(projection["observed_max_abs"], 64.)
+        self.assertEqual(projection["observed_post_relu_maximum"], 0.)
+        self.assertEqual(plan.sites[0].exponent, -24)
+        self.assertEqual(recipe.state_digest(model), source_hash)
+        plan.validate()
+        _, values = recipe.reference(plan, self.evaluation, return_intermediates=True)
+        self.assertTrue((values[projection["relu"]] == 0).all())
 
     def test_averagepool_preserves_fractional_spatial_mean(self):
         _, values = recipe.reference(self.plan, self.evaluation, return_intermediates=True)
