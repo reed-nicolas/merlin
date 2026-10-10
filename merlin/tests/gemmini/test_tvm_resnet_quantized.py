@@ -1,0 +1,368 @@
+"""Direct unittest entry point for the explicit ResNet development recipe."""
+
+import importlib.util
+import sys
+import unittest
+
+import numpy as np
+from merlin.common.paths import repo_root
+
+
+MODULE_PATH = repo_root() / "examples/gemmini/comparisons/tvm/resnet_quantized.py"
+sys.path.insert(0, str(MODULE_PATH.parent))
+spec = importlib.util.spec_from_file_location("resnet_quantized", MODULE_PATH)
+recipe = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = recipe
+spec.loader.exec_module(recipe)
+
+
+class IntegerPolicies(unittest.TestCase):
+    def test_signed_rounding_and_shifts(self):
+        values = np.arange(-9, 10, dtype=np.int64)
+        np.testing.assert_array_equal(recipe.round_divide(values, 2), [-5, -4, -4, -3, -3, -2, -2, -1, -1, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5])
+        np.testing.assert_array_equal(recipe.rescale(values, -1), recipe.round_divide(values, 2))
+        np.testing.assert_array_equal(recipe.rescale(values, 2), values * 4)
+        with self.assertRaises(ValueError):
+            recipe.rescale(values, 31)
+        with self.assertRaises(ValueError):
+            recipe.round_divide(np.array([np.iinfo(np.int64).min]), 2)
+        with self.assertRaises(ValueError):
+            recipe.rescale(np.array([np.iinfo(np.int64).min]), 1)
+        with self.assertRaises(ValueError):
+            recipe.round_divide(values, 1.5)
+        with self.assertRaises(ValueError):
+            recipe.rescale(values.astype(np.float64), 1)
+        np.testing.assert_array_equal(recipe.round_divide(values, 3),
+                                      [-3, -3, -2, -2, -2, -1, -1, -1, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3])
+        for operation in (lambda: recipe.round_divide(np.array([np.iinfo(np.int64).max]), 2),
+                          lambda: recipe.rescale(np.array([np.iinfo(np.int64).max]), 1),
+                          lambda: recipe.rescale(values, np.iinfo(np.int64).min)):
+            with self.assertRaises(ValueError):
+                operation()
+
+    def test_symmetric_quantization(self):
+        np.testing.assert_array_equal(recipe.quantize(np.array([-200., -1.5, -.5, 0., .5, 1.5, 200.]), 0), [-127, -2, -1, 0, 1, 2, 127])
+        self.assertEqual(recipe.exponent_for(127.), 0)
+        self.assertEqual(recipe.exponent_for(128.), 1)
+        with self.assertRaises(ValueError):
+            recipe.quantize(np.array([np.nan]), 0)
+
+    def test_contraction_against_direct_int64(self):
+        x = np.arange(-18, 18, dtype=np.int8).reshape(1, 2, 3, 6)
+        w = np.arange(-16, 16, dtype=np.int8).reshape(2, 2, 2, 4)
+        attrs = {"stride": [1, 2], "padding": [1, 1], "dilation": [1, 1]}
+        actual = recipe.integer_contraction(x, w, attrs)
+        padded = np.pad(x.astype(np.int64), ((0, 0), (0, 0), (1, 1), (1, 1)))
+        expected = np.zeros((1, 2, 4, 3), dtype=np.int64)
+        for o in range(2):
+            for y in range(4):
+                for z in range(3):
+                    expected[0, o, y, z] = (padded[0, :, y:y + 2, 2 * z:2 * z + 4] * w[o].astype(np.int64)).sum()
+        np.testing.assert_array_equal(actual, expected)
+        a, b = x.reshape(1, -1), w.reshape(2, -1)
+        np.testing.assert_array_equal(recipe.integer_contraction(a[:, :16], b[:, :16]), a[:, :16].astype(np.int64) @ b[:, :16].astype(np.int64).T)
+
+    def test_bias_aware_scaling_independent_power_of_two_witness(self):
+        # Tiny folded weights can coexist with a substantial folded bias.
+        raw_weight = np.array([[2. ** -24, -2. ** -24], [-2. ** -24, 2. ** -24], [0., 0.], [1., -1.]], dtype=np.float32)
+        raw_bias = np.array([4., -4., 64., 2.], dtype=np.float32)
+        original_weight, original_bias = raw_weight.copy(), raw_bias.copy()
+        weight, exponents, bias, changes = recipe.quantize_parameters(raw_weight, raw_bias, -1)
+        # At e=-28 the first two biases have magnitude 2**31; e=-27 is
+        # the first admissible scale, with exact qweights +/-8 and bias +/-2**30.
+        np.testing.assert_array_equal(exponents, [-27, -27, -23, -6])
+        np.testing.assert_array_equal(weight, [[8, -8], [-8, 8], [0, 0], [64, -64]])
+        np.testing.assert_array_equal(bias, [2 ** 30, -(2 ** 30), 2 ** 30, 256])
+        self.assertEqual([change["channel"] for change in changes], [0, 1, 2])
+        for channel, change in enumerate(changes):
+            self.assertEqual(change["raw_weight_sha256"], recipe.array_digest(raw_weight[channel]))
+            self.assertGreater(change["initial_bound_with_bias"], recipe.LIMIT)
+            self.assertEqual(change["bound_with_bias"], 127 * sum(abs(int(v)) for v in weight[channel]) + abs(int(bias[channel])))
+            self.assertLessEqual(change["bound_with_bias"], recipe.LIMIT)
+        for channel in (0, 1):
+            self.assertEqual(changes[channel]["initial_exponent"], -30)
+            self.assertEqual(changes[channel]["initial_bias"], (1 if channel == 0 else -1) * 2 ** 33)
+            self.assertEqual(changes[channel]["initial_accumulation_bound"], 127 * 128)
+        # Independent Python integer contraction+bias witness at both endpoints.
+        for channel in range(4):
+            for inputs in ((127, -127), (-127, 127)):
+                result = sum(x * int(w) for x, w in zip(inputs, weight[channel])) + int(bias[channel])
+                self.assertLessEqual(abs(result), recipe.LIMIT)
+        np.testing.assert_array_equal(raw_weight, original_weight)
+        np.testing.assert_array_equal(raw_bias, original_bias)
+
+    def test_bias_aware_scaling_exact_int32_boundary(self):
+        for sign in (-1, 1):
+            for extra, expected_exponent in ((0, -24), (1, -23)):
+                with self.subTest(sign=sign, extra=extra):
+                    raw_bias = np.array([sign * (recipe.LIMIT + extra) * 2. ** -24])
+                    weight, exponents, bias, changes = recipe.quantize_parameters(np.zeros((1, 1)), raw_bias, 0)
+                    self.assertEqual(int(exponents[0]), expected_exponent)
+                    self.assertEqual(int(bias[0]), sign * (recipe.LIMIT if extra == 0 else 2 ** 30))
+                    self.assertEqual(len(changes), extra)
+        # A representable bias also needs headroom for the contraction itself.
+        weight, exponents, bias, changes = recipe.quantize_parameters(np.array([[64.]]), np.array([float(recipe.LIMIT - 8127)]), 0)
+        self.assertEqual(int(exponents[0]), 1)
+        self.assertEqual(changes[0]["initial_bound_with_bias"], recipe.LIMIT + 1)
+        self.assertEqual(changes[0]["initial_accumulation_bound"], 8128)
+        self.assertEqual(int(weight[0, 0]), 32)
+
+    def test_bias_aware_scaling_retains_fail_closed_limits(self):
+        cases = [
+            (np.array([[127. * 2. ** 30]]), np.array([float(recipe.LIMIT) * 2. ** 60]), 30),
+            (np.zeros((1, 131072)), np.zeros(1), 0),
+            (np.array([[2. ** -40]]), np.zeros(1), 0),
+            (np.array([[np.nan]]), np.zeros(1), 0),
+            (np.zeros((1, 1)), np.array([np.inf]), 0),
+            (np.zeros((1, 1)), np.zeros(1), 31),
+        ]
+        for weight, bias, exponent in cases:
+            with self.subTest(shape=weight.shape, exponent=exponent), self.assertRaises(ValueError):
+                recipe.quantize_parameters(weight, bias, exponent)
+
+    def test_finer_activation_scale_recomputes_bias_headroom(self):
+        weight = np.array([[2. ** -24, -2. ** -24]], dtype=np.float32)
+        bias = np.array([4.], dtype=np.float32)
+        coarse = recipe.quantize_parameters(weight, bias, -1)
+        fine = recipe.quantize_parameters(weight, bias, -2)
+        self.assertEqual(int(coarse[1][0]), -27)
+        self.assertEqual(int(fine[1][0]), -26)
+        self.assertEqual(int(fine[2][0]), 2 ** 30)
+        self.assertLessEqual(127 * abs(fine[0].astype(np.int64)).sum() + abs(int(fine[2][0])), recipe.LIMIT)
+        with self.assertRaises(ValueError):
+            recipe.quantize_parameters(np.zeros((1, 1)), np.array([float(recipe.LIMIT) * 2.]), -30)
+
+    def test_post_relu_range_proof_and_signed_residual_cancellation(self):
+        import operator
+        import torch
+
+        modules = torch.nn.Module()
+        modules.add_module("arbitrary_left", torch.nn.Conv2d(1, 1, 1))
+        modules.add_module("arbitrary_right", torch.nn.Conv2d(1, 1, 1))
+        modules.add_module("pass_through", torch.nn.Identity())
+        modules.add_module("discard_negative", torch.nn.ReLU(inplace=True))
+        for branch in ("none", "producer", "identity", "residual"):
+            with self.subTest(branch=branch):
+                graph = torch.fx.Graph()
+                image = graph.placeholder("pixels")
+                left = graph.call_module("arbitrary_left", (image,))
+                producer = left
+                if branch == "residual":
+                    right = graph.call_module("arbitrary_right", (image,))
+                    producer = graph.call_function(operator.add, (left, right))
+                identity = graph.call_module("pass_through", (producer,))
+                relu = graph.call_module("discard_negative", (identity,))
+                extra = producer if branch == "producer" else identity
+                graph.output((relu, extra) if branch in ("producer", "identity") else relu)
+                targets = recipe.post_relu_calibration_targets(torch.fx.GraphModule(modules, graph))
+                if branch in ("producer", "identity"):
+                    self.assertEqual(targets, {})
+                else:
+                    self.assertEqual(targets, {producer.name: {"relu": relu.name, "identities": [identity.name]}})
+        # Signed pre-Add arms must survive unchanged: +128 and -126 cancel
+        # to +2. Clipping the positive arm before addition would give +1.
+        arms = [recipe.rescale(np.array([64], dtype=np.int8), 1),
+                recipe.rescale(np.array([-63], dtype=np.int8), 1)]
+        np.testing.assert_array_equal(recipe.saturate(sum(arms)), [2])
+        # Large discarded negatives cannot consume the positive capacity.
+        values = np.array([-512., -1., 0., .125, 1.], dtype=np.float32)
+        exponent = recipe.exponent_for(float(np.maximum(values, 0).max()))
+        np.testing.assert_array_equal(np.maximum(recipe.quantize(values, exponent), 0),
+                                      recipe.quantize(np.maximum(values, 0), exponent))
+        self.assertEqual(recipe.exponent_for(0.), -24)
+
+    def test_averagepool_single_rounding_independent_witnesses(self):
+        cases = [
+            ([1, 0, 0], 0, -1, 1),
+            ([-1, 0, 0], 0, -1, -1),
+            ([1, 0, 0, 0], 0, -1, 1),
+            ([-1, 0, 0, 0], 0, -1, -1),
+            ([1, 1, 0], 0, 1, 0),
+            ([-1, -1, 0], 0, 1, 0),
+            ([3, 0, 0], 0, 1, 1),
+            ([-3, 0, 0], 0, 1, -1),
+            ([1, 2, 3], -2, -2, 2),
+            ([127, 127], 0, -1, 127),
+            ([-127, -127], 0, -1, -127),
+        ]
+        for values, input_exponent, output_exponent, expected in cases:
+            with self.subTest(values=values, scales=(input_exponent, output_exponent)):
+                actual = recipe.averagepool(np.array(values, dtype=np.int8).reshape(1, 1, 1, -1), input_exponent, output_exponent)
+                self.assertEqual(actual.dtype, np.int8)
+                self.assertEqual(actual.shape, (1, 1, 1, 1))
+                self.assertEqual(int(actual.item()), expected)
+
+    def test_averagepool_overflow_and_shift_proofs(self):
+        limit64 = int(np.iinfo(np.int64).max)
+        cases = [
+            (limit64 // 128 + 1, 0, 0),
+            (limit64 // (127 * 2 ** 30) + 1, 0, -30),
+            (limit64 // 2 ** 30 + 1, -30, 0),
+            (limit64 // 128, -2, 0),  # Sum and denominator fit; rounded numerator does not.
+            (1, 30, -1),
+            (1, 31, 1),
+            (0, 0, 0),
+        ]
+        for area, input_exponent, output_exponent in cases:
+            with self.subTest(area=area, scales=(input_exponent, output_exponent)), self.assertRaises(ValueError):
+                recipe.averagepool_scale_factors(area, input_exponent, output_exponent)
+        self.assertEqual(recipe.averagepool_scale_factors(3, 0, -1), (2, 3))
+        self.assertEqual(recipe.averagepool_scale_factors(3, 0, 1), (1, 6))
+        self.assertEqual(recipe.averagepool_scale_factors(limit64 // 128, 0, 0), (1, limit64 // 128))
+        with self.assertRaises(ValueError):
+            recipe.averagepool(np.full((1, 1, 1, 1), -128, dtype=np.int8), 0, 0)
+
+
+class FullResNetDiagnostic(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import torch
+        import torchvision
+        torch.set_num_threads(2)
+        torch.manual_seed(811)
+        cls.model = torchvision.models.resnet50(weights=None).cpu().eval()
+        rng = np.random.default_rng(815)
+        cls.calibration = rng.standard_normal((1, 3, 64, 64), dtype=np.float32)
+        cls.evaluation = rng.standard_normal((1, 3, 64, 64), dtype=np.float32)
+        cls.original_hash = recipe.state_digest(cls.model)
+        cls.plan = recipe.calibrate_resnet50(cls.model, [cls.calibration], calibration_ids=["synthetic-calibration-815"], input_shape=cls.calibration.shape,
+                                            checkpoint_declaration="random diagnostic; not pretrained")
+
+    def test_complete_inventory_and_source_preserved(self):
+        manifest = self.plan.manifest()
+        self.assertFalse(manifest["paper_quality_approved"])
+        self.assertEqual(manifest["recipe"], "resnet50-v1.5-symmetric-pow2-development-v4")
+        for site in manifest["sites"]:
+            if "bound_with_bias" in site:
+                self.assertLessEqual(max(site["bound_with_bias"]), recipe.LIMIT)
+                self.assertLessEqual(site["contraction_dimension_bound"], recipe.LIMIT)
+            if "mean_requantization" in site:
+                self.assertLessEqual(site["mean_requantization"]["rounded_numerator_bound"], np.iinfo(np.int64).max)
+        self.assertEqual(sum(site.kind == "conv2d" for site in self.plan.sites), 53)
+        self.assertEqual(sum(site.kind == "linear" for site in self.plan.sites), 1)
+        self.assertEqual(sum(site.kind == "add" for site in self.plan.sites), 16)
+        self.assertEqual(self.original_hash, recipe.state_digest(self.model))
+        with self.assertRaises(ValueError):
+            recipe.reference(self.plan, self.calibration)
+
+    def test_full_semantic_cpu_graph_matches_independent_reference(self):
+        import tvm
+        from verify_resnet import prepare_graph
+        mod = recipe.export_relax(self.plan, return_integer_logits=True)
+        image = recipe.quantize(self.evaluation, self.plan.input_exponent)
+        integer_expected, expected = recipe.reference(self.plan, self.evaluation, return_integer_logits=True)
+        for mode in ("baseline", "optimized"):
+            with self.subTest(mode=mode):
+                _, lowered = prepare_graph(mod, mode, tvm)
+                executable = tvm.relax.build(lowered, target="llvm", pipeline=None)
+                vm = tvm.relax.VirtualMachine(executable, tvm.cpu())
+                outputs = vm["main"](tvm.nd.array(image))
+                integer_actual, actual = outputs[0].numpy(), outputs[1].numpy()
+                self.assertEqual(integer_actual.dtype, np.int32)
+                np.testing.assert_array_equal(integer_actual, integer_expected)
+                np.testing.assert_array_equal(actual, expected)
+                self.assertEqual(actual.dtype, np.float32)
+                self.assertEqual(actual.shape, (1, 1000))
+
+    def test_all_contractions_reach_device_graph(self):
+        for optimize in (False, True):
+            with self.subTest(optimize=optimize):
+                _, _, coverage = recipe.prepare_device_graph(self.plan, optimize=optimize)
+                self.assertEqual(coverage["device_invocations"], 54)
+
+    def test_zero_positive_range_preserves_source_and_rebuilds_biases(self):
+        import copy
+        import torch
+        model = copy.deepcopy(self.model)
+        with torch.no_grad():
+            model.conv1.weight.zero_()
+            model.bn1.bias.fill_(-64.)
+        source_hash = recipe.state_digest(model)
+        plan = recipe.calibrate_resnet50(model, [self.calibration], calibration_ids=["negative-stem"], input_shape=self.calibration.shape)
+        projection = next(row for row in plan.provenance["post_relu_calibration"] if row["site"] == plan.sites[0].name)
+        self.assertEqual(projection["observed_max_abs"], 64.)
+        self.assertEqual(projection["observed_post_relu_maximum"], 0.)
+        self.assertEqual(plan.sites[0].exponent, -24)
+        self.assertEqual(recipe.state_digest(model), source_hash)
+        plan.validate()
+        _, values = recipe.reference(plan, self.evaluation, return_intermediates=True)
+        self.assertTrue((values[projection["relu"]] == 0).all())
+
+    def test_averagepool_preserves_fractional_spatial_mean(self):
+        _, values = recipe.reference(self.plan, self.evaluation, return_intermediates=True)
+        site = next(site for site in self.plan.sites if site.kind == "averagepool")
+        data = values[site.inputs[0]]
+        self.assertEqual(data.shape[2:], (2, 2))
+        self.assertTrue((data >= 0).all())
+        source = next(source for source in self.plan.sites if source.name == site.inputs[0])
+        shift = source.exponent - site.exponent
+        numerator = data.astype(np.int64).sum(axis=(2, 3), keepdims=True) * 2 ** max(shift, 0)
+        denominator = 4 * 2 ** max(-shift, 0)
+        expected = np.clip((numerator + denominator // 2) // denominator, -127, 127).astype(np.int8)
+        np.testing.assert_array_equal(values[site.name], expected)
+
+    def test_unsafe_modified_plan_refused(self):
+        import copy
+        modified = copy.copy(self.plan)
+        modified.sites = list(self.plan.sites)
+        modified.sites[0] = copy.copy(modified.sites[0])
+        modified.sites[0].bias = np.full_like(modified.sites[0].bias, recipe.LIMIT)
+        with self.assertRaises(ValueError):
+            recipe.reference(modified, self.evaluation)
+        with self.assertRaises(ValueError):
+            recipe.export_relax(modified)
+
+    def test_invalid_calibration_refused(self):
+        with self.assertRaises(ValueError):
+            recipe.calibrate_resnet50(self.model, [self.calibration, self.calibration], calibration_ids=["one", "two"], input_shape=self.calibration.shape)
+
+    def test_invalid_plan_parameters_and_geometry_refused(self):
+        import copy
+        def modify_site(kind, update):
+            plan = copy.copy(self.plan)
+            plan.sites = list(self.plan.sites)
+            index = next(i for i, site in enumerate(plan.sites) if site.kind == kind)
+            plan.sites[index] = copy.copy(plan.sites[index])
+            update(plan.sites[index])
+            return plan
+        cases = [
+            ("conv2d", lambda site: setattr(site, "weight_exponents", np.full_like(site.weight_exponents, np.iinfo(np.int64).min))),
+            ("linear", lambda site: setattr(site, "weight_exponents", np.full_like(site.weight_exponents, np.iinfo(np.int64).min))),
+            ("conv2d", lambda site: setattr(site, "inputs", site.inputs * 2)),
+            ("conv2d", lambda site: setattr(site, "weight", site.weight[:, :2].copy())),
+            ("conv2d", lambda site: setattr(site, "shape", (*site.shape[:-1], site.shape[-1] + 1))),
+            ("conv2d", lambda site: setattr(site, "attrs", {**site.attrs, "stride": [0, 1]})),
+            ("conv2d", lambda site: setattr(site, "exponent", 30)),
+            ("relu", lambda site: setattr(site, "exponent", site.exponent + 1)),
+            ("add", lambda site: setattr(site, "inputs", site.inputs[:1])),
+            ("flatten", lambda site: setattr(site, "shape", (1, 1))),
+            ("averagepool", lambda site: setattr(site, "shape", (*site.shape[:2], 2, 1))),
+            ("averagepool", lambda site: setattr(site, "exponent", 30)),
+            ("maxpool", lambda site: setattr(site, "attrs", {**site.attrs, "padding": [100, 100]})),
+            ("linear", lambda site: setattr(site, "shape", (1, 999))),
+            ("linear", lambda site: setattr(site, "exponent", 0)),
+        ]
+        for kind, update in cases:
+            with self.subTest(kind=kind, update=update):
+                plan = modify_site(kind, update)
+                with self.assertRaises(ValueError):
+                    plan.validate()
+                with self.assertRaises(ValueError):
+                    recipe.reference(plan, self.evaluation)
+        self.assertEqual(recipe.state_digest(self.model), self.original_hash)
+
+    def test_modified_calibration_provenance_refused(self):
+        import copy
+        for hashes in ((), ("bad-hash",), self.plan.calibration_hashes * 2):
+            plan = copy.copy(self.plan)
+            plan.calibration_hashes = hashes
+            with self.subTest(hashes=hashes), self.assertRaises(ValueError):
+                plan.validate()
+        plan = copy.copy(self.plan)
+        plan.provenance = {**plan.provenance, "calibration_ids": []}
+        with self.assertRaises(ValueError):
+            plan.validate()
+
+
+if __name__ == "__main__":
+    unittest.main()
