@@ -13,7 +13,7 @@ For a new TVM checkout, clone without checkout and apply the mandatory name excl
 ```bash
 export TVM_ROOT=/absolute/path/to/tvm-gemmini
 export TVM_BUILD=/absolute/path/to/tvm-host-build
-tvm_commit=74d669fab5c6f21e14de9f23f28975559b6bd764
+tvm_commit=e88d3ff550856cd1f717814a593e1f4ae0cf0686
 git clone --filter=blob:none --no-checkout https://github.com/reed-nicolas/tvm.git "$TVM_ROOT"
 git -C "$TVM_ROOT" sparse-checkout set --no-cone --stdin <<'PATTERNS'
 /*
@@ -28,7 +28,7 @@ In the same shell, verify the selected source pin and prepare the host environme
 ```bash
 : "${TVM_ROOT:?Set TVM_ROOT to the independent TVM checkout}"
 : "${TVM_BUILD:?Set TVM_BUILD to the TVM host build directory}"
-test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = 74d669fab5c6f21e14de9f23f28975559b6bd764 || { echo 'TVM source pin mismatch' >&2; exit 1; }
+test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = e88d3ff550856cd1f717814a593e1f4ae0cf0686 || { echo 'TVM source pin mismatch' >&2; exit 1; }
 merlin_root="$PWD"
 setup_dir="$merlin_root/examples/gemmini/comparisons/tvm"
 host_python="${TVM_HOST_PYTHON:-$(command -v python3.10)}"
@@ -60,7 +60,7 @@ The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. Initial
 git -C "$TVM_ROOT" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
 ```
 
-A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `74d669fab5c6f21e14de9f23f28975559b6bd764`. Clone each dependency without checkout and apply the same exclusions before checkout:
+A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `e88d3ff550856cd1f717814a593e1f4ae0cf0686`. Clone each dependency without checkout and apply the same exclusions before checkout:
 
 ```bash
 git -C "$TVM_ROOT" submodule init -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
@@ -281,7 +281,7 @@ python "$setup_dir/verify_resnet.py" --model2mlir-root "$model2mlir_source" --tv
 
 Both preparation and verification require new output directories. The preparer binds the supplied archive; it does not authenticate an official archive digest or prove checkpoint training provenance. The verification command enforces the unchanged development quality threshold and reports failure if quantization exceeds it. Twenty focused artifact tests pass, including exact V2 transforms, existing NPZ/label admission, archive bounds, content separation and source-mutation controls.
 
-Integer exports also emit `reference.npz` and `reference.json` from the separate integer oracle for every selected image. Use these with the TVM fork's [complete exported-graph simulator recipe](https://github.com/reed-nicolas/tvm/blob/74d669fab5c6f21e14de9f23f28975559b6bd764/apps/gemmini/README.md#complete-exported-graphs-in-gemmini-spike); select the matching `baremetal_baseline` or `baremetal_optimized` directory. Each mode's detailed memory/export records stay in separate hashed artifacts, while `results.json` summarizes their storage. Export alone is not device execution. The recorded full random-model session passes both modes and fixture admission; pretrained quality/device execution still require the supplied weights/data.
+Integer exports also emit `reference.npz` and `reference.json` from the separate integer oracle for every selected image. Use these with the TVM fork's [complete exported-graph simulator recipe](https://github.com/reed-nicolas/tvm/blob/e88d3ff550856cd1f717814a593e1f4ae0cf0686/apps/gemmini/README.md#complete-exported-graphs-in-gemmini-spike); select the matching `baremetal_baseline` or `baremetal_optimized` directory. Each mode's detailed memory/export records stay in separate hashed artifacts, while `results.json` summarizes their storage. Export alone is not device execution. The recorded full random-model session passes both modes and fixture admission; pretrained quality/device execution still require the supplied weights/data.
 
 ## Stateful host sessions
 
@@ -306,9 +306,11 @@ Original BF16 tensors use exact uint16 payload views through the optional `ml_dt
 python -m pip install 'ml_dtypes==0.5.4' 'onnxscript==0.5.6' 'onnx_ir==0.1.12'
 ```
 
+`--bf16-fused-export` is an optional modern-export candidate implemented in [bf16_export.py](bf16_export.py). It retains public ATen linear/attention boundaries, original BF16 operands/results and FP32 internal math, and disables ONNX export optimization to preserve initializer dtypes. The receipt binds the translation source and retained ATen operation counts. Masks, fully masked rows, causal attention and explicit scale are checked; dropout, grouped-query expansion and incompatible dtypes are refused. This mode does not reproduce every native CPU kernel's rounding and still must pass the unchanged source comparison. It selects no whole-model FP32 conversion or relaxed acceptance. Ordinary legacy and modern export remain the defaults.
+
 Factories can expose `get_verification_artifacts(model, inputs)` to bind the checkpoint, tokenizer, input and supporting source files they actually select. Those files are hashed before session execution and checked again afterward. ONNX external tensor files are validated before loading, included in each stage's `onnx_artifacts` and rechecked after execution. The verifier uses the path-based ONNX checker to support external-weight models beyond the in-memory protobuf limit; the focused tests exercise smaller external-weight graphs, invalid locations/ranges/metadata and mutation rejection. These identities do not establish complete runtime source closure.
 
-Sixteen focused tests pass, including real LLVM execution of recurrence/growing-state stages, exact BF16 payloads/state routing, explicit schema admission, external weights, a modern-export cache/reset regression and failed numerical receipts. The modern case requires optional onnxscript and `TVM_SESSION_MODERN_ONNX=1`; these diagnostic fixtures contain no model checkpoints. In the activated host environment:
+Twenty-one focused tests pass, including BF16 fused-boundary export, mask/causal/scale cases, FP32 delegation and real LLVM execution of recurrence/growing-state stages, exact BF16 payloads/state routing, explicit schema admission, external weights, a modern-export cache/reset regression and failed numerical receipts. The modern case requires optional onnxscript and `TVM_SESSION_MODERN_ONNX=1`; these diagnostic fixtures contain no model checkpoints. In the activated host environment:
 
 ```bash
 TVM_SESSION_MODEL2MLIR="$model2mlir_source" PYTHONPATH="$merlin_root/src:$PYTHONPATH" \
@@ -355,7 +357,7 @@ The complete pretrained model passes both session repeats and reset, comparing e
 
 [smolvla_session.py](smolvla_session.py) stages the complete [pinned SmolVLA policy](https://huggingface.co/lerobot/smolvla_base/tree/c83c3163b8ca9b7e67c509fffd9121e66cb96205) with a supplied [SmolVLM backbone](https://huggingface.co/HuggingFaceTB/SmolVLM2-500M-Video-Instruct/tree/dc831d5df58eb65ae2fc25b50b7f5a896edec069). Original LeRobot precision is preserved, including BF16 prefix/cache. The selected backbone files are hashed; its training-time revision is unverified. The complete neural session includes all three cameras, prefix/cache construction, ten denoising steps and physical six-dimensional action decoding. Its boundary is preprocessed observations to normalized action chunks; robot execution and unnormalization are outside this declared session.
 
-Keep this model in a separate Python 3.12 environment: LeRobot 0.5.1 requires its original Transformers 4.57.1 stack. The modern source-preserving export probes use Torch 2.10.0, ONNX 1.19.1, onnxscript 0.7.2, NumPy 1.26.4 and ml_dtypes 0.5.4. Do not combine its dependency path with TinyLlama's Transformers 5.4.0 target.
+Keep this model in a separate Python 3.12 environment: LeRobot 0.5.1 requires its original Transformers 4.57.1 stack. The modern ONNX compatibility probes use Torch 2.10.0, ONNX 1.19.1, onnxscript 0.7.2, NumPy 1.26.4 and ml_dtypes 0.5.4. Do not combine its dependency path with TinyLlama's Transformers 5.4.0 target.
 
 ```bash
 python3.12 -m venv "$build_root/smolvla-venv"
