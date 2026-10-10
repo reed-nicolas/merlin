@@ -319,13 +319,13 @@ class QuantizedResNet:
                 row["mean_requantization"] = {"area": area, "input_exponent": scales[site.inputs[0]], "output_exponent": site.exponent, "factor": factor, "denominator": denominator, "sum_bound": 127 * area, "scaled_numerator_bound": 127 * area * factor, "rounded_numerator_bound": 127 * area * factor + denominator // 2}
             sites.append(row)
             scales[site.name], shapes[site.name] = site.exponent, site.shape
-        return {"recipe": "resnet50-v1.5-symmetric-pow2-development-v3", "paper_quality_approved": False,
+        return {"recipe": "resnet50-v1.5-symmetric-pow2-development-v4", "paper_quality_approved": False,
                 "application_quality": "requires_separate_labeled_evaluation_and_approved_thresholds",
                 "input_shape": list(self.input_shape), "input_exponent": self.input_exponent,
                 "calibration_tensor_sha256": list(self.calibration_hashes), "provenance": self.provenance,
                 "numeric_contract": {"operands": "symmetric signed int8 [-127,127], zero_point=0",
                     "weights": "per-output-channel max-abs power-of-two scale, minimally coarsened until worst-case contraction plus rounded bias fits int32; refuse outside [-30,30]",
-                    "activations": "per-tensor power-of-two max-abs calibration",
+                    "activations": "per-tensor TRAIN power-of-two max-abs; Conv/Add with a sole-consumer Identity* chain ending in ReLU use that ReLU's maximum; signed residual arms retain max-abs",
                     "accumulator": "int32 with worst-case partial-sum and bias bound", "rounding": "nearest ties away from zero",
                     "bias": "round folded FP32 bias / (input_scale * channel_weight_scale), int32",
                     "requantization": "bounded int64 scale then signed rounded division and saturation",
@@ -333,6 +333,37 @@ class QuantizedResNet:
                     "maxpool": "integer maximum with negative-infinity padding", "averagepool": "int64 spatial sum, multiply/divide to TRAIN-calibrated output scale, round once and saturate; shift and intermediate overflow bounds checked",
                     "classifier": "int8/int32 contraction plus int32 bias, per-channel FP32 dequantized logits"},
                 "sites": sites}
+
+
+def post_relu_calibration_targets(graph):
+    """Find Conv/Add outputs whose negative values every consumer discards.
+
+    Each edge must have one user, including intermediate Identity nodes. A
+    signed residual arm, side branch, or other operation terminates the proof.
+    Names identify the result; operation semantics alone select the policy.
+    """
+    import torch
+
+    targets = {}
+    for producer in graph.graph.nodes:
+        contraction = producer.op == "call_module" and type(graph.get_submodule(producer.target)) is torch.nn.Conv2d
+        residual = producer.op == "call_function" and producer.target is operator.add and len(producer.all_input_nodes) == 2
+        if not (contraction or residual):
+            continue
+        node, identities = producer, []
+        while len(node.users) == 1:
+            user = next(iter(node.users))
+            if user.op != "call_module" or tuple(user.all_input_nodes) != (node,):
+                break
+            module = graph.get_submodule(user.target)
+            if type(module) is torch.nn.ReLU:
+                targets[producer.name] = {"relu": user.name, "identities": identities}
+                break
+            if type(module) is not torch.nn.Identity:
+                break
+            identities.append(user.name)
+            node = user
+    return targets
 
 
 def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shape=(1, 3, 224, 224), checkpoint_declaration="unverified"):
@@ -400,6 +431,12 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
             folding_checks.append({"max_absolute_error": float((folded_logits - source_logits).abs().max()), "passed": passed})
             if not passed:
                 raise AssertionError("Folded FP32 model differs from source on calibration input")
+    projections = post_relu_calibration_targets(graph)
+    activation_maxima = dict(maxima)
+    for name, projection in projections.items():
+        # Observer records each node before an in-place ReLU can change it.
+        # The terminal ReLU maximum excludes negatives discarded on every use.
+        activation_maxima[name] = maxima[projection["relu"]]
     sites, scales, weight_scale_adjustments = [], {}, []
     input_name = None
     for node in graph.graph.nodes:
@@ -432,7 +469,7 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
                 except ValueError as error:
                     raise ValueError(f"{error}: {node.name}") from error
                 weight_scale_adjustments.extend({"site": node.name, **adjustment} for adjustment in adjustments)
-                output_exponent = exponent_for(maxima[node.name]) if kind == "conv2d" else None
+                output_exponent = exponent_for(activation_maxima[node.name]) if kind == "conv2d" else None
                 if kind == "conv2d" and np.any(np.abs(scales[inputs[0]] + weight_exponents - output_exponent) > 30):
                     raise ValueError("Requantization shift exceeds 30 bits")
             elif type(module) in (torch.nn.ReLU, torch.nn.Identity):
@@ -451,7 +488,7 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
             else:
                 raise ValueError(f"Unsupported module: {node.target}/{type(module).__name__}")
         elif node.op == "call_function" and node.target is operator.add and len(inputs) == 2:
-            kind, output_exponent = "add", exponent_for(maxima[node.name])
+            kind, output_exponent = "add", exponent_for(activation_maxima[node.name])
             if shapes[inputs[0]] != shapes[inputs[1]]:
                 raise ValueError("Residual broadcasting is not admitted")
             if any(abs(scales[name] - output_exponent) > 30 for name in inputs):
@@ -470,6 +507,11 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
                           {"source_state_dict_sha256": source_digest, "folded_state_dict_sha256": fold_report["derived_state_dict_sha256"],
                            "checkpoint_declaration": checkpoint_declaration, "calibration_ids": ids, "input_name": input_name,
                            "weight_scale_adjustments": weight_scale_adjustments,
+                           "post_relu_calibration": [{"site": name, **projection,
+                                                       "observed_max_abs": maxima[name],
+                                                       "observed_post_relu_maximum": activation_maxima[name],
+                                                       "selected_exponent": scales[name]}
+                                                      for name, projection in projections.items()],
                            "batchnorm_folding_checks": folding_checks, "batchnorm_folding_tolerance": {"rtol": 1e-4, "atol": 1e-4}})
     plan.validate()
     return plan
