@@ -54,6 +54,49 @@ def quantize(value, exponent):
     return np.clip(rounded, -127, 127).astype(np.int8)
 
 
+def quantize_parameters(raw_weight, raw_bias, input_exponent):
+    """Select the finest max-abs-or-coarser channel scale safe with its bias.
+
+    Increasing a power-of-two exponent cannot increase either rounded magnitude.
+    Check the full admitted [-127,127] input range and every contraction partial
+    sum, before converting the rounded bias to int32. Never saturate the bias.
+    """
+    raw_weight, raw_bias = np.asarray(raw_weight), np.asarray(raw_bias)
+    if (raw_weight.ndim not in (2, 4) or min(raw_weight.shape) < 1
+            or raw_bias.shape != (raw_weight.shape[0],)
+            or not np.isfinite(raw_weight).all() or not np.isfinite(raw_bias).all()
+            or type(input_exponent) is not int or not -30 <= input_exponent <= 30):
+        raise ValueError("Invalid finite contraction coefficients or input scale")
+    if math.prod(raw_weight.shape[1:]) * 128 * 128 > LIMIT:
+        raise ValueError("Unsafe int32 contraction dimension bound")
+    exponents = np.array([exponent_for(float(abs(row).max())) for row in raw_weight], dtype=np.int64)
+    weight, bias, adjustments = np.empty_like(raw_weight, dtype=np.int8), np.empty(raw_bias.shape, dtype=np.int32), []
+    for channel, row in enumerate(raw_weight):
+        initial_exponent = exponent = int(exponents[channel])
+        initial = None
+        while True:
+            quantized = quantize(row, exponent)
+            bound = int(127 * np.abs(quantized.astype(np.int64)).sum())
+            scaled_bias = float(raw_bias[channel]) / math.ldexp(1.0, input_exponent + exponent)
+            rounded_bias = math.copysign(math.floor(abs(scaled_bias) + 0.5), scaled_bias) if math.isfinite(scaled_bias) else scaled_bias
+            combined = bound + abs(rounded_bias)
+            if initial is None:
+                initial = {"initial_exponent": exponent, "initial_accumulation_bound": bound,
+                           "initial_bias": rounded_bias, "initial_bound_with_bias": combined}
+            if math.isfinite(rounded_bias) and combined <= LIMIT:
+                break
+            if exponent == 30:
+                raise ValueError("Unsafe int32 contraction/bias bound at maximum channel exponent")
+            exponent += 1
+        weight[channel], bias[channel], exponents[channel] = quantized, int(rounded_bias), exponent
+        if exponent != initial_exponent:
+            adjustments.append({"channel": channel, **initial, "selected_exponent": exponent,
+                                "raw_weight_sha256": array_digest(row), "raw_weight_maximum": float(abs(row).max()),
+                                "raw_bias": float(raw_bias[channel]), "accumulation_bound": bound,
+                                "bias": int(rounded_bias), "bound_with_bias": int(combined)})
+    return weight, exponents, bias, adjustments
+
+
 def round_divide(value, denominator):
     """Exact signed nearest division, including negative ties."""
     value = np.asarray(value)
@@ -242,16 +285,20 @@ class QuantizedResNet:
             row = {"name": site.name, "kind": site.kind, "inputs": list(site.inputs),
                    "shape": list(site.shape), "activation_exponent": site.exponent, "attributes": site.attrs}
             if site.weight is not None:
+                bound = 127 * np.abs(site.weight.astype(np.int64)).reshape(site.weight.shape[0], -1).sum(axis=1)
                 row.update(weight_sha256=array_digest(site.weight), bias_sha256=array_digest(site.bias),
                            weight_exponents=site.weight_exponents.tolist(),
-                           accumulation_bound=(127 * np.abs(site.weight.astype(np.int64)).reshape(site.weight.shape[0], -1).sum(axis=1)).tolist())
+                           accumulation_bound=bound.tolist(),
+                           bound_with_bias=(bound + np.abs(site.bias.astype(np.int64))).tolist(),
+                           contraction_dimension_bound=math.prod(site.weight.shape[1:]) * 128 * 128)
             sites.append(row)
-        return {"recipe": "resnet50-v1.5-symmetric-pow2-development-v1", "paper_quality_approved": False,
+        return {"recipe": "resnet50-v1.5-symmetric-pow2-development-v2", "paper_quality_approved": False,
                 "application_quality": "requires_separate_labeled_evaluation_and_approved_thresholds",
                 "input_shape": list(self.input_shape), "input_exponent": self.input_exponent,
                 "calibration_tensor_sha256": list(self.calibration_hashes), "provenance": self.provenance,
                 "numeric_contract": {"operands": "symmetric signed int8 [-127,127], zero_point=0",
-                    "weights": "per-output-channel power-of-two scale", "activations": "per-tensor power-of-two max-abs calibration",
+                    "weights": "per-output-channel max-abs power-of-two scale, minimally coarsened until worst-case contraction plus rounded bias fits int32; refuse outside [-30,30]",
+                    "activations": "per-tensor power-of-two max-abs calibration",
                     "accumulator": "int32 with worst-case partial-sum and bias bound", "rounding": "nearest ties away from zero",
                     "bias": "round folded FP32 bias / (input_scale * channel_weight_scale), int32",
                     "requantization": "bounded int64 scale then signed rounded division and saturation",
@@ -326,7 +373,7 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
             folding_checks.append({"max_absolute_error": float((folded_logits - source_logits).abs().max()), "passed": passed})
             if not passed:
                 raise AssertionError("Folded FP32 model differs from source on calibration input")
-    sites, scales = [], {}
+    sites, scales, weight_scale_adjustments = [], {}, []
     input_name = None
     for node in graph.graph.nodes:
         if node.op == "placeholder":
@@ -352,15 +399,12 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
                         raise ValueError("Only groups=1 zero-padded undilated convolution is admitted")
                     attrs = {"stride": list(module.stride), "padding": list(module.padding), "dilation": list(module.dilation)}
                 raw_weight = module.weight.detach().numpy()
-                weight_exponents = np.array([exponent_for(float(abs(row).max())) for row in raw_weight], dtype=np.int64)
-                channel_shape = (-1,) + (1,) * (raw_weight.ndim - 1)
-                weight = quantize(raw_weight, weight_exponents.reshape(channel_shape))
-                raw_bias = module.bias.detach().numpy() if module.bias is not None else np.zeros(weight.shape[0])
-                bias64 = np.copysign(np.floor(np.abs(raw_bias.astype(np.float64) / np.exp2(scales[inputs[0]] + weight_exponents)) + 0.5), raw_bias)
-                bound = 127 * np.abs(weight.astype(np.int64)).reshape(weight.shape[0], -1).sum(axis=1)
-                if not np.isfinite(bias64).all() or np.any(bound + np.abs(bias64) > LIMIT) or math.prod(weight.shape[1:]) * 128 * 128 > LIMIT:
-                    raise ValueError(f"Unsafe int32 contraction/bias bound: {node.name}")
-                bias = bias64.astype(np.int32)
+                raw_bias = module.bias.detach().numpy() if module.bias is not None else np.zeros(raw_weight.shape[0])
+                try:
+                    weight, weight_exponents, bias, adjustments = quantize_parameters(raw_weight, raw_bias, scales[inputs[0]])
+                except ValueError as error:
+                    raise ValueError(f"{error}: {node.name}") from error
+                weight_scale_adjustments.extend({"site": node.name, **adjustment} for adjustment in adjustments)
                 output_exponent = exponent_for(maxima[node.name]) if kind == "conv2d" else None
                 if kind == "conv2d" and np.any(np.abs(scales[inputs[0]] + weight_exponents - output_exponent) > 30):
                     raise ValueError("Requantization shift exceeds 30 bits")
@@ -398,6 +442,7 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
     plan = QuantizedResNet(sites, input_shape, scales[input_name], tuple(hashes),
                           {"source_state_dict_sha256": source_digest, "folded_state_dict_sha256": fold_report["derived_state_dict_sha256"],
                            "checkpoint_declaration": checkpoint_declaration, "calibration_ids": ids, "input_name": input_name,
+                           "weight_scale_adjustments": weight_scale_adjustments,
                            "batchnorm_folding_checks": folding_checks, "batchnorm_folding_tolerance": {"rtol": 1e-4, "atol": 1e-4}})
     plan.validate()
     return plan
