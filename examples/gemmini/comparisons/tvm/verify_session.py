@@ -367,7 +367,7 @@ def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, a
 
 
 class StageCompiler:
-    def __init__(self, out, mode, np, torch, onnx, tvm, exporter="legacy", opset=None):
+    def __init__(self, out, mode, np, torch, onnx, tvm, exporter="legacy", opset=None, bf16_fused_export=False):
         if exporter not in ("legacy", "dynamo"):
             raise ValueError("Unsupported ONNX exporter selection")
         if opset is not None and (type(opset) is not int or not 1 <= opset <= onnx.defs.onnx_opset_version()):
@@ -375,6 +375,16 @@ class StageCompiler:
         self.out, self.mode, self.np, self.torch, self.onnx, self.tvm = out, mode, np, torch, onnx, tvm
         self.exporter = exporter
         self.opset = opset if opset is not None else (18 if exporter == "dynamo" else 17)
+        if type(bf16_fused_export) is not bool or bf16_fused_export and (exporter != "dynamo" or self.opset < 18):
+            raise ValueError("Fused BF16 export requires explicit dynamo selection and opset18 or newer")
+        self.translation_source, self.export_options = None, {}
+        if bf16_fused_export:
+            path = safe_path(Path(__file__).with_name("bf16_export.py"))
+            self.translation_source = file_identity(path, safe_path)
+            helper = load_module("tvm_session_bf16_export", path)
+            self.export_options["custom_translation_table"] = helper.translations(torch)
+            # Preserve original initializer dtypes, including BF16 bias storage.
+            self.export_options["optimize"] = False
         self.records = []
 
     def __call__(self, program, inputs, output_count):
@@ -386,9 +396,9 @@ class StageCompiler:
         # Tracing mutates plain Python cache attributes into FakeTensor objects.
         # Export an isolated stage so subsequent source calls and resets remain real.
         export_module = copy.deepcopy(program.module)
-        self.torch.onnx.export(export_module, tensors, str(graph_path), input_names=names,
-                              output_names=["output_" + str(index) for index in range(output_count)],
-                              opset_version=self.opset, dynamo=self.exporter == "dynamo", external_data=True, do_constant_folding=True)
+        exported = self.torch.onnx.export(export_module, tensors, str(graph_path), input_names=names,
+                                         output_names=["output_" + str(index) for index in range(output_count)],
+                                         opset_version=self.opset, dynamo=self.exporter == "dynamo", external_data=True, do_constant_folding=True, **self.export_options)
         del export_module
         graph, artifacts = load_onnx_graph(graph_path, self.onnx)
         from tvm.relax.frontend.onnx import from_onnx
@@ -397,6 +407,15 @@ class StageCompiler:
         record = {"program": program.name, "inputs": [tensor_identity(value) for value in inputs], "onnx": artifacts[0], "onnx_artifacts": artifacts,
                   "exporter": self.exporter, "opset": self.opset, "export_source_isolation": "deepcopy",
                   "pipelines": ["zero", "default_build"] if self.mode == "optimized" else ["default_build"]}
+        if self.translation_source:
+            if file_identity(self.translation_source["path"], safe_path) != self.translation_source:
+                raise AssertionError("Selected BF16 export translations changed")
+            record["translation_source"] = self.translation_source
+            record["bf16_fused_arithmetic"] = "original BF16 operands/results; linear and SDPA FP32-math candidates, not native CPU kernel/layout reproductions; unchanged source reference gate"
+            record["bf16_attention_profile"] = "fp32-math"
+            record["onnx_export_optimization"] = False
+            targets = self.export_options["custom_translation_table"]
+            record["translated_aten_operations"] = {str(target): sum(node.op == "call_function" and node.target == target for node in exported.exported_program.graph.nodes) for target in targets}
         for name, value in (("imported", mod), ("graph", transformed), ("vm", lowered)):
             path = folder / (name + ".relax.py")
             path.write_text(value.script())
@@ -423,6 +442,7 @@ def main():
     parser.add_argument("--graph-mode", choices=("baseline", "optimized"), default="optimized")
     parser.add_argument("--onnx-exporter", choices=("legacy", "dynamo"), default="legacy", help="Explicit modern exporter for compatible source models; dynamo defaults to opset18 and needs onnxscript")
     parser.add_argument("--opset", type=int, help="Explicit ONNX schema version; defaults to17 legacy or18 dynamo; native BF16 Conv requires22")
+    parser.add_argument("--bf16-fused-export", action="store_true", help="Opt-in dynamo BF16 linear/SDPA FP32-math candidates; original BF16 ABI, unchanged source comparison, no native CPU kernel/layout equivalence claim")
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--max-signatures", type=int, default=64)
     parser.add_argument("--rtol", type=float, default=1e-4)
@@ -475,13 +495,18 @@ def main():
             session = protocol.external_runtime_session(model, tuple(inputs), session=metadata)
             report["session"] = describe_session(session, np, torch)[0]
             report["onnx_exporter"] = args.onnx_exporter
-            compiler = StageCompiler(out, args.graph_mode, np, torch, onnx, tvm, exporter=args.onnx_exporter, opset=args.opset)
+            compiler = StageCompiler(out, args.graph_mode, np, torch, onnx, tvm, exporter=args.onnx_exporter, opset=args.opset, bf16_fused_export=args.bf16_fused_export)
+            report["bf16_fused_export"] = args.bf16_fused_export
+            if compiler.translation_source:
+                report["translation_source"] = compiler.translation_source
             report["compiled_stages"] = compiler.records
             report.update(verify_session(session, compiler, np, torch, repeats=args.repeats, rtol=args.rtol, atol=args.atol, max_signatures=args.max_signatures))
         infos = [report["verifier_source"], report["graph_helper_source"], report["protocol_source"], report["factory_source"],
                  report["compiler_library"], *report["declared_artifacts"], *report["factory_artifacts"]]
         if "factory_arguments" in report:
             infos.append(report["factory_arguments"])
+        if "translation_source" in report:
+            infos.append(report["translation_source"])
         infos.extend(artifact for stage in report["compiled_stages"] for artifact in stage["onnx_artifacts"])
         for info in infos:
             if file_identity(info["path"], safe_path) != info:

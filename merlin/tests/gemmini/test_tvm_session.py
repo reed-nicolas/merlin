@@ -82,6 +82,160 @@ class SessionTests(unittest.TestCase):
                 self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, opset=value)
         with self.assertRaisesRegex(ValueError, "exporter"):
             self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, exporter="unknown")
+        for options in ({}, {"exporter": "dynamo", "opset": 17}):
+            with self.assertRaisesRegex(ValueError, "Fused BF16 export"):
+                self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, bf16_fused_export=True, **options)
+        self.assertEqual(compiler.export_options, {})
+        self.assertIsNone(compiler.translation_source)
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
+    def test_fused_bf16_export_preserves_bias_boundary_and_attention_dtypes(self):
+        import onnx
+        import tvm
+        torch, np = self.torch, self.np
+
+        class Fused(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                weight = torch.zeros((3, 17), dtype=torch.bfloat16)
+                weight[:, :2] = 1
+                self.register_buffer("weight", weight)
+                self.register_buffer("bias", torch.full((3,), 1 / 256, dtype=torch.bfloat16))
+
+            def forward(self, image, q, k, v):
+                return torch.nn.functional.linear(image, self.weight, self.bias), torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+        image = torch.zeros((1, 2, 17), dtype=torch.bfloat16)
+        image[:, :, 0], image[:, :, 1] = 1, 1 / 256
+        q, k = torch.zeros((1, 2, 17, 8), dtype=torch.bfloat16), torch.zeros((1, 2, 17, 8), dtype=torch.bfloat16)
+        v = torch.arange(17, dtype=torch.bfloat16).reshape(1, 1, 17, 1).expand(1, 2, 17, 8).contiguous()
+        values, module = (image, q, k, v), Fused().eval()
+        with torch.no_grad():
+            expected = module(*values)
+            split = (image @ module.weight.t()) + module.bias
+        self.assertFalse(torch.equal(split, expected[0]))
+        inputs = tuple(self.verifier.array(value, np, torch) for value in values)
+        program = SimpleNamespace(name="fused_bf16", module=module)
+        original_weights = self.verifier.parameter_digest(module, torch)
+        with tempfile.TemporaryDirectory(prefix="tvm-session-fused-bf16-") as temp:
+            compiler = self.verifier.StageCompiler(Path(temp), "baseline", np, torch, onnx, tvm, exporter="dynamo", opset=22, bf16_fused_export=True)
+            actual = self.verifier.outputs(compiler(program, inputs, 2)(inputs), np, torch)
+            for value, reference in zip(actual, expected):
+                self.verifier.compare(value, self.verifier.array(reference, np, torch), np, 0, 0)
+            graph = onnx.shape_inference.infer_shapes(onnx.load(str(Path(temp) / "stage_0/model.onnx")))
+            types = {value.name: value.type.tensor_type.elem_type for value in (*graph.graph.input, *graph.graph.value_info, *graph.graph.output)}
+            for node in graph.graph.node:
+                if node.op_type in ("MatMul", "Add", "Mul", "Softmax"):
+                    self.assertTrue(all(types[name] == onnx.TensorProto.FLOAT for name in node.output))
+            self.assertTrue(all(value.type.tensor_type.elem_type == onnx.TensorProto.BFLOAT16 for value in graph.graph.input))
+            self.assertTrue(all(value.type.tensor_type.elem_type == onnx.TensorProto.BFLOAT16 for value in graph.graph.output))
+            parameters = {value.name: value for value in graph.graph.initializer if value.name in ("weight", "bias")}
+            self.assertEqual(set(parameters), {"weight", "bias"})
+            self.assertTrue(all(value.data_type == onnx.TensorProto.BFLOAT16 for value in parameters.values()))
+            self.assertEqual(compiler.records[0]["translation_source"], compiler.translation_source)
+            self.assertEqual(compiler.records[0]["translated_aten_operations"], {"aten.linear.default": 1, "aten.scaled_dot_product_attention.default": 1})
+            self.assertEqual(self.verifier.parameter_digest(module, torch), original_weights)
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
+    def test_fused_bf16_attention_masks_causal_and_scale(self):
+        import math
+        import onnx
+        import tvm
+        torch, np = self.torch, self.np
+
+        class MaskedAttention(torch.nn.Module):
+            def __init__(self, mask=None, causal=False, scale=None):
+                super().__init__()
+                self.register_buffer("mask", mask)
+                self.causal, self.scale = causal, scale
+
+            def forward(self, q, k, v):
+                return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=self.mask, is_causal=self.causal, scale=self.scale)
+
+        mask = torch.zeros((3, 5), dtype=torch.bool)
+        mask[1:, -1] = True
+        additive = torch.where(mask, 0., -torch.inf)
+        q, k = torch.zeros((1, 1, 3, 1), dtype=torch.bfloat16), torch.zeros((1, 1, 5, 1), dtype=torch.bfloat16)
+        v = torch.arange(0, 10, 2, dtype=torch.bfloat16).reshape(1, 1, 5, 1)
+        masked_output = torch.tensor([0., 8., 8.], dtype=torch.bfloat16).reshape(1, 1, 3, 1)
+        causal_output = torch.tensor([0., 1., 2.], dtype=torch.bfloat16).reshape(1, 1, 3, 1)
+        scaled_values = (torch.ones((1, 1, 3, 1), dtype=torch.bfloat16), torch.tensor([-1., 1.], dtype=torch.bfloat16).reshape(1, 1, 2, 1), torch.tensor([0., 4.], dtype=torch.bfloat16).reshape(1, 1, 2, 1))
+        cases = [("bool", MaskedAttention(mask), (q, k, v), masked_output), ("bf16-mask", MaskedAttention(additive.bfloat16()), (q, k, v), masked_output), ("fp32-mask", MaskedAttention(additive), (q, k, v), masked_output), ("rectangular-causal", MaskedAttention(causal=True), (q, k, v), causal_output), ("explicit-scale", MaskedAttention(scale=math.log(3) / 2), scaled_values, torch.full_like(q, 3))]
+        for name, module, values, known_output in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory(prefix="tvm-session-bf16-mask-") as temp:
+                with torch.no_grad():
+                    reference = module(*values)
+                self.assertTrue(torch.equal(reference, known_output))
+                inputs = tuple(self.verifier.array(value, np, torch) for value in values)
+                compiler = self.verifier.StageCompiler(Path(temp), "baseline", np, torch, onnx, tvm, exporter="dynamo", opset=22, bf16_fused_export=True)
+                actual = self.verifier.array(compiler(SimpleNamespace(name=name, module=module), inputs, 1)(inputs), np, torch)
+                self.verifier.compare(actual, self.verifier.array(reference, np, torch), np, 0, 0)
+        malformed = MaskedAttention(torch.full((3, 5), torch.nan))
+        with tempfile.TemporaryDirectory(prefix="tvm-session-bf16-nan-mask-") as temp:
+            inputs = tuple(self.verifier.array(value, np, torch) for value in (q, k, v))
+            compiler = self.verifier.StageCompiler(Path(temp), "baseline", np, torch, onnx, tvm, exporter="dynamo", opset=22, bf16_fused_export=True)
+            result = compiler(SimpleNamespace(name="nan-mask", module=malformed), inputs, 1)(inputs)
+            actual = self.verifier.array(result, np, torch, require_finite=False)
+            self.assertTrue(np.isnan(actual).all())
+            with self.assertRaisesRegex(ValueError, "finite"):
+                self.verifier.array(result, np, torch)
+
+    @unittest.skipUnless(os.environ.get("TVM_LIBRARY_PATH"), "Requires explicit LLVM-enabled TVM host build")
+    def test_importer_literal_and_cast_like_refusals(self):
+        import tvm
+        from tvm.relax.frontend.onnx.onnx_frontend import CastLike, Constant
+        for attributes in ({}, {"value_int": 1, "value_float": 1.}, {"value_string": b"unsupported"}):
+            with self.subTest(attributes=attributes), self.assertRaisesRegex(ValueError, "exactly one supported"):
+                Constant._impl_v13(None, [], attributes, None)
+        target = tvm.relax.Var("target", tvm.relax.TensorStructInfo([1], dtype=""))
+        with self.assertRaisesRegex(ValueError, "known target dtype"):
+            CastLike._impl_v15(None, [None, target], {}, None)
+        with self.assertRaisesRegex(ValueError, "attributes"):
+            CastLike._impl_v15(None, [None, target], {"round_mode": b"unknown"}, None)
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
+    def test_fused_export_keeps_fp32_builtin_semantics(self):
+        import onnx
+        import tvm
+        torch, np = self.torch, self.np
+
+        class FloatOperators(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(8, 8)
+
+            def forward(self, q, k, v):
+                return self.linear(q), torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+        with torch.random.fork_rng():
+            torch.manual_seed(151)
+            module = FloatOperators().eval()
+            values = tuple(torch.randn((1, 2, 17, 8)) for _ in range(3))
+        with torch.no_grad():
+            expected = module(*values)
+        inputs = tuple(self.verifier.array(value, np, torch) for value in values)
+        with tempfile.TemporaryDirectory(prefix="tvm-session-fused-fp32-") as temp:
+            compiler = self.verifier.StageCompiler(Path(temp), "baseline", np, torch, onnx, tvm, exporter="dynamo", opset=22, bf16_fused_export=True)
+            actual = self.verifier.outputs(compiler(SimpleNamespace(name="fp32", module=module), inputs, 2)(inputs), np, torch)
+            for value, reference in zip(actual, expected):
+                self.verifier.compare(value, self.verifier.array(reference, np, torch), np, 1e-4, 1e-4)
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
+    def test_fused_bf16_export_refuses_unverified_contracts(self):
+        from onnxscript import ir
+        helper = self.verifier.load_module("fused_bf16_test_helper", repo_root() / "examples/gemmini/comparisons/tvm/bf16_export.py")
+        translations = helper.translations(self.torch)
+        bf16 = SimpleNamespace(dtype=ir.DataType.BFLOAT16, shape=(1, 2, 17, 8))
+        fp32 = SimpleNamespace(dtype=ir.DataType.FLOAT, shape=(1, 2, 17, 8))
+        linear = translations[self.torch.ops.aten.linear.default]
+        attention = translations[self.torch.ops.aten.scaled_dot_product_attention.default]
+        with self.assertRaisesRegex(ValueError, "matching operand"):
+            linear(bf16, fp32)
+        for options in ({"dropout_p": 0.1}, {"enable_gqa": True}, {"is_causal": True, "attn_mask": bf16}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                attention(bf16, bf16, bf16, **options)
+        with self.assertRaisesRegex(ValueError, "matching Q/K/V"):
+            attention(bf16, fp32, bf16)
 
     @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
     def test_modern_export_preserves_source_cache_across_repeats(self):
