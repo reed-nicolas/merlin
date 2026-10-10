@@ -392,6 +392,18 @@ Eight focused staging/routing tests pass. The actual full eager session agrees e
 
 The full compiled policy remains under qualification. Legacy export fails on a complex intermediate; newer modern-export dependencies fix an invalid position-indexing Where, and original-BF16 vision embedding/operator probes pass. BF16 softmax/GELU/sigmoid corrections are committed and eleven native operator probes pass. The complete prefix exports, imports, builds and runs, but its first compiled output fails the unchanged numerical gate before denoising/action stages. The discrepancy is being characterized; no tolerance or checkpoint precision has been changed. Target numerical policy, application-quality acceptance and timing remain pending.
 
+[diagnose_smolvla_backends.py](diagnose_smolvla_backends.py) compares complete unchanged native CPU policies under default flash and forced MATH attention. It records prefix/cache, every denoising update and final actions, with identical observation/noise hashes, exact within-backend repeats, source/parameter/cache preservation and backend/RNG restoration. Profiling attributes the native attention calls to vision-prefix processing; denoising uses LeRobot's manual eager attention. Three synthetic development fixtures show differences propagating into final actions beyond the existing 1e-4 comparison. This informs a proposed BF16 acceptance contract; the active compiled-policy gate and original dtypes remain unchanged.
+
+```bash
+diagnostic_root="$(PYTHONPATH="$merlin_root/src" "$build_root/smolvla-venv/bin/python" -c 'from merlin.common.paths import artifacts_dir; print(artifacts_dir() / "verification/gemmini/tvm")')"
+PYTHONPATH="$merlin_root/src" "$build_root/smolvla-venv/bin/python" "$setup_dir/diagnose_smolvla_backends.py" \
+  --checkpoint-dir /absolute/path/to/smolvla-policy --backbone-dir /absolute/path/to/smolvlm-backbone \
+  --seeds 0 1 17 --output-dir "$diagnostic_root/smolvla-native-backends-new-run"
+PYTHONPATH="$merlin_root/src" "$build_root/smolvla-venv/bin/python" "$merlin_root/merlin/tests/gemmini/test_smolvla_backends.py"
+```
+
+The output directory must be fresh and beneath Merlin's configured artifacts root. For an attributed observation fixture, add `--fixture-kind dataset --input-npz /absolute/path/to/fixture.npz --input-source 'revision/episode/frame and preprocessing'` and select one seed; the supplied NPZ binds its own initial noise. Supplied synthetic fixtures also require an explicit input source. Saved BF16 tensors retain exact uint16 payloads; representable-step distances collapse signed zero and can grow large near zero/sign crossings. No replacement tolerance, robot-quality criterion or compiled-policy acceptance is selected by this diagnostic.
+
 ## Scheduled graph and learned-search checks
 
 The TVM fork owns graph optimization, primitive scheduling and bounded learned search. Use its `apps/gemmini/README.md` for the graph/simulator recipe and the contracts of `prepare_gemmini_graph` and `BoundedGemminiSearch`. Graph optimization folds mathematical constants before device substitution, fuses surrounding CPU operations and inlines eligible internal pointwise buffers while preserving Gemmini as an explicit boundary. Baremetal export rejects unresolved TVM workspace callbacks. This does not implement fusion through the device kernel.
