@@ -367,7 +367,7 @@ def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, a
 
 
 class StageCompiler:
-    def __init__(self, out, mode, np, torch, onnx, tvm, exporter="legacy", opset=None, bf16_fused_export=False):
+    def __init__(self, out, mode, np, torch, onnx, tvm, exporter="legacy", opset=None, bf16_fused_export=False, export_options=None):
         if exporter not in ("legacy", "dynamo"):
             raise ValueError("Unsupported ONNX exporter selection")
         if opset is not None and (type(opset) is not int or not 1 <= opset <= onnx.defs.onnx_opset_version()):
@@ -385,7 +385,24 @@ class StageCompiler:
             self.export_options["custom_translation_table"] = helper.translations(torch)
             # Preserve original initializer dtypes, including BF16 bias storage.
             self.export_options["optimize"] = False
-        self.records = []
+        if export_options is not None:
+            if not isinstance(export_options, dict) or set(export_options) - {"custom_translation_table", "optimize"}:
+                raise ValueError("Factory export options may only select translations and exporter optimization")
+            translations = export_options.get("custom_translation_table", {})
+            if not isinstance(translations, dict) or any(not callable(value) for value in translations.values()):
+                raise ValueError("Factory ONNX translations must be a dictionary of callables")
+            if translations and exporter != "dynamo":
+                raise ValueError("Factory ONNX translations require explicit dynamo export")
+            existing = self.export_options.get("custom_translation_table", {})
+            if set(translations) & set(existing):
+                raise ValueError("Factory and BF16 ONNX translations overlap")
+            if translations:
+                self.export_options["custom_translation_table"] = {**existing, **translations}
+            if "optimize" in export_options:
+                if type(export_options["optimize"]) is not bool or bf16_fused_export and export_options["optimize"]:
+                    raise ValueError("Invalid factory exporter optimization policy")
+                self.export_options["optimize"] = export_options["optimize"]
+        self.records, self.imported_modules = [], []
 
     def __call__(self, program, inputs, output_count):
         folder = self.out / ("stage_" + str(len(self.records)))
@@ -407,6 +424,11 @@ class StageCompiler:
         record = {"program": program.name, "inputs": [tensor_identity(value) for value in inputs], "onnx": artifacts[0], "onnx_artifacts": artifacts,
                   "exporter": self.exporter, "opset": self.opset, "export_source_isolation": "deepcopy",
                   "pipelines": ["zero", "default_build"] if self.mode == "optimized" else ["default_build"]}
+        if self.export_options.get("custom_translation_table"):
+            targets = self.export_options["custom_translation_table"]
+            record["translated_aten_operations"] = {str(target): sum(node.op == "call_function" and node.target == target for node in exported.exported_program.graph.nodes) for target in targets}
+        if "optimize" in self.export_options:
+            record["onnx_export_optimization"] = self.export_options["optimize"]
         if self.translation_source:
             if file_identity(self.translation_source["path"], safe_path) != self.translation_source:
                 raise AssertionError("Selected BF16 export translations changed")
@@ -414,14 +436,13 @@ class StageCompiler:
             record["bf16_fused_arithmetic"] = "original BF16 operands/results; linear and SDPA FP32-math candidates, not native CPU kernel/layout reproductions; unchanged source reference gate"
             record["bf16_attention_profile"] = "fp32-math"
             record["onnx_export_optimization"] = False
-            targets = self.export_options["custom_translation_table"]
-            record["translated_aten_operations"] = {str(target): sum(node.op == "call_function" and node.target == target for node in exported.exported_program.graph.nodes) for target in targets}
         for name, value in (("imported", mod), ("graph", transformed), ("vm", lowered)):
             path = folder / (name + ".relax.py")
             path.write_text(value.script())
             record[name] = {"ir": file_identity(path, safe_path), "inventory": relax_inventory(value, self.tvm)}
         vm = self.tvm.relax.VirtualMachine(self.tvm.relax.build(lowered, "llvm", pipeline=None), self.tvm.cpu())
         self.records.append(record)
+        self.imported_modules.append(mod)
 
         def run(values):
             arguments = [self.tvm.nd.array(value.copy(), self.tvm.cpu()) for value in values]
@@ -430,6 +451,32 @@ class StageCompiler:
                 raise AssertionError("TVM stage mutated caller inputs")
             return result
         return run
+
+
+    def export_stages(self, output_dir, *, memory_limit_bytes, target=None):
+        """Package already checked static signatures; caller supplies state routing."""
+        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+        from tvm.relax.backend.contrib.gemmini_tuning import collect_gemmini_workloads
+        if not self.records or len(self.records) != len(self.imported_modules):
+            raise ValueError("No complete compiled stage inventory is available")
+        app = safe_path(Path(self.tvm.__file__).parents[2] / "apps/gemmini")
+        sys.path.insert(0, str(app))
+        exporter = load_module("tvm_session_baremetal", app / "baremetal.py")
+        sources = [file_identity(function.__code__.co_filename, safe_path) for function in (exporter.export_graphs, prepare_gemmini_graph, collect_gemmini_workloads)]
+        modules, stages = {}, {}
+        for index, (record, mod) in enumerate(zip(self.records, self.imported_modules)):
+            name = "stage_" + str(index)
+            modules[name] = prepare_gemmini_graph(mod, optimize=self.mode == "optimized")
+            stages[name] = {"program": record["program"], "inputs": record["inputs"],
+                            "onnx_artifacts": record["onnx_artifacts"], "workloads": collect_gemmini_workloads(mod)}
+        bundle = exporter.export_graphs(modules, output_dir, target=target or exporter.RV64_TARGET, memory_limit_bytes=memory_limit_bytes)
+        return {"artifact": file_identity(safe_path(output_dir) / "graphs.json", safe_path), "sources": sources,
+                "stages": stages, "constants_bytes": bundle["constants_bytes"],
+                "duplicated_stage_constants_bytes": bundle["duplicated_stage_constants_bytes"],
+                "maximum_stage_tensor_bytes": bundle["maximum_stage_tensor_bytes"],
+                "serial_workspace_bytes": bundle["serial_workspace_bytes"],
+                "state_routing": "caller_owned", "session_device_execution": False,
+                "quality_qualified": False, "timing_qualified": False}
 
 
 def main():
@@ -443,6 +490,8 @@ def main():
     parser.add_argument("--onnx-exporter", choices=("legacy", "dynamo"), default="legacy", help="Explicit modern exporter for compatible source models; dynamo defaults to opset18 and needs onnxscript")
     parser.add_argument("--opset", type=int, help="Explicit ONNX schema version; defaults to17 legacy or18 dynamo; native BF16 Conv requires22")
     parser.add_argument("--bf16-fused-export", action="store_true", help="Opt-in dynamo BF16 linear/SDPA FP32-math candidates; original BF16 ABI, unchanged source comparison, no native CPU kernel/layout equivalence claim")
+    parser.add_argument("--export-baremetal", action="store_true", help="Package numerically checked static stages with shared constants; caller still owns state routing")
+    parser.add_argument("--memory-limit-bytes", type=int, help="Explicit tensor-only budget required for baremetal export; add retained state, ELF, stack and fixtures")
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--max-signatures", type=int, default=64)
     parser.add_argument("--rtol", type=float, default=1e-4)
@@ -450,6 +499,10 @@ def main():
     args = parser.parse_args()
     if not 2 <= args.repeats <= 10 or not 1 <= args.max_signatures <= 128 or not 0 <= args.rtol <= 0.1 or not 0 <= args.atol <= 0.1:
         parser.error("Invalid repeat/signature budget or numerical tolerances")
+    if args.export_baremetal and (args.memory_limit_bytes is None or args.memory_limit_bytes <= 0):
+        parser.error("Baremetal export requires a positive explicit --memory-limit-bytes")
+    if not args.export_baremetal and args.memory_limit_bytes is not None:
+        parser.error("Memory budget requires --export-baremetal")
     sys.dont_write_bytecode = True
     out = safe_path(args.output_dir)
     out.mkdir(parents=True, exist_ok=False)
@@ -495,19 +548,31 @@ def main():
             session = protocol.external_runtime_session(model, tuple(inputs), session=metadata)
             report["session"] = describe_session(session, np, torch)[0]
             report["onnx_exporter"] = args.onnx_exporter
-            compiler = StageCompiler(out, args.graph_mode, np, torch, onnx, tvm, exporter=args.onnx_exporter, opset=args.opset, bf16_fused_export=args.bf16_fused_export)
+            hook = getattr(factory, "get_onnx_export_options", None)
+            export_options = hook(torch) if callable(hook) else None
+            if callable(hook):
+                report["factory_export_source"] = file_identity(hook.__code__.co_filename, safe_path)
+                report["factory_export_translations"] = [str(target) for target in export_options.get("custom_translation_table", {})] if isinstance(export_options, dict) else []
+            compiler = StageCompiler(out, args.graph_mode, np, torch, onnx, tvm, exporter=args.onnx_exporter, opset=args.opset, bf16_fused_export=args.bf16_fused_export, export_options=export_options)
             report["bf16_fused_export"] = args.bf16_fused_export
             if compiler.translation_source:
                 report["translation_source"] = compiler.translation_source
             report["compiled_stages"] = compiler.records
             report.update(verify_session(session, compiler, np, torch, repeats=args.repeats, rtol=args.rtol, atol=args.atol, max_signatures=args.max_signatures))
+            report["host_session_verified"] = True
+            if args.export_baremetal:
+                report["baremetal_export"] = compiler.export_stages(out / "baremetal", memory_limit_bytes=args.memory_limit_bytes)
         infos = [report["verifier_source"], report["graph_helper_source"], report["protocol_source"], report["factory_source"],
                  report["compiler_library"], *report["declared_artifacts"], *report["factory_artifacts"]]
         if "factory_arguments" in report:
             infos.append(report["factory_arguments"])
         if "translation_source" in report:
             infos.append(report["translation_source"])
+        if "factory_export_source" in report:
+            infos.append(report["factory_export_source"])
         infos.extend(artifact for stage in report["compiled_stages"] for artifact in stage["onnx_artifacts"])
+        if "baremetal_export" in report:
+            infos.extend(report["baremetal_export"]["sources"])
         for info in infos:
             if file_identity(info["path"], safe_path) != info:
                 raise AssertionError("Selected source or declared artifact changed")

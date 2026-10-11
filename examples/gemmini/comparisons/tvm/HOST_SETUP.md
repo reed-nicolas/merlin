@@ -13,7 +13,7 @@ For a new TVM checkout, clone without checkout and apply the mandatory name excl
 ```bash
 export TVM_ROOT=/absolute/path/to/tvm-gemmini
 export TVM_BUILD=/absolute/path/to/tvm-host-build
-tvm_commit=e88d3ff550856cd1f717814a593e1f4ae0cf0686
+tvm_commit=372bbd447565faf24a783885c5c2e6be65514df3
 git clone --filter=blob:none --no-checkout https://github.com/reed-nicolas/tvm.git "$TVM_ROOT"
 git -C "$TVM_ROOT" sparse-checkout set --no-cone --stdin <<'PATTERNS'
 /*
@@ -28,7 +28,7 @@ In the same shell, verify the selected source pin and prepare the host environme
 ```bash
 : "${TVM_ROOT:?Set TVM_ROOT to the independent TVM checkout}"
 : "${TVM_BUILD:?Set TVM_BUILD to the TVM host build directory}"
-test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = e88d3ff550856cd1f717814a593e1f4ae0cf0686 || { echo 'TVM source pin mismatch' >&2; exit 1; }
+test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = 372bbd447565faf24a783885c5c2e6be65514df3 || { echo 'TVM source pin mismatch' >&2; exit 1; }
 merlin_root="$PWD"
 setup_dir="$merlin_root/examples/gemmini/comparisons/tvm"
 host_python="${TVM_HOST_PYTHON:-$(command -v python3.10)}"
@@ -60,7 +60,7 @@ The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. Initial
 git -C "$TVM_ROOT" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
 ```
 
-A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `e88d3ff550856cd1f717814a593e1f4ae0cf0686`. Clone each dependency without checkout and apply the same exclusions before checkout:
+A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `372bbd447565faf24a783885c5c2e6be65514df3`. Clone each dependency without checkout and apply the same exclusions before checkout:
 
 ```bash
 git -C "$TVM_ROOT" submodule init -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
@@ -281,7 +281,17 @@ python "$setup_dir/verify_resnet.py" --model2mlir-root "$model2mlir_source" --tv
 
 Both preparation and verification require new output directories. The preparer binds the supplied archive; it does not authenticate an official archive digest or prove checkpoint training provenance. The verification command enforces the unchanged development quality threshold and reports failure if quantization exceeds it. Twenty focused artifact tests pass, including exact V2 transforms, existing NPZ/label admission, archive bounds, content separation and source-mutation controls.
 
-Integer exports also emit `reference.npz` and `reference.json` from the separate integer oracle for every selected image. Use these with the TVM fork's [complete exported-graph simulator recipe](https://github.com/reed-nicolas/tvm/blob/e88d3ff550856cd1f717814a593e1f4ae0cf0686/apps/gemmini/README.md#complete-exported-graphs-in-gemmini-spike); select the matching `baremetal_baseline` or `baremetal_optimized` directory. Each mode's detailed memory/export records stay in separate hashed artifacts, while `results.json` summarizes their storage. Export alone is not device execution. The recorded full random-model session passes both modes and fixture admission; pretrained quality/device execution still require the supplied weights/data.
+Integer exports also emit `reference.npz` and `reference.json` from the separate integer oracle for every selected image. Use these with the TVM fork's [complete exported-graph simulator recipe](https://github.com/reed-nicolas/tvm/blob/372bbd447565faf24a783885c5c2e6be65514df3/apps/gemmini/README.md#complete-exported-graphs-in-gemmini-spike); select the matching `baremetal_baseline` or `baremetal_optimized` directory. Each mode's detailed memory/export records stay in separate hashed artifacts, while `results.json` summarizes their storage. Export alone is not device execution. The recorded full random-model session passes both modes and fixture admission; pretrained quality/device execution still require the supplied weights/data.
+
+The optional `--activation-estimator mse` freezes power-of-two scales from bounded TRAIN reconstruction error; labels and evaluation tensors never choose scales. Prepare the larger disjoint development/final streams with:
+
+```bash
+python "$setup_dir/prepare_resnet_inputs.py" --archive "$model_cache/resnet50/imagenette2-320.tgz" \
+  --calibration-per-class 8 --evaluation-per-class 2 --final-per-class 10 \
+  --selection-seed resnet50-v2-train-final-v1 --output-dir "$model_cache/resnet50/train80-final100-new"
+```
+
+Freeze `plan.manifest()` before evaluation and pass it through `--frozen-quantization`; recomputed TRAIN coefficients must match exactly. `--evaluation-role held-out` requires that frozen manifest. The final stream uses `final.npz` and `final_labels.json`; keep it untouched during recipe development. `--device-sample-indices 0,18` selects simulator fixtures after every host image passes its numerical/quality checks; selected device images remain a subset. The trained MSE candidate still fails the unchanged development accuracy gate, so its export/device qualification remains pending.
 
 ## Stateful host sessions
 
@@ -316,6 +326,10 @@ Twenty-one focused tests pass, including BF16 fused-boundary export, mask/causal
 TVM_SESSION_MODEL2MLIR="$model2mlir_source" PYTHONPATH="$merlin_root/src:$PYTHONPATH" \
   python "$merlin_root/merlin/tests/gemmini/test_tvm_session.py"
 ```
+
+`get_onnx_export_options(torch)` may supply reviewed operator translations and an exporter optimization choice; it cannot override opset, exporter or verification controls. Integer factories use this hook for standard ONNX `MatMulInteger`, preserving signed INT8 operands and INT32 results. The importer implements ONNX ties-to-even rounding explicitly. Bind each supporting helper through `get_verification_artifacts` as well as the factory source.
+
+After all host session checks pass, `--export-baremetal --memory-limit-bytes BYTES` packages checked static signatures through TVM's `export_graphs`. Distinct stage entry points share one constant pool and error runtime. Stage manifests retain workload inventories and graph/source identities. This package supplies no session driver or device result: the caller owns state routing, and the tensor budget excludes retained state, ELF, stack and fixtures. Unsupported dtypes/hidden allocators remain errors.
 
 ## Complete TinyLlama host session
 
@@ -352,6 +366,23 @@ PYTHONPATH="$merlin_root/src:$PYTHONPATH" python "$merlin_root/merlin/tests/gemm
 ```
 
 The complete pretrained model passes both session repeats and reset, comparing every compiled output and KV/position route at `rtol=atol=1e-4`. Maximum logit error is 3.81e-5 and KV error 3.62e-5; positions are exact. The official checkpoint has 1,100,048,384 parameters, with 4,400,193,536 converted FP32 parameter bytes. Large ONNX weights remain external and source/cache state is isolated during export. Five focused factory tests pass. This baseline host recipe neither offloads the transformer to Gemmini nor selects an integer numerical/quality policy or timing result.
+
+Add `"quantized": true` to the factory arguments for the explicit W8A8 projection recipe. All 155 learned projections use per-output-channel INT8 weights, dynamic token INT8 activations, exact INT32 contractions and FP32 dequantization; attention, normalization, embedding, masks and cache operations remain explicit CPU FP32. `"activation_scale": "power_of_two"` is the default declared recipe; `"maxabs"` retains the earlier diagnostic. Source weights and sampled complete-K integer references are recorded.
+
+The development language contract requires 128 prefill plus 32 teacher-forced decode tokens, two repeats/reset and at least eight distinct attributed 128-token articles. Its frozen checks are mean next-token NLL increase at most 0.20 nats and top-one agreement at least 0.80 versus the unchanged checkpoint after explicit FP32 conversion. These are development quantization checks, not a canonical paper language benchmark. Prepare the pinned [WikiText validation file](https://huggingface.co/datasets/Salesforce/wikitext/blob/b08601e04326c79dfdd32d625aee71d232d685c3/wikitext-2-raw-v1/validation-00000-of-00001.parquet) locally; `pyarrow` is needed only for preparation:
+
+```bash
+PYTHONPATH="$setup_dir:$merlin_root/src:$PYTHONPATH" python - <<'PYTHON'
+import json, os
+from pathlib import Path
+from tinyllama_integer import prepare_wikitext_corpus
+arguments = prepare_wikitext_corpus(os.environ["WIKITEXT_PARQUET"], os.environ["TINYLLAMA_CHECKPOINT"], os.environ["CORPUS_OUTPUT"])
+arguments.update(checkpoint_dir=os.environ["TINYLLAMA_CHECKPOINT"], model2mlir_root=os.environ["MODEL2MLIR_ROOT"], precision="float32", cpu_threads=2)
+Path(os.environ["FACTORY_ARGUMENTS"]).write_text(json.dumps(arguments, indent=2) + "\n")
+PYTHON
+```
+
+Set the five environment variables to selected local files/new output directories, then use that arguments file in the existing session command. WikiText preparation verifies pinned bytes and selects the first eight eligible articles without model feedback. Development language quality passes, but the complete 128+32 cache/full-sequence gate currently fails an INT8 rounding discontinuity; the short integer diagnostic cannot qualify that full session. No gate has been relaxed.
 
 ## Original SmolVLA policy session
 
@@ -404,6 +435,19 @@ PYTHONPATH="$merlin_root/src" "$build_root/smolvla-venv/bin/python" "$merlin_roo
 
 The output directory must be fresh and beneath Merlin's configured artifacts root. For an attributed observation fixture, add `--fixture-kind dataset --input-npz /absolute/path/to/fixture.npz --input-source 'revision/episode/frame and preprocessing'` and select one seed; the supplied NPZ binds its own initial noise. Supplied synthetic fixtures also require an explicit input source. Saved BF16 tensors retain exact uint16 payloads; representable-step distances collapse signed zero and can grow large near zero/sign crossings. No replacement tolerance, robot-quality criterion or compiled-policy acceptance is selected by this diagnostic.
 
+For recorded observations, [prepare_smolvla_observation.py](prepare_smolvla_observation.py) uses the pinned [SO100 dataset](https://huggingface.co/datasets/lerobot/svla_so100_pickplace/tree/3d6d687a25cdf1565cdf24550814f72d999a861d), saved checkpoint processor and explicit top→camera1/wrist→camera2 mapping. It validates dataset schema/parquet identities, records video bytes/decoder and never invents a third camera or refits normalization. Camera training assignment and training-time backbone identity remain unverified. TRAIN/development/heldout use disjoint whole episodes; recorded replay does not establish closed-loop robot success.
+
+```bash
+export HF_DATASETS_CACHE="$model_cache/huggingface/datasets"
+PYTHONPATH="$setup_dir:$merlin_root/src:$PYTHONPATH" "$build_root/smolvla-venv/bin/python" "$setup_dir/prepare_smolvla_observation.py" \
+  --dataset-root "$SO100_DATASET" --checkpoint-dir "$SMOLVLA_CHECKPOINT" --backbone-dir "$SMOLVLM_BACKBONE" \
+  --frame-index 0 --split train --noise-seed 0 --video-backend pyav --output-dir "$OBSERVATION_OUTPUT"
+```
+
+Use PyAV 15.1.0 for the declared decoder. Supply the resulting `observation.npz` and `observation.json` through factory `input_npz`, `input_manifest`, `fixture_kind: dataset`, and an attributed `input_source`; select `["camera1", "camera2"]`. For the separate W8A8 reference, add `quantized: true` and a fresh `integer_diagnostic_dir` beneath Merlin's artifacts root. The original policy stays intact while a target copy replaces learned linears with INT8/INT32 contractions, FP32 dequantization/bias and one original BF16/FP32 interface cast. Nonlinear/attention/vision-convolution/cache work keeps original CPU precision. Receipts separate executed/inactive projections, sampled complete-K integer checks, all-ten-step same-state velocity comparisons and independent final trajectories. Complete eager/reset checks pass on a recorded TRAIN observation; original-policy quality and compiled/device qualification remain pending.
+
+`diagnose_smolvla_backends.py --velocity-replay` isolates denoiser arithmetic using identical states, timesteps, masks and prefix caches. A preserved-operand FP64 fused-linear diagnostic supplies a conditional dtype-aware arithmetic bound; it assumes FP32 operations/gradual underflow and one original BF16 output cast. That bound does not qualify native kernels, softmax/attention or full-trajectory amplification, and selects no replacement for the active 1e-4 gate.
+
 ## Scheduled graph and learned-search checks
 
 The TVM fork owns graph optimization, primitive scheduling and bounded learned search. Use its `apps/gemmini/README.md` for the graph/simulator recipe and the contracts of `prepare_gemmini_graph` and `BoundedGemminiSearch`. Graph optimization folds mathematical constants before device substitution, fuses surrounding CPU operations and inlines eligible internal pointwise buffers while preserving Gemmini as an explicit boundary. Baremetal export rejects unresolved TVM workspace callbacks. This does not implement fusion through the device kernel.
@@ -414,6 +458,8 @@ Learned ranking uses TVM MetaSchedule's `PerStoreFeature` and `XGBModel`. In the
 python -m pip install 'xgboost==1.7.6' 'pytest==8.3.5'
 python -m pytest -c /dev/null -p no:cacheprovider "$TVM_ROOT/tests/python/relax/test_backend_contrib_gemmini_tuning.py" -q
 ```
+
+`GemminiModelSearch` aggregates admitted shapes and host fallbacks, distributes a finite reproducible model-wide budget and emits candidate-bound requests with repeated-sample requirements. Measurements must match issued requests and one platform/compiler/adapter/protocol domain; invalid records leave search state unchanged. Per-shape choices feed `prepare_gemmini_graph` without changing defaults.
 
 These packages are optional for ordinary host compilation and untrained candidate generation. Synthetic labels exercise the search machinery only. Actual timing records require consistent workload, compiler, adapter, platform and measurement-protocol bindings plus separate semantic/device correctness gates; these declarations do not authenticate the supplied evidence. Functional Spike execution supplies no timing labels. Record real target measurements separately before selecting a performance result.
 

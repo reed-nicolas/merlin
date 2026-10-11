@@ -88,6 +88,19 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(compiler.export_options, {})
         self.assertIsNone(compiler.translation_source)
 
+    def test_factory_translation_options_preserve_verifier_controls(self):
+        import onnx
+        options = {"custom_translation_table": {self.torch.ops.aten._int_mm.default: lambda a, b: (a, b)}, "optimize": False}
+        compiler = self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, exporter="dynamo", export_options=options)
+        self.assertEqual(compiler.export_options, options)
+        options["custom_translation_table"].clear()
+        self.assertEqual(len(compiler.export_options["custom_translation_table"]), 1)
+        for invalid in ({"dynamo": True}, {"opset_version": 22}, {"optimize": 1}, {"custom_translation_table": []}, {"custom_translation_table": {"op": 1}}):
+            with self.subTest(options=invalid), self.assertRaises(ValueError):
+                self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, exporter="dynamo", export_options=invalid)
+        with self.assertRaisesRegex(ValueError, "explicit dynamo"):
+            self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, export_options={"custom_translation_table": {"op": lambda: None}})
+
     @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
     def test_fused_bf16_export_preserves_bias_boundary_and_attention_dtypes(self):
         import onnx
@@ -507,6 +520,23 @@ class SessionTests(unittest.TestCase):
                 weights.write_bytes(bytes([weights.read_bytes()[0] ^ 1]) + weights.read_bytes()[1:])
             with patch.object(onnx.checker, "check_model", mutate), self.assertRaisesRegex(AssertionError, "changed"):
                 self.verifier.load_onnx_graph(path, onnx)
+
+    @unittest.skipUnless(os.environ.get("TVM_LIBRARY_PATH"), "Requires explicit LLVM-enabled TVM host build")
+    def test_checked_session_exports_static_stages_with_shared_constants(self):
+        import onnx
+        import tvm
+        with tempfile.TemporaryDirectory(prefix="tvm-session-package-") as temp:
+            compiler = self.verifier.StageCompiler(Path(temp), "optimized", self.np, self.torch, onnx, tvm)
+            result = self.verifier.verify_session(self.session(), compiler, self.np, self.torch)
+            exported = compiler.export_stages(Path(temp) / "baremetal", memory_limit_bytes=1 << 20, target="llvm")
+            self.assertTrue(result["reset_verified"])
+            self.assertFalse(exported["session_device_execution"])
+            self.assertEqual(exported["state_routing"], "caller_owned")
+            self.assertEqual({stage["program"] for stage in exported["stages"].values()}, {"prefill", "decode"})
+            manifest = json.loads(Path(exported["artifact"]["path"]).read_text())
+            self.assertEqual(len(manifest["stages"]), 2)
+            self.assertLessEqual(manifest["constants_bytes"], manifest["duplicated_stage_constants_bytes"])
+            self.assertTrue(all(stage["entrypoint"].endswith("_model_run") for stage in manifest["stages"].values()))
 
     @unittest.skipUnless(os.environ.get("TVM_LIBRARY_PATH"), "Requires explicit LLVM-enabled TVM host build")
     def test_real_onnx_relax_pipeline_verifies_every_stage(self):
