@@ -13,7 +13,7 @@ For a new TVM checkout, clone without checkout and apply the mandatory name excl
 ```bash
 export TVM_ROOT=/absolute/path/to/tvm-gemmini
 export TVM_BUILD=/absolute/path/to/tvm-host-build
-tvm_commit=40eb035987715ebb6658fbce74965c2c866e94e7
+tvm_commit=46f3e0954bc4b36266a959774fe7221892b354c6
 git clone --filter=blob:none --no-checkout https://github.com/reed-nicolas/tvm.git "$TVM_ROOT"
 git -C "$TVM_ROOT" sparse-checkout set --no-cone --stdin <<'PATTERNS'
 /*
@@ -28,7 +28,7 @@ In the same shell, verify the selected source pin and prepare the host environme
 ```bash
 : "${TVM_ROOT:?Set TVM_ROOT to the independent TVM checkout}"
 : "${TVM_BUILD:?Set TVM_BUILD to the TVM host build directory}"
-test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = 40eb035987715ebb6658fbce74965c2c866e94e7 || { echo 'TVM source pin mismatch' >&2; exit 1; }
+test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = 46f3e0954bc4b36266a959774fe7221892b354c6 || { echo 'TVM source pin mismatch' >&2; exit 1; }
 merlin_root="$PWD"
 setup_dir="$merlin_root/examples/gemmini/comparisons/tvm"
 host_python="${TVM_HOST_PYTHON:-$(command -v python3.10)}"
@@ -60,7 +60,7 @@ The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. Initial
 git -C "$TVM_ROOT" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
 ```
 
-A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `40eb035987715ebb6658fbce74965c2c866e94e7`. Clone each dependency without checkout and apply the same exclusions before checkout:
+A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `46f3e0954bc4b36266a959774fe7221892b354c6`. Clone each dependency without checkout and apply the same exclusions before checkout:
 
 ```bash
 git -C "$TVM_ROOT" submodule init -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
