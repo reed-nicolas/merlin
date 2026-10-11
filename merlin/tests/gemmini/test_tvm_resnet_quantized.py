@@ -17,6 +17,30 @@ spec.loader.exec_module(recipe)
 
 
 class IntegerPolicies(unittest.TestCase):
+    def test_activation_mse_accounts_for_signed_clipping_and_ties(self):
+        values = np.array([-100.0, -1.5, -0.5, 0.5, 1.5, 100.0], dtype=np.float32)
+        count, errors = recipe.activation_scale_errors(values, (0, -1))
+        self.assertEqual(count, 6)
+        # Independent scalar oracle includes signed ties and both saturated tails.
+        import math
+        expected = []
+        for exponent in (0, -1):
+            scale = 2.0 ** exponent
+            total = 0.0
+            for value in values:
+                rounded = math.copysign(math.floor(abs(float(value) / scale) + 0.5), value)
+                dequantized = max(-127, min(127, rounded)) * scale
+                total += (dequantized - float(value)) ** 2
+            expected.append(total)
+        self.assertEqual(errors, expected)
+        self.assertLess(errors[0], errors[1])
+        count, errors = recipe.activation_scale_errors(np.arange(10, dtype=np.float32), (0,), sample_limit=3)
+        self.assertEqual(count, 3)
+        self.assertEqual(errors, [0.0])
+        for values in (np.zeros(0, dtype=np.float32), np.array([np.nan], dtype=np.float32), np.array([1.0], dtype=np.float64)):
+            with self.assertRaises(ValueError):
+                recipe.activation_scale_errors(values, (0,))
+
     def test_signed_rounding_and_shifts(self):
         values = np.arange(-9, 10, dtype=np.int64)
         np.testing.assert_array_equal(recipe.round_divide(values, 2), [-5, -4, -4, -3, -3, -2, -2, -1, -1, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5])
@@ -269,6 +293,45 @@ class FullResNetDiagnostic(unittest.TestCase):
             with self.subTest(optimize=optimize):
                 _, _, coverage = recipe.prepare_device_graph(self.plan, optimize=optimize)
                 self.assertEqual(coverage["device_invocations"], 54)
+
+    def test_train_mse_plan_signed_observations_and_exact_cpu_graph(self):
+        import tvm
+        from verify_resnet import prepare_graph
+        source = recipe.state_digest(self.model)
+        plan = recipe.calibrate_resnet50(self.model, [self.calibration], calibration_ids=["synthetic-mse-training"],
+                                        input_shape=self.calibration.shape, activation_estimator="mse")
+        self.assertEqual(source, recipe.state_digest(self.model))
+        self.assertEqual(plan.input_exponent, self.plan.input_exponent)
+        self.assertEqual(plan.manifest()["recipe"], "resnet50-v1.5-symmetric-pow2-train-mse-v5")
+        observed = {row["observed_site"] for row in plan.provenance["activation_scale_checks"]}
+        projected = {row["site"]: row["relu"] for row in plan.provenance["post_relu_calibration"]}
+        self.assertTrue(any(site.kind == "conv2d" and site.name not in projected for site in plan.sites))
+        for site in plan.sites:
+            if site.kind in ("conv2d", "add", "averagepool"):
+                self.assertIn(projected.get(site.name, site.name), observed)
+        for row in plan.provenance["activation_scale_checks"]:
+            index = row["candidate_exponents"].index(row["selected_exponent"])
+            self.assertEqual(row["mean_squared_errors"][index], min(row["mean_squared_errors"]))
+        mod = recipe.export_relax(plan, return_integer_logits=True)
+        _, lowered = prepare_graph(mod, "optimized", tvm)
+        vm = tvm.relax.VirtualMachine(tvm.relax.build(lowered, target="llvm", pipeline=None), tvm.cpu())
+        actual = vm["main"](tvm.nd.array(recipe.quantize(self.evaluation, plan.input_exponent)))
+        expected = recipe.reference(plan, self.evaluation, return_integer_logits=True)
+        for value, oracle in zip(actual, expected):
+            np.testing.assert_array_equal(value.numpy(), oracle)
+
+    def test_classifier_logits_do_not_require_an_activation_exponent(self):
+        import copy
+        import torch
+        model = copy.deepcopy(self.model)
+        with torch.no_grad():
+            model.fc.weight.fill_(1e9)
+            model.fc.bias.zero_()
+            self.assertGreater(float(model(torch.from_numpy(self.calibration)).abs().max()), 127 * 2.0**30)
+        plan = recipe.calibrate_resnet50(model, [self.calibration], calibration_ids=["large-classifier-logits"],
+                                        input_shape=self.calibration.shape, activation_estimator="mse")
+        self.assertIsNone(plan.sites[-1].exponent)
+        plan.validate()
 
     def test_zero_positive_range_preserves_source_and_rebuilds_biases(self):
         import copy

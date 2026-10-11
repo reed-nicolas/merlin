@@ -54,6 +54,30 @@ def quantize(value, exponent):
     return np.clip(rounded, -127, 127).astype(np.int8)
 
 
+def activation_scale_errors(value, exponents, *, sample_limit=8192):
+    """Bounded, deterministic TRAIN reconstruction errors for candidate scales.
+
+    Uniform flattened indices cover channels and spatial positions. Each image
+    contributes at most sample_limit values per site; no activation archive or
+    evaluation tensor participates in selection. Saturation is part of the
+    error, and the coarse max-abs candidate wins exact ties.
+    """
+    value = np.asarray(value)
+    if value.dtype != np.float32 or not value.size or not np.isfinite(value).all():
+        raise ValueError("Activation scale estimation requires finite nonempty FP32 values")
+    if type(sample_limit) is not int or not 1 <= sample_limit <= 8192:
+        raise ValueError("Invalid activation sampling bound")
+    exponents = tuple(exponents)
+    if not exponents or any(type(e) is not int or not -30 <= e <= 30 for e in exponents):
+        raise ValueError("Invalid candidate activation exponents")
+    count = min(value.size, sample_limit)
+    indices = np.arange(count, dtype=np.int64) * value.size // count
+    sampled = value.reshape(-1)[indices].astype(np.float64)
+    errors = [float(np.square(quantize(sampled, exponent).astype(np.float64) * math.ldexp(1.0, exponent) - sampled).sum())
+              for exponent in exponents]
+    return count, errors
+
+
 def quantize_parameters(raw_weight, raw_bias, input_exponent):
     """Select the finest max-abs-or-coarser channel scale safe with its bias.
 
@@ -319,13 +343,14 @@ class QuantizedResNet:
                 row["mean_requantization"] = {"area": area, "input_exponent": scales[site.inputs[0]], "output_exponent": site.exponent, "factor": factor, "denominator": denominator, "sum_bound": 127 * area, "scaled_numerator_bound": 127 * area * factor, "rounded_numerator_bound": 127 * area * factor + denominator // 2}
             sites.append(row)
             scales[site.name], shapes[site.name] = site.exponent, site.shape
-        return {"recipe": "resnet50-v1.5-symmetric-pow2-development-v4", "paper_quality_approved": False,
+        estimator = self.provenance.get("activation_estimator", "maxabs")
+        return {"recipe": "resnet50-v1.5-symmetric-pow2-development-v4" if estimator == "maxabs" else "resnet50-v1.5-symmetric-pow2-train-mse-v5", "paper_quality_approved": False,
                 "application_quality": "requires_separate_labeled_evaluation_and_approved_thresholds",
                 "input_shape": list(self.input_shape), "input_exponent": self.input_exponent,
                 "calibration_tensor_sha256": list(self.calibration_hashes), "provenance": self.provenance,
                 "numeric_contract": {"operands": "symmetric signed int8 [-127,127], zero_point=0",
                     "weights": "per-output-channel max-abs power-of-two scale, minimally coarsened until worst-case contraction plus rounded bias fits int32; refuse outside [-30,30]",
-                    "activations": "per-tensor TRAIN power-of-two max-abs; Conv/Add with a sole-consumer Identity* chain ending in ReLU use that ReLU's maximum; signed residual arms retain max-abs",
+                    "activations": "per-tensor TRAIN power-of-two " + estimator + "; Conv/Add with a sole-consumer Identity* chain ending in ReLU use that ReLU's observations; signed residual arms retain signed observations; input remains max-abs",
                     "accumulator": "int32 with worst-case partial-sum and bias bound", "rounding": "nearest ties away from zero",
                     "bias": "round folded FP32 bias / (input_scale * channel_weight_scale), int32",
                     "requantization": "bounded int64 scale then signed rounded division and saturation",
@@ -366,7 +391,7 @@ def post_relu_calibration_targets(graph):
     return targets
 
 
-def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shape=(1, 3, 224, 224), checkpoint_declaration="unverified"):
+def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shape=(1, 3, 224, 224), checkpoint_declaration="unverified", activation_estimator="maxabs"):
     """Fold an unchanged CPU evaluation ResNet and freeze scales on this stream.
 
     Arrays are already preprocessed FP32 NCHW. This API performs no download or
@@ -377,6 +402,8 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
     import torchvision
     from verify_resnet import fold_resnet_batchnorm
 
+    if activation_estimator not in ("maxabs", "mse"):
+        raise ValueError("Expected maxabs or mse TRAIN activation estimator")
     if type(model) is not torchvision.models.resnet.ResNet or [len(getattr(model, f"layer{i}")) for i in range(1, 5)] != [3, 4, 6, 3]:
         raise ValueError("Expected torchvision ResNet50 v1.5 with [3,4,6,3] bottlenecks")
     if any(type(block) is not torchvision.models.resnet.Bottleneck for i in range(1, 5) for block in getattr(model, f"layer{i}")) or model.fc.out_features != 1000:
@@ -437,6 +464,43 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
         # Observer records each node before an in-place ReLU can change it.
         # The terminal ReLU maximum excludes negatives discarded on every use.
         activation_maxima[name] = maxima[projection["relu"]]
+    # Only these operations introduce a quantized activation scale. In
+    # particular, classifier logits remain FP32 and need no bounded exponent.
+    activation_exponents = {node.name: exponent_for(activation_maxima[node.name]) for node in graph.graph.nodes
+                            if (node.op == "call_module" and type(graph.get_submodule(node.target)) in (torch.nn.Conv2d, torch.nn.AdaptiveAvgPool2d)
+                                or node.op == "call_function" and node.target is operator.add)}
+    scale_checks = []
+    if activation_estimator == "mse":
+        observed_names = set()
+        for node in graph.graph.nodes:
+            if (node.op == "call_module" and type(graph.get_submodule(node.target)) in (torch.nn.Conv2d, torch.nn.AdaptiveAvgPool2d)
+                    or node.op == "call_function" and node.target is operator.add):
+                observed_names.add(projections.get(node.name, {}).get("relu", node.name))
+        candidates = {name: tuple(range(exponent_for(maxima[name]), max(-31, exponent_for(maxima[name]) - 4), -1))
+                      for name in observed_names}
+        totals = {name: np.zeros(len(exponents), dtype=np.float64) for name, exponents in candidates.items()}
+        counts = {name: 0 for name in candidates}
+
+        class ErrorObserver(torch.fx.Interpreter):
+            def run_node(self, node):
+                result = super().run_node(node)
+                if node.name in candidates:
+                    count, errors = activation_scale_errors(result.detach().numpy(), candidates[node.name])
+                    counts[node.name] += count
+                    totals[node.name] += errors
+                return result
+
+        with torch.no_grad():
+            for image in images:
+                ErrorObserver(graph).run(torch.from_numpy(image.copy()))
+        for name, exponents in candidates.items():
+            selected = exponents[int(np.argmin(totals[name]))]
+            activation_exponents[name] = selected
+            scale_checks.append({"observed_site": name, "observed_max_abs": maxima[name], "candidate_exponents": list(exponents),
+                                 "sample_count": counts[name], "mean_squared_errors": (totals[name] / counts[name]).tolist(),
+                                 "selected_exponent": selected})
+        for name, projection in projections.items():
+            activation_exponents[name] = activation_exponents[projection["relu"]]
     sites, scales, weight_scale_adjustments = [], {}, []
     input_name = None
     for node in graph.graph.nodes:
@@ -469,7 +533,7 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
                 except ValueError as error:
                     raise ValueError(f"{error}: {node.name}") from error
                 weight_scale_adjustments.extend({"site": node.name, **adjustment} for adjustment in adjustments)
-                output_exponent = exponent_for(activation_maxima[node.name]) if kind == "conv2d" else None
+                output_exponent = activation_exponents[node.name] if kind == "conv2d" else None
                 if kind == "conv2d" and np.any(np.abs(scales[inputs[0]] + weight_exponents - output_exponent) > 30):
                     raise ValueError("Requantization shift exceeds 30 bits")
             elif type(module) in (torch.nn.ReLU, torch.nn.Identity):
@@ -484,11 +548,11 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
                 attrs = {"kernel": pair(module.kernel_size), "stride": pair(module.stride or module.kernel_size), "padding": pair(module.padding)}
                 output_exponent = scales[inputs[0]]
             elif type(module) is torch.nn.AdaptiveAvgPool2d and module.output_size == (1, 1):
-                kind, output_exponent = "averagepool", exponent_for(maxima[node.name])
+                kind, output_exponent = "averagepool", activation_exponents[node.name]
             else:
                 raise ValueError(f"Unsupported module: {node.target}/{type(module).__name__}")
         elif node.op == "call_function" and node.target is operator.add and len(inputs) == 2:
-            kind, output_exponent = "add", exponent_for(activation_maxima[node.name])
+            kind, output_exponent = "add", activation_exponents[node.name]
             if shapes[inputs[0]] != shapes[inputs[1]]:
                 raise ValueError("Residual broadcasting is not admitted")
             if any(abs(scales[name] - output_exponent) > 30 for name in inputs):
@@ -507,6 +571,9 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
                           {"source_state_dict_sha256": source_digest, "folded_state_dict_sha256": fold_report["derived_state_dict_sha256"],
                            "checkpoint_declaration": checkpoint_declaration, "calibration_ids": ids, "input_name": input_name,
                            "weight_scale_adjustments": weight_scale_adjustments,
+                           "activation_estimator": activation_estimator,
+                           "activation_scale_checks": sorted(scale_checks, key=lambda row: row["observed_site"]),
+                           "activation_sampling": {"maximum_values_per_image_per_site": 8192, "selection": "floor(arange(count)*numel/count)", "candidate_offsets_from_maxabs": [0, -1, -2, -3], "tie_break": "coarsest scale", "data": "calibration stream only"} if activation_estimator == "mse" else None,
                            "post_relu_calibration": [{"site": name, **projection,
                                                        "observed_max_abs": maxima[name],
                                                        "observed_post_relu_maximum": activation_maxima[name],

@@ -16,6 +16,16 @@ import traceback
 RTOL, ATOL = 1e-4, 1e-4
 
 
+def parse_sample_indices(value):
+    try:
+        indices = tuple(int(item) for item in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Device samples require comma-separated integer indices") from error
+    if not indices or min(indices) < 0 or len(set(indices)) != len(indices):
+        raise argparse.ArgumentTypeError("Device sample indices must be distinct and nonnegative")
+    return indices
+
+
 def safe_path(value):
     """Validate the helper's import path before importing its path validator."""
     path = Path(os.path.abspath(value))
@@ -319,8 +329,17 @@ def verify_integer_resnet(args, model, expected_outputs, labels, report, output,
     report["artifacts"]["calibration_inputs"] = identity
     ids = [f"{identity['sha256']}:{index}" for index in range(len(calibration))]
     plan = recipe.calibrate_resnet50(model.model, calibration, calibration_ids=ids,
-        checkpoint_declaration="local supplied state_dict" if args.checkpoint else "random diagnostic; not pretrained")
+        checkpoint_declaration="local supplied state_dict" if args.checkpoint else "random diagnostic; not pretrained",
+        activation_estimator=args.activation_estimator)
     report["quantization"] = plan.manifest()
+    if args.frozen_quantization:
+        frozen_identity = file_identity(args.frozen_quantization, safe_path)
+        frozen = json.loads(Path(frozen_identity["path"]).read_text())
+        if frozen != report["quantization"]:
+            raise AssertionError("TRAIN calibration differs from the frozen quantization manifest")
+        report["artifacts"]["frozen_quantization"] = frozen_identity
+        report["frozen_quantization_verified"] = True
+    report["evaluation_role"] = args.evaluation_role
     report["quantization"]["calibration_source"] = args.calibration_source
     write_json("quantization.json", report["quantization"])
     expected = [recipe.reference(plan, image.numpy(), return_integer_logits=True) for image in model.session_images]
@@ -398,14 +417,18 @@ def verify_integer_resnet(args, model, expected_outputs, labels, report, output,
     if not report["session"]["complete"]:
         raise AssertionError("Integer verification omitted declared images")
     if args.export_baremetal:
+        selected = list(args.device_sample_indices) if args.device_sample_indices is not None else list(range(len(expected)))
+        if max(selected) >= len(expected):
+            raise ValueError("Device sample index exceeds the complete checked host session")
         fixture = output / "reference.npz"
-        np.savez(fixture, input_0=np.stack([recipe.quantize(image.numpy(), plan.input_exponent) for image in model.session_images]), output_0=np.stack([value[0] for value in expected]), output_1=np.stack([value[1] for value in expected]))
+        np.savez(fixture, input_0=np.stack([recipe.quantize(model.session_images[index].numpy(), plan.input_exponent) for index in selected]), output_0=np.stack([expected[index][0] for index in selected]), output_1=np.stack([expected[index][1] for index in selected]))
         identity = file_identity(fixture, safe_path)
-        sample_ids = [f"{index}:{labels['samples'][index]['id'] if labels else recipe.array_digest(image.numpy())}" for index, image in enumerate(model.session_images)]
+        sample_ids = [f"{index}:{labels['samples'][index]['id'] if labels else recipe.array_digest(model.session_images[index].numpy())}" for index in selected]
         provenance = {"fixture_sha256": identity["sha256"], "sample_ids": sample_ids, "reference_sources": references,
-            "reference_contract": report["quantization"]["recipe"], "oracle": "independent integer reference; no exported or accelerated contraction", "paper_quality_approved": False}
+            "reference_contract": report["quantization"]["recipe"], "oracle": "independent integer reference; no exported or accelerated contraction", "paper_quality_approved": False,
+            "selected_session_indices": selected, "complete_host_session_images": len(expected)}
         write_json("reference.json", provenance)
-        report["device_fixture"] = {"fixture": identity, "provenance": file_identity(output / "reference.json", safe_path), "samples": len(expected)}
+        report["device_fixture"] = {"fixture": identity, "provenance": file_identity(output / "reference.json", safe_path), "samples": len(selected), "selected_session_indices": selected, "complete_host_session_images": len(expected)}
     report.update(status="passed", integer_reference_verified=True)
     stage("complete")
     return 0
@@ -424,8 +447,12 @@ def main():
     parser.add_argument("--quantized", action="store_true", help="Verify the explicit full integer development recipe; no automatic paper qualification")
     parser.add_argument("--calibration-inputs", type=Path, help="Distinct FP32 NPZ stream required by --quantized")
     parser.add_argument("--calibration-source", help="Declared origin of the distinct calibration stream")
+    parser.add_argument("--activation-estimator", choices=("maxabs", "mse"), default="maxabs", help="TRAIN-only activation scale estimator; mse admits deterministic bounded clipping candidates")
+    parser.add_argument("--frozen-quantization", type=Path, help="Previously frozen plan.manifest() JSON; recomputed TRAIN plan must match before integer evaluation")
+    parser.add_argument("--evaluation-role", choices=("development", "held-out"), default="development", help="Explicit evaluation use; held-out requires --frozen-quantization")
     parser.add_argument("--max-top1-drop", type=float, default=0.02, help="Development top-1 rate-loss gate versus unchanged FP32 on supplied labels (default 0.02)")
     parser.add_argument("--export-baremetal", action="store_true", help="Export complete integer device graph; does not execute or time it")
+    parser.add_argument("--device-sample-indices", type=parse_sample_indices, help="Comma-separated checked host-session indices for the simulator fixture; every host image still undergoes numerical/quality checks")
     parser.add_argument("--memory-limit-bytes", type=int, default=256 * 1024 * 1024, help="Explicit tensor-storage budget; additional platform reservations are required")
     parser.add_argument("--tile-i", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--tile-j", type=int, choices=(1, 2, 4), default=1)
@@ -434,6 +461,12 @@ def main():
     parser.add_argument("--graph-mode", choices=("baseline", "optimized", "both"), default="baseline",
                         help="Opt-in graph diagnostic: optimized runs zero_pipeline before the ordinary VM build; default preserves the baseline")
     args = parser.parse_args()
+    if args.evaluation_role == "held-out" and not args.frozen_quantization:
+        parser.error("Held-out evaluation requires a previously frozen quantization manifest")
+    if args.frozen_quantization and not args.quantized:
+        parser.error("Frozen quantization requires --quantized")
+    if args.device_sample_indices is not None and not args.export_baremetal:
+        parser.error("Device sample selection requires --export-baremetal")
     supplied = (args.checkpoint, args.inputs, args.input_source, args.preprocessing)
     if any(value is not None for value in supplied) and not all(value is not None and str(value).strip() for value in supplied):
         parser.error("Supplied-artifact mode requires --checkpoint, --inputs, --input-source and --preprocessing together")

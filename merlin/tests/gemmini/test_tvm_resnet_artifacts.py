@@ -50,6 +50,13 @@ class ResNetArtifactTests(unittest.TestCase):
                 np.testing.assert_array_equal(actual, images[:, None])
                 self.assert_identity(identity, path)
 
+    def test_selected_device_fixture_indices_preserve_order_and_refuse_duplicates(self):
+        import argparse
+        self.assertEqual(self.verifier.parse_sample_indices("90,0"), (90, 0))
+        for value in ("", "0,0", "-1", "0,no", "1.5"):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                self.verifier.parse_sample_indices(value)
+
     def test_invalid_images_are_rejected(self):
         np = self.np
         valid = np.zeros((1, 3, 224, 224), dtype=np.float32)
@@ -378,6 +385,20 @@ class ResNetArtifactTests(unittest.TestCase):
 
 
 class ResNetPreparationTests(unittest.TestCase):
+    def test_hashed_train_final_selection_preserves_development_and_excludes_overlap(self):
+        from types import SimpleNamespace
+        groups = {(split, wnid): [SimpleNamespace(name=f"{split}/{wnid}/{index:03}.JPEG") for index in range(20)]
+                  for split in ("train", "val") for wnid, _, _ in self.preparer.CLASSES}
+        selected = self.preparer.select_members(groups, 8, 2, 10, "frozen-recipe-v1")
+        repeated = self.preparer.select_members({key: list(reversed(value)) for key, value in groups.items()}, 8, 2, 10, "frozen-recipe-v1")
+        self.assertEqual({key: [row[0].name for row in value] for key, value in selected.items()},
+                         {key: [row[0].name for row in value] for key, value in repeated.items()})
+        names = {key: {row[0].name for row in value} for key, value in selected.items()}
+        self.assertEqual({key: len(value) for key, value in names.items()}, {"calibration": 80, "evaluation": 20, "final": 100})
+        self.assertTrue(names["evaluation"].isdisjoint(names["final"]))
+        self.assertTrue(all(name.endswith(("/000.JPEG", "/001.JPEG")) for name in names["evaluation"]))
+        self.assertTrue(all(name.startswith("train/") for name in names["calibration"]))
+
     @classmethod
     def setUpClass(cls):
         import io
