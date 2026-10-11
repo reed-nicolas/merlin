@@ -7,7 +7,7 @@ source:
   checkout_env: TVM_ROOT
   work_branch: gemmini/bringup
   fork: git@github.com:reed-nicolas/tvm.git
-  commit: 79c64f3ee350271ae8c0641df0e9c46928c02785
+  commit: 2c6b8166f829d13cf6503e06b872225cf711002f
   initial_commit: fb78e0e3adcee44948a1542cd394710b3a6f9dba
   apache_release: v0.19.0
   apache_commit: c4dc0c29ff81ddae688da24625a603da3b4a2c0e
@@ -79,6 +79,6 @@ measurement:
   final_substrate: firesim
   coordination: platform_owners # Platform access and timing/capture procedure still pending.
 workload_order:
-  - resnet50 # Canonical model; exact variant/checkpoint still pending.
-  - tiny_llama # TinyLlama 1B; exact checkpoint/session still pending.
+  - resnet50 # Selected torchvision v1.5 / IMAGENET1K_V2; final paper qualification remains.
+  - tiny_llama # Selected TinyLlama-1.1B-Chat-v1.0; full integer session remains unqualified.
   - smolvla
