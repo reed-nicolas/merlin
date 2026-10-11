@@ -264,6 +264,88 @@ class SmolVLAObservationTests(unittest.TestCase):
 
 
 class SmolVLAArithmeticDiagnosticTests(unittest.TestCase):
+    def test_original_processor_provenance_binds_selected_config_state_and_classes(self):
+        import torch
+        from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+        from lerobot.processor import PolicyProcessorPipeline
+        from lerobot.processor.normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
+        features = {"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(2,)), "action": PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
+        norm_map = {FeatureType.STATE: NormalizationMode.MEAN_STD, FeatureType.ACTION: NormalizationMode.MEAN_STD}
+        before = NormalizerProcessorStep(features=features, norm_map=norm_map, stats={})
+        after = UnnormalizerProcessorStep(features=features, norm_map=norm_map, stats={})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = DIAGNOSTIC.original_processor_diagnostic(root, root, torch, physical_dim=2)
+            self.assertFalse(result["available"])
+            (root / "stats.safetensors").write_bytes(b"selected bytes; mocked processor loading")
+            for name in ("policy_preprocessor.json", "policy_postprocessor.json"):
+                (root / name).write_text(json.dumps({"steps": [{"state_file": "stats.safetensors"}]}))
+            with mock.patch.object(PolicyProcessorPipeline.__origin__, "from_pretrained", side_effect=[SimpleNamespace(steps=[before]), SimpleNamespace(steps=[after])]) as load:
+                result = DIAGNOSTIC.original_processor_diagnostic(root, root, torch, physical_dim=2)
+            self.assertEqual(load.call_count, 2)
+            self.assertTrue(result["available"])
+            self.assertTrue(result["bindings_unchanged"])
+            bound = {Path(item["path"]).name for item in result["bindings"]}
+            self.assertTrue({"policy_preprocessor.json", "policy_postprocessor.json", "stats.safetensors", "normalize_processor.py", "pipeline.py", "processor_smolvla.py"} <= bound)
+            self.assertFalse(result["normalization_qualified"])
+            self.assertTrue(result["action_probe_transform_is_identity"])
+
+    def test_original_processor_namespaced_statistics_are_not_silently_remapped(self):
+        import torch
+        from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+        from lerobot.processor.normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
+        features = {"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(2,)), "action": PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
+        norm_map = {FeatureType.STATE: NormalizationMode.MEAN_STD, FeatureType.ACTION: NormalizationMode.MEAN_STD}
+        stats = {"so100.buffer.action": {"mean": [3.0, 7.0], "std": [2.0, 4.0]}}
+        before = NormalizerProcessorStep(features=features, norm_map=norm_map, stats=stats)
+        after = UnnormalizerProcessorStep(features=features, norm_map=norm_map, stats=stats)
+        result = DIAGNOSTIC.processor_transform_diagnostic(SimpleNamespace(steps=[before]), SimpleNamespace(steps=[after]), torch, physical_dim=2)
+        self.assertTrue(result["state_probe_transform_is_identity"])
+        self.assertTrue(result["action_probe_transform_is_identity"])
+        self.assertFalse(result["plain_action_statistics_present"])
+        self.assertFalse(result["statistics_remapped"])
+        self.assertEqual(sorted(after._tensor_stats), ["so100.buffer.action"])
+        after = UnnormalizerProcessorStep(features=features, norm_map=norm_map, stats={"action": stats["so100.buffer.action"]})
+        result = DIAGNOSTIC.processor_transform_diagnostic(SimpleNamespace(steps=[before]), SimpleNamespace(steps=[after]), torch, physical_dim=2)
+        self.assertTrue(result["plain_action_statistics_present"])
+        self.assertFalse(result["action_probe_transform_is_identity"])
+        self.assertFalse(result["physical_action_units_qualified"])
+
+    def test_action_diagnostic_separates_policy_coordinates_from_explicit_physical_units(self):
+        import torch
+        source = torch.zeros(1, 3, 2)
+        candidate = source + torch.tensor([0.25, -0.5])
+        result = DIAGNOSTIC.action_quality_diagnostic(source, candidate, torch)
+        self.assertIsNone(result["physical"])
+        self.assertEqual(len(result["policy_coordinates_by_coordinate"]), 2)
+        self.assertEqual(len(result["policy_coordinates_by_horizon"]), 3)
+        self.assertFalse(result["normalization_qualified"])
+        self.assertFalse(result["acceptance_contract_selected"])
+        self.assertFalse(result["model_quality_qualified"])
+        self.assertFalse(result["robot_success_qualified"])
+        result = DIAGNOSTIC.action_quality_diagnostic(source, candidate, torch, physical_transform=lambda value: value * torch.tensor([2.0, 10.0]) + 7.0, physical_units=["first coordinate units", "second coordinate units"])
+        self.assertEqual(result["physical"]["by_coordinate"][0]["max_absolute_error"], 0.5)
+        self.assertEqual(result["physical"]["by_coordinate"][1]["max_absolute_error"], 5.0)
+        self.assertIn("mixed BF16/FP32", result["reference_forward_precision"])
+
+    def test_action_diagnostic_rejects_missing_units_nonfinite_and_mutating_transforms(self):
+        import torch
+        source = torch.zeros(1, 2, 2)
+        for kwargs in ({"physical_transform": lambda value: value}, {"physical_units": ["units", "units"]}, {"physical_transform": lambda value: value, "physical_units": ["units", " "]}):
+            with self.subTest(kwargs=list(kwargs)), self.assertRaises(ValueError):
+                DIAGNOSTIC.action_quality_diagnostic(source, source, torch, **kwargs)
+        with self.assertRaises(ValueError):
+            DIAGNOSTIC.action_quality_diagnostic(source, source + float("nan"), torch)
+        rng = torch.random.get_rng_state().clone()
+        def mutate(value):
+            value.add_(1)
+            torch.rand(1)
+            return value
+        with self.assertRaisesRegex(AssertionError, "mutated its inputs"):
+            DIAGNOSTIC.action_quality_diagnostic(source, source, torch, physical_transform=mutate, physical_units=["units", "units"])
+        self.assertEqual(source.count_nonzero().item(), 0)
+        self.assertTrue(torch.equal(rng, torch.random.get_rng_state()))
+
     def test_declared_integer_projection_bias_cast_and_source_preservation(self):
         import copy
         import torch

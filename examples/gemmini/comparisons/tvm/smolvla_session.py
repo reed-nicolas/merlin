@@ -365,6 +365,7 @@ def run_integer_policy_diagnostic(source, candidate, inputs, records, projection
         "unexecuted_projection_names": [record["name"] for record in records if not record["calls_by_stage"]],
         "operator_reference": "sampled rows/columns with complete K; independent NumPy int64 and explicit float bias/output cast",
         "comparisons": {name: diagnostic.statistics(original[name], integer[name], torch) for name in original},
+        "action_quality_diagnostic": diagnostic.action_quality_diagnostic(original["final_actions"], integer["final_actions"], torch),
         "identical_state_velocity_replay": replays,
         "memory": integer_memory_plan(source, candidate, records, inputs, integer, torch),
         "placement": {"learned_linear": "eager CPU int8/int32; Gemmini candidate, not device qualified",
@@ -388,7 +389,7 @@ class SessionProvider:
 
 
 def make_policy_session(model, inputs, loader, provenance):
-    """Split upstream inference, preserving exact timesteps and physical action decode."""
+    """Split upstream inference, preserving exact timesteps and policy action slicing."""
     import torch
     from torch import nn
     from m2m.capture.external_runtime import ExternalRuntimeProgram, make_external_runtime_session
@@ -449,7 +450,8 @@ def make_policy_session(model, inputs, loader, provenance):
                        "physical_action_dim": action_dim, "camera_count": inputs[0].shape[1],
                        "batch": 1, "semantic_observations": "denoising iterations for one action chunk",
                        "input_boundary": "preprocessed normalized images/tokens/zero-padded state",
-                       "output_boundary": "normalized physical action chunk; no robot/unnormalizer"},
+                       "output_boundary": "policy action coordinates before original postprocessing",
+                       "action_normalization_qualified": False, "physical_action_units_qualified": False},
         "provenance": provenance,
     }
     session = make_external_runtime_session(version=2, programs=(
@@ -527,10 +529,11 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
     inputs = fixture_inputs(config, len(selected_cameras), input_npz=input_npz, seed=seed)
     if torch.any(inputs[2] >= model.vlm_with_expert.config.text_config.vocab_size):
         raise ValueError("Fixture token ID is outside the pinned backbone vocabulary")
+    import diagnose_smolvla_backends as diagnostic
+    processor_diagnostic = diagnostic.original_processor_diagnostic(checkpoint_dir, backbone, torch, physical_dim=int(config.action_feature.shape[0]))
     integer_report, integer_receipt, helper_identity = None, None, None
     if quantized:
         import tinyllama_integer as shared
-        import diagnose_smolvla_backends as diagnostic
         original_state = diagnostic.state_identity(model, torch)
         candidate = copy.deepcopy(model)
         records, projections, recipe = install_integer_projections(candidate, torch)
@@ -546,6 +549,7 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
         sys.modules[SmolVLAConfig.__module__].__file__, smolvlm_with_expert.__file__,
         sys.modules[PreTrainedConfig.__module__].__file__)]
     files = checkpoint_files + backbone_files + sources
+    files.extend(processor_diagnostic["bindings"])
     if quantized:
         files.extend([integer_receipt, helper_identity, file_identity(diagnostic.__file__, safe_path)])
     if input_npz:
@@ -570,6 +574,7 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
                                    ("lerobot", "torch", "transformers", "safetensors", "numpy", "onnx")},
                   "model_state_bytes_by_dtype": dtype_bytes, "model_quality_qualified": False,
                   "source_closure_verified": False}
+    provenance["original_processor_diagnostic"] = processor_diagnostic
     if quantized:
         provenance.update(precision="declared_w8a8_with_original_lerobot_float_interfaces",
                           source_precision="original_lerobot", quantized_recipe_quality_qualified=False,

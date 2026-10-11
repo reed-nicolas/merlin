@@ -74,7 +74,7 @@ def statistics(default, alternate, torch):
         "relative_l2_error": float(torch.linalg.vector_norm(left - right) / norm) if norm > 0 else None,
         "symmetric_relative_error_max_nonzero": float(relative.max()) if relative.numel() else 0.0,
         "symmetric_relative_error_mean_nonzero": float(relative.mean()) if relative.numel() else 0.0,
-        "relative_denominator": "max(abs(default),abs(math)); both-zero omitted",
+        "relative_denominator": "max(abs(reference),abs(candidate)); both-zero omitted",
         "outside_existing_pointwise_comparison_count": int((~torch.isclose(right, left, rtol=RTOL, atol=ATOL)).sum()),
     }
     if default.dtype == torch.bfloat16:
@@ -94,6 +94,104 @@ def statistics(default, alternate, torch):
 
 def cache_identity(cache, layers, torch):
     return {f"{index}:{name}": tensor_identity(cache[index][name], torch) for index in range(layers) for name in ("key_states", "value_states")}
+
+
+def processor_transform_diagnostic(preprocessor, postprocessor, torch, *, physical_dim):
+    """Measure the original loaded processors without selecting or renaming robot statistics."""
+    if type(physical_dim) is not int or physical_dim <= 0:
+        raise ValueError("Processor diagnostic requires a positive physical feature dimension")
+    before = [step for step in preprocessor.steps if hasattr(step, "_normalize_observation")]
+    after = [step for step in postprocessor.steps if hasattr(step, "_normalize_action")]
+    if len(before) != 1 or len(after) != 1:
+        raise ValueError("Processor diagnostic requires one original normalizer and unnormalizer")
+    state_step, action_step = before[0], after[0]
+    probes = torch.stack((torch.zeros(physical_dim), torch.ones(physical_dim), -torch.ones(physical_dim)))
+    state = state_step._normalize_observation({"observation.state": probes.clone()}, inverse=False)["observation.state"]
+    action = action_step._normalize_action(probes[:, None, :].clone(), inverse=True)
+    if state.shape != probes.shape or state.dtype != probes.dtype or action.shape != (3, 1, physical_dim) or action.dtype != probes.dtype or not torch.isfinite(state).all() or not torch.isfinite(action).all():
+        raise ValueError("Original processor changed feature shape/dtype or produced nonfinite probes")
+    return {
+        "diagnostic_only": True, "acceptance_contract_selected": False, "statistics_remapped": False,
+        "state_statistics_keys": sorted(state_step._tensor_stats), "action_statistics_keys": sorted(action_step._tensor_stats),
+        "plain_state_statistics_present": "observation.state" in state_step._tensor_stats,
+        "plain_action_statistics_present": "action" in action_step._tensor_stats,
+        "state_probe_transform_is_identity": bool(torch.equal(state, probes)),
+        "action_probe_transform_is_identity": bool(torch.equal(action, probes[:, None, :])),
+        "state_probe": tensor_identity(state, torch), "action_probe": tensor_identity(action, torch),
+        "physical_action_units_qualified": False,
+        "interpretation": "Actual original processor behavior; namespaced statistics are not automatically mapped to the plain feature keys. Physical units require a reviewed effective mapping and coordinate convention.",
+    }
+
+
+def original_processor_diagnostic(checkpoint_dir, backbone_dir, torch, *, physical_dim):
+    """Bind and inspect saved processors; never rename feature statistics."""
+    checkpoint = factory.safe_path(checkpoint_dir)
+    configurations = [factory.safe_path(checkpoint / name) for name in ("policy_preprocessor.json", "policy_postprocessor.json")]
+    missing = [path.name for path in configurations if not path.is_file()]
+    if missing:
+        return {"available": False, "missing_configurations": missing, "bindings": [], "normalization_qualified": False, "physical_action_units_qualified": False}
+    selected = set(configurations)
+    for path in configurations:
+        for step in json.loads(path.read_text())["steps"]:
+            if "state_file" in step:
+                state = factory.safe_path(checkpoint / step["state_file"])
+                if not state.is_relative_to(checkpoint):
+                    raise ValueError("Saved processor state must stay inside the selected checkpoint")
+                selected.add(state)
+    bindings = [factory.file_identity(path, factory.safe_path) for path in sorted(selected)]
+    from lerobot.policies.smolvla import processor_smolvla  # Register the original saved newline step.
+    from lerobot.processor import PolicyProcessorPipeline
+    with offline():
+        before = PolicyProcessorPipeline.from_pretrained(str(checkpoint), config_filename=configurations[0].name, local_files_only=True, overrides={"device_processor": {"device": "cpu"}, "tokenizer_processor": {"tokenizer_name": str(factory.safe_path(backbone_dir))}})
+        after = PolicyProcessorPipeline.from_pretrained(str(checkpoint), config_filename=configurations[1].name, local_files_only=True, overrides={"device_processor": {"device": "cpu"}})
+    sources = {factory.safe_path(__file__), factory.safe_path(factory.__file__), factory.safe_path(processor_smolvla.__file__), factory.safe_path(sys.modules[PolicyProcessorPipeline.__module__].__file__)}
+    sources.update(factory.safe_path(sys.modules[step.__class__.__module__].__file__) for step in (*before.steps, *after.steps))
+    bindings.extend(factory.file_identity(path, factory.safe_path) for path in sorted(sources))
+    result = processor_transform_diagnostic(before, after, torch, physical_dim=physical_dim)
+    if any(factory.file_identity(item["path"], factory.safe_path) != item for item in bindings):
+        raise AssertionError("Original processor configuration, statistics or source changed during diagnosis")
+    return {**result, "available": True, "bindings": bindings, "bindings_unchanged": True, "normalization_qualified": False, "runtime_overrides": "CPU device and selected local tokenizer path only"}
+
+
+def action_quality_diagnostic(reference, candidate, torch, *, physical_transform=None, physical_units=None):
+    """Separate policy action drift from an explicitly supplied physical transform.
+
+    Reference and candidate forwards retain their original dtypes. FP64 here is
+    metric arithmetic only; it does not make the reference forward FP32 or FP64.
+    No threshold is selected, and paired trajectories do not establish robot success.
+    """
+    if reference.ndim != 3 or any(extent <= 0 for extent in reference.shape):
+        raise ValueError("Action diagnostic requires a nonempty batch/horizon/coordinate tensor")
+    policy_coordinates = statistics(reference, candidate, torch)
+    result = {
+        "diagnostic_only": True, "acceptance_contract_selected": False, "model_quality_qualified": False,
+        "reference_forward_precision": "original policy mixed BF16/FP32; metrics computed in FP64",
+        "policy_coordinates": policy_coordinates, "normalization_qualified": False,
+        "policy_coordinates_by_coordinate": [statistics(reference[:, :, index], candidate[:, :, index], torch) for index in range(reference.shape[-1])],
+        "policy_coordinates_by_horizon": [statistics(reference[:, index, :], candidate[:, index, :], torch) for index in range(reference.shape[1])],
+        "physical": None, "physical_action_units_qualified": False,
+        "physical_unavailable_reason": "No independently specified original processor/coordinate-unit mapping supplied",
+        "robot_success_qualified": False,
+    }
+    if (physical_transform is None) != (physical_units is None):
+        raise ValueError("Physical action diagnostics require both the original transform and explicit coordinate units")
+    if physical_transform is not None:
+        if not callable(physical_transform) or not isinstance(physical_units, (tuple, list)) or len(physical_units) != reference.shape[-1] or any(not isinstance(unit, str) or not unit.strip() for unit in physical_units):
+            raise ValueError("Physical coordinate units must be explicit for every action coordinate")
+        left, right = reference.detach().clone(), candidate.detach().clone()
+        left_before, right_before = tensor_identity(left, torch), tensor_identity(right, torch)
+        rng = torch.random.get_rng_state().clone()
+        try:
+            with torch.no_grad():
+                physical_reference, physical_candidate = physical_transform(left), physical_transform(right)
+            if tensor_identity(left, torch) != left_before or tensor_identity(right, torch) != right_before or not torch.equal(rng, torch.random.get_rng_state()):
+                raise AssertionError("Physical action transform mutated its inputs or consumed RNG")
+            if physical_reference.shape != reference.shape or physical_candidate.shape != candidate.shape or physical_reference.dtype != reference.dtype or physical_candidate.dtype != candidate.dtype:
+                raise ValueError("Physical action transform must preserve the original action interface")
+            result.update(physical={"coordinate_units": list(physical_units), "comparison": statistics(physical_reference, physical_candidate, torch), "by_coordinate": [statistics(physical_reference[:, :, index], physical_candidate[:, :, index], torch) for index in range(reference.shape[-1])]}, physical_unavailable_reason=None)
+        finally:
+            torch.random.set_rng_state(rng)
+    return result
 
 
 def compare_identical_state_velocities(reference_velocity, candidate_velocity, captures, torch,
@@ -365,7 +463,7 @@ def main(argv=None):
         "fixture_origin": "supplied_npz" if args.input_npz is not None else "generated_seeded",
         "input_source": args.input_source or "Seeded synthetic preprocessed tensors",
         "observation_manifest": fixture_manifest, "observation_schema_verified": fixture_manifest is not None,
-        "reference": "Unchanged LeRobot sample_actions, original dtype, normalized physical action chunk",
+        "reference": "Unchanged LeRobot sample_actions, original mixed BF16/FP32 forward, policy action coordinates before postprocessing",
         "intervention": "Public sdpa_kernel(SDPBackend.MATH) context",
         "existing_pointwise_comparison": {"rtol": RTOL, "atol": ATOL, "reference": "default native source policy", "acceptance_contract_selected": False},
         "geometry": factory.GEOMETRY, "checkpoint_revision": factory.MODEL_REVISION,
@@ -392,6 +490,10 @@ def main(argv=None):
         sources.update(factory.safe_path(sys.modules[module.__class__.__module__].__file__) for module in model.modules() if getattr(sys.modules.get(module.__class__.__module__), "__file__", None))
         sources.update(factory.safe_path(sys.modules[name].__file__) for name in (PreTrainedConfig.__module__, config.__class__.__module__, "torch.nn.attention"))
         report["source_bindings"] = [factory.file_identity(path, factory.safe_path) for path in sorted(sources)]
+        processor_diagnostic = original_processor_diagnostic(args.checkpoint_dir, args.backbone_dir, torch, physical_dim=int(config.action_feature.shape[0]))
+        report["original_processor_diagnostic"] = processor_diagnostic
+        already_bound = {item["path"] for item in report["source_bindings"] + report["checkpoint_bindings"]}
+        report["source_bindings"].extend(item for item in processor_diagnostic["bindings"] if item["path"] not in already_bound)
         report["dependencies"] = {name: importlib.metadata.version(name) for name in ("torch", "transformers", "lerobot", "numpy", "onnx", "safetensors")}
         if args.input_npz is not None:
             report["fixture_binding"] = factory.file_identity(args.input_npz, factory.safe_path)
@@ -428,6 +530,7 @@ def main(argv=None):
                 "comparisons": {name: statistics(default[name], math[name], torch) for name in default},
                 "action_dimensions": [statistics(default["final_actions"][:, :, index], math["final_actions"][:, :, index], torch) for index in range(config.action_feature.shape[0])],
                 "action_timesteps": [statistics(default["final_actions"][:, index, :], math["final_actions"][:, index, :], torch) for index in range(config.chunk_size)],
+                "action_quality_diagnostic": action_quality_diagnostic(default["final_actions"], math["final_actions"], torch),
             }
             if args.velocity_replay:
                 from torch.nn.attention import SDPBackend, sdpa_kernel
