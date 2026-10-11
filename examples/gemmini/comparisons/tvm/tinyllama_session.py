@@ -65,7 +65,10 @@ def validate_reference_stages(capture, causal, torch):
         for length in range(capture.prefill_tokens, capacity + 1):
             full_logits = capture.lm(
                 input_ids=capture.tokens[:, :length], use_cache=False).logits[:, -1, :]
-            torch.testing.assert_close(logits, full_logits, rtol=rtol, atol=atol)
+            try:
+                torch.testing.assert_close(logits, full_logits, rtol=rtol, atol=atol)
+            except AssertionError as error:
+                raise AssertionError(f"TinyLlama full-sequence cache gate failed at {length} tokens: {error}") from error
             expected_position = torch.full_like(position, length)
             if not torch.equal(position, expected_position):
                 raise AssertionError("Functional TinyLlama cache used lengths are incorrect")
@@ -89,7 +92,8 @@ def validate_reference_stages(capture, causal, torch):
 
 def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
                          prefill_tokens=8, decode_tokens=3, precision="float32",
-                         cpu_threads=2):
+                         cpu_threads=2, quantized=False, quality_corpus_path=None,
+                         workload="frontend_diagnostic", activation_scale="power_of_two"):
     """Build compiled prefill plus teacher-forced recurrent decode on actual text.
 
     ``corpus_path`` is a local UTF-8 text file tokenized with this checkpoint's
@@ -98,6 +102,20 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
     """
     if precision not in ("float32", "bfloat16"):
         raise ValueError("Precision must be explicitly float32 or bfloat16")
+    if type(quantized) is not bool or quantized and precision != "float32":
+        raise ValueError("W8A8 requires explicit CPU FP32 surrounding operations")
+    if activation_scale not in ("maxabs", "power_of_two"):
+        raise ValueError("Unknown integer activation scale policy")
+    if quality_corpus_path is not None and not quantized:
+        raise ValueError("Language quantization quality requires the explicit W8A8 recipe")
+    if workload not in ("frontend_diagnostic", "development_language", "synthetic_feasibility"):
+        raise ValueError("Unknown TinyLlama workload contract")
+    if workload == "development_language" and (
+            prefill_tokens != 128 or decode_tokens != 32 or quality_corpus_path is None):
+        raise ValueError("Development language workload requires 128 prefill, 32 decode and quality corpus")
+    if workload == "synthetic_feasibility" and (
+            prefill_tokens != 128 or decode_tokens != 32 or quality_corpus_path is not None):
+        raise ValueError("Synthetic feasibility requires 128 prefill, 32 decode and no quality corpus")
     if (type(prefill_tokens) is not int or type(decode_tokens) is not int
             or prefill_tokens < 1 or decode_tokens < 2):
         raise ValueError("Require a positive prefill and at least two recurrent decode steps")
@@ -154,6 +172,23 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
     if any(value.dtype != dtype or value.device.type != "cpu" for value in lm.parameters()):
         raise ValueError("Loaded model violates explicit CPU precision selection")
     lm.eval().requires_grad_(False)
+    source_parameter_count = sum(value.numel() for value in lm.parameters())
+    source_parameter_bytes = sum(value.numel() * value.element_size() for value in lm.parameters())
+    integer = None
+    integer_records, integer_checks = [], []
+    language_contract, language_check = None, None
+    if quantized:
+        import tinyllama_integer as integer
+        if quality_corpus_path is not None:
+            quality_tokens, language_contract = integer.language_inputs(
+                quality_corpus_path, tokenizer, safe_path, file_identity, activation_scale=activation_scale)
+            # Freeze IDs, source, selection and fixed thresholds before quantization.
+            quality_reference = integer.language_reference(lm, quality_tokens)
+        integer_records = integer.install_projections(lm, activation_scale=activation_scale)
+        if quality_corpus_path is not None:
+            language_check = integer.language_quality(
+                lm, quality_tokens, quality_reference, language_contract)
+            del quality_tokens, quality_reference
     model_root = safe_path(model2mlir_root)
     load_protocol(model_root)
     causal_path = safe_path(model_root / "m2m/capture/causal_session.py")
@@ -165,8 +200,9 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
         "execution_precision": precision,
         "weight_conversion": "bfloat16_to_float32" if precision == "float32" else "none",
         "reference_precision": precision, "reference_role": "compiler_correctness",
-        "quality_reference": "not_evaluated", "synthetic_tokens": False,
-        "token_source": "local_utf8_corpus_with_pinned_checkpoint_tokenizer",
+        "quality_reference": "not_evaluated", "synthetic_tokens": workload == "synthetic_feasibility",
+        "token_source": "synthetic_utf8_feasibility_corpus_with_pinned_checkpoint_tokenizer"
+        if workload == "synthetic_feasibility" else "local_utf8_corpus_with_pinned_checkpoint_tokenizer",
         "corpus": corpus_identity, "token_ids": tokens.tolist(),
         "token_sha256": hashlib.sha256(tokens.numpy().tobytes()).hexdigest(),
         "causal_session_source": file_identity(causal_path, safe_path),
@@ -175,16 +211,63 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
         "transformers_model_source": file_identity(sys.modules[type(lm).__module__].__file__, safe_path),
         "tokenizer_version": tokenizer.__class__.__name__,
         "decode_policy": "teacher_forced_actual_tokens",
-        "parameter_count": sum(value.numel() for value in lm.parameters()),
-        "parameter_bytes": sum(value.numel() * value.element_size() for value in lm.parameters()),
+        "parameter_count": source_parameter_count,
+        "parameter_bytes": source_parameter_bytes,
+        "parameter_bytes_role": "checkpoint_after_explicit_precision_selection_before_optional_quantization",
         "kv_cache_bytes": 2 * 22 * 4 * capacity * 64 * torch.empty((), dtype=dtype).element_size(),
         "position_bytes": 22 * 8, "cpu_threads": cpu_threads,
+        "workload_contract": {"name": workload, "batch": 1,
+                              "prefill_tokens": prefill_tokens, "decode_tokens": decode_tokens,
+                              "kv_capacity": capacity, "decode_policy": "teacher_forced_actual_tokens",
+                              "repeats": 2, "reset": "between_repeats",
+                              "application_quality": "separate_language_corpus" if language_contract else "not_evaluated"},
     }
+    if integer is not None:
+        provenance.update({"execution_precision": "w8a8_projections_float32_cpu_surrounding_ops",
+                           "weight_conversion": "bfloat16_to_float32_then_per_channel_int8_projections",
+                           "reference_precision": "source_bound_w8a8_integer_projection_reference",
+                           "integer_recipe": integer.recipe(activation_scale),
+                           "integer_source": file_identity(integer.__file__, safe_path),
+                           "integer_projections": integer_records,
+                           "operation_placement": integer.operation_placement(),
+                           "memory_plan": integer.memory_plan(lm, integer_records, prefill_tokens, decode_tokens),
+                           "language_quality_contract": language_contract,
+                           "language_quality": language_check or {"evaluated": False, "passed": False},
+                           "quality_reference": integer.QUALITY_CONTRACT["reference"] if language_contract else "not_evaluated",
+                           "checkpoint_parameter_count": 1100048384,
+                           "state_dict_bytes": sum(value.numel() * value.element_size() for value in lm.state_dict().values())})
+        # Every trained projection is checked over its full reduction dimension at
+        # representative rows/columns on the first actual prefill call.
+        handles = []
+        for name, module in lm.named_modules():
+            if isinstance(module, integer.IntegerProjection):
+                def check_once(projection, inputs, selected_name=name):
+                    if selected_name not in checked:
+                        integer_checks.append({"name": selected_name,
+                                               **integer.check_projection(projection, inputs[0])})
+                        checked.add(selected_name)
+                handles.append(module.register_forward_pre_hook(check_once))
+        checked = set()
     capture = causal.CausalMultiProgramCapture(
         lm, tokens, checkpoint=MODEL_ID, full_checkpoint=True, paper_ready=False,
         provenance=provenance, prefill_tokens=prefill_tokens, decode_tokens=decode_tokens)
-    capture.provenance["functional_cache_reference"] = validate_reference_stages(
-        capture, causal, torch)
+    try:
+        capture.provenance["functional_cache_reference"] = validate_reference_stages(
+            capture, causal, torch)
+    except AssertionError as error:
+        # Retain quality/source/memory evidence even when the independent cache
+        # gate fails. This attaches diagnostics and never accepts the model.
+        error.tinyllama_provenance = capture.provenance
+        error.tinyllama_integer_projection_reference = integer_checks
+        raise
+    finally:
+        if integer is not None:
+            for handle in handles:
+                handle.remove()
+    if integer is not None:
+        if len(integer_checks) != 155:
+            raise AssertionError("The complete trained projection arithmetic was not checked")
+        capture.provenance["integer_projection_reference"] = integer_checks
     return capture, ()
 
 
@@ -194,4 +277,16 @@ def get_verification_artifacts(model, _inputs):
     identities = [*provenance["checkpoint_artifacts"].values(),
                   provenance["corpus"], provenance["causal_session_source"],
                   provenance["transformers_cache_source"], provenance["transformers_model_source"]]
+    if provenance.get("integer_source"):
+        identities.append(provenance["integer_source"])
+    if provenance.get("language_quality_contract"):
+        identities.append(provenance["language_quality_contract"]["corpus"])
+        if provenance["language_quality_contract"].get("dataset_artifact"):
+            identities.append(provenance["language_quality_contract"]["dataset_artifact"])
     return tuple(safe_path(identity["path"]) for identity in identities)
+
+
+def get_onnx_export_options(torch):
+    """Preserve real int8/int32 semantics when the opt-in projection recipe is used."""
+    from tinyllama_integer import export_options
+    return export_options(torch)
