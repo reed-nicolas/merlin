@@ -118,8 +118,14 @@ def identity(value):
 
 
 def independent_quantize_rows(value, activation_scale="maxabs"):
-    """NumPy oracle, separate from the Torch quantization expression/export."""
-    value = np.asarray(value, dtype=np.float32)
+    """Independent encoder: frexp scale selection and explicit floor/parity RNE.
+
+    Division retains the recipe's FP32 rounding before integer rounding. Neither
+    Torch round/log2 nor NumPy rint supplies the integer rounding oracle.
+    """
+    value = np.asarray(value)
+    if value.dtype != np.float32 or value.ndim < 1 or not value.size or not np.isfinite(value).all():
+        raise ValueError("Encoding oracle requires a nonempty finite FP32 tensor")
     maximum = np.max(np.abs(value), axis=-1, keepdims=True)
     scale = np.where(maximum == 0, np.float32(1),
                      np.maximum(maximum / np.float32(127), np.finfo(np.float32).tiny))
@@ -130,7 +136,69 @@ def independent_quantize_rows(value, activation_scale="maxabs"):
         scale = np.ldexp(np.ones_like(scale), exponent - (mantissa == np.float32(.5)))
     elif activation_scale != "maxabs":
         raise ValueError("Unknown integer activation scale policy")
-    return np.clip(np.rint(value / scale), -127, 127).astype(np.int8), scale
+    ratio = (value / scale).astype(np.float64)
+    lower = np.floor(ratio)
+    fraction = ratio - lower
+    rounded = lower + ((fraction > .5) | ((fraction == .5) & (np.remainder(lower, 2) != 0)))
+    return np.clip(rounded, -127, 127).astype(np.int8), scale
+
+
+def check_operand_encoding(value, codes, scales, activation_scale="maxabs"):
+    """Check emitted codes and scales against actual inputs, before any dot check."""
+    value, codes, scales = np.asarray(value), np.asarray(codes), np.asarray(scales)
+    expected_codes, expected_scales = independent_quantize_rows(value, activation_scale)
+    if codes.dtype != np.int8 or codes.shape != value.shape:
+        raise ValueError("Emitted activation codes must have exact INT8 shape")
+    if scales.dtype != np.float32 or scales.shape != expected_scales.shape or not np.isfinite(scales).all():
+        raise ValueError("Emitted activation scales must have exact finite FP32 shape")
+    if not np.array_equal(scales, expected_scales):
+        raise AssertionError("Activation scale encoding disagrees with independent oracle")
+    if not np.array_equal(codes, expected_codes):
+        raise AssertionError("Activation code rounding/clipping disagrees with independent oracle")
+    return {"passed": True, "oracle": "numpy_fp32_division_frexp_floor_parity_rne",
+            "checked_codes": int(codes.size), "checked_scales": int(scales.size),
+            "rounding": "nearest_ties_even", "range": [-127, 127], "scale_policy": activation_scale}
+
+
+def diagnose_activation_pair(source, actual, activation_scale="power_of_two", *, actual_codes=None, actual_scales=None, maximum_elements=160 * 5632):
+    """Bounded local encoder checks and propagated input/threshold diagnostics.
+
+    This reports a changed quantized program, never a model acceptance verdict.
+    Supplying emitted codes/scales checks an implementation on its actual inputs.
+    """
+    source, actual = np.asarray(source), np.asarray(actual)
+    if type(maximum_elements) is not int or maximum_elements < 1 or source.shape != actual.shape or source.size > maximum_elements:
+        raise ValueError("Activation diagnostic requires matching shapes within its element budget")
+    source_codes, source_scales = independent_quantize_rows(source, activation_scale)
+    expected_codes, expected_scales = independent_quantize_rows(actual, activation_scale)
+    if (actual_codes is None) != (actual_scales is None):
+        raise ValueError("Actual emitted codes and scales must be supplied together")
+    actual_codes = expected_codes if actual_codes is None else np.asarray(actual_codes)
+    actual_scales = expected_scales if actual_scales is None else np.asarray(actual_scales)
+    local = check_operand_encoding(actual, actual_codes, actual_scales, activation_scale)
+    differences = actual_codes != source_codes
+    result = {"scope": "local_actual_input_encoding_and_propagated_source_input",
+              "source_input": identity(torch.from_numpy(source.copy())),
+              "actual_input": identity(torch.from_numpy(actual.copy())),
+              "local_actual_encoding": local,
+              "input_mismatches": int(np.count_nonzero(source != actual)),
+              "max_absolute_input_error": float(np.max(np.abs(source.astype(np.float64) - actual.astype(np.float64)))),
+              "scale_mismatches": int(np.count_nonzero(source_scales != actual_scales)),
+              "code_mismatches": int(np.count_nonzero(differences)), "first_code_difference": None}
+    if np.any(differences):
+        index = tuple(int(v) for v in np.argwhere(differences)[0])
+        scale_index = (*index[:-1], 0)
+        source_ratio = float(np.float32(source[index] / source_scales[scale_index]))
+        actual_ratio = float(np.float32(actual[index] / actual_scales[scale_index]))
+        boundary = math.floor(min(source_ratio, actual_ratio)) + .5
+        result["first_code_difference"] = {"index": list(index), "source_code": int(source_codes[index]),
+                                          "actual_code": int(actual_codes[index]), "source_input": float(source[index]),
+                                          "actual_input": float(actual[index]), "source_scale": float(source_scales[scale_index]),
+                                          "actual_scale": float(actual_scales[scale_index]), "source_ratio": source_ratio,
+                                          "actual_ratio": actual_ratio, "nearest_lower_half_integer": boundary,
+                                          "same_scale_crosses_rounding_boundary": bool(source_scales[scale_index] == actual_scales[scale_index]
+                                                                                       and min(source_ratio, actual_ratio) <= boundary <= max(source_ratio, actual_ratio))}
+    return result
 
 
 def quantize_rows(value, activation_scale="maxabs"):
@@ -233,7 +301,7 @@ def install_projections(lm, activation_scale="maxabs"):
                         "packed_weight": identity(projection.weight_kn),
                         "weight_scale": identity(projection.weight_scale),
                         "input_k": projection.in_features, "output_n": projection.out_features,
-                        "weight_quantization_reference": {"passed": True, "oracle": "numpy_float32_round_ties_even",
+                        "weight_quantization_reference": {"passed": True, "oracle": "numpy_fp32_division_floor_parity_rne",
                                                           "channels": channels.tolist(), "full_k": projection.in_features},
                         "placement": "gemmini_int8_int32_candidate"})
         # Release original FP32 projection promptly rather than retaining a second checkpoint.
@@ -243,17 +311,16 @@ def install_projections(lm, activation_scale="maxabs"):
 
 def check_projection(projection, value, *, rows=3, columns=7):
     """Independent NumPy int64 dot checks sampled outputs over the complete K axis."""
+    if type(rows) is not int or type(columns) is not int or rows < 1 or columns < 1:
+        raise ValueError("Projection reference requires positive integer row/column budgets")
     quantized, _scale = projection.integer_inputs(value)
     row_indices = np.unique(np.linspace(0, quantized.shape[0] - 1,
                                         min(rows, quantized.shape[0]), dtype=int))
     column_indices = np.unique(np.linspace(0, projection.out_features - 1,
                                            min(columns, projection.out_features), dtype=int))
     a = quantized.numpy()[row_indices].astype(np.int64)
-    q_expected, scale_expected = independent_quantize_rows(
-        value.detach().reshape(-1, projection.in_features).numpy()[row_indices], projection.activation_scale)
-    if (not np.array_equal(a, q_expected.astype(np.int64))
-            or not np.array_equal(_scale.detach().reshape(-1, 1).numpy()[row_indices], scale_expected)):
-        raise AssertionError("Dynamic activation quantization disagrees with independent NumPy oracle")
+    encoding = check_operand_encoding(value.detach().reshape(-1, projection.in_features).numpy()[row_indices],
+                                      quantized.numpy()[row_indices], _scale.detach().reshape(-1, 1).numpy()[row_indices], projection.activation_scale)
     b = projection.weight_kn.numpy()[:, column_indices].astype(np.int64)
     expected = a @ b
     actual = torch._int_mm(quantized, projection.weight_kn).numpy()[np.ix_(row_indices, column_indices)]
@@ -262,7 +329,7 @@ def check_projection(projection, value, *, rows=3, columns=7):
     return {"passed": True, "oracle": "numpy_int64_complete_k_sampled_rows_columns",
             "k": projection.in_features, "rows": row_indices.tolist(),
             "columns": column_indices.tolist(), "checked_elements": int(expected.size),
-            "max_absolute_error": 0}
+            "max_absolute_error": 0, "activation_encoding": encoding}
 
 
 def language_inputs(path, tokenizer, safe_path, file_identity, activation_scale="maxabs"):

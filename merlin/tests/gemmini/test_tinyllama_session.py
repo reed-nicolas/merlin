@@ -87,6 +87,95 @@ except ImportError:
 
 @unittest.skipIf(torch is None, "Optional PyTorch environment is absent")
 class TinyLlamaIntegerTests(unittest.TestCase):
+    def test_encoder_oracle_rejects_wrong_codes_scales_dtype_and_nonfinite(self):
+        value = np.asarray([[127., .5, 1.5, -2.5], [0., 0., 0., 0.]], dtype=np.float32)
+        codes, scales = INTEGER.independent_quantize_rows(value)
+        result = INTEGER.check_operand_encoding(value, codes, scales)
+        self.assertEqual(result["checked_codes"], 8)
+        self.assertEqual(result["checked_scales"], 2)
+        wrong_codes = codes.copy()
+        wrong_codes[0, 1] = 1
+        for wrong in (wrong_codes, np.full_like(codes, -128)):
+            with self.assertRaisesRegex(AssertionError, "rounding/clipping"):
+                INTEGER.check_operand_encoding(value, wrong, scales)
+        with self.assertRaisesRegex(AssertionError, "scale encoding"):
+            INTEGER.check_operand_encoding(value, codes, scales * np.float32(2))
+        for wrong_codes, wrong_scales in ((codes.astype(np.int32), scales), (codes, scales.astype(np.float64)), (codes[:, :2], scales), (codes, scales[:, 0])):
+            with self.assertRaises(ValueError):
+                INTEGER.check_operand_encoding(value, wrong_codes, wrong_scales)
+        for wrong in (value.astype(np.float64), np.asarray([[np.inf]], dtype=np.float32), np.zeros((0, 3), dtype=np.float32)):
+            with self.assertRaises(ValueError):
+                INTEGER.independent_quantize_rows(wrong)
+
+    def test_oracle_detects_shared_emitted_code_bug_before_integer_dot(self):
+        projection = INTEGER.IntegerProjection(torch.ones(2, 4))
+        value = torch.tensor([[127., .5, 1.5, -2.5]])
+        for rows, columns in ((0, 7), (3, 0), (True, 7)):
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                INTEGER.check_projection(projection, value, rows=rows, columns=columns)
+        codes, scales = INTEGER.quantize_rows(value)
+        codes[0, 1] = 1
+        with mock.patch.object(INTEGER, "quantize_rows", return_value=(codes, scales)):
+            with self.assertRaisesRegex(AssertionError, "rounding/clipping"):
+                INTEGER.check_projection(projection, value)
+
+    def test_bounded_pair_isolates_boundary_crossing_from_local_encoding(self):
+        source = np.asarray([[.9921875, .0664062425494194]], dtype=np.float32)
+        actual = np.asarray([[.9921875, .0664062574505806]], dtype=np.float32)
+        codes, scales = INTEGER.independent_quantize_rows(actual, "power_of_two")
+        result = INTEGER.diagnose_activation_pair(source, actual, actual_codes=codes, actual_scales=scales)
+        first = result["first_code_difference"]
+        self.assertTrue(result["local_actual_encoding"]["passed"])
+        self.assertEqual(first["index"], [0, 1])
+        self.assertEqual((first["source_code"], first["actual_code"]), (8, 9))
+        self.assertTrue(first["same_scale_crosses_rounding_boundary"])
+        self.assertLess(first["source_ratio"], 8.5)
+        self.assertGreater(first["actual_ratio"], 8.5)
+        with self.assertRaisesRegex(ValueError, "element budget"):
+            INTEGER.diagnose_activation_pair(source, actual, maximum_elements=1)
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            INTEGER.diagnose_activation_pair(source, actual, actual_codes=codes)
+        codes[0, 1] = 8
+        with self.assertRaisesRegex(AssertionError, "rounding/clipping"):
+            INTEGER.diagnose_activation_pair(source, actual, actual_codes=codes, actual_scales=scales)
+
+    def test_trace_reports_first_float_and_later_first_code_difference(self):
+        lm = torch.nn.Module()
+        for name in ("first", "second"):
+            lm.add_module(name, INTEGER.IntegerProjection(torch.ones(2, 2), "power_of_two"))
+        source = {"first": torch.tensor([[.9921875, .0625]]), "second": torch.tensor([[.9921875, .0664062425494194]])}
+        actual = {"first": torch.tensor([[.9921875, np.nextafter(np.float32(.0625), np.float32(1))]]), "second": torch.tensor([[.9921875, .0664062574505806]])}
+        result = FACTORY.compare_projection_traces(actual, source, lm)
+        self.assertEqual(result["first_float_input_difference"], "first")
+        self.assertEqual(result["first_quantized_input_difference"]["projection"], "second")
+        self.assertEqual(result["checks"][0]["code_mismatches"], 0)
+        with self.assertRaisesRegex(AssertionError, "invocation order"):
+            FACTORY.compare_projection_traces(dict(reversed(list(actual.items()))), source, lm)
+
+    def test_capture_hooks_remove_on_failure_and_attention_checks_refuse_wrong_state(self):
+        projection = INTEGER.IntegerProjection(torch.ones(2, 3), "power_of_two")
+        with self.assertRaisesRegex(RuntimeError, "intentional"):
+            with FACTORY.capture_last_token_inputs(projection):
+                projection(torch.ones(1, 3))
+                raise RuntimeError("intentional")
+        self.assertEqual(len(projection._forward_pre_hooks), 0)
+        source = {"mask": torch.zeros(1, 1, 1, 3), "rope": (torch.ones(1, 1, 2), torch.zeros(1, 1, 2))}
+        actual = {"mask": torch.tensor([[[[0., 0., 0., -torch.inf]]]]), "rope": source["rope"]}
+        self.assertTrue(FACTORY.compare_cache_attention(actual, source, 3, torch)["active_mask_exact"])
+        actual["mask"][..., -1] = 0
+        with self.assertRaisesRegex(AssertionError, "unused cache slots"):
+            FACTORY.compare_cache_attention(actual, source, 3, torch)
+        actual["mask"][..., -1] = -.1
+        with self.assertRaisesRegex(AssertionError, "unused cache slots"):
+            FACTORY.compare_cache_attention(actual, source, 3, torch)
+        actual["mask"][..., -1] = -torch.inf
+        actual["rope"] = source["rope"][:1]
+        with self.assertRaisesRegex(AssertionError, "RoPE components"):
+            FACTORY.compare_cache_attention(actual, source, 3, torch)
+        actual["rope"] = (torch.zeros(1, 1, 2), torch.zeros(1, 1, 2))
+        with self.assertRaises(AssertionError):
+            FACTORY.compare_cache_attention(actual, source, 3, torch)
+
     def test_actual_integer_projection_matches_independent_numpy(self):
         generator = np.random.default_rng(194)
         weight = generator.uniform(-2, 2, (19, 33)).astype(np.float32)
@@ -233,6 +322,62 @@ class TinyLlamaIntegerTests(unittest.TestCase):
                 self.assertEqual(result["passed"], passed)
                 self.assertEqual(result["predicted_tokens"], 8 * 127)
                 self.assertFalse(result["paper_language_quality"])
+
+    @unittest.skipUnless(os.environ.get("TVM_TINYLLAMA_INTEGER_ONNX") == "1", "Optional ONNX/TVM integration disabled")
+    def test_compiled_emitted_activation_codes_and_scales_match_independent_oracle(self):
+        import onnx
+        import tvm
+        import verify_session
+        from types import SimpleNamespace
+        class Probe(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.projection = INTEGER.IntegerProjection(torch.tensor([[1., -2., 3., 4.], [-1., 0., 2., 3.]]), "power_of_two")
+            def forward(self, value):
+                codes, scales = self.projection.integer_inputs(value)
+                return self.projection(value), codes, scales
+        values = np.asarray([[254., 1., 3., -5.], [0., 0., 0., 0.], [.9921875, .0664062425494194, .0664062574505806, -.0664062574505806]], dtype=np.float32)
+        probe = Probe().eval()
+        with tempfile.TemporaryDirectory() as directory:
+            compiler = verify_session.StageCompiler(Path(directory), "optimized", np, torch, onnx, tvm,
+                                                     exporter="dynamo", export_options=INTEGER.export_options(torch))
+            executable = compiler(SimpleNamespace(name="emitted_operands", module=probe), [values], 3)
+            _result, codes, scales = verify_session.outputs(executable([values]), np, torch)
+            checked = INTEGER.check_operand_encoding(values, codes, scales, "power_of_two")
+            self.assertEqual(checked["checked_codes"], values.size)
+            self.assertEqual(codes[2].tolist(), [127, 8, 9, -9])
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODEL2MLIR"), "Optional pinned cache-wrapper integration disabled")
+    def test_real_hf_fixed_cache_matches_positions_masks_and_full_sequence(self):
+        from transformers import LlamaConfig, LlamaForCausalLM
+        from types import SimpleNamespace
+        path = FACTORY.safe_path(Path(os.environ["TVM_SESSION_MODEL2MLIR"]) / "m2m/capture/causal_session.py")
+        spec = importlib.util.spec_from_file_location("tinyllama_test_causal_session", path)
+        causal = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(causal)
+        torch.manual_seed(194)
+        config = LlamaConfig(hidden_size=64, intermediate_size=96, num_hidden_layers=2,
+                             num_attention_heads=4, num_key_value_heads=2, vocab_size=128)
+        config._attn_implementation = "eager"
+        lm = LlamaForCausalLM(config).eval().requires_grad_(False)
+        capture = SimpleNamespace(lm=lm, tokens=torch.arange(12).reshape(1, -1), prefill_tokens=4, decode_tokens=8, provenance={})
+        result = FACTORY.validate_reference_stages(capture, causal, torch)
+        self.assertTrue(result["passed"])
+        self.assertEqual(len(result["checks"]), 9)
+        self.assertTrue(all(check["attention"]["active_mask_exact"] and check["attention"]["last_token_rope_exact"] for check in result["checks"]))
+        self.assertEqual(len(lm.model.layers[0].self_attn._forward_pre_hooks), 0)
+        original_decode = causal.FixedCacheDecodeStep.forward
+        def wrong_decode(stage, *args):
+            logits, cache, position = original_decode(stage, *args)
+            return logits + .01, cache, position
+        with mock.patch.object(causal.FixedCacheDecodeStep, "forward", wrong_decode):
+            with self.assertRaisesRegex(AssertionError, "cache gate failed at 5"):
+                FACTORY.validate_reference_stages(capture, causal, torch)
+        diagnostic = capture.provenance["functional_cache_reference"]
+        self.assertFalse(diagnostic["passed"])
+        self.assertEqual((diagnostic["rtol"], diagnostic["atol"]), (1e-4, 1e-4))
+        self.assertTrue(diagnostic["attention"]["active_mask_exact"])
+        self.assertEqual(len(lm.model.layers[0].self_attn._forward_pre_hooks), 0)
 
     @unittest.skipUnless(os.environ.get("TVM_TINYLLAMA_INTEGER_ONNX") == "1", "Optional ONNX/TVM integration disabled")
     def test_real_integer_export_import_and_llvm_execution(self):

@@ -9,6 +9,7 @@ qualification. No model artifacts are downloaded and no layer count is changed.
 import hashlib
 import json
 import sys
+from contextlib import contextmanager
 from verify_resnet import file_identity, safe_path
 
 
@@ -52,6 +53,77 @@ def checkpoint_artifacts(checkpoint_dir):
     return root, identities
 
 
+@contextmanager
+def capture_last_token_inputs(lm):
+    """Observe bounded real inputs without changing model arithmetic or state."""
+    import tinyllama_integer as integer
+    trace, attention, handles = {}, {}, []
+    for name, module in lm.named_modules():
+        if isinstance(module, integer.IntegerProjection):
+            def record(projection, args, selected_name=name):
+                if selected_name in trace:
+                    raise AssertionError("TinyLlama diagnostic requires one invocation per named projection")
+                trace[selected_name] = args[0].detach().reshape(-1, projection.in_features)[-1:].clone()
+            handles.append(module.register_forward_pre_hook(record))
+        elif name == "model.layers.0.self_attn":
+            def record_attention(_module, _args, kwargs):
+                mask = kwargs.get("attention_mask")
+                attention["mask"] = None if mask is None else mask.detach()[..., -1:, :].clone()
+                embeddings = kwargs.get("position_embeddings")
+                attention["rope"] = None if embeddings is None else tuple(value.detach()[..., -1:, :].clone() for value in embeddings)
+            handles.append(module.register_forward_pre_hook(record_attention, with_kwargs=True))
+    try:
+        yield trace, attention
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def compare_cache_attention(actual, source, length, torch):
+    """Compare the final token's active causal mask and RoPE in both routes."""
+    result = {"observed": bool(actual) and bool(source)}
+    if not result["observed"]:
+        return result
+    source_mask, actual_mask = source["mask"], actual["mask"]
+    if source_mask is None or actual_mask is None:
+        result["mask_comparison"] = "not_observed_both_routes"
+    else:
+        torch.testing.assert_close(actual_mask[..., :length], source_mask[..., :length], rtol=0, atol=0)
+        unused = actual_mask[..., length:]
+        blocked = torch.isneginf(unused) | (unused == torch.finfo(unused.dtype).min)
+        if unused.numel() and not bool(blocked.all()):
+            raise AssertionError("Functional TinyLlama attention exposes unused cache slots")
+        result.update({"active_mask_exact": True, "unused_slots_masked": True,
+                       "source_mask_shape": list(source_mask.shape), "actual_mask_shape": list(actual_mask.shape)})
+    if source["rope"] is not None and actual["rope"] is not None:
+        if len(actual["rope"]) != len(source["rope"]):
+            raise AssertionError("Functional TinyLlama RoPE components differ")
+        for actual_value, source_value in zip(actual["rope"], source["rope"]):
+            torch.testing.assert_close(actual_value, source_value, rtol=0, atol=0)
+        result["last_token_rope_exact"] = True
+    return result
+
+
+def compare_projection_traces(actual, source, lm):
+    """Locate the first changed incoming float and independently encoded INT8 row."""
+    import tinyllama_integer as integer
+    if list(actual) != list(source):
+        raise AssertionError("TinyLlama projection invocation order or coverage differs")
+    checks, first_float, first_code = [], None, None
+    for name in actual:
+        projection = lm.get_submodule(name)
+        codes, scales = projection.integer_inputs(actual[name])
+        check = {"projection": name, **integer.diagnose_activation_pair(source[name].numpy(), actual[name].numpy(), projection.activation_scale,
+                                                                       actual_codes=codes.numpy(), actual_scales=scales.numpy())}
+        checks.append(check)
+        if check["input_mismatches"] and first_float is None:
+            first_float = name
+        if check["code_mismatches"] and first_code is None:
+            first_code = {"projection": name, **check["first_code_difference"]}
+    return {"scope": "last_token_all_invoked_projections_not_complete_session_acceptance", "projections": len(checks),
+            "first_float_input_difference": first_float, "first_quantized_input_difference": first_code, "checks": checks}
+
+
 def validate_reference_stages(capture, causal, torch):
     """Check functional cache wrappers against the original full-sequence HF model."""
     capacity = capture.prefill_tokens + capture.decode_tokens
@@ -60,25 +132,39 @@ def validate_reference_stages(capture, causal, torch):
     errors = []
     # BF16 is a separate explicit reference option; this CPU ONNX verifier uses FP32.
     rtol = atol = 1e-4 if next(capture.lm.parameters()).dtype == torch.float32 else 0.05
-    with torch.no_grad():
+    with torch.no_grad(), capture_last_token_inputs(capture.lm) as (trace, attention):
         logits, cache, position = prefill(capture.tokens[:, :capture.prefill_tokens])
         for length in range(capture.prefill_tokens, capacity + 1):
+            cached_trace, cached_attention = dict(trace), dict(attention)
+            trace.clear()
+            attention.clear()
+            positions = torch.arange(length, device=capture.tokens.device).unsqueeze(0)
             full_logits = capture.lm(
-                input_ids=capture.tokens[:, :length], use_cache=False).logits[:, -1, :]
-            try:
-                torch.testing.assert_close(logits, full_logits, rtol=rtol, atol=atol)
-            except AssertionError as error:
-                raise AssertionError(f"TinyLlama full-sequence cache gate failed at {length} tokens: {error}") from error
+                input_ids=capture.tokens[:, :length], position_ids=positions, use_cache=False).logits[:, -1, :]
+            full_trace, full_attention = dict(trace), dict(attention)
             expected_position = torch.full_like(position, length)
             if not torch.equal(position, expected_position):
                 raise AssertionError("Functional TinyLlama cache used lengths are incorrect")
             if bool(cache[..., length:, :].count_nonzero()):
                 raise AssertionError("Functional TinyLlama cache padding is not zero")
+            attention_check = compare_cache_attention(cached_attention, full_attention, length, torch)
+            try:
+                torch.testing.assert_close(logits, full_logits, rtol=rtol, atol=atol)
+            except AssertionError as error:
+                diagnostic = {"passed": False, "failed_tokens": length, "rtol": rtol, "atol": atol,
+                              "matched_tokens": capture.tokens[:, :length].tolist(), "position": position.tolist(),
+                              "unused_cache_slots_zero": True, "attention": attention_check, "checks_before_failure": errors,
+                              "max_absolute_logit_error": float((logits - full_logits).abs().max()),
+                              "projection_inputs": compare_projection_traces(cached_trace, full_trace, capture.lm)}
+                capture.provenance["functional_cache_reference"] = diagnostic
+                raise AssertionError(f"TinyLlama full-sequence cache gate failed at {length} tokens: {error}") from error
             errors.append({"tokens": length, "max_absolute_logit_error":
                            float((logits - full_logits).abs().max()),
-                           "position": position.tolist(), "unused_cache_slots_zero": True})
+                           "position": position.tolist(), "unused_cache_slots_zero": True, "attention": attention_check})
             if length < capacity:
                 before_cache, before_position = cache.clone(), position.clone()
+                trace.clear()
+                attention.clear()
                 logits, next_cache, next_position = decode(
                     capture.tokens[:, length:length + 1], cache, position)
                 if not torch.equal(cache, before_cache) or not torch.equal(position, before_position):
