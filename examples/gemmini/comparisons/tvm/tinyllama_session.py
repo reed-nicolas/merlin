@@ -114,8 +114,8 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
             prefill_tokens != 128 or decode_tokens != 32 or quality_corpus_path is None):
         raise ValueError("Development language workload requires 128 prefill, 32 decode and quality corpus")
     if workload == "synthetic_feasibility" and (
-            prefill_tokens != 128 or decode_tokens != 32 or quality_corpus_path is not None):
-        raise ValueError("Synthetic feasibility requires 128 prefill, 32 decode and no quality corpus")
+            (prefill_tokens, decode_tokens) not in ((8, 3), (128, 32)) or quality_corpus_path is not None):
+        raise ValueError("Synthetic feasibility requires explicit 8+3 or 128+32 and no quality corpus")
     if (type(prefill_tokens) is not int or type(decode_tokens) is not int
             or prefill_tokens < 1 or decode_tokens < 2):
         raise ValueError("Require a positive prefill and at least two recurrent decode steps")

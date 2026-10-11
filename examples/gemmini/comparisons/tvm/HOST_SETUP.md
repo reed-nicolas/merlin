@@ -13,7 +13,7 @@ For a new TVM checkout, clone without checkout and apply the mandatory name excl
 ```bash
 export TVM_ROOT=/absolute/path/to/tvm-gemmini
 export TVM_BUILD=/absolute/path/to/tvm-host-build
-tvm_commit=372bbd447565faf24a783885c5c2e6be65514df3
+tvm_commit=79c64f3ee350271ae8c0641df0e9c46928c02785
 git clone --filter=blob:none --no-checkout https://github.com/reed-nicolas/tvm.git "$TVM_ROOT"
 git -C "$TVM_ROOT" sparse-checkout set --no-cone --stdin <<'PATTERNS'
 /*
@@ -28,7 +28,7 @@ In the same shell, verify the selected source pin and prepare the host environme
 ```bash
 : "${TVM_ROOT:?Set TVM_ROOT to the independent TVM checkout}"
 : "${TVM_BUILD:?Set TVM_BUILD to the TVM host build directory}"
-test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = 372bbd447565faf24a783885c5c2e6be65514df3 || { echo 'TVM source pin mismatch' >&2; exit 1; }
+test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = 79c64f3ee350271ae8c0641df0e9c46928c02785 || { echo 'TVM source pin mismatch' >&2; exit 1; }
 merlin_root="$PWD"
 setup_dir="$merlin_root/examples/gemmini/comparisons/tvm"
 host_python="${TVM_HOST_PYTHON:-$(command -v python3.10)}"
@@ -60,7 +60,7 @@ The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. Initial
 git -C "$TVM_ROOT" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
 ```
 
-A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `372bbd447565faf24a783885c5c2e6be65514df3`. Clone each dependency without checkout and apply the same exclusions before checkout:
+A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `79c64f3ee350271ae8c0641df0e9c46928c02785`. Clone each dependency without checkout and apply the same exclusions before checkout:
 
 ```bash
 git -C "$TVM_ROOT" submodule init -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
@@ -281,7 +281,7 @@ python "$setup_dir/verify_resnet.py" --model2mlir-root "$model2mlir_source" --tv
 
 Both preparation and verification require new output directories. The preparer binds the supplied archive; it does not authenticate an official archive digest or prove checkpoint training provenance. The verification command enforces the unchanged development quality threshold and reports failure if quantization exceeds it. Twenty focused artifact tests pass, including exact V2 transforms, existing NPZ/label admission, archive bounds, content separation and source-mutation controls.
 
-Integer exports also emit `reference.npz` and `reference.json` from the separate integer oracle for every selected image. Use these with the TVM fork's [complete exported-graph simulator recipe](https://github.com/reed-nicolas/tvm/blob/372bbd447565faf24a783885c5c2e6be65514df3/apps/gemmini/README.md#complete-exported-graphs-in-gemmini-spike); select the matching `baremetal_baseline` or `baremetal_optimized` directory. Each mode's detailed memory/export records stay in separate hashed artifacts, while `results.json` summarizes their storage. Export alone is not device execution. The recorded full random-model session passes both modes and fixture admission; pretrained quality/device execution still require the supplied weights/data.
+Integer exports also emit `reference.npz` and `reference.json` from the separate integer oracle for every selected image. Use these with the TVM fork's [complete exported-graph simulator recipe](https://github.com/reed-nicolas/tvm/blob/79c64f3ee350271ae8c0641df0e9c46928c02785/apps/gemmini/README.md#complete-exported-graphs-in-gemmini-spike); select the matching `baremetal_baseline` or `baremetal_optimized` directory. Each mode's detailed memory/export records stay in separate hashed artifacts, while `results.json` summarizes their storage. Export alone is not device execution. The recorded full random-model session passes both modes and fixture admission; pretrained quality/device execution still require the supplied weights/data.
 
 The optional `--activation-estimator mse` freezes power-of-two scales from bounded TRAIN reconstruction error; labels and evaluation tensors never choose scales. Prepare the larger disjoint development/final streams with:
 
@@ -365,7 +365,7 @@ python "$setup_dir/verify_session.py" --model2mlir-root "$model2mlir_source" --t
 PYTHONPATH="$merlin_root/src:$PYTHONPATH" python "$merlin_root/merlin/tests/gemmini/test_tinyllama_session.py"
 ```
 
-The complete pretrained model passes both session repeats and reset, comparing every compiled output and KV/position route at `rtol=atol=1e-4`. Maximum logit error is 3.81e-5 and KV error 3.62e-5; positions are exact. The official checkpoint has 1,100,048,384 parameters, with 4,400,193,536 converted FP32 parameter bytes. Large ONNX weights remain external and source/cache state is isolated during export. Five focused factory tests pass. This baseline host recipe neither offloads the transformer to Gemmini nor selects an integer numerical/quality policy or timing result.
+The complete pretrained model passes both session repeats and reset, comparing every compiled output and KV/position route at `rtol=atol=1e-4`. Maximum logit error is 3.81e-5 and KV error 3.62e-5; positions are exact. The official checkpoint has 1,100,048,384 parameters, with 4,400,193,536 converted FP32 parameter bytes. Large ONNX weights remain external and source/cache state is isolated during export. Seventeen focused factory/integer-reference tests pass. This baseline host recipe neither offloads the transformer to Gemmini nor selects an integer numerical/quality policy or timing result.
 
 Add `"quantized": true` to the factory arguments for the explicit W8A8 projection recipe. All 155 learned projections use per-output-channel INT8 weights, dynamic token INT8 activations, exact INT32 contractions and FP32 dequantization; attention, normalization, embedding, masks and cache operations remain explicit CPU FP32. `"activation_scale": "power_of_two"` is the default declared recipe; `"maxabs"` retains the earlier diagnostic. Source weights and sampled complete-K integer references are recorded.
 
@@ -382,7 +382,7 @@ Path(os.environ["FACTORY_ARGUMENTS"]).write_text(json.dumps(arguments, indent=2)
 PYTHON
 ```
 
-Set the five environment variables to selected local files/new output directories, then use that arguments file in the existing session command. WikiText preparation verifies pinned bytes and selects the first eight eligible articles without model feedback. Development language quality passes, but the complete 128+32 cache/full-sequence gate currently fails an INT8 rounding discontinuity; the short integer diagnostic cannot qualify that full session. No gate has been relaxed.
+Set the five environment variables to selected local files/new output directories, then use that arguments file in the existing session command. WikiText preparation verifies pinned bytes and selects the first eight eligible articles without model feedback. Development language quality passes, but the complete 128+32 cache/full-sequence gate currently fails an INT8 rounding discontinuity; the short integer diagnostic cannot qualify that full session. For a separately labeled synthetic probe, use workload="synthetic_feasibility", quantized=true, explicit 8+3 or 128+32 lengths, and no quality corpus. The native 8+3 reference passes, but compiled prefill fails the unchanged gate: bounded diagnosis identifies FP32 propagation crossing a nearest-even INT8 threshold; independent INT64 checks confirm all tested compiled dot products for identical inputs. This failure reaches neither decode/reset nor target export. No gate has been relaxed.
 
 ## Original SmolVLA policy session
 

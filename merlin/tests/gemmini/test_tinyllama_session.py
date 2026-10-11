@@ -66,7 +66,8 @@ class TinyLlamaArtifactTests(unittest.TestCase):
                 "corpus_path": "/missing"}
         for changes in ({"quantized": 1}, {"quantized": True, "precision": "bfloat16"},
                         {"quality_corpus_path": "/missing"}, {"workload": "other"},
-                        {"workload": "development_language"}, {"workload": "synthetic_feasibility"},
+                        {"workload": "development_language"},
+                        {"workload": "synthetic_feasibility", "prefill_tokens": 9},
                         {"activation_scale": "other"}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 FACTORY.get_model_and_inputs(**{**base, **changes})
