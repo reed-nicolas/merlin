@@ -69,6 +69,249 @@ class SessionTests(unittest.TestCase):
             return program.module(*(self.verifier.torch_array(value, self.np, self.torch) for value in values))
         return run
 
+    def adapter_fixture(self, session=None, compiler=None):
+        trace = {}
+        result = self.verifier.verify_session(session or self.session(), compiler or self.reference_compiler, self.np, self.torch, adapter_trace=trace)
+        records, stages, seen = [], {}, set()
+        for call in trace["calls"]:
+            signature = self.verifier.static_signature(call["program"], call["inputs"])
+            if signature not in seen:
+                seen.add(signature)
+                name = "stage_" + str(len(records))
+                records.append({"program": call["program"], "inputs": call["inputs"]})
+                stages[name] = {"inputs": call["inputs"], "outputs": call["outputs"]}
+        package = {"stages": stages, "constants_bytes": 64, "duplicated_stage_constants_bytes": 128, "serial_workspace_bytes": 128}
+        return result, trace, records, package
+
+    def test_automatic_adapter_routes_and_source_fixture_are_independent(self):
+        def perturbed(program, inputs, output_count):
+            run = self.reference_compiler(program, inputs, output_count)
+            def invoke(values):
+                result = self.verifier.outputs(run(values), self.np, self.torch)
+                result[0] += self.np.float32(1e-5)
+                return tuple(self.verifier.torch_array(value, self.np, self.torch) for value in result)
+            return invoke
+        result, trace, records, package = self.adapter_fixture(compiler=perturbed)
+        route, order = self.verifier.session_adapter_plan(trace, records, package)
+        self.assertTrue(result["reset_verified"])
+        self.assertEqual(route, {"version": 1, "calls": [{"stage": "stage_0", "inputs": [{"fixture": 0}]},
+                                                        {"stage": "stage_1", "inputs": [{"fixture": 1}, {"output": [0, 0]}]},
+                                                        {"stage": "stage_1", "inputs": [{"fixture": 2}, {"output": [1, 1]}]},
+                                                        {"stage": "stage_1", "inputs": [{"fixture": 3}, {"output": [2, 1]}]}]})
+        expected = [[1., 2.], [3., -2.], [2., 0.], [-4., 8.], [-1., 4.], [3., 6.], [1., 5.]]
+        self.assertEqual([(value["invocation"], value["output_index"]) for value in order], [(0, 0), (1, 0), (1, 1), (2, 0), (2, 1), (3, 0), (3, 1)])
+        with tempfile.TemporaryDirectory(prefix="tvm-session-adapter-") as temp:
+            source = self.verifier.file_identity(__file__, self.verifier.safe_path)
+            report = self.verifier.write_session_adapter(Path(temp) / "session", trace, records, package, self.np, reference_sources=[source])
+            with self.np.load(report["fixture"]["path"], allow_pickle=False) as fixture:
+                self.assertEqual(set(fixture.files), {*("input_" + str(index) for index in range(4)), *("output_" + str(index) for index in range(7))})
+                for index, value in enumerate(expected):
+                    self.np.testing.assert_array_equal(fixture["output_" + str(index)], self.np.array([value], dtype="float32"))
+            provenance = json.loads(Path(report["fixture_provenance"]["path"]).read_text())
+            self.assertEqual(provenance["reference_sources"], [source])
+            self.assertEqual(provenance["fixture_sha256"], report["fixture"]["sha256"])
+            self.assertEqual(provenance["observation_outputs"], [[1, 0], [2, 0], [3, 0]])
+            self.assertEqual(provenance["final_output"], [3, 0])
+            self.assertFalse(report["device_admission_verified"])
+
+    def test_automatic_adapter_admission_refuses_state_and_abi_changes(self):
+        import copy
+        _, trace, records, package = self.adapter_fixture()
+        cases = []
+        invalid = copy.deepcopy(trace); invalid["host_verified"] = False
+        cases.append((invalid, records, package, "host gates"))
+        invalid = copy.deepcopy(trace); invalid["source_reset_stable"] = False
+        cases.append((invalid, records, package, "source resets"))
+        invalid = copy.deepcopy(trace); invalid["calls"][1]["routes"][1] = {"output": [1, 0]}
+        cases.append((invalid, records, package, "earlier invocation"))
+        invalid = copy.deepcopy(trace); invalid["calls"][0]["routes"][0] = {"fixture": True}
+        cases.append((invalid, records, package, "plain integer"))
+        invalid = copy.deepcopy(trace); invalid["calls"][1]["routes"][1] = {"cast": [0, 0]}
+        cases.append((invalid, records, package, "No transforms"))
+        invalid = copy.deepcopy(trace); invalid["calls"][1]["routes"][1] = {"output": [0, 1]}
+        cases.append((invalid, records, package, "earlier invocation"))
+        invalid = copy.deepcopy(trace); invalid["calls"][0]["values"][0][0] += 1
+        cases.append((invalid, records, package, "output bytes changed"))
+        invalid = copy.deepcopy(trace); invalid["calls"][0]["state_after"] = [[1, 0]]
+        cases.append((invalid, records, package, "future or absent"))
+        invalid_package = copy.deepcopy(package); invalid_package["stages"]["stage_1"]["outputs"][0] = {**invalid_package["stages"]["stage_1"]["outputs"][0], "dtype": "float64"}
+        cases.append((trace, records, invalid_package, "source ABI"))
+        for invalid, inventory, exported, error in cases:
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                self.verifier.session_adapter_plan(invalid, inventory, exported)
+        with tempfile.TemporaryDirectory(prefix="tvm-session-rejected-adapter-") as temp:
+            destination = Path(temp) / "session"
+            with self.assertRaisesRegex(ValueError, "identities"):
+                self.verifier.write_session_adapter(destination, trace, records, package, self.np, reference_sources=[])
+            self.assertFalse(destination.exists())
+            with self.assertRaisesRegex(ValueError, "explicit export budget"):
+                self.verifier.write_session_adapter(destination, trace, records, package, self.np,
+                                                    reference_sources=[self.verifier.file_identity(__file__, self.verifier.safe_path)], memory_limit_bytes=767)
+            self.assertFalse(destination.exists())
+
+    def test_session_memory_counts_simultaneous_state_and_trace_separately(self):
+        _, trace, records, package = self.adapter_fixture()
+        self.verifier.session_adapter_plan(trace, records, package)
+        memory = self.verifier.session_memory_plan(trace, package)
+        self.assertEqual(memory["staged_external_inputs_bytes"], 256)
+        self.assertEqual(memory["peak_planned_tensor_bytes"], 768)
+        self.assertEqual(memory["invocations"][1]["routed_prior_input_bytes"], 64)
+        self.assertEqual(memory["invocations"][1]["current_output_bytes"], 128)
+        self.assertEqual(memory["verification_trace"]["single_trace_tensor_bytes"], 896)
+        self.assertGreater(memory["verification_trace"]["single_trace_tensor_bytes"], memory["peak_planned_tensor_bytes"])
+        self.assertFalse(memory["production_fit_established"])
+        self.assertIsNone(memory["complete_production_peak_bytes"])
+        self.assertIn("stack", memory["unknown_overheads"])
+        for value in (True, 1., -1):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "plain nonnegative"):
+                self.verifier.session_memory_plan(trace, {**package, "constants_bytes": value})
+
+    def test_automatic_adapter_growing_state_uses_actual_static_signatures(self):
+        _, trace, records, package = self.adapter_fixture(self.growing_session())
+        route, order = self.verifier.session_adapter_plan(trace, records, package)
+        self.assertEqual([call["stage"] for call in route["calls"]], ["stage_0", "stage_1", "stage_2"])
+        self.assertEqual([record["inputs"][1]["shape"] for record in records], [[1], [2], [3]])
+        self.assertEqual([call["inputs"][1] for call in route["calls"]], [{"fixture": 1}, {"output": [0, 1]}, {"output": [1, 1]}])
+        self.assertEqual(len(order), 6)
+
+    def test_automatic_adapter_bf16_preserves_raw_payload(self):
+        torch, np, protocol = self.torch, self.np, self.protocol
+        class Identity(torch.nn.Module):
+            def forward(self, value):
+                return value.clone()
+        words = np.array([0x0000, 0x8000, 0x0001, 0x3f80, 0xbf80], dtype=np.uint16)
+        values = torch.from_numpy(words.copy()).view(torch.bfloat16)
+        program = protocol.ExternalRuntimeProgram("raw_bf16", Identity().eval(), (values,), 1, {"steps": 1, "quality": {"output_index": 0}})
+        session = protocol.make_external_runtime_session(version=1, programs=(program,), metadata={})
+        _, trace, records, package = self.adapter_fixture(session)
+        with tempfile.TemporaryDirectory(prefix="tvm-session-bf16-adapter-") as temp:
+            report = self.verifier.write_session_adapter(Path(temp) / "session", trace, records, package, np, reference_sources=[self.verifier.file_identity(__file__, self.verifier.safe_path)])
+            with np.load(report["fixture"]["path"], allow_pickle=False) as fixture:
+                self.assertEqual(fixture["output_0"].dtype, np.uint16)
+                np.testing.assert_array_equal(fixture["input_0"], words[None])
+                np.testing.assert_array_equal(fixture["output_0"], words[None])
+
+    def test_adapter_trace_cannot_bypass_host_failure(self):
+        import copy
+        import onnx
+        from unittest.mock import Mock, patch
+        trace = {}
+        def wrong(program, inputs, output_count):
+            run = self.reference_compiler(program, inputs, output_count)
+            return lambda values: tuple(self.verifier.torch_array(value + 10, self.np, self.torch) for value in self.verifier.outputs(run(values), self.np, self.torch))
+        with self.assertRaises(self.verifier.SessionComparisonError):
+            self.verifier.verify_session(self.session(), wrong, self.np, self.torch, adapter_trace=trace)
+        self.assertFalse(trace["host_verified"])
+        with self.assertRaisesRegex(ValueError, "host gates"):
+            self.verifier.session_adapter_plan(trace, [], {})
+        _, valid, records, _ = self.adapter_fixture()
+        source = self.verifier.file_identity(__file__, self.verifier.safe_path)
+        compiler = self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None)
+        compiler.records, compiler.imported_modules = records, [object()] * len(records)
+        unstable = copy.deepcopy(valid); unstable["source_reset_stable"] = False
+        bounded = copy.deepcopy(valid); bounded["capture_error"] = "bounded adapter trace"
+        for refused, sources, error in ((trace, [source], "host gates"), (unstable, [source], "source resets"), (bounded, [source], "bounded adapter trace"), (valid, [], "identities")):
+            exporter = SimpleNamespace(export_graphs=Mock())
+            with self.subTest(error=error), patch.object(self.verifier, "load_module", return_value=exporter) as loader, self.assertRaisesRegex(ValueError, error):
+                compiler.export_stages(Path("unused-export"), memory_limit_bytes=1 << 20, adapter_trace=refused, reference_sources=sources)
+            loader.assert_not_called()
+            exporter.export_graphs.assert_not_called()
+
+    def test_adapter_source_reset_instability_and_trace_bound_preserve_host_result(self):
+        torch, protocol = self.torch, self.protocol
+        class Stateful(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+            def forward(self, value):
+                self.calls += 1
+                return value + self.calls * 1e-6
+        program = protocol.ExternalRuntimeProgram("unstable", Stateful().eval(), (torch.ones(2),), 2, {"steps": 2, "quality": {"output_index": 0}})
+        session = protocol.make_external_runtime_session(version=1, programs=(program,), metadata={})
+        trace = {}
+        result = self.verifier.verify_session(session, lambda program, inputs, count: lambda values: torch.from_numpy(values[0].copy()), self.np, torch, adapter_trace=trace)
+        self.assertTrue(result["reset_verified"])
+        self.assertTrue(trace["host_verified"])
+        self.assertFalse(trace["source_reset_stable"])
+        with self.assertRaisesRegex(ValueError, "source resets"):
+            self.verifier.session_adapter_plan(trace, [], {})
+        class Identity(torch.nn.Module):
+            def forward(self, value):
+                return value.clone()
+        program = protocol.ExternalRuntimeProgram("bounded", Identity().eval(), (torch.ones(2),), 65, {"steps": 65, "quality": {"output_index": 0}})
+        session = protocol.make_external_runtime_session(version=1, programs=(program,), metadata={})
+        result, trace, records, package = self.adapter_fixture(session)
+        self.assertTrue(result["reset_verified"])
+        self.assertEqual(len(result["checks"]), 130)
+        self.assertEqual(len(trace["calls"]), 64)
+        with self.assertRaisesRegex(ValueError, "bounded adapter trace"):
+            self.verifier.session_adapter_plan(trace, records, package)
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit modern exporter and LLVM host build")
+    def test_integer_session_automatic_adapter_with_complete_k_oracle(self):
+        from contextlib import nullcontext
+        import onnx
+        import tvm
+        import tinyllama_integer
+        torch, np, protocol = self.torch, self.np, self.protocol
+        weight = (torch.arange(51, dtype=torch.int32).reshape(17, 3) % 7 - 3).to(torch.int8)
+        image = (torch.arange(34, dtype=torch.int32).reshape(2, 17) % 9 - 4).to(torch.int8)
+        tokens = torch.stack((image + 1, -image, image - 2))
+        class Prefix(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("weight", weight)
+            def forward(self, image):
+                value = torch._int_mm(image, self.weight)
+                return value, value + 3
+        class Decode(Prefix):
+            def forward(self, token, state):
+                value = torch._int_mm(token, self.weight) + state
+                return value, value + 3
+        spec = {"steps": 3, "streams": [{"name": "token", "input_index": 0, "values": tokens}],
+                "states": [{"name": "state", "input_index": 1, "output_index": 1}], "quality": {"output_index": 0}}
+        session = protocol.make_external_runtime_session(version=2,
+            programs=(protocol.ExternalRuntimeProgram("prefill", Prefix().eval(), (image,), 1),
+                      protocol.ExternalRuntimeProgram("decode", Decode().eval(), (tokens[0], torch.zeros((2, 3), dtype=torch.int32)), 3, spec)),
+            metadata={"kind": "synthetic_integer_adapter_probe", "paper_ready": False, "quality_program": "decode",
+                      "stages": ["prefill", "decode"], "stage_schedule": [{"name": "prefill", "steps": 1}, {"name": "decode", "steps": 3}],
+                      "bindings": [{"name": "initial_state", "from": {"program": "prefill", "output_index": 1}, "to": {"program": "decode", "input_index": 1}}],
+                      "provenance": {"checkpoint": "none", "synthetic_inputs": True, "full_checkpoint": False}})
+        def dot(left):
+            return np.array([[sum(int(left[row, k]) * int(weight[k, column]) for k in range(17)) for column in range(3)] for row in range(2)], dtype=np.int32)
+        oracle = []
+        value = dot(image)
+        oracle.extend((value, value + 3))
+        state = value + 3
+        for token in tokens:
+            value = dot(token) + state
+            oracle.extend((value, value + 3))
+            state = value + 3
+        destination = os.environ.get("TVM_SESSION_INTEGER_PROBE_DIR")
+        context = nullcontext(destination) if destination else tempfile.TemporaryDirectory(prefix="tvm-session-integer-adapter-")
+        with context as folder:
+            out = self.verifier.safe_path(Path(folder))
+            if destination:
+                out.mkdir(parents=True, exist_ok=False)
+            compiler = self.verifier.StageCompiler(out, "optimized", np, torch, onnx, tvm, exporter="dynamo", export_options=tinyllama_integer.export_options(torch))
+            trace = {}
+            result = self.verifier.verify_session(session, compiler, np, torch, adapter_trace=trace)
+            references = [self.verifier.file_identity(path, self.verifier.safe_path) for path in (__file__, self.verifier.__file__, protocol.__file__, tinyllama_integer.__file__)]
+            exported = compiler.export_stages(out / "baremetal", memory_limit_bytes=1 << 20, adapter_trace=trace, reference_sources=references)
+            adapter = exported["automatic_session_adapter"]
+            self.assertEqual(len(result["checks"]), 8)
+            self.assertTrue(result["reset_verified"])
+            self.assertEqual(adapter["invocations"], 4)
+            self.assertEqual(adapter["retained_invocation_outputs"], 8)
+            with np.load(adapter["fixture"]["path"], allow_pickle=False) as fixture:
+                for index, expected in enumerate(oracle):
+                    np.testing.assert_array_equal(fixture["output_" + str(index)], expected[None])
+            for record in compiler.records:
+                graph = onnx.load(record["onnx"]["path"])
+                self.assertEqual(sum(node.op_type == "MatMulInteger" for node in graph.graph.node), 1)
+            (out / "host.json").write_text(json.dumps({"host": result, "baremetal_export": exported, "source_identities": references,
+                                                       "oracle": "Complete-K Python integer sum over signed source operands; exact all eight invocation outputs; no TVM evaluation", "model_qualified": False}, indent=2, sort_keys=True) + "\n")
+
     def test_exporter_and_schema_selection_are_explicit(self):
         import onnx
         compiler = self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None)
@@ -527,7 +770,8 @@ class SessionTests(unittest.TestCase):
         import tvm
         with tempfile.TemporaryDirectory(prefix="tvm-session-package-") as temp:
             compiler = self.verifier.StageCompiler(Path(temp), "optimized", self.np, self.torch, onnx, tvm)
-            result = self.verifier.verify_session(self.session(), compiler, self.np, self.torch)
+            trace = {}
+            result = self.verifier.verify_session(self.session(), compiler, self.np, self.torch, adapter_trace=trace)
             exported = compiler.export_stages(Path(temp) / "baremetal", memory_limit_bytes=1 << 20, target="llvm")
             self.assertTrue(result["reset_verified"])
             self.assertFalse(exported["session_device_execution"])
@@ -537,6 +781,16 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(len(manifest["stages"]), 2)
             self.assertLessEqual(manifest["constants_bytes"], manifest["duplicated_stage_constants_bytes"])
             self.assertTrue(all(stage["entrypoint"].endswith("_model_run") for stage in manifest["stages"].values()))
+            exported = compiler.export_stages(Path(temp) / "automatic", memory_limit_bytes=1 << 20, target="llvm", adapter_trace=trace,
+                                              reference_sources=[self.verifier.file_identity(__file__, self.verifier.safe_path)])
+            adapter = exported["automatic_session_adapter"]
+            self.assertEqual(adapter["invocations"], 4)
+            self.assertEqual(adapter["retained_invocation_outputs"], 7)
+            self.assertTrue(adapter["static_route_generated"])
+            self.assertFalse(adapter["device_admission_verified"])
+            self.assertFalse(adapter["production_memory"]["production_fit_established"])
+            with self.np.load(adapter["fixture"]["path"], allow_pickle=False) as fixture:
+                self.np.testing.assert_array_equal(fixture["output_5"], self.np.array([[3., 6.]], dtype="float32"))
 
     @unittest.skipUnless(os.environ.get("TVM_LIBRARY_PATH"), "Requires explicit LLVM-enabled TVM host build")
     def test_real_onnx_relax_pipeline_verifies_every_stage(self):

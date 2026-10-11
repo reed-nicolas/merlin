@@ -273,10 +273,15 @@ def describe_session(session, np, torch):
     return record, initial
 
 
-def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, atol=1e-4, max_signatures=64):
+def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, atol=1e-4, max_signatures=64, adapter_trace=None):
     if not 2 <= repeats <= 10 or not 1 <= max_signatures <= 128:
         raise ValueError("Invalid session repeat/signature budget")
     description, initial = describe_session(session, np, torch)
+    if adapter_trace is not None:
+        if not isinstance(adapter_trace, dict) or adapter_trace:
+            raise ValueError("Adapter capture requires a fresh dictionary")
+        adapter_trace.update(session=description, external=[], calls=[], observation_outputs=[], final_output=None, source_reset_stable=True, host_verified=False)
+    external_indices = {}
     programs = {program.name: program for program in session.programs}
     parameter_hashes = {name: parameter_digest(program.module, torch) for name, program in programs.items()}
     compiled, checks, previous = {}, [], None
@@ -285,9 +290,11 @@ def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, a
         reference = {key: value.copy() for key, value in initial.items()}
         candidate = {key: value.copy() for key, value in initial.items()}
         last, fingerprints = {}, []
+        origins = {key: ("initial", *key) for key in initial}
+        last_calls, ordinal = {}, 0
 
         def invoke(invocation, observation):
-            nonlocal high_water
+            nonlocal high_water, ordinal
             program = programs[invocation.program]
             if observation is not None:
                 for stream in session.streams:
@@ -295,6 +302,7 @@ def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, a
                         value = array(stream.values[observation], np, torch)
                         reference[endpoint(stream.target)] = value.copy()
                         candidate[endpoint(stream.target)] = value.copy()
+                        origins[endpoint(stream.target)] = ("stream", *endpoint(stream.target), observation)
             keys = [(program.name, index) for index in range(len(program.inputs))]
             expected_args, actual_args = [reference[key] for key in keys], [candidate[key] for key in keys]
             context = {"stage": invocation.cadence, "program": program.name, "repeat": repeat, "observation": observation}
@@ -319,7 +327,28 @@ def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, a
                 raise AssertionError("Stage output count differs from reference")
             values = [compare(a, b, np, rtol, atol, context={**context, "tensor": "output", "output_index": index})
                       for index, (a, b) in enumerate(zip(actual, expected))]
+            if adapter_trace is not None and "capture_error" not in adapter_trace:
+                identities = [tensor_identity(value) for value in expected]
+                new_external = len({origins[target] for target in keys if origins[target][0] != "output" and origins[target] not in external_indices})
+                if repeat == 0 and (ordinal >= 64 or sum(len(call["outputs"]) for call in adapter_trace["calls"]) + len(expected) + len(adapter_trace["external"]) + new_external > 256):
+                    adapter_trace["capture_error"] = "Session exceeds bounded adapter trace call/tensor slots at invocation " + str(ordinal)
+                elif repeat == 0:
+                    bindings = []
+                    for target, value in zip(keys, expected_args):
+                        origin = origins[target]
+                        if origin[0] == "output":
+                            bindings.append({"output": list(origin[1:])})
+                        else:
+                            if origin not in external_indices:
+                                external_indices[origin] = len(adapter_trace["external"])
+                                adapter_trace["external"].append({"origin": list(origin), "value": value.copy()})
+                            bindings.append({"fixture": external_indices[origin]})
+                    adapter_trace["calls"].append({"program": program.name, "inputs": [tensor_identity(value) for value in expected_args], "routes": bindings,
+                                                   "outputs": identities, "values": tuple(value.copy() for value in expected), "cadence": invocation.cadence, "observation": observation})
+                elif identities != adapter_trace["calls"][ordinal]["outputs"] or [tensor_identity(value) for value in expected_args] != adapter_trace["calls"][ordinal]["inputs"]:
+                    adapter_trace["source_reset_stable"] = False
             last[program.name] = actual
+            last_calls[program.name] = ordinal
             routes = []
             for route in session.routes:
                 if route.source.program != program.name:
@@ -331,10 +360,15 @@ def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, a
                 if value.dtype != initial[target].dtype or value.ndim != initial[target].ndim:
                     raise ValueError("State route changes the declared dtype or rank")
                 reference[target], candidate[target] = expected[index].copy(), value.copy()
+                origins[target] = ("output", ordinal, index)
                 routes.append({"name": route.name, "target": asdict(route.target), "comparison": compare(candidate[target], reference[target], np, rtol, atol)})
             high_water = max(high_water, sum(value.nbytes for value in candidate.values()))
             fingerprints.append([tensor_identity(value) for value in actual])
             checks.append({"repeat": repeat, "observation": observation, "program": program.name, "outputs": values, "routed_states": routes})
+            if adapter_trace is not None and repeat == 0 and "capture_error" not in adapter_trace:
+                adapter_trace["calls"][-1]["state_after"] = [list(origins[endpoint(binding.target)][1:]) for binding in session.input_bindings
+                                                            if binding.kind == "state" and origins[endpoint(binding.target)][0] == "output"]
+            ordinal += 1
 
         def phase(cadence, observation=None):
             for invocation in session.execution_schedule:
@@ -351,19 +385,179 @@ def verify_session(session, compile_stage, np, torch, *, repeats=2, rtol=1e-4, a
             if selector.program not in last or not 0 <= selector.output_index < len(last[selector.program]):
                 raise ValueError("Observation selector is unavailable at its declared cadence")
             observations.append(tensor_identity(last[selector.program][selector.output_index]))
+            if adapter_trace is not None and repeat == 0:
+                adapter_trace["observation_outputs"].append([last_calls[selector.program], selector.output_index])
         phase("once_after_observations")
         selector = session.final_output
         if selector.program not in last or not 0 <= selector.output_index < len(last[selector.program]):
             raise ValueError("Final output selector is unavailable")
         fingerprints.append([tensor_identity(last[selector.program][selector.output_index]), observations])
+        if adapter_trace is not None and repeat == 0:
+            adapter_trace["final_output"] = [last_calls[selector.program], selector.output_index]
         if previous is not None and fingerprints != previous:
             raise AssertionError("Session outputs differ after restoring initial inputs")
         previous = fingerprints
     for name, program in programs.items():
         if parameter_digest(program.module, torch) != parameter_hashes[name]:
             raise AssertionError("Stage parameters or registered buffers changed")
+    if adapter_trace is not None:
+        adapter_trace.update(host_verified=True, host_repeats=repeats, host_rtol=rtol, host_atol=atol, parameter_sha256=parameter_hashes)
     return {"session": description, "checks": checks, "repeats": repeats, "reset_verified": True,
             "compilation_signatures": len(compiled), "parameter_sha256": parameter_hashes, "retained_stage_input_high_water_bytes": high_water}
+
+
+def static_signature(program, tensors):
+    return program, tuple((tensor["dtype"], tuple(tensor["shape"])) for tensor in tensors)
+
+
+def admit_adapter_capture(trace):
+    if not isinstance(trace, dict) or trace.get("host_verified") is not True or trace.get("source_reset_stable") is not True:
+        raise ValueError("Automatic adapter requires verified host gates and byte-stable source resets")
+    if trace.get("capture_error"):
+        raise ValueError(trace["capture_error"])
+    if not 1 <= len(trace["calls"]) <= 64 or not trace["external"]:
+        raise ValueError("Adapter requires bounded nonempty calls and external inputs")
+
+
+def adapter_reference_sources(reference_sources):
+    if not reference_sources:
+        raise ValueError("Independent source reference identities are required")
+    sources = []
+    for source in reference_sources:
+        if file_identity(source["path"], safe_path) != source:
+            raise AssertionError("Independent reference source or artifact changed")
+        if source not in sources:
+            sources.append(source)
+    return sources
+
+
+def session_adapter_plan(trace, records, package):
+    """Bind semantic origins to actual exported ABIs, without transforms or candidate values."""
+    admit_adapter_capture(trace)
+    calls, external = trace["calls"], trace["external"]
+    if not 1 <= len(calls) <= 64 or not 1 <= len(records) <= 64 or not external:
+        raise ValueError("Adapter requires bounded nonempty calls, signatures and external inputs")
+    stages = package["stages"]
+    signatures = {static_signature(record["program"], record["inputs"]): "stage_" + str(index) for index, record in enumerate(records)}
+    if len(signatures) != len(records) or set(stages) != set(signatures.values()):
+        raise ValueError("Exported static signature inventory differs from checked stages")
+    same = lambda tensor: (tensor["dtype"], tensor["shape"], tensor["bytes"])
+    route_calls, output_order, used_fixtures, used_stages = [], [], set(), set()
+    for ordinal, call in enumerate(calls):
+        name = signatures.get(static_signature(call["program"], call["inputs"]))
+        if name is None:
+            raise ValueError("Semantic invocation lacks its actual checked static signature")
+        stage = stages[name]
+        if [same(tensor) for tensor in stage["inputs"]] != [same(tensor) for tensor in call["inputs"]] or [same(tensor) for tensor in stage["outputs"]] != [same(tensor) for tensor in call["outputs"]]:
+            raise ValueError("Exported stage input/output dtype, shape or bytes differ from source ABI")
+        if len(call["routes"]) != len(call["inputs"]) or len(call["values"]) != len(call["outputs"]):
+            raise ValueError("Incomplete semantic route/reference output inventory")
+        for binding, tensor in zip(call["routes"], call["inputs"]):
+            if not isinstance(binding, dict) or len(binding) != 1:
+                raise ValueError("Malformed semantic input route")
+            if "fixture" in binding:
+                index = binding["fixture"]
+                if type(index) is not int or not 0 <= index < len(external):
+                    raise ValueError("Fixture route requires a bounded plain integer")
+                origin = tensor_identity(external[index]["value"])
+                used_fixtures.add(index)
+            elif "output" in binding:
+                source = binding["output"]
+                if not isinstance(source, list) or len(source) != 2 or any(type(index) is not int for index in source) or not 0 <= source[0] < ordinal or not 0 <= source[1] < len(calls[source[0]]["outputs"]):
+                    raise ValueError("State route must name an earlier invocation/output")
+                origin = calls[source[0]]["outputs"][source[1]]
+            else:
+                raise ValueError("No transforms or inferred state are admitted")
+            if origin != tensor:
+                raise ValueError("Semantic input bytes do not match their explicit origin")
+        if [tensor_identity(value) for value in call["values"]] != call["outputs"]:
+            raise ValueError("Source reference output bytes changed after host verification")
+        if any(not isinstance(selector, list) or len(selector) != 2 or any(type(index) is not int for index in selector) or not 0 <= selector[0] <= ordinal or not 0 <= selector[1] < len(calls[selector[0]]["outputs"]) for selector in call["state_after"]):
+            raise ValueError("Persistent state cannot name a future or absent output")
+        route_calls.append({"stage": name, "inputs": copy.deepcopy(call["routes"])})
+        output_order.extend({"invocation": ordinal, "output_index": index, "tensor": tensor} for index, tensor in enumerate(call["outputs"]))
+        used_stages.add(name)
+    if used_fixtures != set(range(len(external))) or used_stages != set(stages) or len(external) + len(output_order) > 256:
+        raise ValueError("Adapter requires dense used fixtures/stages within bounded tensor slots")
+    for selector in [*trace["observation_outputs"], trace["final_output"], *(value for call in calls for value in call["state_after"])]:
+        if not isinstance(selector, list) or len(selector) != 2 or any(type(index) is not int for index in selector) or not 0 <= selector[0] < len(calls) or not 0 <= selector[1] < len(calls[selector[0]]["outputs"]):
+            raise ValueError("Semantic output/state selector is unavailable")
+    return {"version": 1, "calls": route_calls}, output_order
+
+
+def session_memory_plan(trace, package):
+    """Plan immutable routed storage; this is separate from the device verifier's retained trace."""
+    align = lambda size: (size + 63) // 64 * 64
+    for name in ("constants_bytes", "duplicated_stage_constants_bytes", "serial_workspace_bytes"):
+        if type(package.get(name)) is not int or package[name] < 0:
+            raise ValueError("Memory summaries must be plain nonnegative integers")
+    calls = trace["calls"]
+    external_bytes = sum(align(value["value"].nbytes) for value in trace["external"])
+    sizes = {(ordinal, index): align(tensor["bytes"]) for ordinal, call in enumerate(calls) for index, tensor in enumerate(call["outputs"])}
+    last_use = {key: key[0] for key in sizes}
+    for ordinal, call in enumerate(calls):
+        for binding in call["routes"]:
+            if "output" in binding:
+                key = tuple(binding["output"])
+                last_use[key] = max(last_use[key], ordinal)
+        for selector in call["state_after"]:
+            key = tuple(selector)
+            last_use[key] = max(last_use[key], min(ordinal + 1, len(calls) - 1))
+    # Conservatively retain selected observation/final outputs to session end.
+    for selector in [*trace["observation_outputs"], trace["final_output"]]:
+        last_use[tuple(selector)] = len(calls) - 1
+    fixed = align(package["constants_bytes"]) + align(package["serial_workspace_bytes"]) + external_bytes
+    rows = []
+    for ordinal, call in enumerate(calls):
+        live = [key for key in sizes if key[0] <= ordinal <= last_use[key]]
+        routed = {tuple(binding["output"]) for binding in call["routes"] if "output" in binding}
+        rows.append({"invocation": ordinal, "live_output_routes": [list(key) for key in live], "live_output_bytes": sum(sizes[key] for key in live),
+                     "routed_prior_input_bytes": sum(sizes[key] for key in routed), "current_output_bytes": sum(sizes[(ordinal, index)] for index in range(len(call["outputs"]))),
+                     "planned_tensor_bytes": fixed + sum(sizes[key] for key in live)})
+    unknown = ["linked executable/read-only image excluding counted constants", "stack", "CPU math/runtime globals and startup storage", "platform reservations", "packing/conversion scratch outside exported serial workspace", "model persistent or transient state outside explicit stage ABI"]
+    return {"alignment_bytes": 64, "shared_constants_including_exported_packed_weights_bytes": align(package["constants_bytes"]),
+            "duplicated_stage_constants_bytes_not_allocated": package["duplicated_stage_constants_bytes"], "serial_workspace_bytes": align(package["serial_workspace_bytes"]),
+            "staged_external_inputs_bytes": external_bytes, "peak_planned_tensor_bytes": max(row["planned_tensor_bytes"] for row in rows), "invocations": rows,
+            "verification_trace": {"all_retained_output_bytes": sum(sizes.values()), "single_trace_tensor_bytes": fixed + sum(sizes.values()),
+                                   "guarded_double_outputs_frozen_fixture_image_stack_bytes": None},
+            "assumptions": ["All explicit external inputs are staged once per reset; stream delivery can use a different plan", "Read-only routed fanout shares one output allocation; every current output is disjoint from inputs", "Prior state inputs and all current outputs coexist during each invocation", "Selected observation/final outputs remain live until session end", "Released immutable output storage may be reused only after its final route/state/selector use"],
+            "unknown_overheads": unknown, "complete_production_peak_bytes": None, "production_fit_established": False}
+
+
+def write_session_adapter(output_dir, trace, records, package, np, *, reference_sources, package_artifact=None, memory_limit_bytes=None):
+    route, output_order = session_adapter_plan(trace, records, package)
+    sources = adapter_reference_sources(reference_sources)
+    memory = session_memory_plan(trace, package)
+    if memory_limit_bytes is not None:
+        if type(memory_limit_bytes) is not int or memory_limit_bytes <= 0 or memory["peak_planned_tensor_bytes"] > memory_limit_bytes:
+            raise ValueError("Aligned live session tensor plan exceeds the explicit export budget")
+        memory["known_tensor_plan_within_export_budget"] = True
+        memory["tensor_export_budget_bytes"] = memory_limit_bytes
+    if package_artifact is not None and file_identity(package_artifact["path"], safe_path) != package_artifact:
+        raise AssertionError("Exported package identity changed")
+    output_dir = safe_path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=False)
+    arrays = {}
+    for kind, values in (("input", [value["value"] for value in trace["external"]]), ("output", [value for call in trace["calls"] for value in call["values"]])):
+        for index, value in enumerate(values):
+            storage = value.view(np.uint16) if str(value.dtype) == "bfloat16" else value
+            arrays[kind + "_" + str(index)] = np.ascontiguousarray(storage[None])
+    np.savez(output_dir / "fixture.npz", **arrays)
+    (output_dir / "route.json").write_text(json.dumps(route, indent=2, sort_keys=True) + "\n")
+    fixture = file_identity(output_dir / "fixture.npz", safe_path)
+    provenance = {"fixture_sha256": fixture["sha256"], "reference_sources": sources, "sample_ids": ["semantic-session:" + trace["session"]["sha256"] + ":reset-0"],
+                  "reference_contract": "Original declared Torch stage arithmetic on source-routed inputs after all host input/output/state/reset/parameter gates. Every invocation output is retained in call/output order; BF16 is raw uint16 payload. Device acceptance remains exact bytes; host allclose does not imply device acceptance.",
+                  "session": trace["session"], "exported_package": package_artifact, "fixture_byte_order": sys.byteorder,
+                  "parameter_sha256": trace["parameter_sha256"], "reset": "restore_initial_inputs; no route crosses session samples or repeats",
+                  "host_gate": {"rtol": trace["host_rtol"], "atol": trace["host_atol"], "repeats": trace["host_repeats"], "source_reset_bytes_stable": True},
+                  "input_order": [{"origin": value["origin"], "tensor": tensor_identity(value["value"])} for value in trace["external"]],
+                  "output_order": output_order, "observation_outputs": trace["observation_outputs"], "final_output": trace["final_output"],
+                  "route": file_identity(output_dir / "route.json", safe_path), "stage_mapping": [{"stage": "stage_" + str(index), "program": record["program"], "compiled_example_inputs": record["inputs"]} for index, record in enumerate(records)],
+                  "production_memory": memory, "device_execution": False, "quality_qualified": False, "timing_qualified": False}
+    (output_dir / "provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True, allow_nan=False) + "\n")
+    return {"route": provenance["route"], "fixture": fixture, "fixture_provenance": file_identity(output_dir / "provenance.json", safe_path),
+            "invocations": len(route["calls"]), "external_inputs": len(trace["external"]), "retained_invocation_outputs": len(output_order),
+            "production_memory": memory, "static_route_generated": True, "device_admission_verified": False, "exact_byte_device_gate": "unchanged; source fixture can differ from a host-allclose compiled candidate"}
 
 
 class StageCompiler:
@@ -453,12 +647,17 @@ class StageCompiler:
         return run
 
 
-    def export_stages(self, output_dir, *, memory_limit_bytes, target=None):
-        """Package already checked static signatures; caller supplies state routing."""
-        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
-        from tvm.relax.backend.contrib.gemmini_tuning import collect_gemmini_workloads
+    def export_stages(self, output_dir, *, memory_limit_bytes, target=None, adapter_trace=None, reference_sources=()):
+        """Package checked signatures, optionally deriving routes from a checked semantic trace."""
         if not self.records or len(self.records) != len(self.imported_modules):
             raise ValueError("No complete compiled stage inventory is available")
+        if adapter_trace is not None:
+            admit_adapter_capture(adapter_trace)
+            if not 1 <= len(self.records) <= 64:
+                raise ValueError("Adapter exceeds the bounded exported stage inventory")
+            reference_sources = adapter_reference_sources(reference_sources)
+        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+        from tvm.relax.backend.contrib.gemmini_tuning import collect_gemmini_workloads
         app = safe_path(Path(self.tvm.__file__).parents[2] / "apps/gemmini")
         sys.path.insert(0, str(app))
         exporter = load_module("tvm_session_baremetal", app / "baremetal.py")
@@ -470,13 +669,17 @@ class StageCompiler:
             stages[name] = {"program": record["program"], "inputs": record["inputs"],
                             "onnx_artifacts": record["onnx_artifacts"], "workloads": collect_gemmini_workloads(mod)}
         bundle = exporter.export_graphs(modules, output_dir, target=target or exporter.RV64_TARGET, memory_limit_bytes=memory_limit_bytes)
-        return {"artifact": file_identity(safe_path(output_dir) / "graphs.json", safe_path), "sources": sources,
+        result = {"artifact": file_identity(safe_path(output_dir) / "graphs.json", safe_path), "sources": sources,
                 "stages": stages, "constants_bytes": bundle["constants_bytes"],
                 "duplicated_stage_constants_bytes": bundle["duplicated_stage_constants_bytes"],
                 "maximum_stage_tensor_bytes": bundle["maximum_stage_tensor_bytes"],
                 "serial_workspace_bytes": bundle["serial_workspace_bytes"],
                 "state_routing": "caller_owned", "session_device_execution": False,
                 "quality_qualified": False, "timing_qualified": False}
+        if adapter_trace is not None:
+            result["automatic_session_adapter"] = write_session_adapter(safe_path(output_dir) / "session", adapter_trace, self.records, bundle, self.np,
+                                                                        reference_sources=reference_sources, package_artifact=result["artifact"], memory_limit_bytes=memory_limit_bytes)
+        return result
 
 
 def main():
@@ -490,8 +693,8 @@ def main():
     parser.add_argument("--onnx-exporter", choices=("legacy", "dynamo"), default="legacy", help="Explicit modern exporter for compatible source models; dynamo defaults to opset18 and needs onnxscript")
     parser.add_argument("--opset", type=int, help="Explicit ONNX schema version; defaults to17 legacy or18 dynamo; native BF16 Conv requires22")
     parser.add_argument("--bf16-fused-export", action="store_true", help="Opt-in dynamo BF16 linear/SDPA FP32-math candidates; original BF16 ABI, unchanged source comparison, no native CPU kernel/layout equivalence claim")
-    parser.add_argument("--export-baremetal", action="store_true", help="Package numerically checked static stages with shared constants; caller still owns state routing")
-    parser.add_argument("--memory-limit-bytes", type=int, help="Explicit tensor-only budget required for baremetal export; add retained state, ELF, stack and fixtures")
+    parser.add_argument("--export-baremetal", action="store_true", help="Package checked static stages, derive declared session routes and freeze source reference bytes; no device qualification")
+    parser.add_argument("--memory-limit-bytes", type=int, help="Explicit export/live-session tensor budget; ELF, stack, runtime and guarded verification fixtures need separate accounting")
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--max-signatures", type=int, default=64)
     parser.add_argument("--rtol", type=float, default=1e-4)
@@ -558,10 +761,16 @@ def main():
             if compiler.translation_source:
                 report["translation_source"] = compiler.translation_source
             report["compiled_stages"] = compiler.records
-            report.update(verify_session(session, compiler, np, torch, repeats=args.repeats, rtol=args.rtol, atol=args.atol, max_signatures=args.max_signatures))
+            adapter_trace = {} if args.export_baremetal else None
+            report.update(verify_session(session, compiler, np, torch, repeats=args.repeats, rtol=args.rtol, atol=args.atol, max_signatures=args.max_signatures, adapter_trace=adapter_trace))
             report["host_session_verified"] = True
             if args.export_baremetal:
-                report["baremetal_export"] = compiler.export_stages(out / "baremetal", memory_limit_bytes=args.memory_limit_bytes)
+                reference_sources = [report["verifier_source"], report["protocol_source"], report["factory_source"], *report["declared_artifacts"], *report["factory_artifacts"]]
+                if "factory_arguments" in report:
+                    reference_sources.append(report["factory_arguments"])
+                if "factory_export_source" in report:
+                    reference_sources.append(report["factory_export_source"])
+                report["baremetal_export"] = compiler.export_stages(out / "baremetal", memory_limit_bytes=args.memory_limit_bytes, adapter_trace=adapter_trace, reference_sources=reference_sources)
         infos = [report["verifier_source"], report["graph_helper_source"], report["protocol_source"], report["factory_source"],
                  report["compiler_library"], *report["declared_artifacts"], *report["factory_artifacts"]]
         if "factory_arguments" in report:
@@ -573,6 +782,10 @@ def main():
         infos.extend(artifact for stage in report["compiled_stages"] for artifact in stage["onnx_artifacts"])
         if "baremetal_export" in report:
             infos.extend(report["baremetal_export"]["sources"])
+            infos.append(report["baremetal_export"]["artifact"])
+            adapter = report["baremetal_export"].get("automatic_session_adapter")
+            if adapter:
+                infos.extend(adapter[field] for field in ("route", "fixture", "fixture_provenance"))
         for info in infos:
             if file_identity(info["path"], safe_path) != info:
                 raise AssertionError("Selected source or declared artifact changed")
