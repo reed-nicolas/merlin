@@ -118,6 +118,40 @@ def fixture_inputs(config, camera_count, *, input_npz=None, seed=0):
     return inputs
 
 
+def observation_manifest(input_npz, manifest_path):
+    """Bind prepared recorded observations; attribution text alone is not schema proof."""
+    if manifest_path is None:
+        return None
+    if input_npz is None:
+        raise ValueError("Recorded observation manifest requires its exact NPZ")
+    from prepare_smolvla_observation import CAMERA_MAP, DATASET_ID, DATASET_REVISION, STATE_NAMES, episode_split
+
+    path = safe_path(manifest_path)
+    value = json.loads(path.read_text())
+    expected = {"version": 1, "fixture_kind": "dataset", "dataset_id": DATASET_ID,
+                "dataset_revision": DATASET_REVISION, "checkpoint_revision": MODEL_REVISION,
+                "precision": "original_lerobot", "schema_verified": True,
+                "selected_cameras": list(CAMERA_MAP.values()), "camera_mapping": CAMERA_MAP,
+                "state_names": STATE_NAMES, "active_gate_changed": False,
+                "model_quality_qualified": False}
+    if any(value.get(key) != item for key, item in expected.items()) or \
+            value.get("split") != episode_split(value.get("episode_index")):
+        raise ValueError("Recorded observation manifest differs from the pinned preparation recipe")
+    if value.get("input_fixture") != file_identity(input_npz, safe_path):
+        raise ValueError("Recorded observation NPZ identity differs from its preparation manifest")
+    bindings = value.get("bindings")
+    if not isinstance(bindings, list) or not bindings or any(
+            file_identity(item["path"], safe_path) != item for item in bindings):
+        raise ValueError("Recorded observation source/processor bindings changed")
+    # Verify the manifest's record of the original official parquet identities.
+    from prepare_smolvla_observation import PINNED_FILES
+    for relative, digest in PINNED_FILES.items():
+        if not any(Path(item["path"]).as_posix().endswith("/" + relative)
+                   and item["sha256"] == digest for item in bindings):
+            raise ValueError("Recorded observation lacks pinned official parquet bindings")
+    return value
+
+
 class SessionProvider:
     def __init__(self, session, artifacts):
         self.session, self.artifacts = session, tuple(artifacts)
@@ -213,13 +247,16 @@ def make_policy_session(model, inputs, loader, provenance):
 
 def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
                          input_npz=None, fixture_kind="synthetic", input_source=None,
-                         selected_cameras=None, seed=0, cpu_threads=1, precision="original"):
+                         input_manifest=None, selected_cameras=None, seed=0, cpu_threads=1, precision="original"):
     if precision != "original":
         raise ValueError("Only original LeRobot precision is supported; implicit BF16 conversion is forbidden")
     if type(cpu_threads) is not int or not 1 <= cpu_threads <= 4 or type(seed) is not int or seed < 0:
         raise ValueError("Invalid explicit CPU thread/fixture seed budget")
     if fixture_kind not in ("synthetic", "dataset") or (fixture_kind == "dataset" and (not input_npz or not input_source)):
         raise ValueError("Dataset fixtures require both a local NPZ and attributed input_source")
+    if input_manifest is not None and fixture_kind != "dataset":
+        raise ValueError("A recorded observation manifest must be labeled as a dataset fixture")
+    fixture_manifest = observation_manifest(input_npz, input_manifest)
     config_json, checkpoint_files = checkpoint_artifacts(checkpoint_dir)
     backbone = safe_path(backbone_dir)
     backbone_files = directory_artifacts(backbone)
@@ -228,7 +265,10 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
         raise FileNotFoundError("Original-precision SmolVLA requires local backbone config, processor and weights")
     loader_path = safe_path(Path(model2mlir_root) / "workloads/smolvla/loader.py")
     if selected_cameras is None:
-        selected_cameras = [name for name in config_json["input_features"] if name.startswith("observation.images.")]
+        selected_cameras = fixture_manifest["selected_cameras"] if fixture_manifest else [
+            name for name in config_json["input_features"] if name.startswith("observation.images.")]
+    if fixture_manifest and selected_cameras != fixture_manifest["selected_cameras"]:
+        raise ValueError("Selected camera order differs from recorded observation preparation")
     configured = {name for name in config_json["input_features"] if name.startswith("observation.images.")}
     if not isinstance(selected_cameras, list) or not selected_cameras or \
             len(set(selected_cameras)) != len(selected_cameras) or any(name not in configured for name in selected_cameras):
@@ -264,6 +304,9 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
     files = checkpoint_files + backbone_files + sources
     if input_npz:
         files.append(file_identity(input_npz, safe_path))
+    if input_manifest:
+        files.append(file_identity(input_manifest, safe_path))
+        files.extend(fixture_manifest["bindings"])
     dtype_bytes = {}
     for value in model.state_dict().values():
         dtype = str(value.dtype)
@@ -273,6 +316,7 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
                   "full_checkpoint": True, "precision": "original_lerobot",
                   "synthetic_inputs": fixture_kind == "synthetic", "fixture_seed": seed if not input_npz else None,
                   "input_source": input_source or "seeded synthetic preprocessed tensors",
+                  "observation_manifest": fixture_manifest, "observation_schema_verified": fixture_manifest is not None,
                   "selected_cameras": selected_cameras, "all_configured_cameras": set(selected_cameras) == configured,
                   "backbone": BACKBONE_ID, "local_backbone": str(backbone),
                   "backbone_revision_verified": False, "declared_artifacts": files,

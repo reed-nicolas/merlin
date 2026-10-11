@@ -146,6 +146,66 @@ class SmolVLABackendCaptureTests(unittest.TestCase):
         self.assertNotIn("denoise_step", model.__dict__)
         self.assertNotIn("forward", model.vlm_with_expert.__dict__)
 
+    def test_velocity_replay_separates_prefix_from_state_feedback(self):
+        torch = self.torch
+        model, inputs = self.fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            captures, _ = DIAGNOSTIC.run_source_policy(model, inputs, "default", 7, 0,
+                                                       directory, self.np, torch)
+        original = {name: DIAGNOSTIC.tensor_identity(value, torch) for name, value in captures.items()}
+        observed_states = []
+
+        def candidate(**kwargs):
+            observed_states.append(kwargs["x_t"].clone())
+            return model.denoise_step(**kwargs) + 0.125
+
+        _, shared = DIAGNOSTIC.compare_identical_state_velocities(
+            model.denoise_step, candidate, captures, torch, expected_steps=10)
+        self.assertTrue(shared["identical_prefix"])
+        self.assertEqual(shared["steps"], 10)
+        for index, value in enumerate(observed_states):
+            self.assertTrue(torch.equal(value, captures[f"step_{index:02d}_input_state"]))
+        alternate = (captures["prefix_pad_mask"], captures["prefix_key_cache"],
+                     captures["prefix_value_cache"] + 0.25)
+        _, conditioned = DIAGNOSTIC.compare_identical_state_velocities(
+            model.denoise_step, model.denoise_step, captures, torch,
+            expected_steps=10, candidate_prefix=alternate)
+        self.assertFalse(conditioned["identical_prefix"])
+        self.assertTrue(all(row["comparison"]["max_absolute_error"] > 0.2
+                            for row in conditioned["comparisons"]))
+        self.assertEqual(original, {name: DIAGNOSTIC.tensor_identity(value, torch)
+                                    for name, value in captures.items()})
+        self.assertFalse(shared["acceptance_contract_selected"])
+
+    def test_velocity_replay_refuses_incomplete_or_mutating_candidates(self):
+        torch = self.torch
+        model, inputs = self.fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            captures, _ = DIAGNOSTIC.run_source_policy(model, inputs, "default", 7, 0,
+                                                       directory, self.np, torch)
+        incomplete = dict(captures)
+        del incomplete["step_09_input_state"]
+        with self.assertRaisesRegex(ValueError, "complete contiguous"):
+            DIAGNOSTIC.compare_identical_state_velocities(
+                model.denoise_step, model.denoise_step, incomplete, torch, expected_steps=10)
+        rng_before = torch.random.get_rng_state().clone()
+
+        def mutation(**kwargs):
+            kwargs["past_key_values"][0]["key_states"].add_(1)
+            torch.rand(1)
+            return model.denoise_step(**kwargs)
+
+        with self.assertRaisesRegex(AssertionError, "mutated state/mask/cache"):
+            DIAGNOSTIC.compare_identical_state_velocities(
+                model.denoise_step, mutation, captures, torch, expected_steps=10)
+        self.assertTrue(torch.equal(rng_before, torch.random.get_rng_state()))
+        altered_mask = (torch.zeros_like(captures["prefix_pad_mask"]),
+                        captures["prefix_key_cache"], captures["prefix_value_cache"])
+        with self.assertRaisesRegex(ValueError, "routing mask"):
+            DIAGNOSTIC.compare_identical_state_velocities(
+                model.denoise_step, model.denoise_step, captures, torch,
+                expected_steps=10, candidate_prefix=altered_mask)
+
     def test_stride_zero_hash_and_signed_bf16_distances(self):
         torch = self.torch
         singleton = torch.tensor(0.5).expand(1)

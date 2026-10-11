@@ -10,6 +10,69 @@ import math
 from typing import Optional
 
 
+def bf16_linear_error_diagnostic(input, weight, bias, torch):
+    """A conditional worst-case CPU arithmetic diagnostic, never an active gate.
+
+    Covers BF16 operands, FP32 multiply/add/reduction, optional FP32 bias add,
+    and ONE final BF16 rounding. It does not infer that a native source kernel
+    follows this operational contract. FP64 evaluation is a labeled diagnostic
+    and its own roundoff is included; it is not an exact real-valued oracle.
+    """
+    operands = (input, weight) + (() if bias is None else (bias,))
+    if any(value.device.type != "cpu" or value.dtype != torch.bfloat16
+           or not torch.isfinite(value).all() for value in operands):
+        raise ValueError("Linear diagnostic requires finite original BF16 CPU operands")
+    if input.ndim < 1 or weight.ndim != 2 or input.shape[-1] != weight.shape[1] or \
+            bias is not None and bias.shape != (weight.shape[0],):
+        raise ValueError("Linear diagnostic shape mismatch")
+    width = weight.shape[1]
+    if width <= 0:
+        raise ValueError("Linear diagnostic requires a nonempty reduction")
+    operations = 2 * width + (1 if bias is not None else 0)
+
+    def gamma(dtype):
+        unit = torch.finfo(dtype).eps / 2
+        if operations * unit >= 1:
+            raise ValueError("Reduction length exceeds this floating-point error model")
+        return operations * unit / (1 - operations * unit)
+
+    with torch.no_grad():
+        left, right = input.double(), weight.double().T
+        ideal = left @ right
+        magnitude = left.abs() @ right.abs()
+        if bias is not None:
+            ideal = ideal + bias.double()
+            magnitude = magnitude + bias.double().abs()
+        g32, g64 = gamma(torch.float32), gamma(torch.float64)
+        # An upper bound on sum(abs(products))+abs(bias), accounting for FP64
+        # roundoff in the diagnostic's magnitude computation.
+        magnitude_upper = magnitude / (1 - g64)
+        if not torch.isfinite(magnitude_upper).all() or \
+                torch.any(magnitude_upper * (1 + g32) >= torch.finfo(torch.float32).max):
+            raise ValueError("Diagnostic cannot exclude FP32 intermediate overflow")
+        minimum_subnormal32 = torch.finfo(torch.float32).tiny * torch.finfo(torch.float32).eps
+        underflow = operations * minimum_subnormal32 / (2 * (1 - operations * torch.finfo(torch.float32).eps / 2))
+        arithmetic = (g32 + g64) * magnitude_upper + underflow
+        # Relative rounding plus a subnormal absolute term. This avoids an
+        # arbitrary near-zero floor or a fixed number of BF16 representable steps.
+        bf16 = torch.finfo(torch.bfloat16)
+        rounding = (bf16.eps / 2) * (ideal.abs() + arithmetic) + bf16.tiny * bf16.eps / 2
+        bound = arithmetic + rounding
+        rounded = ideal.bfloat16()
+        if not torch.isfinite(rounded).all():
+            raise ValueError("Diagnostic reference overflows BF16 at the declared output cast")
+    return {
+        "higher_precision_value": ideal, "bf16_rounded_diagnostic": rounded,
+        "absolute_error_bound_to_fp64_diagnostic": bound,
+        "fp32_arithmetic_error_bound": arithmetic, "sum_absolute_products_and_bias_upper": magnitude_upper,
+        "diagnostic_only": True, "acceptance_contract_selected": False,
+        "assumptions": "BF16 exact operands; FP32 products/reduction/bias; one BF16 output cast; IEEE rounding; no overflow; gradual underflow",
+        "roundoff_model": "gamma_(2K+bias) sum(abs(products))+abs(bias), plus FP64 diagnostic roundoff and subnormal terms",
+        "reduction_width": width, "operation_bound": operations,
+        "placement": "CPU; regular Gemmini INT8/INT32 is outside this diagnostic",
+    }
+
+
 def translations(torch):
     # Optional exporter dependencies are loaded only when this recipe is selected.
     from onnxscript import ir, opset18 as op

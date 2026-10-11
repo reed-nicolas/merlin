@@ -96,6 +96,76 @@ def cache_identity(cache, layers, torch):
     return {f"{index}:{name}": tensor_identity(cache[index][name], torch) for index in range(layers) for name in ("key_states", "value_states")}
 
 
+def compare_identical_state_velocities(reference_velocity, candidate_velocity, captures, torch,
+                                       *, expected_steps, candidate_prefix=None):
+    """Replay every source state; separate local arithmetic from prefix conditioning.
+
+    Callables receive the source denoise_step keyword ABI. Each invocation owns
+    fresh copies, including the original BF16 cache. This is a diagnostic, not a
+    replacement tolerance or a rollout of the candidate's own state trajectory.
+    """
+    indices = sorted(int(name.split("_")[1]) for name in captures
+                     if name.startswith("step_") and name.endswith("_input_state"))
+    if type(expected_steps) is not int or expected_steps <= 0 or indices != list(range(expected_steps)):
+        raise ValueError("Velocity replay requires a complete contiguous source trajectory")
+    prefix = (captures["prefix_pad_mask"], captures["prefix_key_cache"], captures["prefix_value_cache"])
+    alternate = prefix if candidate_prefix is None else candidate_prefix
+    if len(alternate) != 3 or any(left.shape != right.shape or left.dtype != right.dtype
+                                  for left, right in zip(prefix, alternate, strict=True)):
+        raise ValueError("Candidate prefix must preserve source mask/cache shapes and dtypes")
+    if not torch.equal(prefix[0], alternate[0]):
+        raise ValueError("Candidate prefix routing mask differs")
+    if any(not torch.isfinite(value).all() for value in (*prefix, *alternate)):
+        raise ValueError("Velocity replay prefix contains nonfinite values")
+    bindings = {name: tensor_identity(value, torch) for name, value in captures.items()}
+    alternate_bindings = [tensor_identity(value, torch) for value in alternate]
+    original_rng = torch.random.get_rng_state().clone()
+    outputs, rows = {}, []
+
+    def invoke(callback, selected, state, timestep):
+        mask, keys, values = (value.detach().clone() for value in selected)
+        cache = {index: {"key_states": keys[index].clone(), "value_states": values[index].clone()}
+                 for index in range(keys.shape[0])}
+        state, timestep = state.detach().clone(), timestep.detach().clone()
+        before = {"mask": tensor_identity(mask, torch), "state": tensor_identity(state, torch),
+                  "timestep": tensor_identity(timestep, torch), "cache": cache_identity(cache, keys.shape[0], torch)}
+        rng = torch.random.get_rng_state().clone()
+        with torch.no_grad():
+            result = callback(x_t=state, prefix_pad_masks=mask, past_key_values=cache, timestep=timestep)
+        after = {"mask": tensor_identity(mask, torch), "state": tensor_identity(state, torch),
+                 "timestep": tensor_identity(timestep, torch), "cache": cache_identity(cache, keys.shape[0], torch)}
+        if before != after or not torch.equal(rng, torch.random.get_rng_state()):
+            raise AssertionError("Velocity replay mutated state/mask/cache/timestep or consumed RNG")
+        if result.shape != state.shape or result.dtype != state.dtype or not torch.isfinite(result).all():
+            raise ValueError("Velocity replay output shape/dtype/finiteness differs")
+        return result.detach().clone(), before
+
+    try:
+        for index in indices:
+            stem = f"step_{index:02d}"
+            state, timestep = captures[stem + "_input_state"], captures[stem + "_timestep"]
+            reference, binding = invoke(reference_velocity, prefix, state, timestep)
+            if not torch.equal(reference, captures[stem + "_velocity"]):
+                raise AssertionError("Reference replay differs from the captured source velocity")
+            candidate, candidate_binding = invoke(candidate_velocity, alternate, state, timestep)
+            outputs[stem + "_reference_velocity"] = reference
+            outputs[stem + "_candidate_velocity"] = candidate
+            rows.append({"step": index, "reference_inputs": binding, "candidate_inputs": candidate_binding,
+                         "comparison": statistics(reference, candidate, torch)})
+        if bindings != {name: tensor_identity(value, torch) for name, value in captures.items()} or \
+                alternate_bindings != [tensor_identity(value, torch) for value in alternate]:
+            raise AssertionError("Velocity replay mutated supplied capture/prefix tensors")
+    finally:
+        torch.random.set_rng_state(original_rng)
+    return outputs, {
+        "diagnostic_only": True, "acceptance_contract_selected": False, "steps": len(indices),
+        "identical_states": True, "identical_timesteps": True,
+        "identical_prefix": all(torch.equal(left, right) for left, right in zip(prefix, alternate, strict=True)),
+        "reference_replay_exact": True, "inputs_cache_rng_unchanged": True, "comparisons": rows,
+        "interpretation": "Local velocity comparison at source states; independent rollout is reported separately.",
+    }
+
+
 def profiler_counts(profiler):
     operators = {event.key: event.count for event in profiler.key_averages() if "scaled_dot_product" in event.key}
     stages = dict.fromkeys(SCOPES, 0)
@@ -234,6 +304,10 @@ def parse_args(argv=None):
     parser.add_argument("--input-npz", type=Path)
     parser.add_argument("--fixture-kind", choices=("synthetic", "dataset"))
     parser.add_argument("--input-source")
+    parser.add_argument("--input-manifest", type=Path,
+                        help="Source-bound manifest from prepare_smolvla_observation.py")
+    parser.add_argument("--velocity-replay", action="store_true",
+                        help="Replay all source states with shared and alternate prefix caches; diagnostic only")
     args = parser.parse_args(argv)
     if len(set(args.seeds)) != len(args.seeds) or any(not 0 <= seed < 2**63 for seed in args.seeds):
         parser.error("Seeds must be distinct integers in [0, 2**63)")
@@ -246,7 +320,9 @@ def parse_args(argv=None):
         parser.error("Dataset fixtures require --input-npz and attributed --input-source")
     if args.input_npz is not None and len(args.seeds) != 1:
         parser.error("An explicit fixture has fixed noise; select one seed for its RNG audit")
-    for name in ("checkpoint_dir", "backbone_dir", "output_dir", "input_npz"):
+    if args.input_manifest is not None and (args.input_npz is None or args.fixture_kind != "dataset"):
+        parser.error("Recorded observation manifests require an explicit dataset NPZ")
+    for name in ("checkpoint_dir", "backbone_dir", "output_dir", "input_npz", "input_manifest"):
         if getattr(args, name) is not None:
             setattr(args, name, factory.safe_path(getattr(args, name)))
     from merlin.common.paths import artifacts_dir
@@ -259,6 +335,7 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    fixture_manifest = factory.observation_manifest(args.input_npz, args.input_manifest)
     config_json, checkpoint_artifacts = factory.checkpoint_artifacts(args.checkpoint_dir)
     backbone_artifacts = factory.directory_artifacts(args.backbone_dir)
     if not factory.safe_path(args.backbone_dir / "config.json").is_file() or not any(Path(item["path"]).suffix == ".safetensors" for item in backbone_artifacts):
@@ -282,6 +359,7 @@ def main(argv=None):
         "fixture_kind": args.fixture_kind, "synthetic_inputs": args.fixture_kind == "synthetic",
         "fixture_origin": "supplied_npz" if args.input_npz is not None else "generated_seeded",
         "input_source": args.input_source or "Seeded synthetic preprocessed tensors",
+        "observation_manifest": fixture_manifest, "observation_schema_verified": fixture_manifest is not None,
         "reference": "Unchanged LeRobot sample_actions, original dtype, normalized physical action chunk",
         "intervention": "Public sdpa_kernel(SDPBackend.MATH) context",
         "existing_pointwise_comparison": {"rtol": RTOL, "atol": ATOL, "reference": "default native source policy", "acceptance_contract_selected": False},
@@ -312,7 +390,10 @@ def main(argv=None):
         report["dependencies"] = {name: importlib.metadata.version(name) for name in ("torch", "transformers", "lerobot", "numpy", "onnx", "safetensors")}
         if args.input_npz is not None:
             report["fixture_binding"] = factory.file_identity(args.input_npz, factory.safe_path)
-        cameras = [name for name in config_json["input_features"] if name.startswith("observation.images.")]
+        if args.input_manifest is not None:
+            report["fixture_manifest_binding"] = factory.file_identity(args.input_manifest, factory.safe_path)
+        cameras = fixture_manifest["selected_cameras"] if fixture_manifest else [
+            name for name in config_json["input_features"] if name.startswith("observation.images.")]
         vision = model.vlm_with_expert.get_vlm_model().vision_model
         report["attention_attribution"] = {
             "camera_names": cameras, "vision_layers": len(vision.encoder.layers),
@@ -343,6 +424,26 @@ def main(argv=None):
                 "action_dimensions": [statistics(default["final_actions"][:, :, index], math["final_actions"][:, :, index], torch) for index in range(config.action_feature.shape[0])],
                 "action_timesteps": [statistics(default["final_actions"][:, index, :], math["final_actions"][:, index, :], torch) for index in range(config.chunk_size)],
             }
+            if args.velocity_replay:
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+
+                def math_velocity(**kwargs):
+                    with sdpa_kernel(SDPBackend.MATH):
+                        return model.denoise_step(**kwargs)
+
+                replays = {}
+                for name, candidate_prefix in (("shared_prefix", None), ("alternate_prefix", (
+                        math["prefix_pad_mask"], math["prefix_key_cache"], math["prefix_value_cache"]))):
+                    tensors, metadata = compare_identical_state_velocities(
+                        model.denoise_step, math_velocity, default, torch,
+                        expected_steps=config.num_steps, candidate_prefix=candidate_prefix)
+                    path = factory.safe_path(args.output_dir / f"seed{seed}-velocity-{name}.npz")
+                    if path.exists():
+                        raise FileExistsError("Refusing to overwrite velocity replay captures")
+                    np.savez_compressed(path, **{key: value.numpy() for key, value in tensors.items()})
+                    metadata["output_file"] = factory.file_identity(path, factory.safe_path)
+                    replays[name] = metadata
+                case["identical_state_velocity_replays"] = replays
             if case_index == 0:
                 repeats = {}
                 for backend, first in (("default", default), ("math", math)):
@@ -364,6 +465,8 @@ def main(argv=None):
         if state_identity(model, torch) != state_before or {name: module.training for name, module in model.named_modules()} != modes_before:
             raise AssertionError("Source model state or training modes changed")
         identities = report["source_bindings"] + report["checkpoint_bindings"] + ([report["fixture_binding"]] if "fixture_binding" in report else [])
+        if fixture_manifest:
+            identities += fixture_manifest["bindings"] + [report["fixture_manifest_binding"]]
         if any(factory.file_identity(item["path"], factory.safe_path) != item for item in identities):
             raise AssertionError("Source/checkpoint/fixture bindings changed")
         if backend_flags(torch) != original_flags:
