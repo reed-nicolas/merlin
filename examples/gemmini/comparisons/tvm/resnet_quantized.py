@@ -164,6 +164,47 @@ def saturate(value):
     return np.clip(value, -127, 127).astype(np.int8)
 
 
+def residual_add_factors(left_exponent, right_exponent, output_exponent, left_bound, right_bound):
+    """Prove exact alignment, addition and one rounding fit signed int64.
+
+    Bounds are absolute per-channel bounds, including contraction biases. Align
+    both arms and the destination at their finest exponent before one division;
+    never round or saturate an individual arm. Python integers establish the
+    bounds before any int64 multiplication. All shifts remain at most 30 bits.
+    """
+    values = [np.asarray(value) for value in (left_exponent, right_exponent, output_exponent, left_bound, right_bound)]
+    if any(value.dtype.kind != "i" for value in values):
+        raise ValueError("Residual exponents and bounds must be signed integers")
+    values = np.broadcast_arrays(*values)
+    left, right, output, lb, rb = values
+    if (np.any((left < -60) | (left > 60)) or np.any((right < -60) | (right > 60)) or np.any((output < -30) | (output > 30))
+            or np.any(lb < 0) or np.any(rb < 0) or np.any(lb > LIMIT) or np.any(rb > LIMIT)):
+        raise ValueError("Invalid residual scale or int32 operand bound")
+    common = np.minimum(np.minimum(left, right), output)
+    shifts = (left - common, right - common, output - common)
+    if any(np.any(shift > 30) for shift in shifts):
+        raise ValueError("Residual alignment or rounding shift exceeds 30 bits")
+    factors = [np.left_shift(np.int64(1), shift.astype(np.int64)) for shift in shifts]
+    rounded_bounds = []
+    for a, b, denominator, x, y in zip(*(value.flat for value in (*factors, lb, rb))):
+        bound = int(x) * int(a) + int(y) * int(b) + int(denominator) // 2
+        if bound > np.iinfo(np.int64).max:
+            raise ValueError("Residual aligned sum and rounding offset overflow int64")
+        rounded_bounds.append(bound)
+    return (*factors, np.asarray(rounded_bounds, dtype=np.int64).reshape(left.shape))
+
+
+def residual_add(left, right, left_exponent, right_exponent, output_exponent, left_bound, right_bound):
+    """Independent joint residual rounding with admitted integer arm bounds."""
+    a, b, denominator, _ = residual_add_factors(left_exponent, right_exponent, output_exponent, left_bound, right_bound)
+    left, right = np.asarray(left), np.asarray(right)
+    if (left.dtype not in (np.dtype("int8"), np.dtype("int32")) or right.dtype not in (np.dtype("int8"), np.dtype("int32"))
+            or left.shape != right.shape or np.any(np.abs(left.astype(np.int64)) > left_bound)
+            or np.any(np.abs(right.astype(np.int64)) > right_bound)):
+        raise ValueError("Residual operands exceed their admitted integer bounds")
+    return saturate(round_divide(left.astype(np.int64) * a + right.astype(np.int64) * b, denominator))
+
+
 def averagepool_scale_factors(area, input_exponent, output_exponent):
     """Prove a single rounded division of the scaled spatial sum fits int64."""
     if type(area) is not int or area < 1 or any(type(exponent) is not int or not -30 <= exponent <= 30 for exponent in (input_exponent, output_exponent)):
@@ -198,6 +239,65 @@ class Site:
     weight: np.ndarray | None = None
     weight_exponents: np.ndarray | None = None
     bias: np.ndarray | None = None
+    retain_accumulator: bool = False
+
+
+def residual_accumulator_targets(sites):
+    """Select Conv -> Identity* -> Add -> Identity* -> ReLU by sole users."""
+    users = {site.name: [] for site in sites}
+    for site in sites:
+        for name in site.inputs:
+            if name in users:
+                users[name].append(site)
+
+    def terminal(name, kind):
+        identities = []
+        while len(users[name]) == 1:
+            user = users[name][0]
+            if user.kind == kind:
+                return user, identities
+            if user.kind != "identity" or user.inputs != (name,):
+                break
+            identities.append(user.name)
+            name = user.name
+        return None, []
+
+    targets = {}
+    for site in sites:
+        if site.kind != "conv2d":
+            continue
+        add, identities = terminal(site.name, "add")
+        if add is not None and len(add.inputs) == 2:
+            relu, after_add = terminal(add.name, "relu")
+            if relu is not None:
+                targets[site.name] = {"add": add.name, "identities": identities, "relu": relu.name, "add_identities": after_add}
+    return targets
+
+
+def residual_storage(plan):
+    """Derive actual carrier scales/bounds; declared Conv scales stay frozen."""
+    storage = {plan.provenance["input_name"]: (plan.input_exponent, 127)}
+    for site in plan.sites:
+        if site.kind == "conv2d" and site.retain_accumulator:
+            exponent = storage[site.inputs[0]][0] + site.weight_exponents
+            bound = 127 * np.abs(site.weight.astype(np.int64)).reshape(site.weight.shape[0], -1).sum(axis=1) + np.abs(site.bias.astype(np.int64))
+            storage[site.name] = (exponent, bound)
+        elif site.kind == "identity":
+            storage[site.name] = storage[site.inputs[0]]
+        else:
+            storage[site.name] = (site.exponent, 127)
+    return storage
+
+
+def residual_parameters(site, storage):
+    """Broadcast scalar or per-channel arm metadata over NCHW."""
+    if len(site.shape) != 4:
+        raise ValueError("Accumulator residual policy requires NCHW residuals")
+    def channel(value):
+        value = np.asarray(value, dtype=np.int64)
+        return value.reshape(1, -1, 1, 1) if value.ndim == 1 else value
+    (left, lb), (right, rb) = (storage[name] for name in site.inputs)
+    return channel(left), channel(right), site.exponent, channel(lb), channel(rb)
 
 
 @dataclass
@@ -323,6 +423,26 @@ class QuantizedResNet:
             scales[site.name], shapes[site.name] = site.exponent, output_shape
         if counts != {"conv2d": 53, "linear": 1, "add": 16} or self.sites[-1].kind != "linear":
             raise ValueError("Incomplete ResNet50 graph")
+        policy = self.provenance.get("residual_policy", "legacy")
+        if policy not in ("legacy", "accumulator"):
+            raise ValueError("Invalid residual policy")
+        targets = residual_accumulator_targets(self.sites)
+        retained = set()
+        for site in self.sites:
+            if type(site.retain_accumulator) is not bool:
+                raise ValueError("Invalid accumulator retention flag")
+            if site.retain_accumulator:
+                if policy != "accumulator" or site.kind != "conv2d" or site.name not in targets:
+                    raise ValueError("Accumulator retention requires a unique Identity chain to Add/ReLU")
+                retained.add(site.name)
+                retained.update(targets[site.name]["identities"])
+            if any(name in retained for name in site.inputs) and site.kind not in ("identity", "add"):
+                raise ValueError("Only Identity or residual Add may consume a retained accumulator")
+        if policy == "accumulator":
+            storage = residual_storage(self)
+            for site in self.sites:
+                if site.kind == "add":
+                    residual_add_factors(*residual_parameters(site, storage))
 
     def manifest(self):
         self.validate()
@@ -330,6 +450,8 @@ class QuantizedResNet:
         for site in self.sites:
             row = {"name": site.name, "kind": site.kind, "inputs": list(site.inputs),
                    "shape": list(site.shape), "activation_exponent": site.exponent, "attributes": site.attrs}
+            if site.retain_accumulator:
+                row["retain_accumulator"] = True
             if site.weight is not None:
                 bound = 127 * np.abs(site.weight.astype(np.int64)).reshape(site.weight.shape[0], -1).sum(axis=1)
                 row.update(weight_sha256=array_digest(site.weight), bias_sha256=array_digest(site.bias),
@@ -344,7 +466,20 @@ class QuantizedResNet:
             sites.append(row)
             scales[site.name], shapes[site.name] = site.exponent, site.shape
         estimator = self.provenance.get("activation_estimator", "maxabs")
-        return {"recipe": "resnet50-v1.5-symmetric-pow2-development-v4" if estimator == "maxabs" else "resnet50-v1.5-symmetric-pow2-train-mse-v5", "paper_quality_approved": False,
+        policy = self.provenance.get("residual_policy", "legacy")
+        storage = residual_storage(self) if policy == "accumulator" else {}
+        residual_proofs = []
+        for site in self.sites:
+            if site.kind == "add" and policy == "accumulator":
+                (left, lb), (right, rb) = (storage[name] for name in site.inputs)
+                a, b, denominator, bound = residual_add_factors(left, right, site.exponent, lb, rb)
+                residual_proofs.append({"site": site.name, "left_exponent": np.asarray(left).tolist(), "right_exponent": np.asarray(right).tolist(),
+                    "left_bound": np.asarray(lb).tolist(), "right_bound": np.asarray(rb).tolist(), "left_factor": a.tolist(), "right_factor": b.tolist(),
+                    "denominator": denominator.tolist(), "rounded_numerator_bound": bound.tolist()})
+        recipe = "resnet50-v1.5-symmetric-pow2-development-v4" if estimator == "maxabs" else "resnet50-v1.5-symmetric-pow2-train-mse-v5"
+        if policy == "accumulator":
+            recipe = "resnet50-v1.5-symmetric-pow2-" + estimator + "-residual-accumulator-v6"
+        result = {"recipe": recipe, "paper_quality_approved": False,
                 "application_quality": "requires_separate_labeled_evaluation_and_approved_thresholds",
                 "input_shape": list(self.input_shape), "input_exponent": self.input_exponent,
                 "calibration_tensor_sha256": list(self.calibration_hashes), "provenance": self.provenance,
@@ -354,10 +489,13 @@ class QuantizedResNet:
                     "accumulator": "int32 with worst-case partial-sum and bias bound", "rounding": "nearest ties away from zero",
                     "bias": "round folded FP32 bias / (input_scale * channel_weight_scale), int32",
                     "requantization": "bounded int64 scale then signed rounded division and saturation",
-                    "residual": "rescale each arm to calibrated add scale, int64 add, saturate, then ReLU",
+                    "residual": "rescale each arm to calibrated add scale, int64 add, saturate, then ReLU" if policy == "legacy" else "sole-user Conv/Identity residual arms retain biased int32 accumulators; align both arms in bounded int64, add, round once to TRAIN Add scale, saturate then ReLU; no per-arm rounding or saturation",
                     "maxpool": "integer maximum with negative-infinity padding", "averagepool": "int64 spatial sum, multiply/divide to TRAIN-calibrated output scale, round once and saturate; shift and intermediate overflow bounds checked",
                     "classifier": "int8/int32 contraction plus int32 bias, per-channel FP32 dequantized logits"},
                 "sites": sites}
+        if policy == "accumulator":
+            result["residual_integer_proofs"] = residual_proofs
+        return result
 
 
 def post_relu_calibration_targets(graph):
@@ -391,7 +529,7 @@ def post_relu_calibration_targets(graph):
     return targets
 
 
-def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shape=(1, 3, 224, 224), checkpoint_declaration="unverified", activation_estimator="maxabs"):
+def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shape=(1, 3, 224, 224), checkpoint_declaration="unverified", activation_estimator="maxabs", residual_policy="legacy"):
     """Fold an unchanged CPU evaluation ResNet and freeze scales on this stream.
 
     Arrays are already preprocessed FP32 NCHW. This API performs no download or
@@ -404,6 +542,8 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
 
     if activation_estimator not in ("maxabs", "mse"):
         raise ValueError("Expected maxabs or mse TRAIN activation estimator")
+    if residual_policy not in ("legacy", "accumulator"):
+        raise ValueError("Expected legacy or accumulator residual policy")
     if type(model) is not torchvision.models.resnet.ResNet or [len(getattr(model, f"layer{i}")) for i in range(1, 5)] != [3, 4, 6, 3]:
         raise ValueError("Expected torchvision ResNet50 v1.5 with [3,4,6,3] bottlenecks")
     if any(type(block) is not torchvision.models.resnet.Bottleneck for i in range(1, 5) for block in getattr(model, f"layer{i}")) or model.fc.out_features != 1000:
@@ -567,6 +707,9 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
         raise ValueError("Incomplete ResNet50 graph inventory")
     if state_digest(model) != source_digest:
         raise AssertionError("Quantization mutated the source model")
+    residual_targets = residual_accumulator_targets(sites) if residual_policy == "accumulator" else {}
+    for site in sites:
+        site.retain_accumulator = site.name in residual_targets
     plan = QuantizedResNet(sites, input_shape, scales[input_name], tuple(hashes),
                           {"source_state_dict_sha256": source_digest, "folded_state_dict_sha256": fold_report["derived_state_dict_sha256"],
                            "checkpoint_declaration": checkpoint_declaration, "calibration_ids": ids, "input_name": input_name,
@@ -580,6 +723,9 @@ def calibrate_resnet50(model, calibration_images, *, calibration_ids, input_shap
                                                        "selected_exponent": scales[name]}
                                                       for name, projection in projections.items()],
                            "batchnorm_folding_checks": folding_checks, "batchnorm_folding_tolerance": {"rtol": 1e-4, "atol": 1e-4}})
+    if residual_policy == "accumulator":
+        plan.provenance.update(residual_policy=residual_policy,
+                               residual_accumulator_chains=[{"site": name, **chain} for name, chain in residual_targets.items()])
     plan.validate()
     return plan
 
@@ -615,6 +761,7 @@ def reference(plan, image, *, allow_calibration=False, return_intermediates=Fals
     integer_logits = None
     values = {plan.provenance["input_name"]: quantize(image, plan.input_exponent)}
     scales = {plan.provenance["input_name"]: plan.input_exponent}
+    storage = residual_storage(plan) if plan.provenance.get("residual_policy") == "accumulator" else None
     uses = {name: sum(name in site.inputs for site in plan.sites) for name in [*values, *(site.name for site in plan.sites)]}
     for site in plan.sites:
         args = [values[name] for name in site.inputs]
@@ -625,9 +772,12 @@ def reference(plan, image, *, allow_calibration=False, return_intermediates=Fals
             if site.kind == "linear":
                 integer_logits = acc
             exponent = scales[site.inputs[0]] + site.weight_exponents
-            result = saturate(rescale(acc, (exponent - site.exponent).reshape(channel_shape))) if site.kind == "conv2d" else acc.astype(np.float32) * np.exp2(exponent).astype(np.float32).reshape(channel_shape)
+            if site.kind == "conv2d":
+                result = acc if site.retain_accumulator else saturate(rescale(acc, (exponent - site.exponent).reshape(channel_shape)))
+            else:
+                result = acc.astype(np.float32) * np.exp2(exponent).astype(np.float32).reshape(channel_shape)
         elif site.kind == "add":
-            result = saturate(sum(rescale(arg, scales[name] - site.exponent) for arg, name in zip(args, site.inputs)))
+            result = residual_add(*args, *residual_parameters(site, storage)) if storage is not None else saturate(sum(rescale(arg, scales[name] - site.exponent) for arg, name in zip(args, site.inputs)))
         elif site.kind == "relu":
             result = np.maximum(args[0], 0).astype(np.int8)
         elif site.kind == "identity":
@@ -668,6 +818,7 @@ def export_relax(plan, *, return_integer_logits=False):
     image = relax.Var("image", relax.TensorStructInfo(plan.input_shape, "int8"))
     values = {plan.provenance["input_name"]: image}
     scales = {plan.provenance["input_name"]: plan.input_exponent}
+    storage = residual_storage(plan) if plan.provenance.get("residual_policy") == "accumulator" else None
     def emit(expr):
         return bb.emit(expr)
     def c(value, dtype="int64"):
@@ -698,9 +849,17 @@ def export_relax(plan, *, return_integer_logits=False):
                     if site.kind == "linear":
                         integer_logits = product
                     exponents = scales[site.inputs[0]] + site.weight_exponents
-                    result = clipped(scaled(product, (exponents - site.exponent).reshape(shape))) if site.kind == "conv2d" else emit(relax.op.multiply(emit(relax.op.astype(product, "float32")), c(np.exp2(exponents).astype(np.float32).reshape(shape), "float32")))
+                    if site.kind == "conv2d":
+                        result = product if site.retain_accumulator else clipped(scaled(product, (exponents - site.exponent).reshape(shape)))
+                    else:
+                        result = emit(relax.op.multiply(emit(relax.op.astype(product, "float32")), c(np.exp2(exponents).astype(np.float32).reshape(shape), "float32")))
                 elif site.kind == "add":
-                    result = clipped(emit(relax.op.add(*(scaled(arg, scales[name] - site.exponent) for arg, name in zip(args, site.inputs)))))
+                    if storage is None:
+                        result = clipped(emit(relax.op.add(*(scaled(arg, scales[name] - site.exponent) for arg, name in zip(args, site.inputs)))))
+                    else:
+                        a, b, denominator, _ = residual_add_factors(*residual_parameters(site, storage))
+                        arms = [emit(relax.op.multiply(emit(relax.op.astype(arg, "int64")), c(factor))) for arg, factor in zip(args, (a, b))]
+                        result = clipped(rounded(emit(relax.op.add(*arms)), denominator))
                 elif site.kind == "relu":
                     result = emit(relax.op.maximum(args[0], c(0, "int8")))
                 elif site.kind == "identity":

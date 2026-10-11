@@ -17,6 +17,60 @@ spec.loader.exec_module(recipe)
 
 
 class IntegerPolicies(unittest.TestCase):
+    def test_top1_gate_exact_two_in_one_hundred_boundary(self):
+        import verify_resnet
+        accuracy = {"samples": 100, "torch": {"top1": {"correct": 89}}, "relax": {"top1": {"correct": 87}}}
+        self.assertGreater(89 / 100 - 87 / 100, 0.02)
+        self.assertEqual(verify_resnet.top1_rate_drop(accuracy), 0.02)
+        self.assertLessEqual(verify_resnet.top1_rate_drop(accuracy), 0.02)
+        accuracy["relax"]["top1"]["correct"] = 86
+        self.assertGreater(verify_resnet.top1_rate_drop(accuracy), 0.02)
+        accuracy["relax"]["top1"]["correct"] = 90
+        self.assertEqual(verify_resnet.top1_rate_drop(accuracy), -0.01)
+
+    def test_joint_residual_cancellation_signed_ties_and_independent_fraction_oracle(self):
+        from fractions import Fraction
+        left = np.array([500, -500, 1, -1, recipe.LIMIT, -recipe.LIMIT], dtype=np.int32)
+        right = np.array([-497, 497, 1, -1, -recipe.LIMIT, recipe.LIMIT], dtype=np.int32)
+        np.testing.assert_array_equal(recipe.residual_add(left, right, 0, 0, 0, recipe.LIMIT, recipe.LIMIT), [3, -3, 2, -2, 0, 0])
+        self.assertEqual(int(recipe.saturate(left)[0]) + int(recipe.saturate(right)[0]), 0)
+        for le, re, oe in ((-1, -1, 0), (-3, -1, 0), (30, 30, 0), (0, 0, 30)):
+            with self.subTest(exponents=(le, re, oe)):
+                expected = []
+                for l, r in zip(left, right):
+                    value = Fraction(int(l)) * Fraction(2) ** (le - oe) + Fraction(int(r)) * Fraction(2) ** (re - oe)
+                    magnitude = abs(value)
+                    rounded = (2 * magnitude.numerator + magnitude.denominator) // (2 * magnitude.denominator)
+                    expected.append(max(-127, min(127, -rounded if value < 0 else rounded)))
+                np.testing.assert_array_equal(recipe.residual_add(left, right, le, re, oe, recipe.LIMIT, recipe.LIMIT), expected)
+        a, b, den, bound = recipe.residual_add_factors(30, 30, 0, recipe.LIMIT, recipe.LIMIT)
+        self.assertEqual(int(bound), 2 * recipe.LIMIT * 2**30)
+        self.assertLess(int(bound), np.iinfo(np.int64).max)
+
+    def test_joint_residual_rejects_unsafe_scales_bounds_and_operands(self):
+        for args in ((31, 0, 0, 127, 127), (-31, 0, 0, 127, 127), (0, 0, 31, 127, 127),
+                     (0, 0, 0, recipe.LIMIT + 1, 127), (0, 0, 0, -1, 127),
+                     (np.iinfo(np.int64).min, 0, 0, 127, 127), (0.5, 0, 0, 127, 127)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                recipe.residual_add_factors(*args)
+        for left in (np.array([-128], dtype=np.int8), np.array([np.iinfo(np.int32).min], dtype=np.int32), np.array([1], dtype=np.int64)):
+            with self.assertRaises(ValueError):
+                recipe.residual_add(left, np.array([0], dtype=np.int8), 0, 0, 0, 127, 127)
+
+    def test_accumulator_chain_proof_refuses_fanout_and_preadd_relu(self):
+        import copy
+        shape = (1, 4, 2, 2)
+        sites = [recipe.Site('conv', 'conv2d', ('image',), shape, 0, {}),
+                 recipe.Site('bn', 'identity', ('conv',), shape, 0, {}),
+                 recipe.Site('sum', 'add', ('bn', 'skip'), shape, 0, {}),
+                 recipe.Site('relu', 'relu', ('sum',), shape, 0, {})]
+        self.assertEqual(recipe.residual_accumulator_targets(sites), {'conv': {'add': 'sum', 'identities': ['bn'], 'relu': 'relu', 'add_identities': []}})
+        self.assertEqual(recipe.residual_accumulator_targets(sites + [recipe.Site('side', 'identity', ('conv',), shape, 0, {})]), {})
+        self.assertEqual(recipe.residual_accumulator_targets(sites + [recipe.Site('side', 'identity', ('sum',), shape, 0, {})]), {})
+        altered = copy.deepcopy(sites)
+        altered[1].kind = 'relu'
+        self.assertEqual(recipe.residual_accumulator_targets(altered), {})
+
     def test_activation_mse_accounts_for_signed_clipping_and_ties(self):
         values = np.array([-100.0, -1.5, -0.5, 0.5, 1.5, 100.0], dtype=np.float32)
         count, errors = recipe.activation_scale_errors(values, (0, -1))
@@ -332,6 +386,33 @@ class FullResNetDiagnostic(unittest.TestCase):
                                         input_shape=self.calibration.shape, activation_estimator="mse")
         self.assertIsNone(plan.sites[-1].exponent)
         plan.validate()
+
+    def test_accumulator_residual_full_reference_and_both_llvm_modes(self):
+        import copy
+        import tvm
+        from verify_resnet import prepare_graph
+        source = recipe.state_digest(self.model)
+        plan = recipe.calibrate_resnet50(self.model, [self.calibration], calibration_ids=["synthetic-accumulator-training"],
+                                        input_shape=self.calibration.shape, activation_estimator="mse", residual_policy="accumulator")
+        self.assertEqual(source, recipe.state_digest(self.model))
+        self.assertEqual(sum(site.retain_accumulator for site in plan.sites), 20)
+        manifest = plan.manifest()
+        self.assertEqual(len(manifest['residual_integer_proofs']), 16)
+        mod = recipe.export_relax(plan, return_integer_logits=True)
+        expected = recipe.reference(plan, self.evaluation, return_integer_logits=True)
+        for mode in ("baseline", "optimized"):
+            with self.subTest(mode=mode):
+                _, lowered = prepare_graph(mod, mode, tvm)
+                vm = tvm.relax.VirtualMachine(tvm.relax.build(lowered, target="llvm", pipeline=None), tvm.cpu())
+                actual = vm["main"](tvm.nd.array(recipe.quantize(self.evaluation, plan.input_exponent)))
+                for value, oracle in zip(actual, expected):
+                    np.testing.assert_array_equal(value.numpy(), oracle)
+                _, _, coverage = recipe.prepare_device_graph(plan, optimize=mode == "optimized")
+                self.assertEqual(coverage['device_invocations'], 54)
+        invalid = copy.deepcopy(plan)
+        next(site for site in invalid.sites if site.kind == 'conv2d').retain_accumulator = True
+        with self.assertRaisesRegex(ValueError, "unique Identity chain"):
+            invalid.validate()
 
     def test_zero_positive_range_preserves_source_and_rebuilds_biases(self):
         import copy

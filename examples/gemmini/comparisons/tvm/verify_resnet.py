@@ -151,6 +151,11 @@ def accuracy_counts(classifications):
     return result
 
 
+def top1_rate_drop(accuracy):
+    """Compute a paired loss from counts without subtracting rounded rates."""
+    return (accuracy["torch"]["top1"]["correct"] - accuracy["relax"]["top1"]["correct"]) / accuracy["samples"]
+
+
 def load_model(loader, args, torch, np):
     supplied, artifacts = None, {}
     if args.inputs is not None:
@@ -330,7 +335,7 @@ def verify_integer_resnet(args, model, expected_outputs, labels, report, output,
     ids = [f"{identity['sha256']}:{index}" for index in range(len(calibration))]
     plan = recipe.calibrate_resnet50(model.model, calibration, calibration_ids=ids,
         checkpoint_declaration="local supplied state_dict" if args.checkpoint else "random diagnostic; not pretrained",
-        activation_estimator=args.activation_estimator)
+        activation_estimator=args.activation_estimator, residual_policy=args.residual_policy)
     report["quantization"] = plan.manifest()
     if args.frozen_quantization:
         frozen_identity = file_identity(args.frozen_quantization, safe_path)
@@ -394,7 +399,7 @@ def verify_integer_resnet(args, model, expected_outputs, labels, report, output,
             row["descriptive_accuracy"] = accuracy_counts([image["graph_mode_comparisons"][mode]["classification"] for image in report["images"]])
             rates = row["descriptive_accuracy"]
             row["development_accuracy_gate"] = {"maximum_top1_rate_drop": args.max_top1_drop,
-                "observed_top1_rate_drop": rates["torch"]["top1"]["rate"] - rates["relax"]["top1"]["rate"],
+                "observed_top1_rate_drop": top1_rate_drop(rates),
                 "paper_approved": False, "dataset_truth_verified": False}
             row["development_accuracy_gate"]["passed"] = row["development_accuracy_gate"]["observed_top1_rate_drop"] <= args.max_top1_drop
             if not row["development_accuracy_gate"]["passed"]:
@@ -448,6 +453,7 @@ def main():
     parser.add_argument("--calibration-inputs", type=Path, help="Distinct FP32 NPZ stream required by --quantized")
     parser.add_argument("--calibration-source", help="Declared origin of the distinct calibration stream")
     parser.add_argument("--activation-estimator", choices=("maxabs", "mse"), default="maxabs", help="TRAIN-only activation scale estimator; mse admits deterministic bounded clipping candidates")
+    parser.add_argument("--residual-policy", choices=("legacy", "accumulator"), default="legacy", help="Opt-in proved unique-consumer residual accumulators and joint one-round addition")
     parser.add_argument("--frozen-quantization", type=Path, help="Previously frozen plan.manifest() JSON; recomputed TRAIN plan must match before integer evaluation")
     parser.add_argument("--evaluation-role", choices=("development", "held-out"), default="development", help="Explicit evaluation use; held-out requires --frozen-quantization")
     parser.add_argument("--max-top1-drop", type=float, default=0.02, help="Development top-1 rate-loss gate versus unchanged FP32 on supplied labels (default 0.02)")
@@ -465,6 +471,8 @@ def main():
         parser.error("Held-out evaluation requires a previously frozen quantization manifest")
     if args.frozen_quantization and not args.quantized:
         parser.error("Frozen quantization requires --quantized")
+    if args.residual_policy != "legacy" and not args.quantized:
+        parser.error("Accumulator residual policy requires --quantized")
     if args.device_sample_indices is not None and not args.export_baremetal:
         parser.error("Device sample selection requires --export-baremetal")
     supplied = (args.checkpoint, args.inputs, args.input_source, args.preprocessing)
