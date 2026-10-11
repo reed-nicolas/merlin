@@ -65,7 +65,7 @@ class SmolVLABackendCaptureTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.torch.set_num_threads(cls.original_threads)
 
-    def fixture(self, *, mutate_cache=False):
+    def fixture(self, *, mutate_cache=False, integer_linears=False):
         torch = self.torch
 
         class Backbone(torch.nn.Module):
@@ -80,16 +80,22 @@ class SmolVLABackendCaptureTests(unittest.TestCase):
                 self.config = SimpleNamespace(num_steps=10, num_vlm_layers=2, chunk_size=50, action_feature=SimpleNamespace(shape=[2]))
                 self.vlm_with_expert = Backbone()
                 self.register_buffer("constant", torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4) / 16)
+                if integer_linears:
+                    self.prefix_projection = torch.nn.Linear(4, 4, dtype=torch.bfloat16)
+                    self.flow_projection = torch.nn.Linear(4, 4, dtype=torch.float32)
 
             def embed_prefix(self, images, masks, tokens, language_mask, state):
                 outputs = [torch.nn.functional.scaled_dot_product_attention(self.constant + image.mean(), self.constant, self.constant) for image in images]
                 embedding = sum(outputs).reshape(1, 4, 4).bfloat16()
+                if integer_linears:
+                    embedding = self.prefix_projection(embedding)
                 return embedding, torch.ones(1, 4, dtype=torch.bool), torch.zeros(1, 4, dtype=torch.bool)
 
             def denoise_step(self, *, x_t, prefix_pad_masks, past_key_values, timestep):
                 if mutate_cache:
                     past_key_values[0]["key_states"].add_(1)
-                return x_t * 0.2 + timestep[:, None, None] + past_key_values[0]["value_states"].float().mean()
+                flow = self.flow_projection(x_t) if integer_linears else x_t
+                return flow * 0.2 + timestep[:, None, None] + past_key_values[0]["value_states"].float().mean()
 
             def sample_actions(self, images, masks, tokens, language_mask, state, noise):
                 embedding, padding, _ = self.embed_prefix(images, masks, tokens, language_mask, state)
@@ -205,6 +211,40 @@ class SmolVLABackendCaptureTests(unittest.TestCase):
             DIAGNOSTIC.compare_identical_state_velocities(
                 model.denoise_step, model.denoise_step, captures, torch,
                 expected_steps=10, candidate_prefix=altered_mask)
+
+    def test_complete_integer_policy_keeps_source_and_tracks_stage_placement(self):
+        import copy
+        torch = self.torch
+        source, inputs = self.fixture(integer_linears=True)
+        before = DIAGNOSTIC.state_identity(source, torch)
+        candidate = copy.deepcopy(source)
+        records, projections, recipe = DIAGNOSTIC.factory.install_integer_projections(candidate, torch)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch("merlin.common.paths.artifacts_dir", return_value=root):
+                result, receipt = DIAGNOSTIC.factory.run_integer_policy_diagnostic(
+                    source, candidate, inputs, records, projections, root / "integer",
+                    seed=7, fixture_kind="synthetic", recipe=recipe, torch=torch)
+            self.assertEqual(result["denoising_steps"], 10)
+            self.assertEqual(result["executed_projection_count"], 2)
+            by_name = {record["name"]: record for record in result["projection_inventory"]}
+            self.assertEqual(by_name["prefix_projection"]["calls_by_stage"], {"prefix_encode": 1})
+            self.assertEqual(by_name["flow_projection"]["calls_by_stage"], {"flow_denoise": 10})
+            self.assertTrue(all(record["integer_operator_reference"]["passed"]
+                                for record in result["projection_inventory"]))
+            self.assertTrue(result["source_mask_routing_exact"])
+            for replay in result["identical_state_velocity_replay"].values():
+                self.assertEqual(replay["steps"], 10)
+                self.assertTrue(replay["reference_replay_exact"])
+                self.assertTrue(replay["inputs_cache_rng_unchanged"])
+            self.assertFalse(result["model_quality_qualified"])
+            self.assertFalse(result["active_gate_changed"])
+            self.assertFalse(result["device_execution"])
+            self.assertTrue(Path(receipt["path"]).is_file())
+            memory = result["memory"]
+            self.assertEqual(memory["host_two_model_diagnostic_constants_bytes"],
+                             memory["source_constants_bytes"] + memory["target_constants_bytes"])
+        self.assertEqual(before, DIAGNOSTIC.state_identity(source, torch))
 
     def test_stride_zero_hash_and_signed_bf16_distances(self):
         torch = self.torch

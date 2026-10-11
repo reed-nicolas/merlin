@@ -181,7 +181,8 @@ def profiler_counts(profiler):
     return {"operators": operators, "native_sdpa_calls_by_stage": stages}
 
 
-def run_source_policy(model, inputs, backend, seed, repeat, output_dir, np, torch, *, profile=False):
+def run_source_policy(model, inputs, backend, seed, repeat, output_dir, np, torch, *, profile=False,
+                      stage_observer=None):
     """Observe the unchanged source call; restore temporary hooks and RNG on failure."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -199,8 +200,11 @@ def run_source_policy(model, inputs, backend, seed, repeat, output_dir, np, torc
     initial_cache = None
     step = 0
 
+    def observed(name):
+        return stage_observer(name) if stage_observer is not None else nullcontext()
+
     def embed(*args, **kwargs):
-        with torch.profiler.record_function(SCOPES[0]):
+        with torch.profiler.record_function(SCOPES[0]), observed("prefix_encode"):
             value = embed_prefix(*args, **kwargs)
         for name, tensor in zip(("prefix_embeddings", "prefix_pad_mask", "prefix_attention_mask"), value, strict=True):
             captures[name] = tensor.detach().clone()
@@ -208,7 +212,8 @@ def run_source_policy(model, inputs, backend, seed, repeat, output_dir, np, torc
 
     def encode(*args, **kwargs):
         nonlocal initial_cache
-        with torch.profiler.record_function(SCOPES[1]) if kwargs.get("fill_kv_cache") else nullcontext():
+        with torch.profiler.record_function(SCOPES[1]) if kwargs.get("fill_kv_cache") else nullcontext(), \
+                observed("prefix_encode") if kwargs.get("fill_kv_cache") else nullcontext():
             value = forward(*args, **kwargs)
         if kwargs.get("fill_kv_cache"):
             cache = value[1]
@@ -224,7 +229,7 @@ def run_source_policy(model, inputs, backend, seed, repeat, output_dir, np, torc
             raise AssertionError("Source prefix cache changed between denoising calls")
         captures[f"step_{step:02d}_input_state"] = kwargs["x_t"].detach().clone()
         captures[f"step_{step:02d}_timestep"] = kwargs["timestep"].detach().clone()
-        with torch.profiler.record_function(SCOPES[2]):
+        with torch.profiler.record_function(SCOPES[2]), observed("flow_denoise"):
             value = denoise_step(*args, **kwargs)
         after = cache_identity(kwargs["past_key_values"], model.config.num_vlm_layers, torch)
         if before != after:

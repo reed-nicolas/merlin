@@ -121,6 +121,8 @@ def main(argv=None):
     parser.add_argument("--frame-index", type=int, required=True, help="Global recorded frame index")
     parser.add_argument("--split", choices=("train", "development", "heldout"), required=True)
     parser.add_argument("--noise-seed", type=int, required=True)
+    parser.add_argument("--video-backend", choices=("pyav", "torchcodec"), default="pyav",
+                        help="Explicit supported LeRobot decoder; recorded in the manifest")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     for name in ("dataset_root", "checkpoint_dir", "backbone_dir", "output_dir"):
@@ -145,7 +147,7 @@ def main(argv=None):
 
     with offline():
         dataset = LeRobotDataset(DATASET_ID, root=args.dataset_root, revision=DATASET_REVISION,
-                                 image_transforms=None, delta_timestamps=None)
+                                 image_transforms=None, delta_timestamps=None, video_backend=args.video_backend)
         observation = dataset[args.frame_index]
         episode = int(observation["episode_index"].item())
         if episode_split(episode) != args.split:
@@ -180,6 +182,9 @@ def main(argv=None):
         "dataset_revision": DATASET_REVISION, "dataset_source": DATASET_SOURCE,
         "pinned_parquet_verified": True, "pin_source": PIN_SOURCE,
         "video_upstream_hashes_verified": False, "source_closure_verified": False,
+        "video_decoder": {"backend": args.video_backend,
+                          "dependencies": {name: importlib.metadata.version(name) for name in
+                                           ("av" if args.video_backend == "pyav" else "torchcodec", "torchvision", "torch", "lerobot")}},
         "schema_verified": True, "selected_cameras": list(CAMERA_MAP.values()),
         "camera_mapping": CAMERA_MAP, "training_camera_mapping_verified": False,
         "state_names": STATE_NAMES, "split": args.split,

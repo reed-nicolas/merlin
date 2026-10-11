@@ -261,6 +261,31 @@ class SmolVLAObservationTests(unittest.TestCase):
 
 
 class SmolVLAArithmeticDiagnosticTests(unittest.TestCase):
+    def test_declared_integer_projection_bias_cast_and_source_preservation(self):
+        import copy
+        import torch
+        source = torch.nn.Sequential(torch.nn.Linear(3, 2, bias=True, dtype=torch.bfloat16))
+        with torch.no_grad():
+            source[0].weight.copy_(torch.tensor([[0.25, -0.75, 0.5], [1.0, 0.125, -0.5]]))
+            source[0].bias.copy_(torch.tensor([0.125, -0.25]))
+        before = {name: value.clone() for name, value in source.state_dict().items()}
+        target = copy.deepcopy(source)
+        records, projections, recipe = FACTORY.install_integer_projections(target, torch)
+        value = torch.tensor([[0.25, 1.5, -0.5], [0.0, 0.0, 0.0]], dtype=torch.bfloat16)
+        output = target(value)
+        check = FACTORY.check_integer_projection(projections["0"], value, output, torch)
+        self.assertTrue(check["float_bias_and_output_cast_exact"])
+        self.assertEqual(output.dtype, torch.bfloat16)
+        self.assertEqual(projections["0"].integer.weight_kn.dtype, torch.int8)
+        self.assertEqual(projections["0"].weight.dtype, torch.bfloat16)
+        self.assertEqual(projections["0"].weight.numel(), 0)
+        self.assertTrue(all(torch.equal(before[name], value) for name, value in source.state_dict().items()))
+        self.assertEqual(records[0]["float_interface_dtype"], "torch.bfloat16")
+        self.assertEqual(recipe["accumulator"], "int32")
+        self.assertNotEqual(recipe["attention_and_state"], "float32_cpu")
+        with self.assertRaisesRegex(ValueError, "original floating interface"):
+            target(value.float())
+
     def test_linear_bound_handles_cancellation_and_one_declared_cast(self):
         import torch
         left = torch.tensor([[1.0, -1.0, 0.5], [0.25, 0.5, -0.125]], dtype=torch.bfloat16)

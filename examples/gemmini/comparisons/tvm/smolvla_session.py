@@ -9,6 +9,9 @@ represent those tensors must refuse this session rather than cast them.
 
 import importlib.metadata
 import importlib.util
+import copy
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -152,6 +155,230 @@ def observation_manifest(input_npz, manifest_path):
     return value
 
 
+def install_integer_projections(model, torch):
+    """Declare W8A8 learned linears, preserving original floating tensor interfaces.
+
+    The caller owns a separate target copy. CPU attention/normalization/convolution
+    retain original LeRobot arithmetic. FP32 dequantization and bias addition precede
+    exactly one output cast to the original linear weight/input dtype.
+    """
+    import tinyllama_integer as shared
+    import numpy as np
+
+    class OriginalDtypeProjection(torch.nn.Module):
+        def __init__(self, original):
+            super().__init__()
+            if original.weight.dtype not in (torch.bfloat16, torch.float32) or \
+                    original.bias is not None and original.bias.dtype != original.weight.dtype:
+                raise ValueError("Smol integer recipe requires matching original BF16/FP32 linear operands")
+            self.original_dtype = original.weight.dtype
+            self.integer = shared.IntegerProjection(original.weight.detach().float())
+            self.register_buffer("bias", None if original.bias is None else original.bias.detach().clone())
+            # LeRobot reads q/k/v/o_proj.weight.dtype to retain its explicit cast
+            # boundaries. This zero-element marker preserves those reads without
+            # retaining the original floating weights on the target.
+            self.register_buffer("original_dtype_marker", torch.empty(0, dtype=self.original_dtype))
+
+        @property
+        def weight(self):
+            return self.original_dtype_marker
+
+        def forward(self, value):
+            if not torch.compiler.is_compiling() and value.dtype != self.original_dtype:
+                raise ValueError("Integer projection input differs from its original floating interface")
+            result = self.integer(value.float())
+            if self.bias is not None:
+                result = result + self.bias.float()
+            return result.to(self.original_dtype)
+
+    linears = {name: module for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)}
+    if not linears:
+        raise ValueError("Integer Smol reference requires learned linear modules")
+    records, projections = [], {}
+    for name, original in linears.items():
+        projection = OriginalDtypeProjection(original)
+        channels = np.unique(np.linspace(0, projection.integer.out_features - 1,
+                                         min(7, projection.integer.out_features), dtype=int))
+        quantized, scales = shared.independent_quantize_rows(original.weight.detach().float().numpy()[channels])
+        if not np.array_equal(projection.integer.weight_kn.numpy()[:, channels].T, quantized) or \
+                not np.array_equal(projection.integer.weight_scale.numpy()[channels], scales.flatten()):
+            raise AssertionError("Smol weight quantization differs from the independent NumPy reference")
+        parent, _, leaf = name.rpartition(".")
+        setattr(model.get_submodule(parent) if parent else model, leaf, projection)
+        projections[name] = projection
+        records.append({"name": name, "source_weight": shared.identity(original.weight),
+                        "source_bias": None if original.bias is None else shared.identity(original.bias),
+                        "packed_weight": shared.identity(projection.integer.weight_kn),
+                        "weight_scale": shared.identity(projection.integer.weight_scale),
+                        "input_k": projection.integer.in_features, "output_n": projection.integer.out_features,
+                        "float_interface_dtype": str(projection.original_dtype),
+                        "bias_boundary": "FP32 add after FP32 dequantization, before single original-dtype output cast",
+                        "weight_oracle": {"passed": True, "channels": channels.tolist(), "full_k": projection.integer.in_features},
+                        "placement": "CPU eager INT8/INT32 reference; Gemmini candidate only after export/device checks",
+                        "calls_by_stage": {}, "integer_operator_reference": None})
+        # Do not retain a second floating copy of the target's quantized weights.
+        linears[name] = None
+    recipe = {**shared.RECIPE, "name": "smolvla_w8a8_original_float_interfaces_v1",
+              "bias": "original BF16/FP32 bias converted exactly to FP32; add after dequantization; then original-dtype cast",
+              "attention_and_state": "original LeRobot mixed BF16/FP32 CPU",
+              "source_conversion": "BF16 operands widen exactly to FP32 only inside declared projection quantization"}
+    recipe["sha256"] = hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
+    return records, projections, recipe
+
+
+def check_integer_projection(projection, value, output, torch):
+    """Check quantization, complete-K int64 contraction and explicit bias/cast order."""
+    import tinyllama_integer as shared
+    import numpy as np
+
+    result = shared.check_projection(projection.integer, value.detach().float())
+    rows, columns = result["rows"], result["columns"]
+    quantized, activation_scale = projection.integer.integer_inputs(value.detach().float())
+    accumulator = quantized.numpy()[rows].astype(np.int64) @ projection.integer.weight_kn.numpy()[:, columns].astype(np.int64)
+    expected = accumulator.astype(np.float32) * activation_scale.reshape(-1, 1).numpy()[rows] \
+        * projection.integer.weight_scale.numpy()[columns]
+    if projection.bias is not None:
+        expected = expected + projection.bias.float().numpy()[columns]
+    expected = torch.from_numpy(expected).to(projection.original_dtype)
+    actual = output.detach().reshape(-1, projection.integer.out_features)[rows][:, columns]
+    if not torch.equal(expected, actual):
+        raise AssertionError("Smol projection dequantization/bias/cast differs from its independent reference")
+    return {**result, "float_bias_and_output_cast_exact": True,
+            "float_interface_dtype": str(projection.original_dtype)}
+
+
+def integer_memory_plan(source, candidate, records, inputs, captures, torch):
+    """Actual constants and resident diagnostic scenarios; not a deployed peak/fit."""
+    def constants(model):
+        storages, groups = {}, {}
+        for value in model.state_dict().values():
+            storage = value.untyped_storage()
+            key = (storage.data_ptr(), storage.nbytes())
+            if key not in storages:
+                storages[key] = storage.nbytes()
+                groups[str(value.dtype)] = groups.get(str(value.dtype), 0) + storage.nbytes()
+        return sum(storages.values()), groups
+
+    source_bytes, source_groups = constants(source)
+    target_bytes, target_groups = constants(candidate)
+    packed = sum(record["packed_weight"]["bytes"] for record in records)
+    scales = sum(record["weight_scale"]["bytes"] for record in records)
+    cache = captures["prefix_key_cache"].numel() * captures["prefix_key_cache"].element_size() \
+        + captures["prefix_value_cache"].numel() * captures["prefix_value_cache"].element_size()
+    fixture = sum(value.numel() * value.element_size() for value in inputs)
+    flow = inputs[5].numel() * inputs[5].element_size()
+    return {
+        "kind": "actual_constant_inventory_and_explicit_scenarios_not_target_peak",
+        "source_constants_bytes": source_bytes, "source_bytes_by_dtype": source_groups,
+        "target_constants_bytes": target_bytes, "target_bytes_by_dtype": target_groups,
+        "target_packed_int8_weights_bytes": packed, "target_fp32_weight_scales_bytes": scales,
+        "target_cpu_constants_including_bias_embedding_convolution_bytes": target_bytes - packed - scales,
+        "host_two_model_diagnostic_constants_bytes": source_bytes + target_bytes,
+        "host_clone_before_quantization_constants_bytes": 2 * source_bytes,
+        "one_prefix_cache_bytes": cache, "simultaneous_cache_input_output_bytes": 2 * cache,
+        "fixture_bytes": fixture, "simultaneous_flow_input_output_bytes": 2 * flow,
+        "shared_target_constants_plus_declared_io_bytes": target_bytes + 2 * cache + fixture + 2 * flow,
+        "possible_additional_device_packing_copy_bytes": packed,
+        "naive_full_module_constants_for_three_stages_bytes": 3 * target_bytes,
+        "stage_constant_sharing_implemented": False,
+        "missing_peak_terms": ["graph workspace", "captured diagnostics", "largest conversion temporaries",
+                               "linked image", "stack", "platform reservations", "runtime packing alignment"],
+        "baremetal_missing_dtype_support": ["bfloat16"], "actual_platform_fit": "unqualified",
+        "device_execution": False, "source_model_is_diagnostic_only_not_deployed": True,
+    }
+
+
+def run_integer_policy_diagnostic(source, candidate, inputs, records, projections, directory,
+                                  *, seed, fixture_kind, recipe, torch):
+    """Keep original reference intact; qualify only the declared eager integer session."""
+    import numpy as np
+    import tinyllama_integer as shared
+    import diagnose_smolvla_backends as diagnostic
+
+    root = safe_path(directory)
+    from merlin.common.paths import artifacts_dir
+    if root.exists() or not root.is_relative_to(safe_path(artifacts_dir())):
+        raise ValueError("Choose a new integer diagnostic directory inside the configured artifacts root")
+    root.mkdir(parents=True, exist_ok=False)
+    source_dir, candidate_dir = root / "source", root / "integer"
+    source_dir.mkdir()
+    candidate_dir.mkdir()
+    source_before = diagnostic.state_identity(source, torch)
+    helper_before = file_identity(shared.__file__, safe_path)
+    sources = [file_identity(path, safe_path) for path in (__file__, diagnostic.__file__)]
+    original, source_receipt = diagnostic.run_source_policy(source, inputs, "default", seed, 0, source_dir, np, torch)
+    stage = None
+
+    @contextmanager
+    def observer(name):
+        nonlocal stage
+        previous, stage = stage, name
+        try:
+            yield
+        finally:
+            stage = previous
+
+    by_name = {record["name"]: record for record in records}
+    handles = []
+    for name, projection in projections.items():
+        def inspect(module, arguments, output, *, name=name):
+            record = by_name[name]
+            if stage not in ("prefix_encode", "flow_denoise"):
+                raise AssertionError("Integer projection ran outside a declared policy stage")
+            record["calls_by_stage"][stage] = record["calls_by_stage"].get(stage, 0) + 1
+            if record["integer_operator_reference"] is None:
+                record["integer_operator_reference"] = check_integer_projection(module, arguments[0], output, torch)
+        handles.append(projection.register_forward_hook(inspect))
+    try:
+        integer, target_receipt = diagnostic.run_source_policy(candidate, inputs, "default", seed, 0,
+                                                              candidate_dir, np, torch, stage_observer=observer)
+    finally:
+        for handle in handles:
+            handle.remove()
+    for name in ("prefix_pad_mask", "prefix_attention_mask"):
+        if not torch.equal(original[name], integer[name]):
+            raise AssertionError("Quantized policy changed source mask/routing semantics")
+    replays = {}
+    for name, prefix in (
+        ("original_prefix", None),
+        ("integer_prefix", (integer["prefix_pad_mask"], integer["prefix_key_cache"], integer["prefix_value_cache"])),
+    ):
+        values, replay = diagnostic.compare_identical_state_velocities(
+            source.denoise_step, candidate.denoise_step, original, torch,
+            expected_steps=int(source.config.num_steps), candidate_prefix=prefix)
+        replay_path = safe_path(root / ("identical-state-" + name + ".npz"))
+        np.savez_compressed(replay_path, **{key: value.numpy() for key, value in values.items()})
+        replays[name] = {**replay, "output_file": file_identity(replay_path, safe_path)}
+    if diagnostic.state_identity(source, torch) != source_before:
+        raise AssertionError("Integer preparation/execution changed the original source model")
+    bindings = [helper_before, *sources]
+    if any(file_identity(item["path"], safe_path) != item for item in bindings):
+        raise AssertionError("Integer policy source/shared helper changed during execution")
+    executed = [record for record in records if record["integer_operator_reference"] is not None]
+    report = {
+        "status": "eager_integer_session_checked", "fixture_kind": fixture_kind,
+        "synthetic_inputs": fixture_kind == "synthetic", "recipe": recipe,
+        "source_reference_unchanged": True, "source_state_sha256": source_before,
+        "source_bindings": bindings, "source_run": source_receipt, "integer_run": target_receipt,
+        "denoising_steps": candidate.config.num_steps, "source_mask_routing_exact": True,
+        "projection_inventory": records, "executed_projection_count": len(executed),
+        "unexecuted_projection_names": [record["name"] for record in records if not record["calls_by_stage"]],
+        "operator_reference": "sampled rows/columns with complete K; independent NumPy int64 and explicit float bias/output cast",
+        "comparisons": {name: diagnostic.statistics(original[name], integer[name], torch) for name in original},
+        "identical_state_velocity_replay": replays,
+        "memory": integer_memory_plan(source, candidate, records, inputs, integer, torch),
+        "placement": {"learned_linear": "eager CPU int8/int32; Gemmini candidate, not device qualified",
+                      "convolution_embedding_qk_pv_rope_norm_softmax": "original mixed BF16/FP32 CPU",
+                      "state_cache_masks_euler_action_decode": "original source dtypes and routes"},
+        "active_gate_changed": False, "original_bf16_compiler_gate_passed": False,
+        "model_quality_qualified": False, "quantized_recipe_quality_qualified": False,
+        "device_execution": False, "timing_qualified": False, "source_closure_verified": False,
+    }
+    path = safe_path(root / "results.json")
+    path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    return report, file_identity(path, safe_path)
+
+
 class SessionProvider:
     def __init__(self, session, artifacts):
         self.session, self.artifacts = session, tuple(artifacts)
@@ -247,11 +474,14 @@ def make_policy_session(model, inputs, loader, provenance):
 
 def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
                          input_npz=None, fixture_kind="synthetic", input_source=None,
-                         input_manifest=None, selected_cameras=None, seed=0, cpu_threads=1, precision="original"):
+                         input_manifest=None, selected_cameras=None, seed=0, cpu_threads=1, precision="original",
+                         quantized=False, integer_diagnostic_dir=None):
     if precision != "original":
         raise ValueError("Only original LeRobot precision is supported; implicit BF16 conversion is forbidden")
     if type(cpu_threads) is not int or not 1 <= cpu_threads <= 4 or type(seed) is not int or seed < 0:
         raise ValueError("Invalid explicit CPU thread/fixture seed budget")
+    if type(quantized) is not bool or quantized != (integer_diagnostic_dir is not None):
+        raise ValueError("Declared integer policy requires quantized=True and a new integer_diagnostic_dir")
     if fixture_kind not in ("synthetic", "dataset") or (fixture_kind == "dataset" and (not input_npz or not input_source)):
         raise ValueError("Dataset fixtures require both a local NPZ and attributed input_source")
     if input_manifest is not None and fixture_kind != "dataset":
@@ -297,11 +527,27 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
     inputs = fixture_inputs(config, len(selected_cameras), input_npz=input_npz, seed=seed)
     if torch.any(inputs[2] >= model.vlm_with_expert.config.text_config.vocab_size):
         raise ValueError("Fixture token ID is outside the pinned backbone vocabulary")
+    integer_report, integer_receipt, helper_identity = None, None, None
+    if quantized:
+        import tinyllama_integer as shared
+        import diagnose_smolvla_backends as diagnostic
+        original_state = diagnostic.state_identity(model, torch)
+        candidate = copy.deepcopy(model)
+        records, projections, recipe = install_integer_projections(candidate, torch)
+        if diagnostic.state_identity(model, torch) != original_state:
+            raise AssertionError("Integer projection installation changed original source weights")
+        integer_report, integer_receipt = run_integer_policy_diagnostic(
+            model, candidate, inputs, records, projections, integer_diagnostic_dir,
+            seed=seed, fixture_kind=fixture_kind, recipe=recipe, torch=torch)
+        helper_identity = file_identity(shared.__file__, safe_path)
+        model = candidate
     sources = [file_identity(path, safe_path) for path in (
         __file__, loader_path, sys.modules[SmolVLAPolicy.__module__].__file__,
         sys.modules[SmolVLAConfig.__module__].__file__, smolvlm_with_expert.__file__,
         sys.modules[PreTrainedConfig.__module__].__file__)]
     files = checkpoint_files + backbone_files + sources
+    if quantized:
+        files.extend([integer_receipt, helper_identity, file_identity(diagnostic.__file__, safe_path)])
     if input_npz:
         files.append(file_identity(input_npz, safe_path))
     if input_manifest:
@@ -324,6 +570,11 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
                                    ("lerobot", "torch", "transformers", "safetensors", "numpy", "onnx")},
                   "model_state_bytes_by_dtype": dtype_bytes, "model_quality_qualified": False,
                   "source_closure_verified": False}
+    if quantized:
+        provenance.update(precision="declared_w8a8_with_original_lerobot_float_interfaces",
+                          source_precision="original_lerobot", quantized_recipe_quality_qualified=False,
+                          integer_reference=integer_report, integer_reference_receipt=integer_receipt,
+                          compiler_numerical_reference="declared integer policy; original policy is separate quality reference")
     session = make_policy_session(model, inputs, loader, provenance)
     for identity in files:
         if file_identity(identity["path"], safe_path) != identity:
@@ -332,4 +583,14 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
 
 
 def get_verification_artifacts(model, _inputs):
-    return model.artifacts
+    # The optional exporter hook imports this adjacent shared helper even when a
+    # non-integer graph has no matching nodes. Bind those selected bytes too.
+    return (*model.artifacts, safe_path(Path(__file__).with_name("tinyllama_integer.py")))
+
+
+def get_onnx_export_options(torch):
+    """Expose only standard integer contraction translation; no floating cast rewrite."""
+    import tinyllama_integer as shared
+    if safe_path(shared.__file__) != safe_path(Path(__file__).with_name("tinyllama_integer.py")):
+        raise ValueError("Shared integer projection helper differs from the selected comparison source")
+    return shared.export_options(torch)
