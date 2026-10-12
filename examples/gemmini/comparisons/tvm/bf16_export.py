@@ -120,6 +120,13 @@ def translations(torch):
     from onnxscript.function_libs.torch_lib.tensor_typing import TFloat
     from onnxscript.onnx_types import BFLOAT16, TensorType
 
+    def silu(self: BFLOAT16) -> BFLOAT16:
+        # Fused BF16 SiLU has one logical output cast, not a BF16 sigmoid store.
+        if self.dtype != ir.DataType.BFLOAT16:
+            raise ValueError("Fused SiLU translation requires BF16 dispatcher input")
+        widened = op.Cast(self, to=1)
+        return op.Cast(op.Mul(widened, op.Sigmoid(widened)), to=16)
+
     def linear(input: TFloat, weight: TFloat, bias: Optional[TFloat] = None) -> TFloat:
         if input.dtype != ir.DataType.BFLOAT16:
             return nn.aten_linear(input, weight, bias)
@@ -202,4 +209,4 @@ def translations(torch):
             probabilities = op.Where(blocked, 0.0, probabilities)
         return op.Cast(op.MatMul(probabilities, op.Cast(value, to=1)), to=16)
 
-    return {torch.ops.aten.linear.default: linear, torch.ops.aten.scaled_dot_product_attention.default: attention, torch.ops.aten.layer_norm.default: layer_norm}
+    return {torch.ops.aten.linear.default: linear, torch.ops.aten.scaled_dot_product_attention.default: attention, torch.ops.aten.layer_norm.default: layer_norm, torch.ops.aten.silu.default: silu}

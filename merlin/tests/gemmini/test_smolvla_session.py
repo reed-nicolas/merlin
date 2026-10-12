@@ -264,6 +264,52 @@ class SmolVLAObservationTests(unittest.TestCase):
 
 
 class SmolVLAArithmeticDiagnosticTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("TVM_LIBRARY_PATH"), "Requires explicit LLVM-enabled TVM host build")
+    def test_fused_bf16_silu_preserves_one_output_cast_and_fp32_default(self):
+        from decimal import Decimal, localcontext
+        import numpy as np
+        import onnx
+        import torch
+        import tvm
+        from verify_session import StageCompiler, array
+
+        class Silu(torch.nn.Module):
+            def forward(self, value):
+                return torch.nn.functional.silu(value)
+
+        values = torch.tensor([0.0, -0.0, 0.01171875, 0.01953125, 1.015625, 2.015625, -1.0078125, -2.015625, -15.75, -14.75], dtype=torch.bfloat16)
+        source = Silu()(values)
+        self.assertTrue(torch.equal(source.view(torch.uint16), Silu()(values.float()).bfloat16().view(torch.uint16)))
+        staged = values * values.sigmoid()
+        self.assertTrue(torch.any(staged[values > 0].view(torch.uint16) != source[values > 0].view(torch.uint16)))
+        self.assertTrue(torch.any(staged[values < 0].view(torch.uint16) != source[values < 0].view(torch.uint16)))
+        for value, output in zip(values[2:], source[2:], strict=True):
+            word = int(output.view(torch.uint16))
+            with localcontext() as context:
+                context.prec = 80
+                exact_input = Decimal.from_float(float(value))
+                ideal = exact_input / (1 + (-exact_input).exp())
+                distances = [(abs(ideal - Decimal.from_float(float(torch.tensor(candidate, dtype=torch.uint16).view(torch.bfloat16)))), candidate) for candidate in range(word - 2, word + 3)]
+                ordered = sorted(distances, key=lambda item: (item[0], item[1] & 1))
+                self.assertEqual(ordered[0][1], word)
+                self.assertGreater(ordered[1][0] - ordered[0][0], Decimal("1e-65"))
+        inputs = (array(values, np, torch),)
+        for mode in ("baseline", "optimized"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                compiler = StageCompiler(Path(directory), mode, np, torch, onnx, tvm, exporter="dynamo", opset=18, bf16_fused_export=True)
+                run = compiler(SimpleNamespace(name="bf16_silu", module=Silu()), inputs, 1)
+                actual = array(run(inputs), np, torch)
+                self.assertEqual(actual.tobytes(), array(source, np, torch).tobytes())
+                self.assertEqual(array(run(inputs), np, torch).tobytes(), actual.tobytes())
+                graph = onnx.load(compiler.records[0]["onnx_artifacts"][0]["path"])
+                self.assertEqual([node.op_type for node in graph.graph.node], ["Cast", "Sigmoid", "Mul", "Cast"])
+        # FP32 dispatcher and default BF16 export remain their built-in graphs.
+        for dtype, fused, expected in ((torch.float32, False, ["Sigmoid", "Mul"]), (torch.float32, True, ["Sigmoid", "Mul"]), (torch.bfloat16, False, ["Sigmoid", "Mul"])):
+            graph = torch.onnx.export(Silu(), (values.to(dtype),), dynamo=True, opset_version=18, optimize=False, custom_translation_table=NUMERICS.translations(torch) if fused else None).model_proto
+            self.assertEqual([node.op_type for node in graph.graph.node], expected)
+        self.assertEqual(int(source[0].view(torch.uint16)), 0)
+        self.assertEqual(int(source[1].view(torch.uint16)), 0x8000)
+
     def test_proposal_refuses_heldout_unbound_or_nonfinite_metadata_and_never_accepts(self):
         fixture = {"split": "train", "schema_verified": True, "input_fixture": {"path": "/chosen/observation.npz", "sha256": "0" * 64}, "state_names": ["first", "second"]}
         proposal = DIAGNOSTIC.numerical_contract_proposal(fixture, {}, {}, evidence=[{"status": "passed"}])
