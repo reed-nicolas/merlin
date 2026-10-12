@@ -434,7 +434,7 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(set(parameters), {"weight", "bias"})
             self.assertTrue(all(value.data_type == onnx.TensorProto.BFLOAT16 for value in parameters.values()))
             self.assertEqual(compiler.records[0]["translation_source"], compiler.translation_source)
-            self.assertEqual(compiler.records[0]["translated_aten_operations"], {"aten.scalar_tensor.default": 0, "aten.linear.default": 1, "aten.scaled_dot_product_attention.default": 1, "aten.layer_norm.default": 0})
+            self.assertEqual(compiler.records[0]["translated_aten_operations"], {"aten.scalar_tensor.default": 0, "aten.linear.default": 1, "aten.scaled_dot_product_attention.default": 1, "aten.layer_norm.default": 0, "aten.silu.default": 0})
             self.assertEqual(self.verifier.parameter_digest(module, torch), original_weights)
 
     @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
@@ -731,14 +731,61 @@ class SessionTests(unittest.TestCase):
             argv = ["verify_session.py", "--output-dir", str(folder)]
             for name in ("model2mlir-root", "tvm-source", "tvm-build", "factory"):
                 argv.extend(("--" + name, str(Path(temp) / name)))
-            with patch.object(sys, "argv", argv), patch.object(self.verifier, "file_identity", side_effect=caught.exception):
+            identify = self.verifier.file_identity
+            calls = 0
+            def fail_verification(path, check):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise caught.exception
+                return identify(path, check)
+            with patch.object(sys, "argv", argv), patch.object(self.verifier, "file_identity", side_effect=fail_verification):
                 self.assertEqual(self.verifier.main(), 1)
             receipt = json.loads((folder / "results.json").read_text())
             self.assertEqual(receipt["status"], "failed")
             self.assertFalse(receipt["host_session_verified"])
             self.assertEqual(receipt["failure_diagnostics"], failure)
             self.assertIn("SessionComparisonError", receipt["traceback"])
-            self.assertEqual([path.name for path in folder.iterdir()], ["results.json"])
+            retention = receipt["failure_diagnostics"]["fixture_retention"]
+            self.assertEqual(retention["status"], "retained")
+            self.assertEqual(retention["artifact"], identify(folder / "failed_comparison.npz", self.verifier.safe_path))
+            with self.np.load(retention["artifact"]["path"], allow_pickle=False) as fixture:
+                for name in ("actual", "reference"):
+                    self.assertEqual(self.verifier.tensor_identity(fixture[name]), failure[name]["identity"])
+                self.np.testing.assert_array_equal(fixture["actual"] - fixture["reference"], self.np.full(2, 0.5, dtype="float32"))
+            self.assertEqual({path.name for path in folder.iterdir()}, {"results.json", "failed_comparison.npz"})
+
+    def test_failure_fixture_budget_snapshot_and_failed_write_cleanup(self):
+        from unittest.mock import patch
+        np = self.np
+        actual, reference = np.array([1, -2], dtype="int64"), np.array([2, -2], dtype="int64")
+        with patch.object(self.verifier, "FAILED_FIXTURE_LIMIT_BYTES", 1), self.assertRaises(AssertionError) as caught:
+            self.verifier.compare(actual, reference, np, 0, 0)
+        self.assertIsNone(caught.exception.tensors)
+        self.assertEqual(caught.exception.diagnostics["fixture_retention"]["status"], "skipped")
+        with self.assertRaises(AssertionError) as caught:
+            self.verifier.compare(actual, reference, np, 0, 0)
+        error = caught.exception
+        actual[:] = 0
+        self.assertEqual(self.verifier.tensor_identity(error.tensors[0]), error.diagnostics["actual"]["identity"])
+        def broken_save(stream, **arrays):
+            stream.write(b"partial fixture")
+            raise OSError("fixture write failed")
+        with tempfile.TemporaryDirectory(prefix="tvm-session-failure-write-") as temp:
+            folder = Path(temp)
+            with patch.object(np, "savez", side_effect=broken_save):
+                self.verifier.write_failure_fixture(error, folder)
+            self.assertEqual(error.diagnostics["fixture_retention"]["status"], "failed")
+            self.assertEqual(error.diagnostics["fixture_retention"]["error"], "fixture write failed")
+            self.assertEqual(list(folder.iterdir()), [])
+            self.verifier.write_failure_fixture(error, folder)
+            with np.load(folder / "failed_comparison.npz", allow_pickle=False) as fixture:
+                self.assertEqual(fixture["actual"].dtype, np.dtype("int64"))
+                self.assertEqual(self.verifier.tensor_identity(fixture["actual"]), error.diagnostics["actual"]["identity"])
+            before = (folder / "failed_comparison.npz").read_bytes()
+            self.verifier.write_failure_fixture(error, folder)
+            self.assertEqual(error.diagnostics["fixture_retention"]["status"], "failed")
+            self.assertEqual((folder / "failed_comparison.npz").read_bytes(), before)
 
     def test_invalid_tensor_diagnostics_do_not_claim_numerical_metrics(self):
         np = self.np
@@ -749,6 +796,7 @@ class SessionTests(unittest.TestCase):
             failure = caught.exception.diagnostics
             self.assertIsNone(failure["max_absolute_error"])
             self.assertIsNone(failure["mismatch_count"])
+            self.assertIsNone(caught.exception.tensors)
             json.dumps(failure, allow_nan=False)
         self.assertIsNone(failure["actual"]["identity"])
         def nonfinite(program, inputs, output_count):
@@ -799,6 +847,14 @@ class SessionTests(unittest.TestCase):
         restored = self.verifier.torch_array(value, self.np, self.torch)
         self.assertTrue(self.torch.equal(restored.view(self.torch.uint16), tensor.view(self.torch.uint16)))
         self.assertEqual(self.verifier.tensor_identity(value)["bytes"], 12)
+        with self.assertRaises(AssertionError) as caught:
+            self.verifier.compare(value, value + self.np.array(1, dtype=value.dtype), self.np, 0, 0)
+        with tempfile.TemporaryDirectory(prefix="tvm-session-failure-bf16-") as temp:
+            self.verifier.write_failure_fixture(caught.exception, Path(temp))
+            retention = caught.exception.diagnostics["fixture_retention"]
+            self.assertEqual(retention["encodings"]["actual"], "raw_uint16_bfloat16")
+            with self.np.load(retention["artifact"]["path"], allow_pickle=False) as fixture:
+                self.np.testing.assert_array_equal(fixture["actual"], words)
         if os.environ.get("TVM_LIBRARY_PATH"):
             import tvm
             candidate = self.verifier.outputs(tvm.nd.array(value), self.np, self.torch)[0]

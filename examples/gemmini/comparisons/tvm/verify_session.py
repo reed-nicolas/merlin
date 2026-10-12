@@ -196,9 +196,44 @@ def outputs(value, np, torch, *, require_finite=True):
 
 
 class SessionComparisonError(AssertionError):
-    def __init__(self, message, diagnostics):
+    def __init__(self, message, diagnostics, tensors=None):
         super().__init__(message)
         self.diagnostics = diagnostics
+        self.tensors = tensors
+
+
+FAILED_FIXTURE_LIMIT_BYTES = 64 << 20
+
+
+def write_failure_fixture(error, output_dir):
+    """Retain validated failure snapshots without changing the comparison gate."""
+    if error.tensors is None:
+        return
+    import numpy as np
+    target, temporary = safe_path(output_dir / "failed_comparison.npz"), safe_path(output_dir / "failed_comparison.npz.tmp")
+    created, renamed = False, False
+    try:
+        if target.exists():
+            raise ValueError("Failure fixture already exists")
+        arrays, encodings = {}, {}
+        for name, value in zip(("actual", "reference"), error.tensors):
+            if tensor_identity(value) != error.diagnostics[name]["identity"]:
+                raise ValueError("Failure snapshot changed before retention")
+            arrays[name] = value.view(np.uint16) if value.dtype.name == "bfloat16" else value
+            encodings[name] = "raw_uint16_bfloat16" if value.dtype.name == "bfloat16" else "native_numpy"
+        with temporary.open("xb") as stream:
+            created = True
+            np.savez(stream, **arrays)
+        temporary.replace(target)
+        renamed = True
+        error.diagnostics["fixture_retention"] = {"status": "retained", "artifact": file_identity(target, safe_path), "encodings": encodings,
+                                                  "bytes": sum(value.nbytes for value in error.tensors), "limit_bytes": FAILED_FIXTURE_LIMIT_BYTES}
+    except Exception as failure:
+        if created:
+            temporary.unlink(missing_ok=True)
+        if renamed:
+            target.unlink(missing_ok=True)
+        error.diagnostics["fixture_retention"] = {"status": "failed", "error": str(failure), "limit_bytes": FAILED_FIXTURE_LIMIT_BYTES}
 
 
 def compare(actual, expected, np, rtol, atol, *, context=None):
@@ -229,7 +264,10 @@ def compare(actual, expected, np, rtol, atol, *, context=None):
     diagnostics["mismatch_count"] = int(np.count_nonzero(~matched))
     if diagnostics["mismatch_count"]:
         diagnostics["reason"] = "numerical comparison failed"
-        raise SessionComparisonError("Session numerical comparison failed", diagnostics)
+        size = int(actual.nbytes + expected.nbytes)
+        tensors = (actual.copy(), expected.copy()) if size <= FAILED_FIXTURE_LIMIT_BYTES else None
+        diagnostics["fixture_retention"] = {"status": "pending" if tensors is not None else "skipped", "bytes": size, "limit_bytes": FAILED_FIXTURE_LIMIT_BYTES}
+        raise SessionComparisonError("Session numerical comparison failed", diagnostics, tensors)
     return {"passed": True, "max_absolute_error": diagnostics["max_absolute_error"], "actual": diagnostics["actual"]["identity"], "reference": diagnostics["reference"]["identity"]}
 
 
@@ -811,6 +849,7 @@ def main():
     except Exception as error:
         report.update(status="failed", error=str(error), traceback=traceback.format_exc())
         if isinstance(error, SessionComparisonError):
+            write_failure_fixture(error, out)
             report["failure_diagnostics"] = error.diagnostics
     finally:
         (out / "results.json").write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
