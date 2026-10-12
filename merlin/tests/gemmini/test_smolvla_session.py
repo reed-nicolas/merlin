@@ -385,6 +385,23 @@ class SmolVLASourceSoftmaxTests(unittest.TestCase):
             self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
 
 
+    def test_real_export_keeps_177_policy_and_admits_227_only_when_selected(self):
+        import torch
+        class Softmax(torch.nn.Module):
+            def forward(self, short, long):
+                return short.softmax(-1), long.softmax(-1), long.softmax(2)
+        for dtype in (torch.float32, torch.bfloat16):
+            inputs = tuple(torch.linspace(-2, 2, 750 * width).reshape(1, 15, 50, width).to(dtype) for width in (177, 227))
+            for policy in ("torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1"):
+                with mock.patch.object(NUMERICS, "source_softmax_contract", return_value={"name": policy}):
+                    table = NUMERICS.source_softmax_translations(torch, policy)
+                graph = torch.onnx.export(Softmax().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
+                selected = [node.op_type for node in graph.graph.node if node.domain == "merlin.source_preserving"]
+                expected = ["TorchSoftmaxAvx512F32LastDim177"] + (["TorchSoftmaxAvx512F32LastDim227"] if policy == "torch_cpu_softmax177_227_v1" else [])
+                self.assertEqual(selected, expected if dtype == torch.float32 else [])
+                self.assertEqual(sum(node.op_type == "Softmax" for node in graph.graph.node), 3 - len(selected))
+
+
 class SmolVLASourceLayerNormTests(unittest.TestCase):
     def test_session_hook_selects_only_declared_policy(self):
         import torch
@@ -524,12 +541,43 @@ class SmolVLASourceSgemmTests(unittest.TestCase):
         for dtype in (torch.float32, torch.bfloat16):
             inputs = tuple(torch.ones(shape, dtype=dtype) for shape in ((1, 15, 50, 64), (1, 15, 64, 177), (1, 15, 50, 177), (1, 15, 177, 64)))
             before = tuple(value.clone() for value in inputs)
-            with mock.patch.object(NUMERICS, "source_sgemm_contract", return_value={"name": "torch_cpu_sgemm177_v1"}):
+            with mock.patch.object(NUMERICS, "source_sgemm_contract", return_value={"name": "torch_cpu_sgemm177_v1", "operators": ["TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177"]}):
                 table = NUMERICS.source_sgemm_translations(torch, "torch_cpu_sgemm177_v1")
             graph = torch.onnx.export(Attention().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
             selected = [node for node in graph.graph.node if node.domain == "merlin.source_preserving"]
             self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [("TorchMklSgemmF32QK177", 2, 1, 0), ("TorchMklSgemmF32PV177", 2, 1, 0)] if dtype == torch.float32 else [])
             self.assertEqual(sum(node.op_type == "MatMul" for node in graph.graph.node), 1 if dtype == torch.float32 else 3)
+            self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
+
+
+    def test_extended_contract_refuses_other_bf16_dispatch(self):
+        import torch
+        policy = "torch_cpu_attention177_227_v1"
+        with mock.patch.object(NUMERICS, "_source_cpu_bindings", return_value=[]) as bindings:
+            record = NUMERICS.source_sgemm_contract(torch, policy)
+            self.assertEqual(record["operators"], ["TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177", "TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227"])
+            self.assertIn("include/oneapi/dnnl/dnnl_version.h", bindings.call_args.args[1])
+            for overrides in ({"DNNL_MAX_CPU_ISA": "AVX2"}, {"ONEDNN_DEFAULT_FPMATH_MODE": "BF16"}):
+                with mock.patch.dict(os.environ, overrides), self.assertRaisesRegex(ValueError, "software-BF16"):
+                    NUMERICS.source_sgemm_contract(torch, policy)
+            with mock.patch.object(torch.cpu, "_is_avx512_bf16_supported", return_value=True), self.assertRaisesRegex(ValueError, "software-BF16"):
+                NUMERICS.source_sgemm_contract(torch, policy)
+
+    def test_real_export_keeps_177_policy_and_admits_only_proved_227_dtypes(self):
+        import torch
+        class Attention(torch.nn.Module):
+            def forward(self, query, key, probability, value):
+                return query @ key, probability @ value, query.to(torch.bfloat16) @ key.to(torch.bfloat16), probability.float() @ value.float(), query[..., :49, :] @ key
+        inputs = (torch.ones((1, 15, 50, 64)), torch.ones((1, 15, 64, 227)), torch.ones((1, 15, 50, 227), dtype=torch.bfloat16), torch.ones((1, 15, 227, 64), dtype=torch.bfloat16))
+        before = tuple(value.clone() for value in inputs)
+        for policy in ("torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1"):
+            operators = ["TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177"] + (["TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227"] if policy == "torch_cpu_attention177_227_v1" else [])
+            with mock.patch.object(NUMERICS, "source_sgemm_contract", return_value={"name": policy, "operators": operators}):
+                table = NUMERICS.source_sgemm_translations(torch, policy)
+            graph = torch.onnx.export(Attention().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
+            selected = [node for node in graph.graph.node if node.domain == "merlin.source_preserving"]
+            self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [(name, 2, 1, 0) for name in operators[2:]])
+            self.assertEqual(sum(node.op_type == "MatMul" for node in graph.graph.node), 5 - len(selected))
             self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
 
 

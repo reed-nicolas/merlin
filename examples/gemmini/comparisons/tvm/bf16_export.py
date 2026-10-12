@@ -112,10 +112,10 @@ def source_softmax_contract(torch, policy="native"):
     """Bind the scoped native CPU softmax; leave QK/PV and masks unchanged."""
     if policy == "native":
         return None
-    if policy != "torch_cpu_softmax177_v1":
+    if policy not in ("torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1"):
         raise ValueError("Unknown source softmax export policy")
     bindings = _source_cpu_bindings(torch, SOURCE_SOFTMAX_ARTIFACTS, "Source softmax")
-    return {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
+    record = {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
             "domain": "merlin.source_preserving", "version": 1, "operator": "TorchSoftmaxAvx512F32LastDim177",
             "native": "unchanged_Tensor_softmax_float32_last_axis_Smol_expert_1x15x50x177_contiguous",
             "native_dispatch": "pinned_AVX512_sixteen_lane_softmax", "native_threads": 1,
@@ -125,6 +125,11 @@ def source_softmax_contract(torch, policy="native"):
             "source": "https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/aten/src/ATen/native/cpu/SoftMaxKernel.cpp",
             "unchanged": ["QK", "PV", "masks", "BF16_casts", "native_reference", "acceptance_gates"],
             "bindings": bindings}
+    if policy == "torch_cpu_softmax177_227_v1":
+        record.pop("operator")
+        record.pop("export_shape")
+        record.update({"operators": ["TorchSoftmaxAvx512F32LastDim177", "TorchSoftmaxAvx512F32LastDim227"], "export_shapes": [[1, 15, 50, 177], [1, 15, 50, 227]], "native": "unchanged_FP32_Smol_manual_attention_softmax_width177_or227"})
+    return record
 
 
 def source_softmax_translations(torch, policy="native"):
@@ -136,17 +141,23 @@ def source_softmax_translations(torch, policy="native"):
     from onnxscript.function_libs.torch_lib.ops import core
     from onnxscript.onnx_types import FLOAT
     from onnxscript.values import Opset, Op
-    schema = defs.OpSchema("TorchSoftmaxAvx512F32LastDim177", "merlin.source_preserving", 1, inputs=[defs.OpSchema.FormalParameter("a", "T")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(float)"], "Bound source FP32 softmax")])
-    softmax_op = Op(Opset("merlin.source_preserving", 1), "TorchSoftmaxAvx512F32LastDim177", schema)
+    widths = (177,) if policy == "torch_cpu_softmax177_v1" else (177, 227)
+    ops = {}
+    for width in widths:
+        name = f"TorchSoftmaxAvx512F32LastDim{width}"
+        schema = defs.OpSchema(name, "merlin.source_preserving", 1, inputs=[defs.OpSchema.FormalParameter("a", "T")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(float)"], "Bound source FP32 softmax")])
+        ops[(1, 15, 50, width)] = Op(Opset("merlin.source_preserving", 1), name, schema)
 
     def softmax(self: FLOAT, dim: int, dtype: int = -1) -> FLOAT:
-        if tuple(self.shape or ()) == (1, 15, 50, 177) and dim in (-1, 3) and dtype in (None, -1, ir.DataType.FLOAT):
-            return softmax_op(self)
+        selected = ops.get(tuple(self.shape or ()))
+        if selected is not None and dim in (-1, 3) and dtype in (None, -1, ir.DataType.FLOAT):
+            return selected(self)
         return core.aten_softmax(self, dim, dtype)
 
     def internal_softmax(self: FLOAT, dim: int, half_to_float: bool) -> FLOAT:
-        if tuple(self.shape or ()) == (1, 15, 50, 177) and dim in (-1, 3) and not half_to_float:
-            return softmax_op(self)
+        selected = ops.get(tuple(self.shape or ()))
+        if selected is not None and dim in (-1, 3) and not half_to_float:
+            return selected(self)
         return core.aten__softmax(self, dim, half_to_float)
 
     return {torch.ops.aten.softmax.int: softmax, torch.ops.aten._softmax.default: internal_softmax}
@@ -252,16 +263,22 @@ def source_conv_translations(torch, policy="native"):
 
 
 def source_sgemm_contract(torch, policy="native"):
-    """Bind the observed native FP32 QK/PV kernels, leaving scaling intact."""
+    """Bind the scoped native attention kernels, leaving scaling intact."""
     if policy == "native":
         return None
-    if policy != "torch_cpu_sgemm177_v1":
+    if policy not in ("torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1"):
         raise ValueError("Unknown source SGEMM export policy")
     import os
     if not torch.backends.mkl.is_available() or torch.get_float32_matmul_precision() != "highest" or any(name in os.environ for name in ("MKL_CBWR", "MKL_ENABLE_INSTRUCTIONS", "MKL_DEBUG_CPU_TYPE", "ATEN_CPU_CAPABILITY")):
         raise ValueError("Source SGEMM requires the proved highest-precision MKL dispatch without ISA/consistency overrides")
-    bindings = _source_cpu_bindings(torch, SOURCE_SGEMM_ARTIFACTS, "Source SGEMM")
-    return {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
+    artifacts = SOURCE_SGEMM_ARTIFACTS
+    if policy == "torch_cpu_attention177_227_v1":
+        overrides = ("ONEDNN_MAX_CPU_ISA", "DNNL_MAX_CPU_ISA", "ONEDNN_DEFAULT_FPMATH_MODE", "DNNL_DEFAULT_FPMATH_MODE")
+        if not torch.backends.mkldnn.is_available() or not torch.backends.mkldnn.enabled or torch.cpu._is_avx512_bf16_supported() or torch.cpu._is_amx_tile_supported() or any(name in os.environ for name in overrides):
+            raise ValueError("Source attention requires the proved software-BF16 oneDNN dispatch without ISA/fpmath overrides")
+        artifacts = {**artifacts, **SOURCE_CONV_ARTIFACTS}
+    bindings = _source_cpu_bindings(torch, artifacts, "Source SGEMM")
+    record = {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
             "domain": "merlin.source_preserving", "version": 1,
             "operators": ["TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177"],
             "native": "unchanged_FP32_manual_Smol_denoiser_Q50_K177_QK_and_PV_matmul",
@@ -272,31 +289,39 @@ def source_sgemm_contract(torch, policy="native"):
             "qualification": "bounded_actual_and_controls;finite_RNE_gradual_underflow;native_physical_layouts_bound_by_capture;complete_attention_and_policy_unqualified",
             "unchanged": ["parameters", "QK_scale", "masks", "softmax", "BF16_casts", "native_reference", "acceptance_gates", "ordinary_ONNX_MatMul"],
             "bindings": bindings}
+    if policy == "torch_cpu_attention177_227_v1":
+        record["operators"] += ["TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227"]
+        record.update({"native": "unchanged_manual_Smol_Q50_K177_or227_attention_contractions", "native_dispatch": "MKL_AVX512_FP32_QK177_QK227_PV177;oneDNN3.7.1_gemm_jit_software_BF16_PV227", "qk227_native_strides": [[48000, 64, 960, 1], [217920, 64, 1, 960]], "pv227_native_strides": [[170250, 11350, 227, 1], [217920, 64, 960, 1]], "pv227_algorithm": "positive_zero_then_pair_high_low_explicit_FP32_FMA;odd_tail_FMA_positive_zero_times_last_probability_then_last_product;one_BF16_RNE_store", "pv227_evidence": "all_four_installed_JIT_variants_and_isolated_copy_packing;original_selected_variant_and_internal_buffers_not_observed;driver_alpha1_beta0_inferred_from_ordinary_matmul_semantics"})
+    return record
 
 
 def source_sgemm_translations(torch, policy="native"):
-    """Preserve only the proved manual-denoiser FP32 contraction geometries."""
-    if source_sgemm_contract(torch, policy) is None:
+    """Preserve only the proved manual-attention contraction geometries."""
+    record = source_sgemm_contract(torch, policy)
+    if record is None:
         return {}
     from onnx import defs
     from onnxscript import ir
-    from onnxscript.onnx_types import FLOAT
     from onnxscript.function_libs.torch_lib.ops import core
+    from onnxscript.function_libs.torch_lib.tensor_typing import TFloat
     from onnxscript.values import Opset, Op
     source = Opset("merlin.source_preserving", 1)
     ops = {}
-    for name in ("TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177"):
-        schema = defs.OpSchema(name, source.domain, 1, inputs=[defs.OpSchema.FormalParameter(value, "T") for value in ("left", "right")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(float)"], "Original FP32 contraction operands")])
+    for name in record["operators"]:
+        dtype = "tensor(bfloat16)" if name == "TorchOnednnGemmBf16PV227" else "tensor(float)"
+        schema = defs.OpSchema(name, source.domain, 1, inputs=[defs.OpSchema.FormalParameter(value, "T") for value in ("left", "right")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", [dtype], "Original contraction operands")])
         ops[name] = Op(source, name, schema)
+    geometries = {
+        (ir.DataType.FLOAT, (1, 15, 50, 64), (1, 15, 64, 177)): "TorchMklSgemmF32QK177",
+        (ir.DataType.FLOAT, (1, 15, 50, 177), (1, 15, 177, 64)): "TorchMklSgemmF32PV177",
+        (ir.DataType.FLOAT, (1, 15, 50, 64), (1, 15, 64, 227)): "TorchMklSgemmF32QK227",
+        (ir.DataType.BFLOAT16, (1, 15, 50, 227), (1, 15, 227, 64)): "TorchOnednnGemmBf16PV227",
+    }
 
-    def matmul(self: FLOAT, other: FLOAT) -> FLOAT:
-        shapes = (tuple(self.shape or ()), tuple(other.shape or ()))
-        if self.dtype == other.dtype == ir.DataType.FLOAT:
-            if shapes == ((1, 15, 50, 64), (1, 15, 64, 177)):
-                return ops["TorchMklSgemmF32QK177"](self, other)
-            if shapes == ((1, 15, 50, 177), (1, 15, 177, 64)):
-                return ops["TorchMklSgemmF32PV177"](self, other)
-        return core.aten_matmul(self, other)
+    def matmul(self: TFloat, other: TFloat) -> TFloat:
+        key = (self.dtype, tuple(self.shape or ()), tuple(other.shape or ()))
+        selected = ops.get(geometries.get(key)) if self.dtype == other.dtype else None
+        return selected(self, other) if selected is not None else core.aten_matmul(self, other)
 
     return {torch.ops.aten.matmul.default: matmul}
 
