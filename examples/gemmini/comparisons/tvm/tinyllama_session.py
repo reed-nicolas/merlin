@@ -180,7 +180,7 @@ def validate_reference_stages(capture, causal, torch):
 def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
                          prefill_tokens=8, decode_tokens=3, precision="float32",
                          cpu_threads=2, quantized=False, quality_corpus_path=None,
-                         workload="frontend_diagnostic", activation_scale="power_of_two", arithmetic_policy="native", rotary_policy="native"):
+                         workload="frontend_diagnostic", activation_scale="power_of_two", arithmetic_policy="native", rotary_policy="native", silu_export_policy="native"):
     """Build compiled prefill plus teacher-forced recurrent decode on actual text.
 
     ``corpus_path`` is a local UTF-8 text file tokenized with this checkpoint's
@@ -197,6 +197,8 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
         raise ValueError("Unknown TinyLlama arithmetic policy")
     if rotary_policy not in ("native", "source_table_v1") or rotary_policy != "native" and precision != "float32":
         raise ValueError("Source rotary preservation requires explicit CPU FP32 and source_table_v1")
+    if silu_export_policy not in ("native", "torch_avx512_sleef_v1") or silu_export_policy != "native" and (not quantized or precision != "float32" or cpu_threads != 2):
+        raise ValueError("Source SiLU export preservation requires explicit W8A8 CPU FP32 and two threads")
     if arithmetic_policy != "native" and (not quantized or precision != "float32"):
         raise ValueError("Fixed tree candidate requires explicit W8A8 CPU FP32 execution")
     if quality_corpus_path is not None and not quantized:
@@ -235,6 +237,10 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
                               "cumulative_length", None), torch.Tensor):
         raise RuntimeError("The selected Transformers cache API is incompatible with m2m; use the prepared Transformers 5.4.0 environment")
     torch.set_num_threads(cpu_threads)
+    silu_record = None
+    if silu_export_policy != "native":
+        import tinyllama_integer as silu_integer
+        silu_record = silu_integer.source_silu_contract(torch, silu_export_policy)
     tokenizer = AutoTokenizer.from_pretrained(
         str(checkpoint), local_files_only=True, trust_remote_code=False, use_fast=True)
     tokens = tokenizer(text, return_tensors="pt", add_special_tokens=True)["input_ids"]
@@ -267,6 +273,10 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
     if any(value.dtype != dtype or value.device.type != "cpu" for value in lm.parameters()):
         raise ValueError("Loaded model violates explicit CPU precision selection")
     lm.eval().requires_grad_(False)
+    if silu_record is not None:
+        from transformers.activations import SiLUActivation
+        if any(not isinstance(lm.get_submodule(f"model.layers.{layer}.mlp.act_fn"), SiLUActivation) for layer in range(22)):
+            raise ValueError("Source SiLU preservation requires unchanged native SiLU activation modules")
     source_parameter_count = sum(value.numel() for value in lm.parameters())
     source_parameter_bytes = sum(value.numel() * value.element_size() for value in lm.parameters())
     integer = None
@@ -327,6 +337,9 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
     if rotary_record is not None:
         provenance["rotary_policy"] = rotary_record
         provenance["rotary_source"] = file_identity(sys.modules["tinyllama_integer"].__file__, safe_path)
+    if silu_record is not None:
+        provenance["silu_export_policy"] = {**silu_record,
+                                          "native_activation_source": file_identity(sys.modules[SiLUActivation.__module__].__file__, safe_path)}
     if integer is not None:
         provenance.update({"execution_precision": "w8a8_projections_float32_cpu_surrounding_ops",
                            "weight_conversion": "bfloat16_to_float32_then_per_channel_int8_projections",
@@ -396,6 +409,8 @@ def get_verification_artifacts(model, _inputs):
         identities.append(provenance["integer_source"])
     if provenance.get("rotary_source") and provenance["rotary_source"] != provenance.get("integer_source"):
         identities.append(provenance["rotary_source"])
+    if provenance.get("silu_export_policy"):
+        identities.extend(provenance["silu_export_policy"][name] for name in ("native_library", "native_vector_header", "native_loop_header", "native_sleef_header", "native_activation_source"))
     if provenance.get("language_quality_contract"):
         identities.append(provenance["language_quality_contract"]["corpus"])
         if provenance["language_quality_contract"].get("dataset_artifact"):
@@ -407,4 +422,5 @@ def get_onnx_export_options(torch, model=None):
     """Select translations from this model's declared arithmetic policy."""
     from tinyllama_integer import export_options
     policy = model.provenance.get("arithmetic_policy", {}).get("name", "native") if model is not None else "native"
-    return export_options(torch, policy)
+    silu_policy = model.provenance.get("silu_export_policy", {}).get("name", "native") if model is not None else "native"
+    return export_options(torch, policy, silu_policy)

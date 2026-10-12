@@ -568,7 +568,52 @@ class IntegerProjection(nn.Module):
         return result * scale * self.weight_scale
 
 
-def export_options(torch_module, arithmetic_policy="native"):
+SOURCE_SILU_ARTIFACT_HASHES = {
+    "native_library": "4207b9ed0c3c86b5a99150637aef72e26e49a0629f02faf21f37313505b09d6e",
+    "native_vector_header": "0150e7eebb07a5235f19ce5c759368ac3c3bf93f65ff459632a30bcf99d5896c",
+    "native_loop_header": "a6f2ab2e6e7175454f1c4226994177cd2e934d844fe89b09dc049e7a77a7872d",
+    "native_sleef_header": "2955f7429d04a05c5534a634f1aa77519510c90c603b4cbb4afa29d01e9a5923",
+}
+
+
+def _source_silu_artifacts(torch_module):
+    from pathlib import Path
+    from verify_resnet import file_identity, safe_path
+    root = safe_path(Path(torch_module.__file__).parent)
+    names = {"native_library": "lib/libtorch_cpu.so", "native_vector_header": "include/ATen/cpu/vec/vec512/vec512_float.h",
+             "native_loop_header": "include/ATen/native/cpu/Loops.h", "native_sleef_header": "include/sleef.h"}
+    return {name: file_identity(root / relative, safe_path) for name, relative in names.items()}
+
+
+def source_silu_contract(torch_module, policy="native"):
+    """Admit an export-only reproduction of the bound native vector SiLU kernel."""
+    if policy == "native":
+        return None
+    if policy != "torch_avx512_sleef_v1":
+        raise ValueError("Unknown source SiLU export policy")
+    if (torch_module.version.git_version != "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+            or torch_module.backends.cpu.get_cpu_capability() != "AVX512" or torch_module.get_num_threads() != 2):
+        raise ValueError("Source SiLU requires pinned PyTorch AVX512 CPU dispatch and two threads")
+    artifacts = _source_silu_artifacts(torch_module)
+    if any(artifacts[name]["sha256"] != expected for name, expected in SOURCE_SILU_ARTIFACT_HASHES.items()):
+        raise ValueError("Source SiLU requires the independently proved native library and header identities")
+    return {"name": policy, "status": "opt_in_source_preserving_export_not_qualified",
+            "native": "unchanged_aten_silu_cpu_float32_contiguous_Tiny5632_columns_two_threads_no_scalar_tail",
+            "domain": "merlin.source_preserving", "version": 1, "operator": "TorchSiluAvx512F32",
+            "torch_git": torch_module.version.git_version, "cpu_capability": "AVX512", "cpu_threads": 2,
+            "native_loop": "paired_16_word_vectors;admitted_contiguous_chunks_divisible_by32;scalar_std_exp_tail_not_admitted",
+            "exp_source": "https://github.com/shibatch/sleef/blob/3.8/src/libm/sleefsimdsp.c#L1856",
+            "silu_source": "https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/aten/src/ATen/native/cpu/Activation.cpp#L1098",
+            "exp_algorithm": "sleef3.8_avx512_u10_fp32_RNE_range_reduction_eight_explicit_FMA_separate_square_add_two_exponent_scaling_products",
+            "silu_algorithm": "FP32_x_div_FP32_one_plus_source_exp_negative_x;no_reciprocal_multiply",
+            "compiled_nonfinite": "sanitize_NaN_before_int_cast;NaN_output;infinity_classification_only_no_payload_equality_claim",
+            "compiled_value_admission": "source_session_finite_activations_indirectly_checked_by_down_projection_encoder;no_direct_SiLU_input_or_exported_general_runtime_refusal_guard",
+            "lowering": "LLVM_CPU_explicit_llvm_fma;no_Torch_or_Sleef_runtime_dependency;C_codegen_unsupported",
+            "correct_rounding": "no_universal_correctly_rounded_exp_or_silu_claim",
+            "workspace": "one_FP32_output_same_shape;scalar_local_temporaries_no_private_heap_scratch;target_cost_and_execution_unqualified", **artifacts}
+
+
+def export_options(torch_module, arithmetic_policy="native", silu_export_policy="native"):
     """Modern exporter preserves signed-int8 operands with standard MatMulInteger."""
     from onnxscript import opset18 as op
     from onnxscript.onnx_types import INT8, INT32, FLOAT
@@ -586,6 +631,13 @@ def export_options(torch_module, arithmetic_policy="native"):
 
     arithmetic_contract(arithmetic_policy)
     translations = {torch_module.ops.aten._int_mm.default: integer_mm}
+    if source_silu_contract(torch_module, silu_export_policy) is not None:
+        source = Opset("merlin.source_preserving", 1)
+        schema = defs.OpSchema("TorchSiluAvx512F32", "merlin.source_preserving", 1, inputs=[defs.OpSchema.FormalParameter("a", "T")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(float)"], "Bound source FP32 SiLU")])
+        silu_op = Op(source, "TorchSiluAvx512F32", schema)
+        def source_silu(self: FLOAT) -> FLOAT:
+            return silu_op(self)
+        translations[torch_module.ops.aten.silu.default] = source_silu
     if arithmetic_policy == "native":
         return {"custom_translation_table": translations}
     _ensure_fixed_tree_ops()

@@ -75,6 +75,9 @@ class TinyLlamaArtifactTests(unittest.TestCase):
                         {"arithmetic_policy": "fixed_tree_fp32_v2_pv", "quantized": True, "precision": "bfloat16"},
                         {"arithmetic_policy": "fixed_tree_fp32_v3_softmax_reduce"},
                         {"rotary_policy": "unknown"}, {"rotary_policy": "source_table_v1", "precision": "bfloat16"},
+                        {"silu_export_policy": "unknown"}, {"silu_export_policy": "torch_avx512_sleef_v1"},
+                        {"silu_export_policy": "torch_avx512_sleef_v1", "quantized": True, "cpu_threads": 1},
+                        {"silu_export_policy": "torch_avx512_sleef_v1", "quantized": True, "precision": "bfloat16"},
                         {"rotary_policy": "source_table_v1", "prefill_tokens": 159, "decode_tokens": 2},
                         {"arithmetic_policy": "fixed_tree_fp32_v2_pv", "quantized": True, "prefill_tokens": 159, "decode_tokens": 2}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
@@ -95,6 +98,51 @@ except ImportError:
 
 @unittest.skipIf(torch is None, "Optional PyTorch environment is absent")
 class TinyLlamaIntegerTests(unittest.TestCase):
+    def test_source_silu_export_contract_refuses_unbound_native_dispatch(self):
+        from types import SimpleNamespace
+        fake = SimpleNamespace(version=SimpleNamespace(git_version="449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"), backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX512")), get_num_threads=lambda: 2)
+        self.assertIsNone(INTEGER.source_silu_contract(fake))
+        artifacts = {name: {"path": "/tmp/fixture", "sha256": sha} for name, sha in INTEGER.SOURCE_SILU_ARTIFACT_HASHES.items()}
+        with mock.patch.object(INTEGER, "_source_silu_artifacts", return_value=artifacts):
+            self.assertEqual(INTEGER.source_silu_contract(fake, "torch_avx512_sleef_v1")["native_loop"], "paired_16_word_vectors;admitted_contiguous_chunks_divisible_by32;scalar_std_exp_tail_not_admitted")
+        with mock.patch.object(INTEGER, "_source_silu_artifacts", return_value={name: {**record, "sha256": "unproved"} for name, record in artifacts.items()}), self.assertRaisesRegex(ValueError, "independently proved"):
+            INTEGER.source_silu_contract(fake, "torch_avx512_sleef_v1")
+        for field, value in (("git", "other"), ("cpu", "AVX2"), ("threads", 1)):
+            changed = SimpleNamespace(version=SimpleNamespace(git_version=value if field == "git" else fake.version.git_version), backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: value if field == "cpu" else "AVX512")), get_num_threads=lambda: value if field == "threads" else 2)
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "pinned PyTorch"):
+                INTEGER.source_silu_contract(changed, "torch_avx512_sleef_v1")
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX") and os.environ.get("TVM_LIBRARY_PATH"), "Requires explicit modern exporter and LLVM host build")
+    def test_source_silu_opt_in_export_preserves_fullshape_native_in_both_modes(self):
+        import onnx
+        import tvm
+        import verify_session
+        threads = torch.get_num_threads()
+        torch.set_num_threads(2)
+        try:
+            class Stage(torch.nn.Module):
+                def forward(self, value):
+                    return torch.nn.functional.silu(value)
+            model = Stage().eval()
+            value = torch.linspace(-80, 80, 5632, dtype=torch.float32).reshape(1, 1, 5632)
+            expected = model(value).detach().numpy()
+            state = {name: tensor.clone() for name, tensor in model.state_dict().items()}
+            with tempfile.TemporaryDirectory() as directory:
+                for mode in ("baseline", "optimized"):
+                    options = INTEGER.export_options(torch, silu_export_policy="torch_avx512_sleef_v1")
+                    (Path(directory) / mode).mkdir()
+                    compiler = verify_session.StageCompiler(Path(directory) / mode, mode, np, torch, onnx, tvm, exporter="dynamo", export_options=options)
+                    inputs = (value.numpy(),)
+                    run = compiler(type("Stage", (), {"name": "source_silu", "module": model})(), inputs, 1)
+                    actual = verify_session.outputs(run(inputs), np, torch)[0]
+                    graph = onnx.load(str(Path(directory) / mode / "stage_0/model.onnx"))
+                    self.assertEqual([(node.domain, node.op_type) for node in graph.graph.node], [("merlin.source_preserving", "TorchSiluAvx512F32")])
+                    np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+            self.assertEqual(set(model.state_dict()), set(state))
+            self.assertNotIn(torch.ops.aten.silu.default, INTEGER.export_options(torch)["custom_translation_table"])
+        finally:
+            torch.set_num_threads(threads)
+
     def test_v3_softmax_independent_tree_mask_tail_and_backend_exp_contract(self):
         import decimal
         logits = torch.tensor([[[[0., -1., -80., -100.], [1., 1., 1., 1.], [-0., 0., 2., 3.]]]], dtype=torch.float32)
