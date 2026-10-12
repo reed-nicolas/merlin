@@ -76,6 +76,7 @@ def statistics(default, alternate, torch):
         "symmetric_relative_error_mean_nonzero": float(relative.mean()) if relative.numel() else 0.0,
         "relative_denominator": "max(abs(reference),abs(candidate)); both-zero omitted",
         "outside_existing_pointwise_comparison_count": int((~torch.isclose(right, left, rtol=RTOL, atol=ATOL)).sum()),
+        "raw_encoding_unequal_count": int((dense_flat_copy(default, torch).view(torch.uint8).reshape(default.numel(), default.element_size()) != dense_flat_copy(alternate, torch).view(torch.uint8).reshape(alternate.numel(), alternate.element_size())).any(dim=1).sum()),
     }
     if default.dtype == torch.bfloat16:
         def rank(value):
@@ -118,6 +119,13 @@ def processor_transform_diagnostic(preprocessor, postprocessor, torch, *, physic
         "state_probe_transform_is_identity": bool(torch.equal(state, probes)),
         "action_probe_transform_is_identity": bool(torch.equal(action, probes[:, None, :])),
         "state_probe": tensor_identity(state, torch), "action_probe": tensor_identity(action, torch),
+        "feature_statistics_inventory": {
+            name: {
+                "features": {key: {"type": feature.type.value, "shape": list(feature.shape), "declared_mode": step.norm_map[feature.type].value, "effective_statistics_key": key if key in step._tensor_stats else None} for key, feature in step.features.items()},
+                "statistics": {key: {stat: tensor_identity(value, torch) for stat, value in values.items()} for key, values in step._tensor_stats.items()},
+                "epsilon": step.eps,
+            } for name, step in (("preprocessor", state_step), ("postprocessor", action_step))
+        },
         "physical_action_units_qualified": False,
         "interpretation": "Actual original processor behavior; namespaced statistics are not automatically mapped to the plain feature keys. Physical units require a reviewed effective mapping and coordinate convention.",
     }
@@ -151,6 +159,82 @@ def original_processor_diagnostic(checkpoint_dir, backbone_dir, torch, *, physic
     if any(factory.file_identity(item["path"], factory.safe_path) != item for item in bindings):
         raise AssertionError("Original processor configuration, statistics or source changed during diagnosis")
     return {**result, "available": True, "bindings": bindings, "bindings_unchanged": True, "normalization_qualified": False, "runtime_overrides": "CPU device and selected local tokenizer path only"}
+
+
+def normalization_metadata_inventory(checkpoint_dir, backbone_dir, fixture_manifest):
+    """Inventory saved metadata; configuration presence does not prove execution or training identity."""
+    selected = {}
+    for label, root, names in (("policy", checkpoint_dir, ("config.json", "policy_preprocessor.json", "policy_postprocessor.json")), ("backbone", backbone_dir, ("config.json", "preprocessor_config.json", "processor_config.json", "tokenizer_config.json"))):
+        for name in names:
+            path = factory.safe_path(factory.safe_path(root) / name)
+            if path.is_file():
+                selected[label + "/" + name] = {"binding": factory.file_identity(path, factory.safe_path), "metadata": json.loads(path.read_text())}
+    if "policy/config.json" not in selected or "backbone/config.json" not in selected:
+        raise ValueError("Normalization inventory requires the chosen policy and backbone configurations")
+    policy = selected["policy/config.json"]["metadata"]
+    # Vocabulary metadata is sufficient; avoid copying the tokenizer's token tables into reports.
+    if "backbone/tokenizer_config.json" in selected:
+        tokenizer = selected["backbone/tokenizer_config.json"]
+        tokenizer["metadata"] = {key: tokenizer["metadata"].get(key) for key in ("tokenizer_class", "model_max_length", "padding_side", "clean_up_tokenization_spaces")}
+    bindings = [item["binding"] for item in selected.values()]
+    if any(factory.file_identity(item["path"], factory.safe_path) != item for item in bindings):
+        raise AssertionError("Normalization metadata changed during inventory")
+    return {
+        "saved_metadata": selected, "bindings": bindings, "bindings_unchanged": True,
+        "declared_policy_normalization": policy.get("normalization_mapping"),
+        "configured_policy_cameras": [key for key in policy.get("input_features", {}) if key.startswith("observation.images.")],
+        "selected_cameras": fixture_manifest.get("selected_cameras"), "camera_mapping": fixture_manifest.get("camera_mapping"),
+        "state_coordinate_names": fixture_manifest.get("state_names"),
+        "selected_camera_mapping_is_training_mapping": fixture_manifest.get("training_camera_mapping_verified", False),
+        "chosen_backbone_is_training_backbone": fixture_manifest.get("backbone_revision_verified", False),
+        "image_route": "Recorded preparation invokes the saved policy preprocessor, then original SmolVLAPolicy.prepare_images. Saved backbone image-processor normalization metadata is inventoried; its presence does not establish that this path invoked it.",
+        "physical_units_qualified": False,
+    }
+
+
+def numerical_contract_proposal(fixture_manifest, processor_diagnostic, metadata_inventory, *, recipe=None, evidence=()):
+    """Produce review data only; never select thresholds or return a qualification verdict."""
+    if fixture_manifest.get("split") not in ("train", "development"):
+        raise ValueError("Numerical proposals may use attributed TRAIN/development evidence only")
+    identity = fixture_manifest.get("input_fixture")
+    if not fixture_manifest.get("schema_verified") or not isinstance(identity, dict) or not isinstance(identity.get("path"), str) or not identity["path"] or not isinstance(identity.get("sha256"), str) or len(identity["sha256"]) != 64 or any(char not in "0123456789abcdef" for char in identity["sha256"]):
+        raise ValueError("Numerical proposals require declared recorded-schema and fixture identity metadata")
+    # Detach report data from caller objects, and reject non-JSON/nonfinite metadata.
+    fixture, processor, inventory, recipe, evidence = json.loads(json.dumps((fixture_manifest, processor_diagnostic, metadata_inventory, recipe, list(evidence)), allow_nan=False))
+    def criterion(status, rule, **details):
+        return {"status": status, "rule": rule, "changes_runtime_acceptance": False, **details}
+    return {
+        "version": 2, "status": "proposal_unapproved", "qualification_verdict": "NO_ACCEPTANCE",
+        "acceptance_contract_selected": False, "thresholds_adopted": False, "active_gate_changed": False,
+        "existing_gate": criterion("accepted", "Existing compiled versus native-recipe pointwise gate remains authoritative; explanatory arithmetic diagnostics do not turn a failed gate into PASS.", rtol=RTOL, atol=ATOL),
+        "direction": criterion("accepted", "Independently specified dtype-aware arithmetic, preserved original logical casts/state/routes, separate original-policy quality and higher-precision diagnostics."),
+        "population": {"status": "accepted", "split": fixture["split"], "episode": fixture.get("episode_index"), "frame": fixture.get("frame_index"), "split_rule": fixture.get("split_rule"), "heldout_data_loaded_by_producer": False, "threshold_selection_from_observed_error": False},
+        "source": {"fixture": fixture, "fixture_binding_verified_by_producer": False, "source_closure_verified_by_producer": False, "normalization_inventory": inventory, "original_processor": processor, "declared_integer_recipe": recipe, "evidence": evidence},
+        "local_arithmetic": {
+            "operands": criterion("accepted", "Use identical actual candidate inputs and original parameter bytes; separately record original-native inputs versus propagated candidate inputs, output shape/dtype, source/math/export closures and immutable bindings."),
+            "routing_and_encoding": criterion("accepted", "Exact shapes, BOOL masks, indices, cache/state/action slicing and same-dtype raw-copy storage bytes, including signed zero. For value-preserving widening with different dtypes, compare independently expected destination cast words, not source/destination byte equality. On identical actual operands/scales check exact INT8 codes and INT32 results; code changes caused by different propagated floating inputs are separate arithmetic/quantization/quality evidence, not automatically encoder corruption."),
+            "integer_contraction": criterion("accepted", "On identical actual INT8 operands, signed INT8×INT8→INT32, no saturation/overflow; check complete K using independent INT64 accumulation under the declared recipe K bound. Sampled outputs establish sampled coverage, not every contraction."),
+            "projection_recipe": criterion("proposed", "Freeze FP32 activation/weight scale primitives, maxabs/127, zero-row scale1, tiny clamp, RNE clipping[-127,127], packed layout; check codes/scales independently. Dequantize INT32 in FP32 using the declared multiply order, add original bias in FP32 before one original output cast. No float kernel allowance covers integer/code disagreement."),
+            "fp32_sum_and_dot": criterion("proposed", "For each declared operation tree use u=2^-24 and gamma_m=m*u/(1-m*u); bound sum error by gamma_m*sum(abs(terms)), with m derived from rounded products/additions and final scaling. Record FMA/reassociation, accumulation dtype and every intermediate store/cast. Require m*u<1 and prove finite normal-range operations or explicitly account for underflow; otherwise NO_PROOF. This is a conditional arithmetic bound, not a model tolerance.", implementation_complete=False),
+            "logical_rounding_cells": criterion("proposed", "Independently map each finite FP32→BF16 cast using integer-bit RNE, exact midpoint/parity and signed-zero rules. Propagate the preceding proved interval into rounding cells: a single cell determines exact output; a midpoint-spanning interval permits multiple outputs only under a reviewed bound. Preserve every logical intermediate cast. A lawful midpoint split does not waive the existing source gate.", implementation_complete=False),
+            "norms": criterion("unresolved", "RMSNorm/LayerNorm require exact source epsilon, FLOAT reduction/stash/affine order, BF16 normalization/affine boundaries and conditioning analysis. Prove variance/rsqrt domains and operation-specific intervals; observed native spread is not a bound.", required_decision="Review operation-specific conditional arithmetic proofs before replacing the existing numerical gate."),
+            "nonpolynomial_math_and_attention": criterion("unresolved", "Bind exact exp/sin/cos/pow/rsqrt/softmax implementations and dtypes; library approximations require independent error contracts. Keep exact masking, logits scaling, normalization, probability cast and QK/PV accumulation boundaries. A linear gamma bound or bf16_linear_error_diagnostic (CPU FP32 arithmetic plus ONE BF16 output cast) cannot certify attention or a trajectory."),
+            "fp64_constants": criterion("accepted", "Preserve original DOUBLE scalar/constant bits and declared FP64 operation/dtype/store/cast boundaries until original explicit narrowing. This does not promise bitwise equal FP64 arithmetic under an unspecified order or library approximation; metric upcasting does not change reference-forward precision."),
+            "exceptional_values": criterion("accepted", "Reject newly nonfinite values and unexpected shape/dtype/routing. Overflow, subnormal/flush behavior or unsupported approximation without a proved contract gives NO_PROOF; no NaN-masked or all-nonfinite PASS."),
+        },
+        "quantization_and_trajectory": criterion("proposed", "Separate compiled/native-recipe error, native recipe/original-checkpoint quantization, native CPU-backend variation and accumulated prefix/trajectory error. On each original state/noise/time compare velocity with original prefix, then quantized prefix; compare independently propagated full trajectories separately. For an exact-real contraction diagnose sum_k(|xq-x|*|w|+|xq|*|wq-w|), then add proved FP32 scale/dequantization/bias/cast effects; do not apply this local bound to the full policy."),
+        "action_quality": {
+            "policy_coordinates": criterion("proposed", "Compare unchanged original mixed BF16/FP32 policy against native integer recipe, then separately compiled recipe, with matched observations/noise/reset. Report per-coordinate/per-horizon max, MAE, RMS and relative L2 (reference norm; zero norm reports null), raw encoding drift and existing-gate counts. FP64 metrics are not a higher-precision reference forward.", limits={"max_absolute_error": None, "rms_error": None}, limits_status="unresolved"),
+            "normalized_coordinates": criterion("unresolved", "Require reviewed effective plain action/statistics mapping, declared normalization formula/epsilon and coordinate order; never select or alias a robot namespace. Identity probes alone do not establish normalized units.", limits=None),
+            "physical_coordinates": criterion("unresolved", "Bind original postprocessing, robot coordinate convention and units; freeze per-coordinate limits from independent control/actuator/sensor requirements, not observed TRAIN error, native-backend spread, a fixed ULP allowance or unrelated kernel tolerance.", per_coordinate_limits=[{"name": name, "unit": None, "max_absolute_error": None, "rms_error": None} for name in fixture.get("state_names", [])]),
+            "task_success": criterion("unresolved", "Recorded open-loop action drift is not closed-loop success. Freeze task population, reset/termination/outcome protocol and justified degradation limits before heldout evaluation."),
+        },
+        "claim_scoped_gaps": {
+            "functional_compiler_checks": {"training_camera_or_backbone_identity_required": False, "required": ["Exact chosen backbone/checkpoint/input/camera/mask/state bindings", "Independent source operation semantics and current numerical gates", "Actual graph-mode/repeat/output coverage"]},
+            "training_application_reproduction": {"status": "unresolved", "required": ["Training camera mapping", "Training-time backbone identity", "Effective original action/state statistics and coordinate convention"]},
+            "original_policy_and_physical_quality": {"status": "unresolved", "required": ["Reviewed per-coordinate units/limits", "Application provenance and evaluation protocol", "Frozen TRAIN/development contract followed by untouched heldout evaluation"]},
+        },
+    }
 
 
 def action_quality_diagnostic(reference, candidate, torch, *, physical_transform=None, physical_units=None):
@@ -494,6 +578,12 @@ def main(argv=None):
         report["original_processor_diagnostic"] = processor_diagnostic
         already_bound = {item["path"] for item in report["source_bindings"] + report["checkpoint_bindings"]}
         report["source_bindings"].extend(item for item in processor_diagnostic["bindings"] if item["path"] not in already_bound)
+        if fixture_manifest and fixture_manifest.get("split") in ("train", "development"):
+            inventory = normalization_metadata_inventory(args.checkpoint_dir, args.backbone_dir, fixture_manifest)
+            report["normalization_metadata_inventory"] = inventory
+            report["numerical_contract_proposal"] = numerical_contract_proposal(fixture_manifest, processor_diagnostic, inventory)
+            already_bound.update(item["path"] for item in report["source_bindings"])
+            report["source_bindings"].extend(item for item in inventory["bindings"] if item["path"] not in already_bound)
         report["dependencies"] = {name: importlib.metadata.version(name) for name in ("torch", "transformers", "lerobot", "numpy", "onnx", "safetensors")}
         if args.input_npz is not None:
             report["fixture_binding"] = factory.file_identity(args.input_npz, factory.safe_path)

@@ -264,6 +264,32 @@ class SmolVLAObservationTests(unittest.TestCase):
 
 
 class SmolVLAArithmeticDiagnosticTests(unittest.TestCase):
+    def test_proposal_refuses_heldout_unbound_or_nonfinite_metadata_and_never_accepts(self):
+        fixture = {"split": "train", "schema_verified": True, "input_fixture": {"path": "/chosen/observation.npz", "sha256": "0" * 64}, "state_names": ["first", "second"]}
+        proposal = DIAGNOSTIC.numerical_contract_proposal(fixture, {}, {}, evidence=[{"status": "passed"}])
+        self.assertEqual(proposal["qualification_verdict"], "NO_ACCEPTANCE")
+        self.assertFalse(proposal["thresholds_adopted"])
+        self.assertFalse(proposal["acceptance_contract_selected"])
+        self.assertFalse(proposal["source"]["fixture_binding_verified_by_producer"])
+        self.assertFalse(proposal["source"]["source_closure_verified_by_producer"])
+        self.assertEqual(proposal["existing_gate"]["rtol"], 1e-4)
+        self.assertIsNone(proposal["action_quality"]["policy_coordinates"]["limits"]["rms_error"])
+        self.assertFalse(proposal["claim_scoped_gaps"]["functional_compiler_checks"]["training_camera_or_backbone_identity_required"])
+        proposal["source"]["fixture"]["state_names"].append("third")
+        self.assertEqual(fixture["state_names"], ["first", "second"])
+        for change in ({"split": "heldout"}, {"split": "synthetic"}, {"schema_verified": False}, {"input_fixture": None}, {"input_fixture": {"path": "/chosen/observation.npz", "sha256": "not a hash"}}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                DIAGNOSTIC.numerical_contract_proposal({**fixture, **change}, {}, {})
+        with self.assertRaises(ValueError):
+            DIAGNOSTIC.numerical_contract_proposal(fixture, {"epsilon": float("nan")}, {})
+
+    def test_action_statistics_preserve_raw_signed_zero_encoding_distinction(self):
+        import torch
+        result = DIAGNOSTIC.statistics(torch.tensor([0.0]), torch.tensor([-0.0]), torch)
+        self.assertEqual(result["exactly_unequal_count"], 0)
+        self.assertEqual(result["raw_encoding_unequal_count"], 1)
+        self.assertEqual(result["outside_existing_pointwise_comparison_count"], 0)
+
     def test_original_processor_provenance_binds_selected_config_state_and_classes(self):
         import torch
         from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
@@ -305,6 +331,10 @@ class SmolVLAArithmeticDiagnosticTests(unittest.TestCase):
         self.assertFalse(result["plain_action_statistics_present"])
         self.assertFalse(result["statistics_remapped"])
         self.assertEqual(sorted(after._tensor_stats), ["so100.buffer.action"])
+        inventory = result["feature_statistics_inventory"]["postprocessor"]
+        self.assertIsNone(inventory["features"]["action"]["effective_statistics_key"])
+        self.assertEqual(inventory["statistics"]["so100.buffer.action"]["mean"]["shape"], [2])
+        self.assertEqual(inventory["statistics"]["so100.buffer.action"]["mean"]["dtype"], "torch.float32")
         after = UnnormalizerProcessorStep(features=features, norm_map=norm_map, stats={"action": stats["so100.buffer.action"]})
         result = DIAGNOSTIC.processor_transform_diagnostic(SimpleNamespace(steps=[before]), SimpleNamespace(steps=[after]), torch, physical_dim=2)
         self.assertTrue(result["plain_action_statistics_present"])
