@@ -73,6 +73,18 @@ class SmolVLAArtifactTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source mean"):
                 FACTORY.get_model_and_inputs(**base, **change)
 
+    def test_source_softmax_requires_explicit_integer_session_and_one_native_thread(self):
+        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
+        for change in ({"source_softmax_policy": "unknown"}, {"source_softmax_policy": "torch_cpu_softmax177_v1"}, {"source_softmax_policy": "torch_cpu_softmax177_v1", "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source softmax"):
+                FACTORY.get_model_and_inputs(**base, **change)
+
+    def test_source_layernorm_requires_explicit_integer_session_and_one_native_thread(self):
+        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
+        for change in ({"source_layernorm_policy": "unknown"}, {"source_layernorm_policy": "torch_cpu_layernorm768_v1"}, {"source_layernorm_policy": "torch_cpu_layernorm768_v1", "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source LayerNorm"):
+                FACTORY.get_model_and_inputs(**base, **change)
+
     def test_restricted_component_is_rejected_before_read(self):
         with self.assertRaisesRegex(ValueError, "Restricted path component"):
             FACTORY.directory_artifacts("/tmp/" + "vl" + "si" + "-fixture")
@@ -314,6 +326,97 @@ class SmolVLASourceMeanTests(unittest.TestCase):
             self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [("TorchMean720Fp32", 1, 1, 0)] if dtype == torch.float32 else [])
             self.assertEqual(sum(node.op_type == "ReduceMean" for node in graph.graph.node), 3 if dtype == torch.float32 else 4)
             self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
+
+
+class SmolVLASourceSoftmaxTests(unittest.TestCase):
+    def test_session_hook_selects_only_declared_policy_without_mutating_defaults(self):
+        import torch
+        import bf16_export
+        import tinyllama_integer
+        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
+        with mock.patch.object(tinyllama_integer, "export_options", side_effect=lambda _: {"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_softmax_translations", return_value={torch.ops.aten.softmax.int: "selected"}) as select:
+            self.assertEqual(FACTORY.get_onnx_export_options(torch)["custom_translation_table"], original)
+            model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {}}))
+            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], original)
+            select.assert_not_called()
+            model.session.metadata["provenance"]["source_softmax_policy"] = {"name": "torch_cpu_softmax177_v1"}
+            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, torch.ops.aten.softmax.int: "selected"})
+            self.assertNotIn(torch.ops.aten.softmax.int, original)
+            select.assert_called_once_with(torch, "torch_cpu_softmax177_v1")
+
+    def test_contract_refuses_unproved_runtime_and_modified_binary(self):
+        self.assertIsNone(NUMERICS.source_softmax_contract(None))
+        self.assertEqual(NUMERICS.source_softmax_translations(None), {})
+        with self.assertRaisesRegex(ValueError, "Unknown source softmax"):
+            NUMERICS.source_softmax_contract(None, "unknown")
+        runtime = SimpleNamespace(version=SimpleNamespace(git_version="449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"), backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX512")), get_num_threads=lambda: 1, __file__="/tmp/pinned-torch/__init__.py")
+        with mock.patch("verify_resnet.file_identity", return_value={"sha256": "changed"}), self.assertRaisesRegex(ValueError, "independently proved"):
+            NUMERICS.source_softmax_contract(runtime, "torch_cpu_softmax177_v1")
+        for field, value in (("get_num_threads", lambda: 2), ("version", SimpleNamespace(git_version="different")), ("backends", SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX2")))):
+            with self.subTest(field=field), mock.patch.object(runtime, field, value), self.assertRaisesRegex(ValueError, "pinned PyTorch"):
+                NUMERICS.source_softmax_contract(runtime, "torch_cpu_softmax177_v1")
+
+    def test_export_selects_only_bound_fp32_shape_and_axis(self):
+        import torch
+        class Softmax(torch.nn.Module):
+            def forward(self, value, other):
+                return value.softmax(-1), torch.ops.aten._softmax.default(value, -1, False), value.softmax(2), other.softmax(-1)
+        for dtype in (torch.float32, torch.bfloat16):
+            inputs = (torch.linspace(-2, 2, 132750).reshape(1, 15, 50, 177).to(dtype), torch.ones(1, 15, 50, 176, dtype=dtype))
+            before = tuple(value.clone() for value in inputs)
+            with mock.patch.object(NUMERICS, "source_softmax_contract", return_value={"name": "torch_cpu_softmax177_v1"}):
+                table = NUMERICS.source_softmax_translations(torch, "torch_cpu_softmax177_v1")
+            graph = torch.onnx.export(Softmax().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
+            selected = [node for node in graph.graph.node if node.domain == "merlin.source_preserving"]
+            self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [("TorchSoftmaxAvx512F32LastDim177", 1, 1, 0)] * 2 if dtype == torch.float32 else [])
+            self.assertEqual(sum(node.op_type == "Softmax" for node in graph.graph.node), 2 if dtype == torch.float32 else 4)
+            self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
+
+
+class SmolVLASourceLayerNormTests(unittest.TestCase):
+    def test_session_hook_selects_only_declared_policy(self):
+        import torch
+        import bf16_export
+        import tinyllama_integer
+        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
+        with mock.patch.object(tinyllama_integer, "export_options", side_effect=lambda _: {"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_layernorm_translations", return_value={torch.ops.aten.layer_norm.default: "selected"}) as select:
+            self.assertEqual(FACTORY.get_onnx_export_options(torch)["custom_translation_table"], original)
+            model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {}}))
+            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], original)
+            select.assert_not_called()
+            model.session.metadata["provenance"]["source_layernorm_policy"] = {"name": "torch_cpu_layernorm768_v1"}
+            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, torch.ops.aten.layer_norm.default: "selected"})
+            select.assert_called_once_with(torch, "torch_cpu_layernorm768_v1")
+
+    def test_contract_refuses_unproved_runtime_and_modified_binary(self):
+        self.assertIsNone(NUMERICS.source_layernorm_contract(None))
+        self.assertEqual(NUMERICS.source_layernorm_translations(None), {})
+        with self.assertRaisesRegex(ValueError, "Unknown source LayerNorm"):
+            NUMERICS.source_layernorm_contract(None, "unknown")
+        runtime = SimpleNamespace(version=SimpleNamespace(git_version="449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"), backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX512")), get_num_threads=lambda: 1, __file__="/tmp/pinned-torch/__init__.py")
+        with mock.patch("verify_resnet.file_identity", return_value={"sha256": "changed"}), self.assertRaisesRegex(ValueError, "independently proved"):
+            NUMERICS.source_layernorm_contract(runtime, "torch_cpu_layernorm768_v1")
+        with mock.patch.object(runtime, "get_num_threads", return_value=2), self.assertRaisesRegex(ValueError, "pinned PyTorch"):
+            NUMERICS.source_layernorm_contract(runtime, "torch_cpu_layernorm768_v1")
+
+    def test_export_selects_original_bf16_affines_shape_and_epsilon(self):
+        import torch
+        class LayerNorm(torch.nn.Module):
+            def forward(self, value, weight, bias):
+                return torch.nn.functional.layer_norm(value, (768,), weight, bias, 1e-6), torch.nn.functional.layer_norm(value, (768,), weight, bias, 1e-5), torch.nn.functional.layer_norm(value, (768,), None, None, 1e-6)
+        for dtype in (torch.bfloat16, torch.float32):
+            inputs = (torch.linspace(-2, 2, 786432).reshape(1, 1024, 768).to(dtype), torch.ones(768, dtype=dtype), torch.zeros(768, dtype=dtype))
+            before = tuple(value.clone() for value in inputs)
+            with mock.patch.object(NUMERICS, "source_layernorm_contract", return_value={"name": "torch_cpu_layernorm768_v1"}):
+                table = NUMERICS.source_layernorm_translations(torch, "torch_cpu_layernorm768_v1")
+            graph = torch.onnx.export(LayerNorm().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
+            selected = [node for node in graph.graph.node if node.domain == "merlin.source_preserving"]
+            self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [("TorchLayerNormAvx2Bf16Width768", 4, 1, 0)] if dtype == torch.bfloat16 else [])
+            self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
+            if selected:
+                from onnx import numpy_helper
+                constants = {node.output[0]: numpy_helper.to_array(node.attribute[0].t) for node in graph.graph.node if node.op_type == "Constant" and node.attribute[0].type == 4}
+                self.assertEqual(int(constants[selected[0].input[3]].view("uint32")), 0x358637bd)
 
 
 class SmolVLAArithmeticDiagnosticTests(unittest.TestCase):

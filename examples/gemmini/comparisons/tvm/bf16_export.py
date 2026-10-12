@@ -1,4 +1,4 @@
-"""Source-bound scalar/mean exports and opt-in fused BF16 math.
+"""Source-bound scalar/reduction exports and opt-in fused BF16 math.
 
 The independent scalar hook preserves original Python values in typed DOUBLE
 constants; other ordinary scalar dtypes use their built-in translations.
@@ -23,6 +23,39 @@ SOURCE_MEAN_ARTIFACTS = {
     "include/ATen/cpu/vec/vec256/vec256_float.h": "62cd6915726701b7b62dea00c16406eb1792c140c197ae1a12e4d35b9c6d81dd",
 }
 
+SOURCE_SOFTMAX_ARTIFACTS = {
+    "lib/libtorch_cpu.so": SOURCE_MEAN_ARTIFACTS["lib/libtorch_cpu.so"],
+    "include/ATen/native/DispatchStub.h": SOURCE_MEAN_ARTIFACTS["include/ATen/native/DispatchStub.h"],
+    "include/ATen/cpu/vec/functional_base.h": "f60163d76edecb5bc3871b46af52f6148be9cb12d2d378bde86ccef6b528853a",
+    "include/ATen/cpu/vec/vec512/vec512_float.h": "0150e7eebb07a5235f19ce5c759368ac3c3bf93f65ff459632a30bcf99d5896c",
+    "include/ATen/native/cpu/SoftmaxKernel.h": "2e5d98a57e767e29ace4db183eb6d3f3281f669e7093b0b00bdfbb946118a536",
+    "include/sleef.h": "2955f7429d04a05c5534a634f1aa77519510c90c603b4cbb4afa29d01e9a5923",
+}
+
+SOURCE_LAYERNORM_ARTIFACTS = {
+    "lib/libtorch_cpu.so": SOURCE_MEAN_ARTIFACTS["lib/libtorch_cpu.so"],
+    "include/ATen/native/DispatchStub.h": SOURCE_MEAN_ARTIFACTS["include/ATen/native/DispatchStub.h"],
+    "include/ATen/native/cpu/moments_utils.h": "0225459908f720e74b4d6814e4b61734042b3d7db22fc8c9d98a889ed1126dff",
+    "include/ATen/cpu/vec/vec256/vec256_float.h": SOURCE_MEAN_ARTIFACTS["include/ATen/cpu/vec/vec256/vec256_float.h"],
+    "include/ATen/cpu/vec/vec256/vec256_bfloat16.h": "a337093b5269dd1349f15a3dec8c6113f1af9e11714a669b6273139a67f72242",
+    "include/ATen/cpu/vec/vec256/vec256_16bit_float.h": "aa2fd19c04c46964061cea8395d292613827e77572c6e8f95d105d5cd2bc3e63",
+    "include/ATen/cpu/vec/functional.h": "01672298ad7826eef730bec0d2b1172ed6380bd907daa0de3748cb09d5699258",
+    "include/ATen/cpu/vec/functional_base.h": SOURCE_SOFTMAX_ARTIFACTS["include/ATen/cpu/vec/functional_base.h"],
+    "include/ATen/cpu/vec/functional_bfloat16.h": "6d40c9bd4b21750b0140bdeaf93cd8f455c4f0466b4501c91e6218b420747ef9",
+}
+
+
+def _source_cpu_bindings(torch, artifacts, operation):
+    if torch.version.git_version != "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0" or torch.backends.cpu.get_cpu_capability() != "AVX512" or torch.get_num_threads() != 1:
+        raise ValueError(f"{operation} requires the pinned PyTorch CPU build, AVX512 capability and one native thread")
+    from pathlib import Path
+    from verify_resnet import file_identity, safe_path
+    root = safe_path(Path(torch.__file__).parent)
+    bindings = [file_identity(root / relative, safe_path) for relative in artifacts]
+    if any(record["sha256"] != expected for record, expected in zip(bindings, artifacts.values())):
+        raise ValueError(f"{operation} requires the independently proved native library and headers")
+    return bindings
+
 
 def source_mean_contract(torch, policy="native"):
     """Bind the native CPU mean used by the scoped Smol expert export."""
@@ -30,14 +63,7 @@ def source_mean_contract(torch, policy="native"):
         return None
     if policy != "torch_cpu_mean720_v1":
         raise ValueError("Unknown source mean export policy")
-    if torch.version.git_version != "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0" or torch.backends.cpu.get_cpu_capability() != "AVX512" or torch.get_num_threads() != 1:
-        raise ValueError("Source mean requires the pinned PyTorch CPU build, AVX512 capability and one native thread")
-    from pathlib import Path
-    from verify_resnet import file_identity, safe_path
-    root = safe_path(Path(torch.__file__).parent)
-    bindings = [file_identity(root / relative, safe_path) for relative in SOURCE_MEAN_ARTIFACTS]
-    if any(record["sha256"] != expected for record, expected in zip(bindings, SOURCE_MEAN_ARTIFACTS.values())):
-        raise ValueError("Source mean requires the independently proved native library and headers")
+    bindings = _source_cpu_bindings(torch, SOURCE_MEAN_ARTIFACTS, "Source mean")
     return {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
             "domain": "merlin.source_preserving", "version": 1, "operator": "TorchMean720Fp32",
             "native": "unchanged_Tensor_mean_float32_last_axis_keepdim_Smol_expert_1x50x720_contiguous",
@@ -69,6 +95,91 @@ def source_mean_translations(torch, policy="native"):
         return core.aten_mean_dim(self, dim, keepdim, dtype)
 
     return {torch.ops.aten.mean.dim: mean_dim}
+
+
+def source_softmax_contract(torch, policy="native"):
+    """Bind the scoped native CPU softmax; leave QK/PV and masks unchanged."""
+    if policy == "native":
+        return None
+    if policy != "torch_cpu_softmax177_v1":
+        raise ValueError("Unknown source softmax export policy")
+    bindings = _source_cpu_bindings(torch, SOURCE_SOFTMAX_ARTIFACTS, "Source softmax")
+    return {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
+            "domain": "merlin.source_preserving", "version": 1, "operator": "TorchSoftmaxAvx512F32LastDim177",
+            "native": "unchanged_Tensor_softmax_float32_last_axis_Smol_expert_1x15x50x177_contiguous",
+            "native_dispatch": "pinned_AVX512_sixteen_lane_softmax", "native_threads": 1,
+            "export_shape": [1, 15, 50, 177],
+            "algorithm": "source_lane_reduction_SLEEF_exp_explicit_FMA_then_FP32_reciprocal_multiply",
+            "qualification": "bounded_saved_actual_and_controls;complete_native_attention_and_policy_unqualified",
+            "source": "https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/aten/src/ATen/native/cpu/SoftMaxKernel.cpp",
+            "unchanged": ["QK", "PV", "masks", "BF16_casts", "native_reference", "acceptance_gates"],
+            "bindings": bindings}
+
+
+def source_softmax_translations(torch, policy="native"):
+    """Export only the proved FP32 Smol shape and last axis."""
+    if source_softmax_contract(torch, policy) is None:
+        return {}
+    from onnx import defs
+    from onnxscript import ir
+    from onnxscript.function_libs.torch_lib.ops import core
+    from onnxscript.onnx_types import FLOAT
+    from onnxscript.values import Opset, Op
+    schema = defs.OpSchema("TorchSoftmaxAvx512F32LastDim177", "merlin.source_preserving", 1, inputs=[defs.OpSchema.FormalParameter("a", "T")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(float)"], "Bound source FP32 softmax")])
+    softmax_op = Op(Opset("merlin.source_preserving", 1), "TorchSoftmaxAvx512F32LastDim177", schema)
+
+    def softmax(self: FLOAT, dim: int, dtype: int = -1) -> FLOAT:
+        if tuple(self.shape or ()) == (1, 15, 50, 177) and dim in (-1, 3) and dtype in (None, -1, ir.DataType.FLOAT):
+            return softmax_op(self)
+        return core.aten_softmax(self, dim, dtype)
+
+    def internal_softmax(self: FLOAT, dim: int, half_to_float: bool) -> FLOAT:
+        if tuple(self.shape or ()) == (1, 15, 50, 177) and dim in (-1, 3) and not half_to_float:
+            return softmax_op(self)
+        return core.aten__softmax(self, dim, half_to_float)
+
+    return {torch.ops.aten.softmax.int: softmax, torch.ops.aten._softmax.default: internal_softmax}
+
+
+def source_layernorm_contract(torch, policy="native"):
+    """Bind the single-output BF16 vision LayerNorm's native CPU arithmetic."""
+    if policy == "native":
+        return None
+    if policy != "torch_cpu_layernorm768_v1":
+        raise ValueError("Unknown source LayerNorm export policy")
+    bindings = _source_cpu_bindings(torch, SOURCE_LAYERNORM_ARTIFACTS, "Source LayerNorm")
+    return {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
+            "domain": "merlin.source_preserving", "version": 1, "operator": "TorchLayerNormAvx2Bf16Width768",
+            "native": "unchanged_single_output_BF16_Smol_vision_LayerNorm_1x1024x768_original_affines_epsilon1e-6",
+            "native_dispatch": "pinned_AVX2_BF16_sixteen_lane_FP32_eight_lane_moments;AVX512_registration_null",
+            "native_threads": 1, "export_shape": [1, 1024, 768], "epsilon_fp32_word": "0x358637bd",
+            "algorithm": "source_Welford_cascade_scalar_merge_sqrt_reciprocal_and_two_affine_FMAs",
+            "qualification": "bounded_saved_actual_and_controls;complete_vision_prefix_and_policy_unqualified",
+            "source": "https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/aten/src/ATen/native/cpu/layer_norm_kernel.cpp",
+            "unchanged": ["parameters", "epsilon", "native_reference", "acceptance_gates", "ordinary_ONNX_LayerNormalization"],
+            "bindings": bindings}
+
+
+def source_layernorm_translations(torch, policy="native"):
+    """Preserve only the proved native BF16 vision shape and original epsilon."""
+    if source_layernorm_contract(torch, policy) is None:
+        return {}
+    from onnx import defs
+    from onnxscript import ir, opset18 as op
+    from onnxscript.onnx_types import BFLOAT16
+    from onnxscript.function_libs.torch_lib.tensor_typing import TFloat
+    from onnxscript.values import Opset, Op
+    schema = defs.OpSchema("TorchLayerNormAvx2Bf16Width768", "merlin.source_preserving", 1, inputs=[defs.OpSchema.FormalParameter(name, "T" if name != "epsilon" else "F") for name in ("input", "weight", "bias", "epsilon")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(bfloat16)"], "Original BF16 operands"), ("F", ["tensor(float)"], "Original FP32 kernel epsilon")])
+    layernorm_op = Op(Opset("merlin.source_preserving", 1), "TorchLayerNormAvx2Bf16Width768", schema)
+    fallback = translations(torch)[torch.ops.aten.layer_norm.default]
+
+    def layer_norm(input: BFLOAT16, normalized_shape: Sequence[int], weight: Optional[TFloat] = None, bias: Optional[TFloat] = None, eps: float = 1e-5, cudnn_enable: bool = True) -> BFLOAT16:
+        if tuple(input.shape or ()) == (1, 1024, 768) and tuple(normalized_shape) == (768,) and eps == 1e-6 and all(value is not None and value.dtype == ir.DataType.BFLOAT16 and tuple(value.shape or ()) == (768,) for value in (weight, bias)):
+            epsilon = op.Constant(value=ir.tensor(eps, dtype=ir.DataType.FLOAT))
+            return layernorm_op(input, weight, bias, epsilon)
+        return fallback(input, normalized_shape, weight, bias, eps, cudnn_enable)
+
+    return {torch.ops.aten.layer_norm.default: layer_norm}
 
 
 def bf16_linear_error_diagnostic(input, weight, bias, torch):
