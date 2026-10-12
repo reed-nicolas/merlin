@@ -172,7 +172,7 @@ def validate_reference_stages(capture, causal, torch):
                 torch.testing.assert_close(next_cache[..., :length, :], cache[..., :length, :],
                                            rtol=0, atol=0)
                 cache, position = next_cache, next_position
-    reference = "candidate_full_sequence_hf_use_cache_false" if capture.provenance.get("arithmetic_policy", {}).get("name") == "fixed_tree_fp32_v1" else "original_full_sequence_hf_use_cache_false"
+    reference = "candidate_full_sequence_hf_use_cache_false" if capture.provenance.get("arithmetic_policy", {}).get("name") in ("fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv") else "original_full_sequence_hf_use_cache_false"
     return {"reference": reference, "passed": True,
             "rtol": rtol, "atol": atol, "checks": errors}
 
@@ -193,7 +193,7 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
         raise ValueError("W8A8 requires explicit CPU FP32 surrounding operations")
     if activation_scale not in ("maxabs", "power_of_two"):
         raise ValueError("Unknown integer activation scale policy")
-    if arithmetic_policy not in ("native", "fixed_tree_fp32_v1"):
+    if arithmetic_policy not in ("native", "fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv"):
         raise ValueError("Unknown TinyLlama arithmetic policy")
     if arithmetic_policy != "native" and (not quantized or precision != "float32"):
         raise ValueError("Fixed tree candidate requires explicit W8A8 CPU FP32 execution")
@@ -214,6 +214,8 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
         raise ValueError("cpu_threads must be between 1 and 8")
     if prefill_tokens + decode_tokens > 2048:
         raise ValueError("Session exceeds the checkpoint context capacity")
+    if arithmetic_policy == "fixed_tree_fp32_v2_pv" and prefill_tokens + decode_tokens > 160:
+        raise ValueError("Fixed tree PV session exceeds declared common capacity160")
     checkpoint, artifacts = checkpoint_artifacts(checkpoint_dir)
     corpus = safe_path(corpus_path)
     text = corpus.read_text(encoding="utf-8")
@@ -276,8 +278,8 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
             # Freeze IDs, source, selection and fixed thresholds before quantization.
             quality_reference = integer.language_reference(lm, quality_tokens)
         integer_records = integer.install_projections(lm, activation_scale=activation_scale)
-        if arithmetic_policy == "fixed_tree_fp32_v1":
-            arithmetic_record = integer.install_fixed_tree_arithmetic(lm)
+        if arithmetic_policy != "native":
+            arithmetic_record = integer.install_fixed_tree_arithmetic(lm, arithmetic_policy)
         if quality_corpus_path is not None:
             language_check = integer.language_quality(
                 lm, quality_tokens, quality_reference, language_contract)
@@ -334,6 +336,8 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
             provenance["reference_precision"] = "source_bound_w8a8_fixed_tree_fp32_candidate_reference"
             provenance["operation_placement"]["qk_contractions"]["arithmetic"] = "fixed_tree_fp32_v1"
             provenance["operation_placement"]["rms_norm"]["arithmetic"] = "fixed_tree_mean_squares_fp32_v1_other_norm_ops_unchanged"
+            if arithmetic_policy == "fixed_tree_fp32_v2_pv":
+                provenance["operation_placement"]["pv_contractions"]["arithmetic"] = "fixed_tree_fp32_v2_pv_capacity160_tree256"
         # Every trained projection is checked over its full reduction dimension at
         # representative rows/columns on the first actual prefill call.
         handles = []

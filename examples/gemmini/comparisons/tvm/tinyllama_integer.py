@@ -41,12 +41,25 @@ FIXED_TREE_POLICY = {
 }
 
 
+FIXED_TREE_PV_POLICY = {
+    **FIXED_TREE_POLICY, "name": "fixed_tree_fp32_v2_pv",
+    "attention_scope": "qk_and_pv_scaling_mask_softmax_unchanged",
+    "pv_capacity": 160, "pv_tree_k": 256,
+    "pv_capacity_scope": "common_bound_for_short8plus3_representative128plus32_and_quality128_not_selected_from_each_call_length",
+    "pv_padding": "positive_zero_probability_and_transposed_value_extension_to_declared_tree_k_unused_cache_tails_remain_zero",
+    "pv_signed_zero": "positive_zero_extension_can_canonicalize_negative_zero_not_prior_matmul_bit_preservation",
+    "pv_cache_interface": "none_or_initialized_static_cache_capacity_at_most160",
+}
+
+
 def arithmetic_contract(arithmetic_policy="native"):
     if arithmetic_policy == "native":
         return {"name": "native", "arithmetic": "unchanged_cpu_fp32_eager"}
-    if arithmetic_policy != FIXED_TREE_POLICY["name"]:
-        raise ValueError("Unknown TinyLlama arithmetic policy")
-    return dict(FIXED_TREE_POLICY)
+    if arithmetic_policy == FIXED_TREE_POLICY["name"]:
+        return dict(FIXED_TREE_POLICY)
+    if arithmetic_policy == FIXED_TREE_PV_POLICY["name"]:
+        return dict(FIXED_TREE_PV_POLICY)
+    raise ValueError("Unknown TinyLlama arithmetic policy")
 
 
 def _fixed_tree_shape(value):
@@ -125,6 +138,18 @@ def fixed_tree_mean_squares(value):
     return _ensure_fixed_tree_ops()[1](value)
 
 
+def fixed_tree_pv(probabilities, values):
+    """V2-only PV: every call uses the declared160-token bound and256-leaf tree."""
+    if (probabilities.dtype != torch.float32 or values.dtype != torch.float32 or probabilities.device.type != "cpu" or values.device.type != "cpu"
+            or probabilities.ndim != 4 or values.ndim != 4 or probabilities.shape[:2] != values.shape[:2] or probabilities.shape[-1] != values.shape[-2]
+            or any(dimension < 1 for dimension in (*probabilities.shape, *values.shape)) or probabilities.shape[-2] > 160 or probabilities.shape[-1] > 160):
+        raise ValueError("Fixed tree PV requires positive aligned CPU FP32 shapes and query/KV lengths <= declared capacity160")
+    padded_probabilities = nn.functional.pad(probabilities, (0, 256 - probabilities.shape[-1]), value=0.0)
+    transposed_values = values.transpose(-1, -2)
+    padded_values = nn.functional.pad(transposed_values, (0, 256 - values.shape[-2]), value=0.0)
+    return fixed_tree_dot(padded_probabilities, padded_values)
+
+
 class FixedTreeRMSNorm(nn.Module):
     def __init__(self, original):
         super().__init__()
@@ -147,14 +172,17 @@ def fixed_tree_attention(module, query, key, value, attention_mask, scaling, dro
         weights = weights + attention_mask
     weights = nn.functional.softmax(weights, dim=-1, dtype=torch.float32).to(query.dtype)
     weights = nn.functional.dropout(weights, p=dropout, training=module.training)
-    output = torch.matmul(weights, value_states).transpose(1, 2).contiguous()
+    output = (fixed_tree_pv(weights, value_states) if getattr(module, "arithmetic_policy", "fixed_tree_fp32_v1") == "fixed_tree_fp32_v2_pv" else torch.matmul(weights, value_states)).transpose(1, 2).contiguous()
     return output, weights
 
 
 class FixedTreeAttention(nn.Module):
     """Candidate-only eager forward; model mask construction remains on the eager path."""
-    def __init__(self, original):
+    def __init__(self, original, arithmetic_policy="fixed_tree_fp32_v1"):
         super().__init__()
+        if arithmetic_policy not in ("fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv"):
+            raise ValueError("Fixed tree attention requires an explicit candidate policy")
+        self.arithmetic_policy = arithmetic_policy
         for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
             setattr(self, name, getattr(original, name))
         for name in ("config", "layer_idx", "head_dim", "num_key_value_groups", "scaling", "attention_dropout", "is_causal"):
@@ -164,6 +192,26 @@ class FixedTreeAttention(nn.Module):
     def forward(self, hidden_states, position_embeddings, attention_mask=None, past_key_values=None, **kwargs):
         if attention_mask is None:
             raise ValueError("Fixed tree static inference requires an explicit causal attention mask")
+        if self.arithmetic_policy == "fixed_tree_fp32_v2_pv":
+            if (hidden_states.ndim != 3 or hidden_states.dtype != torch.float32 or hidden_states.device.type != "cpu" or hidden_states.shape[-1] != self.config.hidden_size or not 1 <= hidden_states.shape[-2] <= 160
+                    or attention_mask.ndim != 4 or attention_mask.dtype != torch.float32 or attention_mask.device.type != "cpu" or not 1 <= attention_mask.shape[-1] <= 160
+                    or attention_mask.shape[:3] != (hidden_states.shape[0], 1, hidden_states.shape[-2])):
+                raise ValueError("Fixed tree PV query/mask exceeds declared capacity160")
+            if past_key_values is None:
+                if attention_mask.shape[-1] != hidden_states.shape[-2]:
+                    raise ValueError("Fixed tree PV requires a matching full-sequence mask within capacity160")
+            else:
+                layers = getattr(past_key_values, "layers", ())
+                if not 0 <= self.layer_idx < len(layers):
+                    raise ValueError("Fixed tree PV requires an initialized static cache within capacity160")
+                layer = layers[self.layer_idx]
+                capacity = getattr(layer, "max_cache_len", None)
+                keys = getattr(layer, "keys", None)
+                cache_values = getattr(layer, "values", None)
+                if (type(capacity) is not int or not 1 <= capacity <= 160 or not isinstance(keys, torch.Tensor) or not isinstance(cache_values, torch.Tensor)
+                        or keys.dtype != torch.float32 or cache_values.dtype != torch.float32 or keys.device.type != "cpu" or cache_values.device.type != "cpu"
+                        or keys.shape != (hidden_states.shape[0], self.config.num_key_value_heads, capacity, self.head_dim) or cache_values.shape != keys.shape or attention_mask.shape[-1] != capacity):
+                    raise ValueError("Fixed tree PV requires an initialized static cache within capacity160")
         from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -178,8 +226,10 @@ class FixedTreeAttention(nn.Module):
         return output, weights
 
 
-def install_fixed_tree_arithmetic(lm):
+def install_fixed_tree_arithmetic(lm, arithmetic_policy="fixed_tree_fp32_v1"):
     """Isolate the candidate on the supplied model, retaining trained norm parameters."""
+    if arithmetic_policy not in ("fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv"):
+        raise ValueError("Fixed tree installer requires an explicit candidate policy")
     from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaAttention
     names = [f"model.layers.{index}.{name}" for index in range(22) for name in ("input_layernorm", "post_attention_layernorm")] + ["model.norm"]
     norms = {name: module for name, module in lm.named_modules() if isinstance(module, LlamaRMSNorm)}
@@ -193,13 +243,20 @@ def install_fixed_tree_arithmetic(lm):
         setattr(lm.get_submodule(parent), leaf, FixedTreeRMSNorm(norms[name]))
     for name, module in attentions.items():
         parent, _, leaf = name.rpartition(".")
-        setattr(lm.get_submodule(parent), leaf, FixedTreeAttention(module))
-    return {**arithmetic_contract("fixed_tree_fp32_v1"), "rms_norms": len(names), "attention_layers": 22,
+        setattr(lm.get_submodule(parent), leaf, FixedTreeAttention(module, arithmetic_policy))
+    metadata = {**arithmetic_contract(arithmetic_policy), "rms_norms": len(names), "attention_layers": 22,
             "native_qk_product_scratch_bytes": "B*H*min(M,4)*N*K*4_per_block",
             "native_qk_output_bytes": "B*H*M*N*4_plus_block_results_during_concatenation",
             "native_qk_tree_and_output_upper_bound_bytes": "1.5*product_scratch_bytes+2*output_bytes_excluding_inputs_finiteness_checks_and_allocator_overhead",
             "native_rms_scratch_bytes": "input_elements*4_plus_halving_tree_temporaries",
             "cost": "same_arithmetic_count_tree_elementwise_kernels_instead_of_blas_qk;not_timing_qualified"}
+    if arithmetic_policy == "fixed_tree_fp32_v2_pv":
+        metadata.update({"native_pv_product_scratch_bytes": "B*H*min(M,4)*D*256*4_per_block",
+                         "native_pv_output_bytes": "B*H*M*D*4_plus_block_results_and_output_transpose",
+                         "native_pv_padding_bytes": "B*H*M*256*4+B*H*D*256*4_excluding_inputs_and_repeat_kv",
+                         "compiled_pv_helper_scratch_bytes": 256 * 4,
+                         "cost": "qk_and_pv_use_tree_elementwise_kernels;pv_padding_increases_products_to256_per_output;not_timing_qualified"})
+    return metadata
 
 
 def recipe(activation_scale="maxabs", arithmetic_policy="native"):
@@ -210,7 +267,7 @@ def recipe(activation_scale="maxabs", arithmetic_policy="native"):
             "scale_policy": "smallest_float32_normal_power_of_two_at_least_maxabs_div127"}
     contract = arithmetic_contract(arithmetic_policy)
     if arithmetic_policy != "native":
-        selected = {**selected, "name": selected["name"] + "_fixed_tree_fp32_v1", "arithmetic_policy": contract}
+        selected = {**selected, "name": selected["name"] + "_" + contract["name"], "arithmetic_policy": contract}
     return selected
 QUALITY_CONTRACT = {
     "name": "tinyllama_language_development_v1",
