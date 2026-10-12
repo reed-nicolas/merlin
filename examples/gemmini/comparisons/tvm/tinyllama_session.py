@@ -172,14 +172,15 @@ def validate_reference_stages(capture, causal, torch):
                 torch.testing.assert_close(next_cache[..., :length, :], cache[..., :length, :],
                                            rtol=0, atol=0)
                 cache, position = next_cache, next_position
-    return {"reference": "original_full_sequence_hf_use_cache_false", "passed": True,
+    reference = "candidate_full_sequence_hf_use_cache_false" if capture.provenance.get("arithmetic_policy", {}).get("name") == "fixed_tree_fp32_v1" else "original_full_sequence_hf_use_cache_false"
+    return {"reference": reference, "passed": True,
             "rtol": rtol, "atol": atol, "checks": errors}
 
 
 def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
                          prefill_tokens=8, decode_tokens=3, precision="float32",
                          cpu_threads=2, quantized=False, quality_corpus_path=None,
-                         workload="frontend_diagnostic", activation_scale="power_of_two"):
+                         workload="frontend_diagnostic", activation_scale="power_of_two", arithmetic_policy="native"):
     """Build compiled prefill plus teacher-forced recurrent decode on actual text.
 
     ``corpus_path`` is a local UTF-8 text file tokenized with this checkpoint's
@@ -192,6 +193,10 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
         raise ValueError("W8A8 requires explicit CPU FP32 surrounding operations")
     if activation_scale not in ("maxabs", "power_of_two"):
         raise ValueError("Unknown integer activation scale policy")
+    if arithmetic_policy not in ("native", "fixed_tree_fp32_v1"):
+        raise ValueError("Unknown TinyLlama arithmetic policy")
+    if arithmetic_policy != "native" and (not quantized or precision != "float32"):
+        raise ValueError("Fixed tree candidate requires explicit W8A8 CPU FP32 execution")
     if quality_corpus_path is not None and not quantized:
         raise ValueError("Language quantization quality requires the explicit W8A8 recipe")
     if workload not in ("frontend_diagnostic", "development_language", "synthetic_feasibility"):
@@ -262,15 +267,17 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
     source_parameter_bytes = sum(value.numel() * value.element_size() for value in lm.parameters())
     integer = None
     integer_records, integer_checks = [], []
-    language_contract, language_check = None, None
+    language_contract, language_check, arithmetic_record = None, None, None
     if quantized:
         import tinyllama_integer as integer
         if quality_corpus_path is not None:
             quality_tokens, language_contract = integer.language_inputs(
-                quality_corpus_path, tokenizer, safe_path, file_identity, activation_scale=activation_scale)
+                quality_corpus_path, tokenizer, safe_path, file_identity, activation_scale=activation_scale, arithmetic_policy=arithmetic_policy)
             # Freeze IDs, source, selection and fixed thresholds before quantization.
             quality_reference = integer.language_reference(lm, quality_tokens)
         integer_records = integer.install_projections(lm, activation_scale=activation_scale)
+        if arithmetic_policy == "fixed_tree_fp32_v1":
+            arithmetic_record = integer.install_fixed_tree_arithmetic(lm)
         if quality_corpus_path is not None:
             language_check = integer.language_quality(
                 lm, quality_tokens, quality_reference, language_contract)
@@ -312,7 +319,7 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
         provenance.update({"execution_precision": "w8a8_projections_float32_cpu_surrounding_ops",
                            "weight_conversion": "bfloat16_to_float32_then_per_channel_int8_projections",
                            "reference_precision": "source_bound_w8a8_integer_projection_reference",
-                           "integer_recipe": integer.recipe(activation_scale),
+                           "integer_recipe": integer.recipe(activation_scale, arithmetic_policy),
                            "integer_source": file_identity(integer.__file__, safe_path),
                            "integer_projections": integer_records,
                            "operation_placement": integer.operation_placement(),
@@ -322,6 +329,11 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
                            "quality_reference": integer.QUALITY_CONTRACT["reference"] if language_contract else "not_evaluated",
                            "checkpoint_parameter_count": 1100048384,
                            "state_dict_bytes": sum(value.numel() * value.element_size() for value in lm.state_dict().values())})
+        if arithmetic_record is not None:
+            provenance["arithmetic_policy"] = arithmetic_record
+            provenance["reference_precision"] = "source_bound_w8a8_fixed_tree_fp32_candidate_reference"
+            provenance["operation_placement"]["qk_contractions"]["arithmetic"] = "fixed_tree_fp32_v1"
+            provenance["operation_placement"]["rms_norm"]["arithmetic"] = "fixed_tree_mean_squares_fp32_v1_other_norm_ops_unchanged"
         # Every trained projection is checked over its full reduction dimension at
         # representative rows/columns on the first actual prefill call.
         handles = []
@@ -372,7 +384,8 @@ def get_verification_artifacts(model, _inputs):
     return tuple(safe_path(identity["path"]) for identity in identities)
 
 
-def get_onnx_export_options(torch):
-    """Preserve real int8/int32 semantics when the opt-in projection recipe is used."""
+def get_onnx_export_options(torch, model=None):
+    """Select translations from this model's declared arithmetic policy."""
     from tinyllama_integer import export_options
-    return export_options(torch)
+    policy = model.provenance.get("arithmetic_policy", {}).get("name", "native") if model is not None else "native"
+    return export_options(torch, policy)

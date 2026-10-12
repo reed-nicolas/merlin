@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
@@ -40,6 +41,14 @@ def load_protocol(root):
             raise ValueError("A different model2MLIR session protocol is already loaded")
         return module
     return load_module(name, path)
+
+
+def factory_export_options(factory, torch, model):
+    """Pass the selected model to hooks that explicitly accept it."""
+    hook = getattr(factory, "get_onnx_export_options", None)
+    if not callable(hook):
+        return None
+    return hook(torch, model=model) if "model" in inspect.signature(hook).parameters else hook(torch)
 
 
 @contextmanager
@@ -752,7 +761,7 @@ def main():
             report["session"] = describe_session(session, np, torch)[0]
             report["onnx_exporter"] = args.onnx_exporter
             hook = getattr(factory, "get_onnx_export_options", None)
-            export_options = hook(torch) if callable(hook) else None
+            export_options = factory_export_options(factory, torch, model)
             if callable(hook):
                 report["factory_export_source"] = file_identity(hook.__code__.co_filename, safe_path)
                 report["factory_export_translations"] = [str(target) for target in export_options.get("custom_translation_table", {})] if isinstance(export_options, dict) else []

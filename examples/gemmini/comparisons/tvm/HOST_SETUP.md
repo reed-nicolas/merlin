@@ -13,7 +13,7 @@ For a new TVM checkout, clone without checkout and apply the mandatory name excl
 ```bash
 export TVM_ROOT=/absolute/path/to/tvm-gemmini
 export TVM_BUILD=/absolute/path/to/tvm-host-build
-tvm_commit=46f3e0954bc4b36266a959774fe7221892b354c6
+tvm_commit=fc236e0b21e726fefd9411be9f18384425663537
 git clone --filter=blob:none --no-checkout https://github.com/reed-nicolas/tvm.git "$TVM_ROOT"
 git -C "$TVM_ROOT" sparse-checkout set --no-cone --stdin <<'PATTERNS'
 /*
@@ -28,7 +28,7 @@ In the same shell, verify the selected source pin and prepare the host environme
 ```bash
 : "${TVM_ROOT:?Set TVM_ROOT to the independent TVM checkout}"
 : "${TVM_BUILD:?Set TVM_BUILD to the TVM host build directory}"
-test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = 46f3e0954bc4b36266a959774fe7221892b354c6 || { echo 'TVM source pin mismatch' >&2; exit 1; }
+test "$(git -C "$TVM_ROOT" rev-parse HEAD)" = fc236e0b21e726fefd9411be9f18384425663537 || { echo 'TVM source pin mismatch' >&2; exit 1; }
 merlin_root="$PWD"
 setup_dir="$merlin_root/examples/gemmini/comparisons/tvm"
 host_python="${TVM_HOST_PYTHON:-$(command -v python3.10)}"
@@ -60,7 +60,7 @@ The three required TVM submodules are `dmlc-core`, `dlpack`, and `rang`. Initial
 git -C "$TVM_ROOT" submodule status -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
 ```
 
-A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `46f3e0954bc4b36266a959774fe7221892b354c6`. Clone each dependency without checkout and apply the same exclusions before checkout:
+A leading space in each status line means the pin matches; `-`, `+`, or `U` requires repair before building. For a fresh checkout, initialize only these three dependencies at the gitlinks recorded in TVM commit `fc236e0b21e726fefd9411be9f18384425663537`. Clone each dependency without checkout and apply the same exclusions before checkout:
 
 ```bash
 git -C "$TVM_ROOT" submodule init -- 3rdparty/dmlc-core 3rdparty/dlpack 3rdparty/rang
@@ -327,7 +327,7 @@ Original BF16 tensors use exact uint16 payload views through the optional `ml_dt
 python -m pip install 'ml_dtypes==0.5.4' 'onnxscript==0.5.6' 'onnx_ir==0.1.12'
 ```
 
-`--bf16-fused-export` is an optional modern-export candidate implemented in [bf16_export.py](bf16_export.py). It retains public ATen linear/attention boundaries, original BF16 operands/results and FP32 internal math, and disables ONNX export optimization to preserve initializer dtypes. The receipt binds the translation source and retained ATen operation counts. Masks, fully masked rows, causal attention and explicit scale are checked; dropout, grouped-query expansion and incompatible dtypes are refused. This mode does not reproduce every native CPU kernel's rounding and still must pass the unchanged source comparison. It selects no whole-model FP32 conversion or relaxed acceptance. Ordinary legacy and modern export remain the defaults.
+`--bf16-fused-export` is an optional modern-export candidate implemented in [bf16_export.py](bf16_export.py). It retains public ATen linear/attention/single-output LayerNorm boundaries, original BF16 operands/results and FP32 internal math, and disables ONNX export optimization to preserve initializer dtypes. The receipt binds the translation source and retained ATen operation counts. Masks, fully masked rows, causal attention and explicit scale are checked; dropout, grouped-query expansion and incompatible dtypes are refused. LayerNorm validates static normalized/affine shapes, permits symbolic leading dimensions and preserves one BF16 terminal cast; native auxiliary statistics are outside the translation. This mode does not reproduce every native CPU kernel's reduction/rounding and still must pass the unchanged source comparison. It selects no whole-model FP32 conversion or relaxed acceptance. Ordinary legacy and modern export remain the defaults.
 
 Factories can expose `get_verification_artifacts(model, inputs)` to bind the checkpoint, tokenizer, input and supporting source files they actually select. Those files are hashed before session execution and checked again afterward. ONNX external tensor files are validated before loading, included in each stage's `onnx_artifacts` and rechecked after execution. The verifier uses the path-based ONNX checker to support external-weight models beyond the in-memory protobuf limit; the focused tests exercise smaller external-weight graphs, invalid locations/ranges/metadata and mutation rejection. These identities do not establish complete runtime source closure.
 
@@ -398,6 +398,10 @@ PYTHON
 ```
 
 Set the five environment variables to selected local files/new output directories, then use the produced arguments JSON in the session command. Preparation checks the pinned parquet bytes and selects the first eight eligible articles without model feedback. Its fixed 1,016-prediction development quality check passes (NLL increase `0.02836` nats, top-one agreement `90.748%`), but real 128+32 cache/full-sequence comparison fails at length 150 (maximum logit error `0.8066`). Explicit `"workload": "synthetic_feasibility"` permits 8+3 or 128+32 with no quality corpus. Synthetic 8+3 passes the native source gate; its actual ONNX/TVM prefill fails unchanged `1e-4` tolerances (maximum error `1.1724`), before decode/reset/export. Independent scale/code and complete-K int64 checks pass on the actual inputs of 21 projections; a layer 1 MLP input crosses an RNE threshold. Separately, identical layer-6 Q/K/V expose native FP32 attention differences between full-query and cached execution that cross another threshold. No recipe or tolerance changes, and the quality proxy does not qualify the failed complete session.
+
+The separately named `"arithmetic_policy": "fixed_tree_fp32_v1"` is an opt-in W8A8 candidate for QK and RMSNorm mean-square reductions. It uses separately rounded FP32 products followed by balanced adjacent-pair additions, without an initial zero addition, FMA, reassociation or hidden FP64. Other attention/norm operations, parameters, source quality reference and existing gates remain unchanged. Candidate-only wrappers preserve eager causal masks/cache/RoPE, refuse a missing causal mask before updating state, and register custom operators only on explicit use. The two compact `merlin.fixed_order` version-1 ONNX nodes lower to typed opaque CPU helpers with explicit private scratch counted in the static memory plan.
+
+Native QK processes four query rows at a time; it replaces BLAS with elementwise products/tree additions and temporarily retains block outputs for concatenation. For the declared 128-query/160-key shape, product/tree/output storage is about 12.5 MiB excluding inputs, finite checks and allocator overhead; compiled scratch is only `4*K` bytes per helper plus declared outputs/reshape storage. CPU execution costs remain within the eventual timing boundary. Independent saved-operand/native/host and bounded target helper checks pass, as does the full-checkpoint native 8+3 cache check. The unchanged language proxy passes (NLL increase 0.02186, top-one agreement 91.339%); native 128+32 recurrence fails at length 139 (maximum logit error 0.8016), with masks/RoPE/padding intact. Further isolation and full compiled/reset qualification remain. Keep `"arithmetic_policy": "native"` as the unchanged default and preserve its failed receipts; the candidate is not adopted or a measured performance winner.
 
 ## Original SmolVLA policy session
 

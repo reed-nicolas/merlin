@@ -28,14 +28,190 @@ RECIPE = {
 }
 
 
-def recipe(activation_scale="maxabs"):
+FIXED_TREE_POLICY = {
+    "name": "fixed_tree_fp32_v1", "status": "opt_in_candidate_not_adopted",
+    "domain": "merlin.fixed_order", "version": 1,
+    "order": "adjacent_pairs_each_level_no_initial_zero_addition",
+    "rounding": "float32_each_product_and_pair_add_no_contraction_or_reassociation",
+    "mean": "multiply_tree_sum_by_exact_float32_reciprocal_power_of_two_k",
+    "qualified_operands": "finite_float32_inputs_without_intermediate_overflow",
+    "maximum_k": 4096, "native_query_block": 4, "inference_only": True,
+    "rms_norm_scope": "mean_squares_only_rsqrt_epsilon_and_weight_multiplication_unchanged",
+    "attention_scope": "qk_only_scaling_mask_softmax_and_pv_unchanged",
+}
+
+
+def arithmetic_contract(arithmetic_policy="native"):
+    if arithmetic_policy == "native":
+        return {"name": "native", "arithmetic": "unchanged_cpu_fp32_eager"}
+    if arithmetic_policy != FIXED_TREE_POLICY["name"]:
+        raise ValueError("Unknown TinyLlama arithmetic policy")
+    return dict(FIXED_TREE_POLICY)
+
+
+def _fixed_tree_shape(value):
+    k = value.shape[-1] if value.ndim else 0
+    if value.dtype != torch.float32 or value.device.type != "cpu" or not 1 <= k <= 4096 or k & (k - 1) or any(dimension < 1 for dimension in value.shape):
+        raise ValueError("Fixed tree requires positive static CPU FP32 shapes with power-of-two K <= 4096")
+
+
+def _pair_tree(value):
+    while value.shape[-1] > 1:
+        value = value[..., 0::2] + value[..., 1::2]
+    return value
+
+
+def _fixed_tree_dot_native(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Bounded native oracle implementation; products and tree adds are separate FP32 ops."""
+    _fixed_tree_shape(left)
+    _fixed_tree_shape(right)
+    if left.ndim != 4 or right.ndim != 4 or left.shape[:2] != right.shape[:2] or left.shape[-1] != right.shape[-1]:
+        raise ValueError("Fixed tree dot requires matching [B,H,M,K] and [B,H,N,K] operands")
+    if not bool(torch.isfinite(left).all()) or not bool(torch.isfinite(right).all()):
+        raise ValueError("Fixed tree requires finite operands")
+    blocks = [_pair_tree(left[..., begin:begin + 4, None, :] * right[..., None, :, :]).squeeze(-1) for begin in range(0, left.shape[-2], 4)]
+    result = torch.cat(blocks, dim=-2)
+    if not bool(torch.isfinite(result).all()):
+        raise ValueError("Fixed tree qualified operands must not overflow")
+    return result
+
+
+def _fixed_tree_dot_fake(left, right):
+    _fixed_tree_shape(left)
+    _fixed_tree_shape(right)
+    if left.ndim != 4 or right.ndim != 4 or left.shape[:2] != right.shape[:2] or left.shape[-1] != right.shape[-1]:
+        raise ValueError("Fixed tree dot requires matching [B,H,M,K] and [B,H,N,K] operands")
+    return left.new_empty((*left.shape[:2], left.shape[-2], right.shape[-2]))
+
+
+def _fixed_tree_mean_squares_native(value: torch.Tensor) -> torch.Tensor:
+    _fixed_tree_shape(value)
+    if not bool(torch.isfinite(value).all()):
+        raise ValueError("Fixed tree requires finite operands")
+    result = _pair_tree(value * value) * (1.0 / value.shape[-1])
+    if not bool(torch.isfinite(result).all()):
+        raise ValueError("Fixed tree qualified operands must not overflow")
+    return result
+
+
+def _fixed_tree_mean_squares_fake(value):
+    _fixed_tree_shape(value)
+    return value.new_empty((*value.shape[:-1], 1))
+
+
+_FIXED_TREE_OPS = None
+
+
+def _ensure_fixed_tree_ops():
+    """Register only for explicit candidate use; aliases reuse existing dispatcher ops."""
+    global _FIXED_TREE_OPS
+    if _FIXED_TREE_OPS is None:
+        namespace = torch.ops.merlin_fixed_order
+        if not hasattr(namespace, "dot"):
+            dot = torch.library.custom_op("merlin_fixed_order::dot", mutates_args=())(_fixed_tree_dot_native)
+            dot.register_fake(_fixed_tree_dot_fake)
+        if not hasattr(namespace, "mean_squares"):
+            mean = torch.library.custom_op("merlin_fixed_order::mean_squares", mutates_args=())(_fixed_tree_mean_squares_native)
+            mean.register_fake(_fixed_tree_mean_squares_fake)
+        _FIXED_TREE_OPS = (namespace.dot.default, namespace.mean_squares.default)
+    return _FIXED_TREE_OPS
+
+
+def fixed_tree_dot(left, right):
+    return _ensure_fixed_tree_ops()[0](left, right)
+
+
+def fixed_tree_mean_squares(value):
+    return _ensure_fixed_tree_ops()[1](value)
+
+
+class FixedTreeRMSNorm(nn.Module):
+    def __init__(self, original):
+        super().__init__()
+        self.weight = original.weight
+        self.variance_epsilon = original.variance_epsilon
+        self.training = original.training
+
+    def forward(self, hidden_states):
+        variance = fixed_tree_mean_squares(hidden_states)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states
+
+
+def fixed_tree_attention(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+    from transformers.models.llama.modeling_llama import repeat_kv
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+    weights = fixed_tree_dot(query, key_states) * scaling
+    if attention_mask is not None:
+        weights = weights + attention_mask
+    weights = nn.functional.softmax(weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    weights = nn.functional.dropout(weights, p=dropout, training=module.training)
+    output = torch.matmul(weights, value_states).transpose(1, 2).contiguous()
+    return output, weights
+
+
+class FixedTreeAttention(nn.Module):
+    """Candidate-only eager forward; model mask construction remains on the eager path."""
+    def __init__(self, original):
+        super().__init__()
+        for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            setattr(self, name, getattr(original, name))
+        for name in ("config", "layer_idx", "head_dim", "num_key_value_groups", "scaling", "attention_dropout", "is_causal"):
+            setattr(self, name, getattr(original, name))
+        self.training = original.training
+
+    def forward(self, hidden_states, position_embeddings, attention_mask=None, past_key_values=None, **kwargs):
+        if attention_mask is None:
+            raise ValueError("Fixed tree static inference requires an explicit causal attention mask")
+        from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        query = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query, key = apply_rotary_pos_emb(query, key, *position_embeddings)
+        if past_key_values is not None:
+            key, value = past_key_values.update(key, value, self.layer_idx)
+        output, weights = fixed_tree_attention(self, query, key, value, attention_mask, scaling=self.scaling, dropout=0.0 if not self.training else self.attention_dropout, **kwargs)
+        output = self.o_proj(output.reshape(*input_shape, -1).contiguous())
+        return output, weights
+
+
+def install_fixed_tree_arithmetic(lm):
+    """Isolate the candidate on the supplied model, retaining trained norm parameters."""
+    from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaAttention
+    names = [f"model.layers.{index}.{name}" for index in range(22) for name in ("input_layernorm", "post_attention_layernorm")] + ["model.norm"]
+    norms = {name: module for name, module in lm.named_modules() if isinstance(module, LlamaRMSNorm)}
+    attentions = {name: module for name, module in lm.named_modules() if isinstance(module, LlamaAttention)}
+    if set(norms) != set(names) or any(module.weight.dtype != torch.float32 or module.weight.device.type != "cpu" or module.weight.shape != (2048,) for module in norms.values()):
+        raise ValueError("Fixed tree candidate requires the complete 45 CPU FP32 TinyLlama norms")
+    if set(attentions) != {f"model.layers.{index}.self_attn" for index in range(22)} or lm.config._attn_implementation != "eager":
+        raise ValueError("Fixed tree candidate requires the complete 22 eager TinyLlama attention modules")
+    for name in names:
+        parent, _, leaf = name.rpartition(".")
+        setattr(lm.get_submodule(parent), leaf, FixedTreeRMSNorm(norms[name]))
+    for name, module in attentions.items():
+        parent, _, leaf = name.rpartition(".")
+        setattr(lm.get_submodule(parent), leaf, FixedTreeAttention(module))
+    return {**arithmetic_contract("fixed_tree_fp32_v1"), "rms_norms": len(names), "attention_layers": 22,
+            "native_qk_product_scratch_bytes": "B*H*min(M,4)*N*K*4_per_block",
+            "native_qk_output_bytes": "B*H*M*N*4_plus_block_results_during_concatenation",
+            "native_qk_tree_and_output_upper_bound_bytes": "1.5*product_scratch_bytes+2*output_bytes_excluding_inputs_finiteness_checks_and_allocator_overhead",
+            "native_rms_scratch_bytes": "input_elements*4_plus_halving_tree_temporaries",
+            "cost": "same_arithmetic_count_tree_elementwise_kernels_instead_of_blas_qk;not_timing_qualified"}
+
+
+def recipe(activation_scale="maxabs", arithmetic_policy="native"):
     if activation_scale not in ("maxabs", "power_of_two"):
         raise ValueError("Unknown integer activation scale policy")
-    if activation_scale == "maxabs":
-        return dict(RECIPE)
-    return {**RECIPE, "name": "tinyllama_w8a8_dynamic_token_pot_v1",
+    selected = dict(RECIPE) if activation_scale == "maxabs" else {**RECIPE, "name": "tinyllama_w8a8_dynamic_token_pot_v1",
             "activation": "dynamic_per_token_ceil_power_of_two_maxabs_div127",
             "scale_policy": "smallest_float32_normal_power_of_two_at_least_maxabs_div127"}
+    contract = arithmetic_contract(arithmetic_policy)
+    if arithmetic_policy != "native":
+        selected = {**selected, "name": selected["name"] + "_fixed_tree_fp32_v1", "arithmetic_policy": contract}
+    return selected
 QUALITY_CONTRACT = {
     "name": "tinyllama_language_development_v1",
     "reference": "unchanged_checkpoint_explicit_bfloat16_to_float32_cpu_eager",
@@ -249,15 +425,36 @@ class IntegerProjection(nn.Module):
         return result * scale * self.weight_scale
 
 
-def export_options(torch_module):
+def export_options(torch_module, arithmetic_policy="native"):
     """Modern exporter preserves signed-int8 operands with standard MatMulInteger."""
     from onnxscript import opset18 as op
-    from onnxscript.onnx_types import INT8, INT32
+    from onnxscript.onnx_types import INT8, INT32, FLOAT
+    from onnxscript.values import Opset, Op
+    from onnx import defs
+    ordered = Opset("merlin.fixed_order", 1)
+    def ordered_op(name, inputs):
+        schema = defs.OpSchema(name, "merlin.fixed_order", 1, inputs=[defs.OpSchema.FormalParameter(value, "T") for value in inputs], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(float)"], "Declared ordered FP32 arithmetic")])
+        return Op(ordered, name, schema)
+    dot_op = ordered_op("FixedTreeDot", ("a", "b"))
+    mean_op = ordered_op("FixedTreeMeanSquares", ("a",))
 
     def integer_mm(a: INT8, b: INT8) -> INT32:
         return op.MatMulInteger(a, b)
 
-    return {"custom_translation_table": {torch_module.ops.aten._int_mm.default: integer_mm}}
+    arithmetic_contract(arithmetic_policy)
+    translations = {torch_module.ops.aten._int_mm.default: integer_mm}
+    if arithmetic_policy == "native":
+        return {"custom_translation_table": translations}
+    _ensure_fixed_tree_ops()
+
+    def ordered_dot(a: FLOAT, b: FLOAT) -> FLOAT:
+        return dot_op(a, b)
+
+    def ordered_mean_squares(a: FLOAT) -> FLOAT:
+        return mean_op(a)
+
+    translations.update({torch_module.ops.merlin_fixed_order.dot.default: ordered_dot, torch_module.ops.merlin_fixed_order.mean_squares.default: ordered_mean_squares})
+    return {"custom_translation_table": translations}
 
 
 def projection_names():
@@ -332,7 +529,7 @@ def check_projection(projection, value, *, rows=3, columns=7):
             "max_absolute_error": 0, "activation_encoding": encoding}
 
 
-def language_inputs(path, tokenizer, safe_path, file_identity, activation_scale="maxabs"):
+def language_inputs(path, tokenizer, safe_path, file_identity, activation_scale="maxabs", arithmetic_policy="native"):
     """Freeze an attributed local corpus before any quality inference or quantization.
 
     JSON owns source/selection and documents [{id, text, source}]. This declaration
@@ -372,7 +569,7 @@ def language_inputs(path, tokenizer, safe_path, file_identity, activation_scale=
     contract = {**QUALITY_CONTRACT, "corpus": file_identity(path, safe_path),
                 "corpus_source": payload["source"], "selection_declaration": payload["selection"],
                 "documents": records, "calibration": "none_dynamic_activation_recipe",
-                "quantization_recipe": recipe(activation_scale)}
+                "quantization_recipe": recipe(activation_scale, arithmetic_policy)}
     if payload.get("dataset_artifact") is not None:
         selected = payload["dataset_artifact"]
         if (not isinstance(selected, dict) or set(selected) != {"path", "sha256"}

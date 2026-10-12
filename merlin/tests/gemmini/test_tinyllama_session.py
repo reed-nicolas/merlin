@@ -68,7 +68,9 @@ class TinyLlamaArtifactTests(unittest.TestCase):
                         {"quality_corpus_path": "/missing"}, {"workload": "other"},
                         {"workload": "development_language"},
                         {"workload": "synthetic_feasibility", "prefill_tokens": 9},
-                        {"activation_scale": "other"}):
+                        {"activation_scale": "other"}, {"arithmetic_policy": "other"},
+                        {"arithmetic_policy": "fixed_tree_fp32_v1"},
+                        {"arithmetic_policy": "fixed_tree_fp32_v1", "quantized": True, "precision": "bfloat16"}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 FACTORY.get_model_and_inputs(**{**base, **changes})
 
@@ -87,6 +89,123 @@ except ImportError:
 
 @unittest.skipIf(torch is None, "Optional PyTorch environment is absent")
 class TinyLlamaIntegerTests(unittest.TestCase):
+    @staticmethod
+    def scalar_tree_dot(left, right):
+        output = np.empty((*left.shape[:2], left.shape[-2], right.shape[-2]), dtype=np.float32)
+        for batch, head, row, column in np.ndindex(output.shape):
+            terms = [np.float32(np.float32(a) * np.float32(b)) for a, b in zip(left[batch, head, row], right[batch, head, column])]
+            while len(terms) > 1:
+                terms = [np.float32(terms[index] + terms[index + 1]) for index in range(0, len(terms), 2)]
+            output[batch, head, row, column] = terms[0]
+        return output
+
+    def test_fixed_tree_native_has_independent_order_and_no_fma_oracle(self):
+        generator = np.random.default_rng(194)
+        left = generator.uniform(-4, 4, (1, 2, 7, 64)).astype(np.float32)
+        right = generator.uniform(-4, 4, (1, 2, 9, 64)).astype(np.float32)
+        expected = self.scalar_tree_dot(left, right)
+        actual = INTEGER.fixed_tree_dot(torch.from_numpy(left), torch.from_numpy(right)).numpy()
+        np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+        np.testing.assert_array_equal(INTEGER.fixed_tree_dot(torch.from_numpy(left[..., -1:, :]), torch.from_numpy(right)).numpy(), actual[..., -1:, :])
+        padded = np.pad(right, ((0, 0), (0, 0), (0, 3), (0, 0)))
+        np.testing.assert_array_equal(INTEGER.fixed_tree_dot(torch.from_numpy(left), torch.from_numpy(padded)).numpy()[..., :9], actual)
+        ordered_left = torch.tensor([1e8, 1., -1e8, 1.]).reshape(1, 1, 1, 4)
+        ordered_right = torch.ones_like(ordered_left)
+        self.assertEqual(float(INTEGER.fixed_tree_dot(ordered_left, ordered_right)), 0.)
+        ascending = np.float32(0)
+        for value in ordered_left.numpy().flat:
+            ascending = np.float32(ascending + value)
+        self.assertEqual(float(ascending), 1.)
+        epsilon = np.float32(2**-23)
+        no_fma_left = np.array([np.float32(1 + epsilon), -1], dtype=np.float32).reshape(1, 1, 1, 2)
+        no_fma_right = np.array([np.float32(1 - epsilon), 1], dtype=np.float32).reshape(1, 1, 1, 2)
+        self.assertEqual(float(INTEGER.fixed_tree_dot(torch.from_numpy(no_fma_left), torch.from_numpy(no_fma_right))), 0.)
+        self.assertNotEqual(float(np.float32(np.sum(no_fma_left.astype(np.float64) * no_fma_right.astype(np.float64)))), 0.)
+        for shape in ((2048,), (1, 3, 2048)):
+            value = generator.uniform(-1, 1, shape).astype(np.float32)
+            expected_mean = self.scalar_tree_dot(value.reshape(1, 1, -1, 2048), value.reshape(1, 1, -1, 2048))
+            expected_mean = np.diagonal(expected_mean[0, 0]).reshape(*shape[:-1], 1) * np.float32(1 / 2048)
+            actual_mean = INTEGER.fixed_tree_mean_squares(torch.from_numpy(value)).numpy()
+            np.testing.assert_array_equal(actual_mean.view(np.uint32), expected_mean.view(np.uint32))
+
+    def test_fixed_tree_rejects_invalid_operands_without_mutation(self):
+        value = torch.ones((1, 1, 2, 8))
+        before = value.clone()
+        for bad in (value.double(), value[..., :3], torch.empty((1, 1, 0, 8)), value + float("inf"), torch.full_like(value, torch.finfo(torch.float32).max)):
+            with self.subTest(shape=tuple(bad.shape), dtype=bad.dtype), self.assertRaises(ValueError):
+                INTEGER.fixed_tree_mean_squares(bad)
+        with self.assertRaisesRegex(ValueError, "matching"):
+            INTEGER.fixed_tree_dot(value, torch.ones((1, 2, 2, 8)))
+        self.assertTrue(torch.equal(value, before))
+        self.assertEqual(INTEGER.arithmetic_contract()["name"], "native")
+        self.assertNotIn("arithmetic_policy", INTEGER.recipe("power_of_two"))
+        self.assertEqual(INTEGER.recipe("power_of_two", "fixed_tree_fp32_v1")["arithmetic_policy"]["status"], "opt_in_candidate_not_adopted")
+
+    def test_fixed_tree_installer_preserves_norm_parameters_and_source_interface(self):
+        from types import SimpleNamespace
+        from transformers import LlamaConfig
+        from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaAttention, eager_attention_forward
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        lm = torch.nn.Module()
+        lm.model = torch.nn.Module()
+        lm.model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(22)])
+        config = LlamaConfig(hidden_size=2048, intermediate_size=5632, num_hidden_layers=22, num_attention_heads=32, num_key_value_heads=4)
+        config._attn_implementation = "eager"
+        for index, layer in enumerate(lm.model.layers):
+            layer.input_layernorm = LlamaRMSNorm(2048, 1e-5)
+            layer.post_attention_layernorm = LlamaRMSNorm(2048, 1e-5)
+            with torch.device("meta"):
+                layer.self_attn = LlamaAttention(config, index)
+        lm.model.norm = LlamaRMSNorm(2048, 1e-5)
+        lm.config = config
+        lm.eval()
+        parameters = {name: value for name, value in lm.named_parameters()}
+        metadata = INTEGER.install_fixed_tree_arithmetic(lm)
+        self.assertEqual(metadata["rms_norms"], 45)
+        self.assertEqual(lm.config._attn_implementation, "eager")
+        self.assertTrue(all(isinstance(layer.self_attn, INTEGER.FixedTreeAttention) for layer in lm.model.layers))
+        self.assertTrue(all(not module.training for module in lm.modules()))
+        self.assertIs(ALL_ATTENTION_FUNCTIONS.get_interface("eager", eager_attention_forward), eager_attention_forward)
+        for name, value in lm.named_parameters():
+            self.assertIs(value, parameters[name])
+
+    def test_fixed_tree_missing_mask_fails_before_caller_state_changes(self):
+        from transformers import LlamaConfig
+        from transformers.models.llama.modeling_llama import LlamaAttention
+        config = LlamaConfig(hidden_size=64, num_attention_heads=4, num_key_value_heads=2)
+        original = LlamaAttention(config, 0).eval()
+        candidate = INTEGER.FixedTreeAttention(original).eval()
+        value = torch.ones((1, 1, 64))
+        before = value.clone()
+        cache = mock.Mock()
+        parameters = {name: parameter.detach().clone() for name, parameter in candidate.named_parameters()}
+        with self.assertRaisesRegex(ValueError, "explicit causal attention mask"):
+            candidate(value, (torch.ones((1, 1, 16)), torch.zeros((1, 1, 16))), past_key_values=cache)
+        cache.update.assert_not_called()
+        self.assertTrue(torch.equal(value, before))
+        for name, parameter in candidate.named_parameters():
+            self.assertTrue(torch.equal(parameter, parameters[name]))
+
+    def test_fixed_tree_import_is_lazy_and_alias_registration_is_idempotent(self):
+        import subprocess
+        script = """import importlib.util, sys, torch
+from pathlib import Path
+path=Path(sys.argv[1]);modules=[]
+assert not hasattr(torch.ops.merlin_fixed_order,'dot')
+for name in ('fixed_tree_import_one','fixed_tree_import_alias'):
+ spec=importlib.util.spec_from_file_location(name,path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);modules.append(module)
+assert not hasattr(torch.ops.merlin_fixed_order,'dot')
+assert not hasattr(torch.ops.merlin_fixed_order,'mean_squares')
+assert modules[0].recipe()['name']=='tinyllama_w8a8_dynamic_token_v1'
+value=torch.ones((1,1,1,8));expected=torch.tensor([[[[8.]]]])
+for module in modules:
+ assert torch.equal(module.fixed_tree_dot(value,value),expected)
+ assert torch.equal(module.fixed_tree_mean_squares(value),torch.ones_like(value[...,:1]))
+assert modules[0]._FIXED_TREE_OPS==modules[1]._FIXED_TREE_OPS
+"""
+        result = subprocess.run([sys.executable, "-c", script, str(Path(INTEGER.__file__))], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_encoder_oracle_rejects_wrong_codes_scales_dtype_and_nonfinite(self):
         value = np.asarray([[127., .5, 1.5, -2.5], [0., 0., 0., 0.]], dtype=np.float32)
         codes, scales = INTEGER.independent_quantize_rows(value)
@@ -348,6 +467,35 @@ class TinyLlamaIntegerTests(unittest.TestCase):
             self.assertEqual(codes[2].tolist(), [127, 8, 9, -9])
 
     @unittest.skipUnless(os.environ.get("TVM_SESSION_MODEL2MLIR"), "Optional pinned cache-wrapper integration disabled")
+    def test_real_hf_fixed_tree_cache_dispatch_and_unchanged_gate(self):
+        from transformers import LlamaConfig, LlamaForCausalLM
+        from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaAttention
+        from types import SimpleNamespace
+        path = FACTORY.safe_path(Path(os.environ["TVM_SESSION_MODEL2MLIR"]) / "m2m/capture/causal_session.py")
+        spec = importlib.util.spec_from_file_location("tinyllama_candidate_test_causal_session", path)
+        causal = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(causal)
+        torch.manual_seed(194)
+        config = LlamaConfig(hidden_size=64, intermediate_size=96, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, vocab_size=128)
+        config._attn_implementation = "eager"
+        lm = LlamaForCausalLM(config).eval().requires_grad_(False)
+        for name, module in list(lm.named_modules()):
+            if isinstance(module, LlamaRMSNorm):
+                parent, _, leaf = name.rpartition(".")
+                setattr(lm.get_submodule(parent), leaf, INTEGER.FixedTreeRMSNorm(module))
+            elif isinstance(module, LlamaAttention):
+                parent, _, leaf = name.rpartition(".")
+                setattr(lm.get_submodule(parent), leaf, INTEGER.FixedTreeAttention(module))
+        capture = SimpleNamespace(lm=lm, tokens=torch.arange(12).reshape(1, -1), prefill_tokens=4, decode_tokens=8, provenance={"arithmetic_policy": INTEGER.arithmetic_contract("fixed_tree_fp32_v1")})
+        with mock.patch.object(INTEGER, "fixed_tree_dot", wraps=INTEGER.fixed_tree_dot) as observed:
+            result = FACTORY.validate_reference_stages(capture, causal, torch)
+        self.assertEqual(observed.call_count, 36)
+        self.assertEqual(result["reference"], "candidate_full_sequence_hf_use_cache_false")
+        self.assertEqual((result["rtol"], result["atol"]), (1e-4, 1e-4))
+        self.assertEqual(len(result["checks"]), 9)
+        self.assertTrue(all(check["attention"]["active_mask_exact"] and check["attention"]["last_token_rope_exact"] for check in result["checks"]))
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODEL2MLIR"), "Optional pinned cache-wrapper integration disabled")
     def test_real_hf_fixed_cache_matches_positions_masks_and_full_sequence(self):
         from transformers import LlamaConfig, LlamaForCausalLM
         from types import SimpleNamespace
@@ -403,6 +551,43 @@ class TinyLlamaIntegerTests(unittest.TestCase):
                 self.assertEqual(len(contractions), 1)
                 weights = {tensor.name: tensor for tensor in graph.graph.initializer}
                 self.assertEqual(weights[contractions[0].input[1]].data_type, onnx.TensorProto.INT8)
+
+    @unittest.skipUnless(os.environ.get("TVM_TINYLLAMA_FIXED_TREE_ONNX") == "1", "Optional ordered FP32 ONNX/TVM integration disabled")
+    def test_real_fixed_tree_export_import_and_llvm_execution(self):
+        import onnx
+        import tvm
+        import verify_session
+        from types import SimpleNamespace
+        class Ordered(torch.nn.Module):
+            def forward(self, left, right, value):
+                return INTEGER.fixed_tree_dot(left, right), INTEGER.fixed_tree_mean_squares(value)
+        generator = np.random.default_rng(981)
+        left = generator.uniform(-2, 2, (1, 2, 5, 64)).astype(np.float32)
+        right = generator.uniform(-2, 2, (1, 2, 7, 64)).astype(np.float32)
+        value = generator.uniform(-1, 1, (1, 3, 2048)).astype(np.float32)
+        candidate = SimpleNamespace(provenance={"arithmetic_policy": INTEGER.arithmetic_contract("fixed_tree_fp32_v1")})
+        options = verify_session.factory_export_options(FACTORY, torch, candidate)
+        self.assertEqual(len(options["custom_translation_table"]), 3)
+        # A prior candidate must not opt a later native model into ordered export.
+        native = SimpleNamespace(provenance={})
+        native_options = verify_session.factory_export_options(FACTORY, torch, native)
+        self.assertEqual(set(native_options["custom_translation_table"]), {torch.ops.aten._int_mm.default})
+        self.assertEqual(set(INTEGER.export_options(torch)["custom_translation_table"]), {torch.ops.aten._int_mm.default})
+        legacy = SimpleNamespace(get_onnx_export_options=lambda selected: {"custom_translation_table": {}})
+        self.assertEqual(verify_session.factory_export_options(legacy, torch, candidate), {"custom_translation_table": {}})
+        self.assertIsNone(verify_session.factory_export_options(SimpleNamespace(), torch, candidate))
+        expected_dot = self.scalar_tree_dot(left, right)
+        expected_mean = self.scalar_tree_dot(value.reshape(1, 1, 3, 2048), value.reshape(1, 1, 3, 2048))[0, 0].diagonal().reshape(1, 3, 1) * np.float32(1 / 2048)
+        for mode in ("baseline", "optimized"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                compiler = verify_session.StageCompiler(Path(directory), mode, np, torch, onnx, tvm, exporter="dynamo", export_options=options)
+                executable = compiler(SimpleNamespace(name="ordered", module=Ordered().eval()), [left, right, value], 1)
+                actual_dot, actual_mean = verify_session.outputs(executable([left, right, value]), np, torch)
+                np.testing.assert_array_equal(actual_dot.view(np.uint32), expected_dot.view(np.uint32))
+                np.testing.assert_array_equal(actual_mean.view(np.uint32), expected_mean.view(np.uint32))
+                graph = onnx.load(str(Path(directory) / "stage_0/model.onnx"))
+                self.assertEqual([(node.domain, node.op_type) for node in graph.graph.node], [("merlin.fixed_order", "FixedTreeDot"), ("merlin.fixed_order", "FixedTreeMeanSquares")])
+                self.assertEqual(next(item.version for item in graph.opset_import if item.domain == "merlin.fixed_order"), 1)
 
 
 if __name__ == "__main__":
