@@ -389,7 +389,7 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(set(parameters), {"weight", "bias"})
             self.assertTrue(all(value.data_type == onnx.TensorProto.BFLOAT16 for value in parameters.values()))
             self.assertEqual(compiler.records[0]["translation_source"], compiler.translation_source)
-            self.assertEqual(compiler.records[0]["translated_aten_operations"], {"aten.linear.default": 1, "aten.scaled_dot_product_attention.default": 1})
+            self.assertEqual(compiler.records[0]["translated_aten_operations"], {"aten.linear.default": 1, "aten.scaled_dot_product_attention.default": 1, "aten.layer_norm.default": 0})
             self.assertEqual(self.verifier.parameter_digest(module, torch), original_weights)
 
     @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
@@ -450,6 +450,69 @@ class SessionTests(unittest.TestCase):
             CastLike._impl_v15(None, [None, target], {"round_mode": b"unknown"}, None)
 
     @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
+    def test_fused_bf16_layer_norm_preserves_original_affine_and_output_boundary(self):
+        import onnx
+        import tvm
+        torch, np = self.torch, self.np
+
+        class Norm(torch.nn.Module):
+            def __init__(self, shape, weight, bias):
+                super().__init__()
+                self.shape = shape
+                self.register_buffer("weight", weight)
+                self.register_buffer("bias", bias)
+
+            def forward(self, value):
+                return torch.nn.functional.layer_norm(value, self.shape, self.weight, self.bias, 1e-6)
+
+        data = torch.tensor([[1., 2., 4.], [-2., 1., 3.]], dtype=torch.bfloat16)
+        weight = torch.tensor([0.5, 1.25, -0.75], dtype=torch.bfloat16)
+        bias = torch.tensor([0.125, -0.25, 0.375], dtype=torch.bfloat16)
+        with torch.no_grad():
+            original = torch.nn.functional.layer_norm(data, (3,), weight, bias, 1e-6)
+            split = torch.nn.functional.layer_norm(data.float(), (3,), eps=1e-6).bfloat16() * weight + bias
+        self.assertFalse(torch.equal(original, split))
+        cases = [("affine", (3,), data, weight, bias), ("no-bias", (3,), data, weight, None), ("no-weight", (3,), data, None, bias), ("no-affine", (3,), data, None, None), ("two-axes", (2, 3), data.unsqueeze(0), weight.expand(2, 3).contiguous(), bias.expand(2, 3).contiguous())]
+        for name, shape, value, scale, shift in cases:
+            module = Norm(shape, scale, shift).eval()
+            parameter_digest = self.verifier.parameter_digest(module, torch)
+            with torch.no_grad():
+                expected = self.verifier.array(module(value), np, torch)
+            inputs = (self.verifier.array(value, np, torch),)
+            input_identity = self.verifier.tensor_identity(inputs[0])
+            first = None
+            for mode in ("baseline", "optimized"):
+                with self.subTest(case=name, mode=mode), tempfile.TemporaryDirectory(prefix="tvm-session-bf16-norm-") as temp:
+                    compiler = self.verifier.StageCompiler(Path(temp), mode, np, torch, onnx, tvm, exporter="dynamo", opset=22, bf16_fused_export=True)
+                    run = compiler(SimpleNamespace(name=name, module=module), inputs, 1)
+                    for repeat in range(2):
+                        actual = self.verifier.array(run(inputs), np, torch)
+                        self.verifier.compare(actual, expected, np, 1e-4, 1e-4)
+                        self.assertEqual(actual.tobytes(), expected.tobytes())
+                        if first is None:
+                            first = actual.copy()
+                        self.assertEqual(actual.tobytes(), first.tobytes())
+                        self.assertEqual(self.verifier.tensor_identity(inputs[0]), input_identity)
+                    graph = onnx.shape_inference.infer_shapes(onnx.load(str(Path(temp) / "stage_0/model.onnx")))
+                    types = {entry.name: entry.type.tensor_type.elem_type for entry in (*graph.graph.input, *graph.graph.value_info, *graph.graph.output)}
+                    self.assertFalse(any(node.op_type == "LayerNormalization" for node in graph.graph.node))
+                    self.assertEqual(sum(node.op_type == "ReduceMean" for node in graph.graph.node), 2)
+                    for node in graph.graph.node:
+                        if node.op_type in ("ReduceMean", "Sub", "Mul", "Add", "Sqrt", "Div"):
+                            self.assertTrue(all(types[entry] == onnx.TensorProto.FLOAT for entry in node.output))
+                    self.assertEqual(graph.graph.input[0].type.tensor_type.elem_type, onnx.TensorProto.BFLOAT16)
+                    self.assertEqual(graph.graph.output[0].type.tensor_type.elem_type, onnx.TensorProto.BFLOAT16)
+                    self.assertTrue(all(entry.data_type == onnx.TensorProto.BFLOAT16 for entry in graph.graph.initializer if entry.name in ("weight", "bias")))
+                    self.assertEqual(compiler.records[0]["translated_aten_operations"]["aten.layer_norm.default"], 1)
+                    self.assertEqual(self.verifier.parameter_digest(module, torch), parameter_digest)
+        helper = self.verifier.load_module("fused_bf16_dynamic_norm_helper", repo_root() / "examples/gemmini/comparisons/tvm/bf16_export.py")
+        dynamic = torch.onnx.export(Norm((3,), weight, bias).eval(), (data,), opset_version=22, dynamo=True, optimize=False, custom_translation_table=helper.translations(torch), dynamic_shapes={"value": {0: torch.export.Dim("rows", min=1, max=8)}})
+        dimensions = dynamic.model_proto.graph.input[0].type.tensor_type.shape.dim
+        self.assertTrue(dimensions[0].dim_param)
+        self.assertEqual(dimensions[1].dim_value, 3)
+        self.assertEqual(dynamic.model_proto.graph.output[0].type.tensor_type.elem_type, onnx.TensorProto.BFLOAT16)
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
     def test_fused_export_keeps_fp32_builtin_semantics(self):
         import onnx
         import tvm
@@ -459,9 +522,10 @@ class SessionTests(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.linear = torch.nn.Linear(8, 8)
+                self.norm = torch.nn.LayerNorm(8)
 
             def forward(self, q, k, v):
-                return self.linear(q), torch.nn.functional.scaled_dot_product_attention(q, k, v)
+                return self.linear(q), torch.nn.functional.scaled_dot_product_attention(q, k, v), self.norm(q)
 
         with torch.random.fork_rng():
             torch.manual_seed(151)
@@ -472,9 +536,13 @@ class SessionTests(unittest.TestCase):
         inputs = tuple(self.verifier.array(value, np, torch) for value in values)
         with tempfile.TemporaryDirectory(prefix="tvm-session-fused-fp32-") as temp:
             compiler = self.verifier.StageCompiler(Path(temp), "baseline", np, torch, onnx, tvm, exporter="dynamo", opset=22, bf16_fused_export=True)
-            actual = self.verifier.outputs(compiler(SimpleNamespace(name="fp32", module=module), inputs, 2)(inputs), np, torch)
+            actual = self.verifier.outputs(compiler(SimpleNamespace(name="fp32", module=module), inputs, 3)(inputs), np, torch)
             for value, reference in zip(actual, expected):
                 self.verifier.compare(value, self.verifier.array(reference, np, torch), np, 1e-4, 1e-4)
+            graph = onnx.load(str(Path(temp) / "stage_0/model.onnx"))
+            default = torch.onnx.export(module, values, opset_version=22, dynamo=True, optimize=False, input_names=["input_0", "input_1", "input_2"], output_names=["output_0", "output_1", "output_2"])
+            self.assertEqual([node.op_type for node in graph.graph.node], [node.op_type for node in default.model_proto.graph.node])
+            self.assertEqual(sum(node.op_type == "LayerNormalization" for node in graph.graph.node), 1)
 
     @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
     def test_fused_bf16_export_refuses_unverified_contracts(self):
@@ -485,6 +553,7 @@ class SessionTests(unittest.TestCase):
         fp32 = SimpleNamespace(dtype=ir.DataType.FLOAT, shape=(1, 2, 17, 8))
         linear = translations[self.torch.ops.aten.linear.default]
         attention = translations[self.torch.ops.aten.scaled_dot_product_attention.default]
+        layer_norm = translations[self.torch.ops.aten.layer_norm.default]
         with self.assertRaisesRegex(ValueError, "matching operand"):
             linear(bf16, fp32)
         for options in ({"dropout_p": 0.1}, {"enable_gqa": True}, {"is_causal": True, "attn_mask": bf16}):
@@ -492,6 +561,24 @@ class SessionTests(unittest.TestCase):
                 attention(bf16, bf16, bf16, **options)
         with self.assertRaisesRegex(ValueError, "matching Q/K/V"):
             attention(bf16, fp32, bf16)
+        self.assertNotIn(self.torch.ops.aten.native_layer_norm.default, translations)
+        with self.assertRaisesRegex(ValueError, "BF16 dispatcher"):
+            layer_norm(fp32, [8])
+        for shape in ([], [0], [-1], [8.0], [1, 1, 1, 1, 8]):
+            with self.subTest(shape=shape), self.assertRaisesRegex(ValueError, "positive static"):
+                layer_norm(bf16, shape)
+        for value, shape in ((bf16, [7]), (SimpleNamespace(dtype=ir.DataType.BFLOAT16, shape=(1, None)), [8]), (SimpleNamespace(dtype=ir.DataType.BFLOAT16, shape=(1, 8)), [2, 8])):
+            with self.subTest(input_shape=value.shape, normalized_shape=shape), self.assertRaisesRegex(ValueError, "static trailing"):
+                layer_norm(value, shape)
+        for epsilon in (-1., float("nan"), float("inf")):
+            with self.subTest(epsilon=epsilon), self.assertRaisesRegex(ValueError, "epsilon"):
+                layer_norm(bf16, [8], eps=epsilon)
+        for affine in ({"weight": fp32}, {"bias": fp32}):
+            with self.subTest(affine=affine), self.assertRaisesRegex(ValueError, "original BF16"):
+                layer_norm(bf16, [8], **affine)
+        for name, shape in (("weight", (7,)), ("bias", (1, 8)), ("weight", None)):
+            with self.subTest(affine=name, shape=shape), self.assertRaisesRegex(ValueError, "affine shapes"):
+                layer_norm(bf16, [8], **{name: SimpleNamespace(dtype=ir.DataType.BFLOAT16, shape=shape)})
 
     @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
     def test_modern_export_preserves_source_cache_across_repeats(self):

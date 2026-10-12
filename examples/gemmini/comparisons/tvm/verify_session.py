@@ -627,7 +627,7 @@ class StageCompiler:
             if file_identity(self.translation_source["path"], safe_path) != self.translation_source:
                 raise AssertionError("Selected BF16 export translations changed")
             record["translation_source"] = self.translation_source
-            record["bf16_fused_arithmetic"] = "original BF16 operands/results; linear and SDPA FP32-math candidates, not native CPU kernel/layout reproductions; unchanged source reference gate"
+            record["bf16_fused_arithmetic"] = "original BF16 interfaces; linear, SDPA and single-output LayerNorm use FP32 math; no native reduction/layout/statistics reproduction; unchanged source gate"
             record["bf16_attention_profile"] = "fp32-math"
             record["onnx_export_optimization"] = False
         for name, value in (("imported", mod), ("graph", transformed), ("vm", lowered)):

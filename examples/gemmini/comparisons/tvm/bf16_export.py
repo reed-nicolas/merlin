@@ -3,11 +3,12 @@
 Original operands and results remain BF16. FP32 internal arithmetic avoids adding
 BF16 rounding points inside a mathematical fused operation. Native linear can
 choose an unfused layout-dependent kernel; native attention can use blocked BF16
-exponential storage. These are FP32-math candidates, not reproductions of every
-native CPU kernel. Both operations remain strictly source-reference gated.
+exponential storage. LayerNorm retains its single BF16 output boundary, without
+claiming native reduction order or auxiliary statistics. These are FP32-math
+candidates, not reproductions of every native CPU kernel, and remain source-reference gated.
 """
 import math
-from typing import Optional
+from typing import Optional, Sequence
 
 
 def bf16_linear_error_diagnostic(input, weight, bias, torch):
@@ -78,7 +79,7 @@ def translations(torch):
     from onnxscript import ir, opset18 as op
     from onnxscript.function_libs.torch_lib.ops import nn
     from onnxscript.function_libs.torch_lib.tensor_typing import TFloat
-    from onnxscript.onnx_types import TensorType
+    from onnxscript.onnx_types import BFLOAT16, TensorType
 
     def linear(input: TFloat, weight: TFloat, bias: Optional[TFloat] = None) -> TFloat:
         if input.dtype != ir.DataType.BFLOAT16:
@@ -91,6 +92,37 @@ def translations(torch):
         if bias is not None:
             product = op.Add(product, op.Cast(bias, to=1))
         return op.Cast(product, to=16)
+
+    def layer_norm(input: BFLOAT16, normalized_shape: Sequence[int], weight: Optional[TFloat] = None, bias: Optional[TFloat] = None, eps: float = 1e-5, cudnn_enable: bool = True) -> BFLOAT16:
+        # A BF16-only signature lets the exporter retain its built-in FP32 path.
+        # Register the observed single-output ATen op; native_layer_norm's CPU
+        # auxiliary statistics can be BF16 and are outside this translation.
+        if input.dtype != ir.DataType.BFLOAT16:
+            raise ValueError("LayerNorm translation requires BF16 dispatcher input")
+        if not normalized_shape or any(type(value) is not int or value <= 0 for value in normalized_shape) or input.shape is None or len(input.shape) < len(normalized_shape):
+            raise ValueError("BF16 LayerNorm requires a known rank and positive static normalized shape")
+        trailing_shape = tuple(input.shape)[-len(normalized_shape):]
+        if any(type(value) is not int for value in trailing_shape) or trailing_shape != tuple(normalized_shape):
+            raise ValueError("BF16 LayerNorm normalized shape must equal the static trailing input dimensions")
+        if not math.isfinite(eps) or eps < 0:
+            raise ValueError("BF16 LayerNorm requires a finite nonnegative epsilon")
+        if any(value is not None and value.dtype != ir.DataType.BFLOAT16 for value in (weight, bias)):
+            raise ValueError("BF16 LayerNorm requires original BF16 scale/bias")
+        if any(value is not None and (value.shape is None or tuple(value.shape) != tuple(normalized_shape)) for value in (weight, bias)):
+            raise ValueError("BF16 LayerNorm affine shapes must equal the normalized shape")
+        # Explicit FLOAT standardization and affine have no intervening BF16
+        # normalization cast. Original BF16 parameters widen exactly. The
+        # decomposition also supports omitted affine and all trailing axes.
+        axes = list(range(-len(normalized_shape), 0))
+        widened = op.Cast(input, to=1)
+        centered = op.Sub(widened, op.ReduceMean(widened, axes, keepdims=1))
+        variance = op.ReduceMean(op.Mul(centered, centered), axes, keepdims=1)
+        output = op.Div(centered, op.Sqrt(op.Add(variance, eps)))
+        if weight is not None:
+            output = op.Mul(output, op.Cast(weight, to=1))
+        if bias is not None:
+            output = op.Add(output, op.Cast(bias, to=1))
+        return op.Cast(output, to=16)
 
     def attention(query: TFloat, key: TFloat, value: TFloat, attn_mask: Optional[TensorType] = None, dropout_p: float = 0.0, is_causal: bool = False, scale: Optional[float] = None, enable_gqa: bool = False) -> TFloat:
         if query.dtype != ir.DataType.BFLOAT16:
@@ -131,4 +163,4 @@ def translations(torch):
             probabilities = op.Where(blocked, 0.0, probabilities)
         return op.Cast(op.MatMul(probabilities, op.Cast(value, to=1)), to=16)
 
-    return {torch.ops.aten.linear.default: linear, torch.ops.aten.scaled_dot_product_attention.default: attention}
+    return {torch.ops.aten.linear.default: linear, torch.ops.aten.scaled_dot_product_attention.default: attention, torch.ops.aten.layer_norm.default: layer_norm}
