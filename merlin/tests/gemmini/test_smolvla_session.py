@@ -85,6 +85,18 @@ class SmolVLAArtifactTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source LayerNorm"):
                 FACTORY.get_model_and_inputs(**base, **change)
 
+    def test_source_conv_requires_explicit_integer_session_and_one_native_thread(self):
+        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
+        for change in ({"source_conv_policy": "unknown"}, {"source_conv_policy": "torch_cpu_conv3x16_v1"}, {"source_conv_policy": "torch_cpu_conv3x16_v1", "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source convolution"):
+                FACTORY.get_model_and_inputs(**base, **change)
+
+    def test_source_sgemm_requires_explicit_integer_session_and_one_native_thread(self):
+        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
+        for change in ({"source_sgemm_policy": "unknown"}, {"source_sgemm_policy": "torch_cpu_sgemm177_v1"}, {"source_sgemm_policy": "torch_cpu_sgemm177_v1", "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source SGEMM"):
+                FACTORY.get_model_and_inputs(**base, **change)
+
     def test_restricted_component_is_rejected_before_read(self):
         with self.assertRaisesRegex(ValueError, "Restricted path component"):
             FACTORY.directory_artifacts("/tmp/" + "vl" + "si" + "-fixture")
@@ -417,6 +429,108 @@ class SmolVLASourceLayerNormTests(unittest.TestCase):
                 from onnx import numpy_helper
                 constants = {node.output[0]: numpy_helper.to_array(node.attribute[0].t) for node in graph.graph.node if node.op_type == "Constant" and node.attribute[0].type == 4}
                 self.assertEqual(int(constants[selected[0].input[3]].view("uint32")), 0x358637bd)
+
+
+class SmolVLASourceConvTests(unittest.TestCase):
+    def test_session_hook_selects_only_declared_policy(self):
+        import torch
+        import bf16_export
+        import tinyllama_integer
+        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
+        with mock.patch.object(tinyllama_integer, "export_options", side_effect=lambda _: {"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_conv_translations", return_value={torch.ops.aten.convolution.default: "selected"}) as select:
+            self.assertEqual(FACTORY.get_onnx_export_options(torch)["custom_translation_table"], original)
+            model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {}}))
+            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], original)
+            select.assert_not_called()
+            model.session.metadata["provenance"]["source_conv_policy"] = {"name": "torch_cpu_conv3x16_v1"}
+            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, torch.ops.aten.convolution.default: "selected"})
+            select.assert_called_once_with(torch, "torch_cpu_conv3x16_v1")
+
+    def test_contract_refuses_other_dispatch_and_modified_binary(self):
+        self.assertIsNone(NUMERICS.source_conv_contract(None))
+        self.assertEqual(NUMERICS.source_conv_translations(None), {})
+        with self.assertRaisesRegex(ValueError, "Unknown source convolution"):
+            NUMERICS.source_conv_contract(None, "unknown")
+        import torch
+        with mock.patch.object(NUMERICS, "_source_cpu_bindings", return_value=[]) as bindings:
+            record = NUMERICS.source_conv_contract(torch, "torch_cpu_conv3x16_v1")
+            self.assertEqual(record["operator"], "TorchConv2dAvx512Bf16IC3Kernel16Stride16")
+            bindings.assert_called_once_with(torch, NUMERICS.SOURCE_CONV_ARTIFACTS, "Source convolution")
+            for feature in ("_is_avx512_bf16_supported", "_is_amx_tile_supported"):
+                with mock.patch.object(torch.cpu, feature, return_value=True), self.assertRaisesRegex(ValueError, "software-BF16"):
+                    NUMERICS.source_conv_contract(torch, "torch_cpu_conv3x16_v1")
+            with mock.patch.dict(os.environ, {"ONEDNN_MAX_CPU_ISA": "AVX2"}), self.assertRaisesRegex(ValueError, "software-BF16"):
+                NUMERICS.source_conv_contract(torch, "torch_cpu_conv3x16_v1")
+            with mock.patch.object(torch.backends, "mkldnn", SimpleNamespace(is_available=lambda: True, enabled=False)), self.assertRaisesRegex(ValueError, "software-BF16"):
+                NUMERICS.source_conv_contract(torch, "torch_cpu_conv3x16_v1")
+        with mock.patch.object(torch, "get_num_threads", return_value=1), mock.patch("verify_resnet.file_identity", return_value={"sha256": "changed"}), self.assertRaisesRegex(ValueError, "independently proved"):
+            NUMERICS.source_conv_contract(torch, "torch_cpu_conv3x16_v1")
+
+    def test_real_export_selects_only_bound_bf16_patch_geometry(self):
+        import torch
+        class Conv(torch.nn.Module):
+            def forward(self, value, weight, bias):
+                return torch.ops.aten.conv2d.default(value, weight, bias, [16, 16], [0, 0], [1, 1], 1), torch.ops.aten.convolution.default(value, weight, bias, [16, 16], [0, 0], [1, 1], False, [0, 0], 1), torch.nn.functional.conv2d(value, weight, None, stride=16), torch.nn.functional.conv2d(value, weight, bias, stride=8)
+        for dtype in (torch.bfloat16, torch.float32):
+            inputs = (torch.zeros(1, 3, 512, 512, dtype=dtype), torch.ones(768, 3, 16, 16, dtype=dtype), torch.zeros(768, dtype=dtype))
+            before = tuple(value.clone() for value in inputs)
+            with mock.patch.object(NUMERICS, "source_conv_contract", return_value={"name": "torch_cpu_conv3x16_v1"}):
+                table = NUMERICS.source_conv_translations(torch, "torch_cpu_conv3x16_v1")
+            graph = torch.onnx.export(Conv().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
+            selected = [node for node in graph.graph.node if node.domain == "merlin.source_preserving"]
+            self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [("TorchConv2dAvx512Bf16IC3Kernel16Stride16", 3, 1, 0)] * 2 if dtype == torch.bfloat16 else [])
+            self.assertEqual(sum(node.op_type == "Conv" for node in graph.graph.node), 2 if dtype == torch.bfloat16 else 4)
+            self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
+
+
+class SmolVLASourceSgemmTests(unittest.TestCase):
+    def test_session_hook_selects_only_declared_policy(self):
+        import torch
+        import bf16_export
+        import tinyllama_integer
+        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
+        with mock.patch.object(tinyllama_integer, "export_options", side_effect=lambda _: {"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_sgemm_translations", return_value={torch.ops.aten.matmul.default: "selected"}) as select:
+            self.assertEqual(FACTORY.get_onnx_export_options(torch)["custom_translation_table"], original)
+            model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {}}))
+            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], original)
+            select.assert_not_called()
+            model.session.metadata["provenance"]["source_sgemm_policy"] = {"name": "torch_cpu_sgemm177_v1"}
+            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, torch.ops.aten.matmul.default: "selected"})
+            select.assert_called_once_with(torch, "torch_cpu_sgemm177_v1")
+
+    def test_contract_refuses_other_precision_dispatch_and_modified_binary(self):
+        self.assertIsNone(NUMERICS.source_sgemm_contract(None))
+        self.assertEqual(NUMERICS.source_sgemm_translations(None), {})
+        with self.assertRaisesRegex(ValueError, "Unknown source SGEMM"):
+            NUMERICS.source_sgemm_contract(None, "unknown")
+        runtime = SimpleNamespace(version=SimpleNamespace(git_version="449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"), backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX512"), mkl=SimpleNamespace(is_available=lambda: True)), get_num_threads=lambda: 1, get_float32_matmul_precision=lambda: "highest", __file__="/tmp/pinned-torch/__init__.py")
+        with mock.patch.object(NUMERICS, "_source_cpu_bindings", return_value=[]):
+            record = NUMERICS.source_sgemm_contract(runtime, "torch_cpu_sgemm177_v1")
+            self.assertEqual(record["operators"], ["TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177"])
+            with mock.patch.object(runtime, "get_float32_matmul_precision", return_value="high"), self.assertRaisesRegex(ValueError, "highest-precision"):
+                NUMERICS.source_sgemm_contract(runtime, "torch_cpu_sgemm177_v1")
+            with mock.patch.dict(os.environ, {"MKL_CBWR": "COMPATIBLE"}), self.assertRaisesRegex(ValueError, "highest-precision"):
+                NUMERICS.source_sgemm_contract(runtime, "torch_cpu_sgemm177_v1")
+            with mock.patch.object(runtime.backends.mkl, "is_available", return_value=False), self.assertRaisesRegex(ValueError, "highest-precision"):
+                NUMERICS.source_sgemm_contract(runtime, "torch_cpu_sgemm177_v1")
+        with mock.patch("verify_resnet.file_identity", return_value={"sha256": "changed"}), self.assertRaisesRegex(ValueError, "independently proved"):
+            NUMERICS.source_sgemm_contract(runtime, "torch_cpu_sgemm177_v1")
+
+    def test_real_export_selects_only_bound_fp32_qk_and_pv(self):
+        import torch
+        class Attention(torch.nn.Module):
+            def forward(self, query, key, probability, value):
+                return query @ key, probability @ value, query[..., :49, :] @ key
+        for dtype in (torch.float32, torch.bfloat16):
+            inputs = tuple(torch.ones(shape, dtype=dtype) for shape in ((1, 15, 50, 64), (1, 15, 64, 177), (1, 15, 50, 177), (1, 15, 177, 64)))
+            before = tuple(value.clone() for value in inputs)
+            with mock.patch.object(NUMERICS, "source_sgemm_contract", return_value={"name": "torch_cpu_sgemm177_v1"}):
+                table = NUMERICS.source_sgemm_translations(torch, "torch_cpu_sgemm177_v1")
+            graph = torch.onnx.export(Attention().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
+            selected = [node for node in graph.graph.node if node.domain == "merlin.source_preserving"]
+            self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [("TorchMklSgemmF32QK177", 2, 1, 0), ("TorchMklSgemmF32PV177", 2, 1, 0)] if dtype == torch.float32 else [])
+            self.assertEqual(sum(node.op_type == "MatMul" for node in graph.graph.node), 1 if dtype == torch.float32 else 3)
+            self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
 
 
 class SmolVLAArithmeticDiagnosticTests(unittest.TestCase):

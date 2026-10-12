@@ -44,6 +44,17 @@ SOURCE_LAYERNORM_ARTIFACTS = {
     "include/ATen/cpu/vec/functional_bfloat16.h": "6d40c9bd4b21750b0140bdeaf93cd8f455c4f0466b4501c91e6218b420747ef9",
 }
 
+SOURCE_CONV_ARTIFACTS = {
+    "lib/libtorch_cpu.so": SOURCE_MEAN_ARTIFACTS["lib/libtorch_cpu.so"],
+    "include/dnnl_version.h": "f51d7a673319a0519ace0a799ee718687a6b0571bb42a9b627aec41d850367af",
+    "include/oneapi/dnnl/dnnl_version.h": "99128af2408719334bee22737425b5b4fad774ebba550906f93a6f259a55a6e8",
+}
+
+SOURCE_SGEMM_ARTIFACTS = {
+    "lib/libtorch_cpu.so": SOURCE_MEAN_ARTIFACTS["lib/libtorch_cpu.so"],
+    "include/ATen/native/CPUBlas.h": "a7f1b8b3bcd6669902170c730917ceefa0da1aa18489dbea6d5e086f706987b1",
+}
+
 
 def _source_cpu_bindings(torch, artifacts, operation):
     if torch.version.git_version != "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0" or torch.backends.cpu.get_cpu_capability() != "AVX512" or torch.get_num_threads() != 1:
@@ -180,6 +191,114 @@ def source_layernorm_translations(torch, policy="native"):
         return fallback(input, normalized_shape, weight, bias, eps, cudnn_enable)
 
     return {torch.ops.aten.layer_norm.default: layer_norm}
+
+
+def source_conv_contract(torch, policy="native"):
+    """Bind the proved software-BF16 native patch convolution dispatch."""
+    if policy == "native":
+        return None
+    if policy != "torch_cpu_conv3x16_v1":
+        raise ValueError("Unknown source convolution export policy")
+    import os
+    overrides = ("ONEDNN_MAX_CPU_ISA", "DNNL_MAX_CPU_ISA", "ONEDNN_DEFAULT_FPMATH_MODE", "DNNL_DEFAULT_FPMATH_MODE", "ATEN_CPU_CAPABILITY")
+    if not torch.backends.mkldnn.is_available() or not torch.backends.mkldnn.enabled or torch.cpu._is_avx512_bf16_supported() or torch.cpu._is_amx_tile_supported() or any(name in os.environ for name in overrides):
+        raise ValueError("Source convolution requires the proved software-BF16 oneDNN dispatch without ISA/fpmath overrides")
+    bindings = _source_cpu_bindings(torch, SOURCE_CONV_ARTIFACTS, "Source convolution")
+    return {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
+            "domain": "merlin.source_preserving", "version": 1, "operator": "TorchConv2dAvx512Bf16IC3Kernel16Stride16",
+            "native": "unchanged_BF16_Smol_patch_convolution_1x3x512x512_original_768x3x16x16_weight_and_768_bias",
+            "native_dispatch": "oneDNN3.7.1_jit_bf16_avx512_core_software_BF16", "native_threads": 1,
+            "export_shape": [1, 3, 512, 512], "workspace": "32_FP32_private_words_128_bytes_plus_output",
+            "algorithm": "KH_KW_channel1_channel0_zero_partner_channel2_explicit_FP32_FMA_then_original_bias_add_and_one_BF16_RNE_cast",
+            "qualification": "bounded_actual_and_controls;finite_normal_product_scope;complete_vision_prefix_and_policy_unqualified",
+            "source": "https://github.com/oneapi-src/oneDNN/blob/8d263e693366ef8db40acc569cc7d8edf644556d/src/cpu/x64/jit_avx512_core_bf16_conv_kernel.cpp",
+            "unchanged": ["parameters", "stride", "padding", "dilation", "groups", "native_reference", "acceptance_gates", "ordinary_ONNX_Conv"],
+            "bindings": bindings}
+
+
+def source_conv_translations(torch, policy="native"):
+    """Export the proved patch geometry; keep other convolutions ordinary."""
+    if source_conv_contract(torch, policy) is None:
+        return {}
+    from onnx import defs
+    from onnxscript import ir
+    from onnxscript.onnx_types import BFLOAT16
+    from onnxscript.function_libs.torch_lib.ops import core
+    from onnxscript.function_libs.torch_lib.tensor_typing import TFloat
+    from onnxscript.values import Opset, Op
+    schema = defs.OpSchema("TorchConv2dAvx512Bf16IC3Kernel16Stride16", "merlin.source_preserving", 1, inputs=[defs.OpSchema.FormalParameter(name, "T") for name in ("input", "weight", "bias")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(bfloat16)"], "Original BF16 patch operands")])
+    conv_op = Op(Opset("merlin.source_preserving", 1), schema.name, schema)
+
+    def pair(value):
+        if isinstance(value, int):
+            return (value, value)
+        values = tuple(value) if isinstance(value, (tuple, list)) else ()
+        return values * 2 if len(values) == 1 else values
+
+    def admitted(input, weight, bias, stride, padding, dilation, groups):
+        return all(value is not None and value.dtype == ir.DataType.BFLOAT16 and tuple(value.shape or ()) == shape for value, shape in ((input, (1, 3, 512, 512)), (weight, (768, 3, 16, 16)), (bias, (768,)))) and pair(stride) == (16, 16) and pair(padding) == (0, 0) and pair(dilation) == (1, 1) and groups == 1
+
+    def conv2d(input: BFLOAT16, weight: TFloat, bias: Optional[TFloat] = None, stride: Sequence[int] = (1, 1), padding: Sequence[int] = (0, 0), dilation: Sequence[int] = (1, 1), groups: int = 1) -> BFLOAT16:
+        if admitted(input, weight, bias, stride, padding, dilation, groups):
+            return conv_op(input, weight, bias)
+        return core.aten_conv2d(input, weight, bias, stride, padding, dilation, groups)
+
+    def convolution(input: BFLOAT16, weight: TFloat, bias: Optional[TFloat] = None, stride: Sequence[int] = (1,), padding: Sequence[int] = (0,), dilation: Sequence[int] = (1,), transposed: bool = False, output_padding: Sequence[int] = (0,), groups: int = 1) -> BFLOAT16:
+        if not transposed and pair(output_padding) == (0, 0) and admitted(input, weight, bias, stride, padding, dilation, groups):
+            return conv_op(input, weight, bias)
+        return core.aten_convolution(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups)
+
+    return {torch.ops.aten.conv2d.default: conv2d, torch.ops.aten.convolution.default: convolution}
+
+
+def source_sgemm_contract(torch, policy="native"):
+    """Bind the observed native FP32 QK/PV kernels, leaving scaling intact."""
+    if policy == "native":
+        return None
+    if policy != "torch_cpu_sgemm177_v1":
+        raise ValueError("Unknown source SGEMM export policy")
+    import os
+    if not torch.backends.mkl.is_available() or torch.get_float32_matmul_precision() != "highest" or any(name in os.environ for name in ("MKL_CBWR", "MKL_ENABLE_INSTRUCTIONS", "MKL_DEBUG_CPU_TYPE", "ATEN_CPU_CAPABILITY")):
+        raise ValueError("Source SGEMM requires the proved highest-precision MKL dispatch without ISA/consistency overrides")
+    bindings = _source_cpu_bindings(torch, SOURCE_SGEMM_ARTIFACTS, "Source SGEMM")
+    return {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
+            "domain": "merlin.source_preserving", "version": 1,
+            "operators": ["TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177"],
+            "native": "unchanged_FP32_manual_Smol_denoiser_Q50_K177_QK_and_PV_matmul",
+            "native_dispatch": "observed_AVX512_copied_QK_kernel_0_b0_and_nocopy_NN_PV", "native_threads": 1,
+            "qk_native_strides": [[48000, 64, 960, 1], [169920, 64, 1, 960]],
+            "pv_native_strides": [[132750, 8850, 177, 1], [169920, 64, 960, 1]],
+            "algorithm": "positive_zero_then_increasing_k_explicit_FP32_FMA;native_alpha1_final_multiply_is_identity_in_admitted_scope",
+            "qualification": "bounded_actual_and_controls;finite_RNE_gradual_underflow;native_physical_layouts_bound_by_capture;complete_attention_and_policy_unqualified",
+            "unchanged": ["parameters", "QK_scale", "masks", "softmax", "BF16_casts", "native_reference", "acceptance_gates", "ordinary_ONNX_MatMul"],
+            "bindings": bindings}
+
+
+def source_sgemm_translations(torch, policy="native"):
+    """Preserve only the proved manual-denoiser FP32 contraction geometries."""
+    if source_sgemm_contract(torch, policy) is None:
+        return {}
+    from onnx import defs
+    from onnxscript import ir
+    from onnxscript.onnx_types import FLOAT
+    from onnxscript.function_libs.torch_lib.ops import core
+    from onnxscript.values import Opset, Op
+    source = Opset("merlin.source_preserving", 1)
+    ops = {}
+    for name in ("TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177"):
+        schema = defs.OpSchema(name, source.domain, 1, inputs=[defs.OpSchema.FormalParameter(value, "T") for value in ("left", "right")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(float)"], "Original FP32 contraction operands")])
+        ops[name] = Op(source, name, schema)
+
+    def matmul(self: FLOAT, other: FLOAT) -> FLOAT:
+        shapes = (tuple(self.shape or ()), tuple(other.shape or ()))
+        if self.dtype == other.dtype == ir.DataType.FLOAT:
+            if shapes == ((1, 15, 50, 64), (1, 15, 64, 177)):
+                return ops["TorchMklSgemmF32QK177"](self, other)
+            if shapes == ((1, 15, 50, 177), (1, 15, 177, 64)):
+                return ops["TorchMklSgemmF32PV177"](self, other)
+        return core.aten_matmul(self, other)
+
+    return {torch.ops.aten.matmul.default: matmul}
 
 
 def bf16_linear_error_diagnostic(input, weight, bias, torch):
