@@ -52,6 +52,25 @@ FIXED_TREE_PV_POLICY = {
 }
 
 
+FIXED_TREE_SOFTMAX_POLICY = {
+    **FIXED_TREE_PV_POLICY, "name": "fixed_tree_fp32_v3_softmax_reduce",
+    "attention_scope": "qk_pv_and_softmax_reduction_order_exp_backends_remain_distinct",
+    "softmax_capacity": 160, "softmax_tree_k": 256,
+    "softmax_mask": "additive_zero_or_float32_minimum_at_least_one_active_entry_per_row",
+    "softmax_order": "active_logits_max_then_fp32_subtract_exp_mask_to_positive_zero_tree_sum_fp32_divide",
+    "softmax_sum": "adjacent_pair_tree256_via_ordered_dot_with_exact_one_products_positive_zero_tail",
+    "softmax_native_exp": "torch_exp_cpu_float32_backend_approximation",
+    "softmax_compiled_exp": "onnx_Exp_tvm_cpu_float32_backend_approximation",
+    "softmax_exp_equivalence": "not_bit_deterministic_or_correctly_rounded_qualified_only_by_independent_exp_and_unchanged_model_gates",
+    "softmax_signed_zero": "masked_and_padded_leaves_are_positive_zero_active_equal_max_subtract_follows_fp32",
+    "compiled_value_admission": "only_source_generated_static_zero_minimum_masks;native_value_checks_are_not_exported_runtime_guards",
+    "native_softmax_arrays_bytes": "logits_shifted_exponent_each_B*H*M*L*4;leaves_B*H*M*256*4;ones_B*H*256*4;row_max_and_total_each_B*H*M*4;mask_broadcast_and_allocator_overhead_separate",
+    "native_softmax_sum_scratch_bytes": "B*H*min(M,4)*256*4_plus_tree_and_output_temporaries",
+    "compiled_softmax_sum_private_scratch_bytes": 1024,
+    "softmax_target_workspace": "unqualified;graph_fusion_materialization_and_static_export_not_measured",
+}
+
+
 def arithmetic_contract(arithmetic_policy="native"):
     if arithmetic_policy == "native":
         return {"name": "native", "arithmetic": "unchanged_cpu_fp32_eager"}
@@ -59,6 +78,8 @@ def arithmetic_contract(arithmetic_policy="native"):
         return dict(FIXED_TREE_POLICY)
     if arithmetic_policy == FIXED_TREE_PV_POLICY["name"]:
         return dict(FIXED_TREE_PV_POLICY)
+    if arithmetic_policy == FIXED_TREE_SOFTMAX_POLICY["name"]:
+        return dict(FIXED_TREE_SOFTMAX_POLICY)
     raise ValueError("Unknown TinyLlama arithmetic policy")
 
 
@@ -150,6 +171,67 @@ def fixed_tree_pv(probabilities, values):
     return fixed_tree_dot(padded_probabilities, padded_values)
 
 
+def validate_softmax_mask(mask):
+    if mask.dtype != torch.float32 or mask.device.type != "cpu" or mask.ndim != 4 or any(extent < 1 for extent in mask.shape) or mask.shape[-1] > 160 or mask.shape[-2] > 160:
+        raise ValueError("Ordered softmax requires positive CPU FP32 mask dimensions within capacity160")
+    if not torch.compiler.is_compiling() and (not bool(((mask == 0) | (mask == torch.finfo(torch.float32).min)).all()) or not bool((mask == 0).any(dim=-1).all())):
+        raise ValueError("Ordered softmax requires zero/minimum masks and at least one active entry per row")
+
+
+def fixed_tree_softmax(logits, mask):
+    """V3 fixes the sum order; native and compiled exp approximations remain distinct."""
+    validate_softmax_mask(mask)
+    if logits.dtype != torch.float32 or logits.device.type != "cpu" or logits.ndim != 4 or any(extent < 1 for extent in logits.shape) or logits.shape[-1] > 160 or logits.shape[-2] > 160 or mask.shape != (logits.shape[0], 1, logits.shape[-2], logits.shape[-1]):
+        raise ValueError("Ordered softmax requires aligned CPU FP32 logits/mask within capacity160")
+    if not torch.compiler.is_compiling() and not bool(torch.isfinite(logits).all()):
+        raise ValueError("Ordered softmax requires finite logits")
+    active = mask == 0
+    maximum = torch.where(active, logits, torch.finfo(torch.float32).min).amax(dim=-1, keepdim=True)
+    shifted = torch.where(active, logits - maximum, torch.zeros_like(logits))
+    exponent = torch.where(active, torch.exp(shifted), torch.zeros_like(logits))
+    leaves = nn.functional.pad(exponent, (0, 256 - logits.shape[-1]), value=0.0)
+    ones = torch.ones((logits.shape[0], logits.shape[1], 1, 256), dtype=torch.float32, device=logits.device)
+    total = fixed_tree_dot(leaves, ones)
+    return exponent / total
+
+
+class SourceRotaryTable(nn.Module):
+    """Freeze source-generated words; exporter sees literal buffers and Gather only."""
+    def __init__(self, original):
+        super().__init__()
+        settings = getattr(original.config, "rope_parameters", None)
+        if not isinstance(settings, dict) or settings.get("rope_type") != "default" or settings.get("rope_theta") != 10000.0 or settings.get("partial_rotary_factor", 1.0) != 1.0 or original.inv_freq.dtype != torch.float32 or original.inv_freq.device.type != "cpu":
+            raise ValueError("Source rotary table requires unscaled default10000 CPU FP32 RoPE")
+        positions = torch.arange(160, dtype=torch.int64).reshape(1, -1)
+        value = torch.zeros((1, 160, original.config.hidden_size), dtype=torch.float32)
+        with torch.no_grad():
+            cos, sin = original(value, positions)
+            for selected in (positions[:, :8], positions[:, :128], positions, *(positions[:, index:index + 1] for index in range(160))):
+                actual = original(value[:, :selected.shape[-1]], selected)
+                if any(not torch.equal(output.contiguous().view(torch.int32), table[:, selected[0]].contiguous().view(torch.int32)) for output, table in zip(actual, (cos, sin))):
+                    raise ValueError("Native RoPE words depend on full/cached call shape; table is not source-faithful")
+        self.register_buffer("cos_table", cos[0].contiguous())
+        self.register_buffer("sin_table", sin[0].contiguous())
+        self.training = original.training
+
+    def forward(self, value, position_ids):
+        if value.dtype != torch.float32 or value.device.type != "cpu" or position_ids.dtype != torch.int64 or position_ids.device.type != "cpu" or position_ids.ndim != 2 or position_ids.shape[0] != 1 or not 1 <= position_ids.shape[-1] <= 160:
+            raise ValueError("Source rotary table requires batch1 CPU FP32/int64 positions within capacity160")
+        if not torch.compiler.is_compiling() and bool(((position_ids < 0) | (position_ids >= 160)).any()):
+            raise ValueError("Source rotary table positions must be within0:159")
+        return self.cos_table[position_ids], self.sin_table[position_ids]
+
+
+def install_source_rotary_table(lm):
+    table = SourceRotaryTable(lm.model.rotary_emb)
+    lm.model.rotary_emb = table
+    return {"name": "source_table_v1", "status": "opt_in_export_preservation_not_default", "positions": [0, 159],
+            "source": "original_loaded_native_RoPE_forward_position0_to159", "export": "literal_FP32_model_buffers_Gather_by_int64_positions_no_trigonometric_recomputation",
+            "shape_invariance_checked": "full8_full128_full160_all160_single_cached_positions_raw_exact",
+            "compiled_value_admission": "only_source_generated_int64_positions0_to159;eager_value_checks_are_not_exported_runtime_guards",
+            "cos": identity(table.cos_table), "sin": identity(table.sin_table), "buffer_bytes": 2 * table.cos_table.numel() * 4}
+
+
 class FixedTreeRMSNorm(nn.Module):
     def __init__(self, original):
         super().__init__()
@@ -170,9 +252,9 @@ def fixed_tree_attention(module, query, key, value, attention_mask, scaling, dro
     weights = fixed_tree_dot(query, key_states) * scaling
     if attention_mask is not None:
         weights = weights + attention_mask
-    weights = nn.functional.softmax(weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    weights = fixed_tree_softmax(weights, attention_mask) if getattr(module, "arithmetic_policy", None) == "fixed_tree_fp32_v3_softmax_reduce" else nn.functional.softmax(weights, dim=-1, dtype=torch.float32).to(query.dtype)
     weights = nn.functional.dropout(weights, p=dropout, training=module.training)
-    output = (fixed_tree_pv(weights, value_states) if getattr(module, "arithmetic_policy", "fixed_tree_fp32_v1") == "fixed_tree_fp32_v2_pv" else torch.matmul(weights, value_states)).transpose(1, 2).contiguous()
+    output = (fixed_tree_pv(weights, value_states) if getattr(module, "arithmetic_policy", "fixed_tree_fp32_v1") in ("fixed_tree_fp32_v2_pv", "fixed_tree_fp32_v3_softmax_reduce") else torch.matmul(weights, value_states)).transpose(1, 2).contiguous()
     return output, weights
 
 
@@ -180,7 +262,7 @@ class FixedTreeAttention(nn.Module):
     """Candidate-only eager forward; model mask construction remains on the eager path."""
     def __init__(self, original, arithmetic_policy="fixed_tree_fp32_v1"):
         super().__init__()
-        if arithmetic_policy not in ("fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv"):
+        if arithmetic_policy not in ("fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv", "fixed_tree_fp32_v3_softmax_reduce"):
             raise ValueError("Fixed tree attention requires an explicit candidate policy")
         self.arithmetic_policy = arithmetic_policy
         for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
@@ -192,7 +274,7 @@ class FixedTreeAttention(nn.Module):
     def forward(self, hidden_states, position_embeddings, attention_mask=None, past_key_values=None, **kwargs):
         if attention_mask is None:
             raise ValueError("Fixed tree static inference requires an explicit causal attention mask")
-        if self.arithmetic_policy == "fixed_tree_fp32_v2_pv":
+        if self.arithmetic_policy in ("fixed_tree_fp32_v2_pv", "fixed_tree_fp32_v3_softmax_reduce"):
             if (hidden_states.ndim != 3 or hidden_states.dtype != torch.float32 or hidden_states.device.type != "cpu" or hidden_states.shape[-1] != self.config.hidden_size or not 1 <= hidden_states.shape[-2] <= 160
                     or attention_mask.ndim != 4 or attention_mask.dtype != torch.float32 or attention_mask.device.type != "cpu" or not 1 <= attention_mask.shape[-1] <= 160
                     or attention_mask.shape[:3] != (hidden_states.shape[0], 1, hidden_states.shape[-2])):
@@ -212,6 +294,10 @@ class FixedTreeAttention(nn.Module):
                         or keys.dtype != torch.float32 or cache_values.dtype != torch.float32 or keys.device.type != "cpu" or cache_values.device.type != "cpu"
                         or keys.shape != (hidden_states.shape[0], self.config.num_key_value_heads, capacity, self.head_dim) or cache_values.shape != keys.shape or attention_mask.shape[-1] != capacity):
                     raise ValueError("Fixed tree PV requires an initialized static cache within capacity160")
+        if self.arithmetic_policy == "fixed_tree_fp32_v3_softmax_reduce":
+            if self.training:
+                raise ValueError("Ordered softmax candidate is inference-only")
+            validate_softmax_mask(attention_mask)
         from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -228,7 +314,7 @@ class FixedTreeAttention(nn.Module):
 
 def install_fixed_tree_arithmetic(lm, arithmetic_policy="fixed_tree_fp32_v1"):
     """Isolate the candidate on the supplied model, retaining trained norm parameters."""
-    if arithmetic_policy not in ("fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv"):
+    if arithmetic_policy not in ("fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv", "fixed_tree_fp32_v3_softmax_reduce"):
         raise ValueError("Fixed tree installer requires an explicit candidate policy")
     from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaAttention
     names = [f"model.layers.{index}.{name}" for index in range(22) for name in ("input_layernorm", "post_attention_layernorm")] + ["model.norm"]
@@ -250,7 +336,7 @@ def install_fixed_tree_arithmetic(lm, arithmetic_policy="fixed_tree_fp32_v1"):
             "native_qk_tree_and_output_upper_bound_bytes": "1.5*product_scratch_bytes+2*output_bytes_excluding_inputs_finiteness_checks_and_allocator_overhead",
             "native_rms_scratch_bytes": "input_elements*4_plus_halving_tree_temporaries",
             "cost": "same_arithmetic_count_tree_elementwise_kernels_instead_of_blas_qk;not_timing_qualified"}
-    if arithmetic_policy == "fixed_tree_fp32_v2_pv":
+    if arithmetic_policy in ("fixed_tree_fp32_v2_pv", "fixed_tree_fp32_v3_softmax_reduce"):
         metadata.update({"native_pv_product_scratch_bytes": "B*H*min(M,4)*D*256*4_per_block",
                          "native_pv_output_bytes": "B*H*M*D*4_plus_block_results_and_output_transpose",
                          "native_pv_padding_bytes": "B*H*M*256*4+B*H*D*256*4_excluding_inputs_and_repeat_kv",

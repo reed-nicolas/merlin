@@ -73,6 +73,9 @@ class TinyLlamaArtifactTests(unittest.TestCase):
                         {"arithmetic_policy": "fixed_tree_fp32_v1", "quantized": True, "precision": "bfloat16"},
                         {"arithmetic_policy": "fixed_tree_fp32_v2_pv"},
                         {"arithmetic_policy": "fixed_tree_fp32_v2_pv", "quantized": True, "precision": "bfloat16"},
+                        {"arithmetic_policy": "fixed_tree_fp32_v3_softmax_reduce"},
+                        {"rotary_policy": "unknown"}, {"rotary_policy": "source_table_v1", "precision": "bfloat16"},
+                        {"rotary_policy": "source_table_v1", "prefill_tokens": 159, "decode_tokens": 2},
                         {"arithmetic_policy": "fixed_tree_fp32_v2_pv", "quantized": True, "prefill_tokens": 159, "decode_tokens": 2}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 FACTORY.get_model_and_inputs(**{**base, **changes})
@@ -92,6 +95,106 @@ except ImportError:
 
 @unittest.skipIf(torch is None, "Optional PyTorch environment is absent")
 class TinyLlamaIntegerTests(unittest.TestCase):
+    def test_v3_softmax_independent_tree_mask_tail_and_backend_exp_contract(self):
+        import decimal
+        logits = torch.tensor([[[[0., -1., -80., -100.], [1., 1., 1., 1.], [-0., 0., 2., 3.]]]], dtype=torch.float32)
+        mask = torch.tensor([[[[0., 0., 0., 0.], [0., 0., torch.finfo(torch.float32).min, torch.finfo(torch.float32).min], [0., torch.finfo(torch.float32).min, torch.finfo(torch.float32).min, torch.finfo(torch.float32).min]]]])
+        active = mask.numpy() == 0
+        shifted = np.where(active, logits.numpy() - np.max(np.where(active, logits.numpy(), np.finfo(np.float32).min), axis=-1, keepdims=True), np.float32(0))
+        exponent = np.where(active, torch.exp(torch.from_numpy(shifted)).numpy(), np.float32(0))
+        leaves = np.pad(exponent, ((0, 0), (0, 0), (0, 0), (0, 252)))
+        while leaves.shape[-1] > 1: leaves = (leaves[..., 0::2] + leaves[..., 1::2]).astype(np.float32)
+        expected = exponent / leaves
+        actual = INTEGER.fixed_tree_softmax(logits, mask).numpy()
+        np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+        self.assertTrue(np.all(actual[~active].view(np.uint32) == 0))
+        self.assertEqual(float(actual[0, 0, 2, 0]), 1.)
+        changed = logits.clone(); changed[torch.from_numpy(~active)] = 1000.
+        self.assertTrue(torch.equal(INTEGER.fixed_tree_softmax(changed, mask), torch.from_numpy(actual)))
+        for value in (0., -1., -80., -100.):
+            with decimal.localcontext() as context:
+                context.prec = 80
+                exact = np.float32(float(decimal.Decimal.from_float(value).exp()))
+            candidate = torch.exp(torch.tensor(value, dtype=torch.float32)).numpy()
+            self.assertLessEqual(abs(int(candidate.view(np.uint32)) - int(exact.view(np.uint32))), 1)
+        contract = INTEGER.arithmetic_contract("fixed_tree_fp32_v3_softmax_reduce")
+        self.assertNotEqual(contract["softmax_native_exp"], contract["softmax_compiled_exp"])
+        self.assertIn("not_bit_deterministic", contract["softmax_exp_equivalence"])
+        self.assertEqual(INTEGER.arithmetic_contract("fixed_tree_fp32_v2_pv"), INTEGER.FIXED_TREE_PV_POLICY)
+
+    def test_v3_full_last_static_softmax_rows_and_invalid_admission(self):
+        logits = torch.linspace(-8, 0, 128).reshape(1, 1, 1, 128).expand(1, 2, 3, 128).clone()
+        mask = torch.zeros((1, 1, 3, 128), dtype=torch.float32)
+        mask[..., 0, 64:] = torch.finfo(torch.float32).min
+        full = INTEGER.fixed_tree_softmax(logits, mask)
+        last = INTEGER.fixed_tree_softmax(logits[..., -1:, :], mask[..., -1:, :])
+        static = INTEGER.fixed_tree_softmax(torch.nn.functional.pad(logits, (0, 32)), torch.nn.functional.pad(mask, (0, 32), value=torch.finfo(torch.float32).min))
+        self.assertTrue(torch.equal(full[..., -1:, :].view(torch.int32), last.view(torch.int32)))
+        self.assertTrue(torch.equal(full.view(torch.int32), static[..., :128].contiguous().view(torch.int32)))
+        self.assertFalse(bool(static[..., 128:].view(torch.int32).any()))
+        for bad in (torch.full_like(mask, torch.finfo(torch.float32).min), torch.ones_like(mask), torch.full_like(mask, float("nan")), torch.full_like(mask, float("-inf"))):
+            with self.assertRaises(ValueError): INTEGER.fixed_tree_softmax(logits, bad)
+        for bad in (logits.double(), torch.full_like(logits, float("nan")), torch.ones((1, 2, 1, 161))):
+            with self.assertRaises(ValueError): INTEGER.fixed_tree_softmax(bad, mask)
+
+    def test_v3_invalid_mask_precedes_cache_update_and_projections(self):
+        from types import SimpleNamespace
+        from transformers import LlamaConfig
+        from transformers.models.llama.modeling_llama import LlamaAttention
+        config = LlamaConfig(hidden_size=64, num_attention_heads=4, num_key_value_heads=2)
+        candidate = INTEGER.FixedTreeAttention(LlamaAttention(config, 0).eval(), "fixed_tree_fp32_v3_softmax_reduce").eval()
+        cache = SimpleNamespace(layers=[SimpleNamespace(max_cache_len=160, keys=torch.zeros((1, 2, 160, 16)), values=torch.zeros((1, 2, 160, 16)))], update=mock.Mock())
+        for invalid in (torch.full((1, 1, 1, 160), torch.finfo(torch.float32).min), torch.ones((1, 1, 1, 160))):
+            with mock.patch.object(candidate.q_proj, "forward", side_effect=AssertionError("projection must not run")), self.assertRaisesRegex(ValueError, "zero/minimum masks"):
+                candidate(torch.ones((1, 1, 64)), (torch.ones((1, 1, 16)), torch.zeros((1, 1, 16))), invalid, past_key_values=cache)
+        cache.update.assert_not_called()
+
+    def test_source_rotary_table_preserves_source_words_and_rejects_positions(self):
+        from transformers import LlamaConfig
+        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+        original = LlamaRotaryEmbedding(LlamaConfig(hidden_size=64, num_attention_heads=4)).eval()
+        table = INTEGER.SourceRotaryTable(original).eval()
+        parameters = {name: value.clone() for name, value in original.named_buffers()}
+        for selected in (torch.arange(8), torch.arange(128), torch.arange(160), torch.tensor([0, 127, 159])):
+            positions = selected.reshape(1, -1); value = torch.zeros((1, len(selected), 64))
+            for got, wanted in zip(table(value, positions), original(value, positions)):
+                self.assertTrue(torch.equal(got.view(torch.int32), wanted.view(torch.int32)))
+        for name, value in original.named_buffers(): self.assertTrue(torch.equal(value, parameters[name]))
+        for selected in (torch.tensor([[-1]]), torch.tensor([[160]]), torch.tensor([[1.]])):
+            with self.assertRaises(ValueError): table(torch.zeros((1, 1, 64)), selected)
+        original.config.rope_parameters["rope_theta"] = 5000.
+        with self.assertRaises(ValueError): INTEGER.SourceRotaryTable(original)
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX") and os.environ.get("TVM_LIBRARY_PATH"), "Requires explicit modern exporter and LLVM host build")
+    def test_v3_softmax_and_source_rotary_independent_and_combined_export(self):
+        import onnx, tvm, verify_session
+        from transformers import LlamaConfig
+        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+        table = INTEGER.SourceRotaryTable(LlamaRotaryEmbedding(LlamaConfig(hidden_size=64, num_attention_heads=4)).eval()).eval()
+        class Candidate(torch.nn.Module):
+            def __init__(self, kind):
+                super().__init__(); self.kind = kind; self.rope = table
+            def forward(self, logits, mask, positions):
+                if self.kind == "softmax": return INTEGER.fixed_tree_softmax(logits, mask)
+                cos, sin = self.rope(logits, positions)
+                if self.kind == "rotary": return cos, sin
+                return INTEGER.fixed_tree_softmax(logits, mask), cos, sin
+        logits = torch.linspace(-3., 3., 24).reshape(1, 2, 3, 4); mask = torch.zeros((1, 1, 3, 4)); mask[..., 0, 1:] = torch.finfo(torch.float32).min
+        positions = torch.tensor([[0, 127, 159]], dtype=torch.int64)
+        for kind in ("softmax", "rotary", "both"):
+            module = Candidate(kind).eval(); expected = verify_session.outputs(module(logits, mask, positions), np, torch)
+            for mode in ("baseline", "optimized"):
+                with tempfile.TemporaryDirectory() as directory:
+                    compiler = verify_session.StageCompiler(Path(directory), mode, np, torch, onnx, tvm, exporter="dynamo", export_options=INTEGER.export_options(torch, "fixed_tree_fp32_v3_softmax_reduce"))
+                    inputs = tuple(value.numpy() for value in (logits, mask, positions)); run = compiler(type("Stage", (), {"name": kind, "module": module})(), inputs, len(expected))
+                    actual = verify_session.outputs(run(inputs), np, torch)
+                    for got, wanted in zip(actual, expected): verify_session.compare(got, wanted, np, 1e-4, 1e-4)
+                    if kind != "softmax":
+                        for got, wanted in zip(actual[-2:], expected[-2:]): np.testing.assert_array_equal(got.view(np.uint32), wanted.view(np.uint32))
+                    graph = onnx.load(str(Path(directory) / "stage_0/model.onnx"))
+                    self.assertFalse(any(node.op_type in ("Cos", "Sin") for node in graph.graph.node))
+                    if kind != "rotary": self.assertEqual(sum(node.op_type == "FixedTreeDot" for node in graph.graph.node), 1)
+
     @staticmethod
     def scalar_tree_dot(left, right):
         output = np.empty((*left.shape[:2], left.shape[-2], right.shape[-2]), dtype=np.float32)

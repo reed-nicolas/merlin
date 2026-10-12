@@ -172,7 +172,7 @@ def validate_reference_stages(capture, causal, torch):
                 torch.testing.assert_close(next_cache[..., :length, :], cache[..., :length, :],
                                            rtol=0, atol=0)
                 cache, position = next_cache, next_position
-    reference = "candidate_full_sequence_hf_use_cache_false" if capture.provenance.get("arithmetic_policy", {}).get("name") in ("fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv") else "original_full_sequence_hf_use_cache_false"
+    reference = "candidate_full_sequence_hf_use_cache_false" if capture.provenance.get("arithmetic_policy", {}).get("name") in ("fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv", "fixed_tree_fp32_v3_softmax_reduce") else "original_full_sequence_hf_use_cache_false"
     return {"reference": reference, "passed": True,
             "rtol": rtol, "atol": atol, "checks": errors}
 
@@ -180,7 +180,7 @@ def validate_reference_stages(capture, causal, torch):
 def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
                          prefill_tokens=8, decode_tokens=3, precision="float32",
                          cpu_threads=2, quantized=False, quality_corpus_path=None,
-                         workload="frontend_diagnostic", activation_scale="power_of_two", arithmetic_policy="native"):
+                         workload="frontend_diagnostic", activation_scale="power_of_two", arithmetic_policy="native", rotary_policy="native"):
     """Build compiled prefill plus teacher-forced recurrent decode on actual text.
 
     ``corpus_path`` is a local UTF-8 text file tokenized with this checkpoint's
@@ -193,8 +193,10 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
         raise ValueError("W8A8 requires explicit CPU FP32 surrounding operations")
     if activation_scale not in ("maxabs", "power_of_two"):
         raise ValueError("Unknown integer activation scale policy")
-    if arithmetic_policy not in ("native", "fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv"):
+    if arithmetic_policy not in ("native", "fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv", "fixed_tree_fp32_v3_softmax_reduce"):
         raise ValueError("Unknown TinyLlama arithmetic policy")
+    if rotary_policy not in ("native", "source_table_v1") or rotary_policy != "native" and precision != "float32":
+        raise ValueError("Source rotary preservation requires explicit CPU FP32 and source_table_v1")
     if arithmetic_policy != "native" and (not quantized or precision != "float32"):
         raise ValueError("Fixed tree candidate requires explicit W8A8 CPU FP32 execution")
     if quality_corpus_path is not None and not quantized:
@@ -214,7 +216,7 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
         raise ValueError("cpu_threads must be between 1 and 8")
     if prefill_tokens + decode_tokens > 2048:
         raise ValueError("Session exceeds the checkpoint context capacity")
-    if arithmetic_policy == "fixed_tree_fp32_v2_pv" and prefill_tokens + decode_tokens > 160:
+    if (arithmetic_policy in ("fixed_tree_fp32_v2_pv", "fixed_tree_fp32_v3_softmax_reduce") or rotary_policy != "native") and prefill_tokens + decode_tokens > 160:
         raise ValueError("Fixed tree PV session exceeds declared common capacity160")
     checkpoint, artifacts = checkpoint_artifacts(checkpoint_dir)
     corpus = safe_path(corpus_path)
@@ -269,7 +271,7 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
     source_parameter_bytes = sum(value.numel() * value.element_size() for value in lm.parameters())
     integer = None
     integer_records, integer_checks = [], []
-    language_contract, language_check, arithmetic_record = None, None, None
+    language_contract, language_check, arithmetic_record, rotary_record = None, None, None, None
     if quantized:
         import tinyllama_integer as integer
         if quality_corpus_path is not None:
@@ -280,10 +282,15 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
         integer_records = integer.install_projections(lm, activation_scale=activation_scale)
         if arithmetic_policy != "native":
             arithmetic_record = integer.install_fixed_tree_arithmetic(lm, arithmetic_policy)
+        if rotary_policy != "native":
+            rotary_record = integer.install_source_rotary_table(lm)
         if quality_corpus_path is not None:
             language_check = integer.language_quality(
                 lm, quality_tokens, quality_reference, language_contract)
             del quality_tokens, quality_reference
+    if rotary_policy != "native" and rotary_record is None:
+        import tinyllama_integer as rotary_integer
+        rotary_record = rotary_integer.install_source_rotary_table(lm)
     model_root = safe_path(model2mlir_root)
     load_protocol(model_root)
     causal_path = safe_path(model_root / "m2m/capture/causal_session.py")
@@ -317,6 +324,9 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
                               "repeats": 2, "reset": "between_repeats",
                               "application_quality": "separate_language_corpus" if language_contract else "not_evaluated"},
     }
+    if rotary_record is not None:
+        provenance["rotary_policy"] = rotary_record
+        provenance["rotary_source"] = file_identity(sys.modules["tinyllama_integer"].__file__, safe_path)
     if integer is not None:
         provenance.update({"execution_precision": "w8a8_projections_float32_cpu_surrounding_ops",
                            "weight_conversion": "bfloat16_to_float32_then_per_channel_int8_projections",
@@ -336,8 +346,11 @@ def get_model_and_inputs(*, checkpoint_dir, model2mlir_root, corpus_path,
             provenance["reference_precision"] = "source_bound_w8a8_fixed_tree_fp32_candidate_reference"
             provenance["operation_placement"]["qk_contractions"]["arithmetic"] = "fixed_tree_fp32_v1"
             provenance["operation_placement"]["rms_norm"]["arithmetic"] = "fixed_tree_mean_squares_fp32_v1_other_norm_ops_unchanged"
-            if arithmetic_policy == "fixed_tree_fp32_v2_pv":
+            if arithmetic_policy in ("fixed_tree_fp32_v2_pv", "fixed_tree_fp32_v3_softmax_reduce"):
                 provenance["operation_placement"]["pv_contractions"]["arithmetic"] = "fixed_tree_fp32_v2_pv_capacity160_tree256"
+            if arithmetic_policy == "fixed_tree_fp32_v3_softmax_reduce":
+                provenance["operation_placement"]["softmax"]["arithmetic"] = "fixed_tree_sum256_distinct_native_compiled_fp32_exp"
+                provenance["operation_placement"]["softmax"]["runtime_admission"] = "eager_mask_checks_before_cache_update;compiled_static_source_generated_zero_or_minimum_masks_no_general_runtime_value_guard"
         # Every trained projection is checked over its full reduction dimension at
         # representative rows/columns on the first actual prefill call.
         handles = []
@@ -381,6 +394,8 @@ def get_verification_artifacts(model, _inputs):
                   provenance["transformers_cache_source"], provenance["transformers_model_source"]]
     if provenance.get("integer_source"):
         identities.append(provenance["integer_source"])
+    if provenance.get("rotary_source") and provenance["rotary_source"] != provenance.get("integer_source"):
+        identities.append(provenance["rotary_source"])
     if provenance.get("language_quality_contract"):
         identities.append(provenance["language_quality_contract"]["corpus"])
         if provenance["language_quality_contract"].get("dataset_artifact"):
