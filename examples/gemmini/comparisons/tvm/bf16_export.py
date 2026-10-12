@@ -1,7 +1,8 @@
-"""Source-faithful DOUBLE scalar constants and opt-in fused BF16 math.
+"""Source-bound scalar/mean exports and opt-in fused BF16 math.
 
 The independent scalar hook preserves original Python values in typed DOUBLE
 constants; other ordinary scalar dtypes use their built-in translations.
+The Smol mean hook preserves a separately pinned native reduction order.
 
 Original operands and results remain BF16. FP32 internal arithmetic avoids adding
 BF16 rounding points inside a mathematical fused operation. Native linear can
@@ -12,6 +13,62 @@ candidates, not reproductions of every native CPU kernel, and remain source-refe
 """
 import math
 from typing import Optional, Sequence
+
+
+SOURCE_MEAN_ARTIFACTS = {
+    "lib/libtorch_cpu.so": "c960407c516ec84d7994fd2c46cf2adc282d0fe6d3d0e928e1d64cc66598e5e4",
+    "include/ATen/native/DispatchStub.h": "45cde3f5f24a89acc536a064a17f007189255d6998321a7ac534c7b6f14ddb27",
+    "include/ATen/AccumulateType.h": "93381e925f39f8f7f689df6a07f528db2e50c97c4c18d71a9971becafb9e8746",
+    "include/ATen/native/cpu/Reduce.h": "f7286c1fa97e96597b8728968a9f639d1d17f1913c64926f8e485ed570df854f",
+    "include/ATen/cpu/vec/vec256/vec256_float.h": "62cd6915726701b7b62dea00c16406eb1792c140c197ae1a12e4d35b9c6d81dd",
+}
+
+
+def source_mean_contract(torch, policy="native"):
+    """Bind the native CPU mean used by the scoped Smol expert export."""
+    if policy == "native":
+        return None
+    if policy != "torch_cpu_mean720_v1":
+        raise ValueError("Unknown source mean export policy")
+    if torch.version.git_version != "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0" or torch.backends.cpu.get_cpu_capability() != "AVX512" or torch.get_num_threads() != 1:
+        raise ValueError("Source mean requires the pinned PyTorch CPU build, AVX512 capability and one native thread")
+    from pathlib import Path
+    from verify_resnet import file_identity, safe_path
+    root = safe_path(Path(torch.__file__).parent)
+    bindings = [file_identity(root / relative, safe_path) for relative in SOURCE_MEAN_ARTIFACTS]
+    if any(record["sha256"] != expected for record, expected in zip(bindings, SOURCE_MEAN_ARTIFACTS.values())):
+        raise ValueError("Source mean requires the independently proved native library and headers")
+    return {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
+            "domain": "merlin.source_preserving", "version": 1, "operator": "TorchMean720Fp32",
+            "native": "unchanged_Tensor_mean_float32_last_axis_keepdim_Smol_expert_1x50x720_contiguous",
+            "native_dispatch": "pinned_AVX2_eight_lane_sum;AVX512_sum_registration_null", "native_threads": 1,
+            "export_shape": [1, 50, 720], "workspace": "65_FP32_private_output_words_260_bytes_plus_mean_output_and_reshape",
+            "algorithm": "source_cascade_FP32_sum_then_direct_FP32_division_by720;no_reassociation_or_reciprocal_rewrite",
+            "source": "https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/aten/src/ATen/native/cpu/SumKernel.cpp",
+            "unchanged": ["square", "epsilon", "rsqrt", "affine", "BF16_casts", "native_reference", "acceptance_gates"],
+            "bindings": bindings}
+
+
+def source_mean_translations(torch, policy="native"):
+    """Export only the proved Smol mean geometry; preserve other translations."""
+    if source_mean_contract(torch, policy) is None:
+        return {}
+    from onnx import defs
+    from onnxscript import ir
+    from onnxscript.function_libs.torch_lib.ops import core
+    from onnxscript.onnx_types import FLOAT
+    from onnxscript.values import Opset, Op
+    source = Opset("merlin.source_preserving", 1)
+    schema = defs.OpSchema("TorchMean720Fp32", "merlin.source_preserving", 1, inputs=[defs.OpSchema.FormalParameter("a", "T")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(float)"], "Bound source FP32 mean")])
+    mean_op = Op(source, "TorchMean720Fp32", schema)
+
+    def mean_dim(self: FLOAT, dim: Optional[Sequence[int]] = None, keepdim: bool = False, dtype: int = -1) -> FLOAT:
+        shape = tuple(self.shape) if self.shape is not None else ()
+        if shape == (1, 50, 720) and isinstance(dim, (tuple, list)) and tuple(dim) in ((-1,), (2,)) and keepdim and dtype in (None, -1, ir.DataType.FLOAT):
+            return mean_op(self)
+        return core.aten_mean_dim(self, dim, keepdim, dtype)
+
+    return {torch.ops.aten.mean.dim: mean_dim}
 
 
 def bf16_linear_error_diagnostic(input, weight, bias, torch):

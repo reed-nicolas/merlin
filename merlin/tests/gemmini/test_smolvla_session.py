@@ -67,6 +67,12 @@ class SmolVLAArtifactTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 FACTORY.get_model_and_inputs(**base, **change)
 
+    def test_source_mean_requires_explicit_integer_session_and_one_native_thread(self):
+        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
+        for change in ({"source_mean_policy": "unknown"}, {"source_mean_policy": "torch_cpu_mean720_v1"}, {"source_mean_policy": "torch_cpu_mean720_v1", "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source mean"):
+                FACTORY.get_model_and_inputs(**base, **change)
+
     def test_restricted_component_is_rejected_before_read(self):
         with self.assertRaisesRegex(ValueError, "Restricted path component"):
             FACTORY.directory_artifacts("/tmp/" + "vl" + "si" + "-fixture")
@@ -261,6 +267,53 @@ class SmolVLAObservationTests(unittest.TestCase):
             fixture.write_bytes(b"changed")
             with self.assertRaisesRegex(ValueError, "NPZ identity"):
                 FACTORY.observation_manifest(fixture, path)
+
+
+class SmolVLASourceMeanTests(unittest.TestCase):
+    def test_session_hook_keeps_default_table_and_selects_only_declared_policy(self):
+        import torch
+        import bf16_export
+        import tinyllama_integer
+        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
+        with mock.patch.object(tinyllama_integer, "export_options", side_effect=lambda _: {"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_mean_translations", return_value={torch.ops.aten.mean.dim: "selected"}) as select:
+            self.assertEqual(FACTORY.get_onnx_export_options(torch)["custom_translation_table"], original)
+            model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {}}))
+            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], original)
+            select.assert_not_called()
+            model.session.metadata["provenance"]["source_mean_policy"] = {"name": "torch_cpu_mean720_v1"}
+            table = FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"]
+            self.assertEqual(table, {**original, torch.ops.aten.mean.dim: "selected"})
+            select.assert_called_once_with(torch, "torch_cpu_mean720_v1")
+
+    def test_native_policy_needs_no_source_bindings_and_unknown_policy_is_rejected(self):
+        self.assertIsNone(NUMERICS.source_mean_contract(None))
+        self.assertEqual(NUMERICS.source_mean_translations(None), {})
+        with self.assertRaisesRegex(ValueError, "Unknown source mean"):
+            NUMERICS.source_mean_contract(None, "unknown")
+
+    def test_source_mean_refuses_unproved_runtime_and_modified_binary(self):
+        runtime = SimpleNamespace(version=SimpleNamespace(git_version="449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"), backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX512")), get_num_threads=lambda: 1, __file__="/tmp/pinned-torch/__init__.py")
+        with mock.patch("verify_resnet.file_identity", return_value={"sha256": "changed"}), self.assertRaisesRegex(ValueError, "independently proved"):
+            NUMERICS.source_mean_contract(runtime, "torch_cpu_mean720_v1")
+        for field, value in (("get_num_threads", lambda: 2), ("version", SimpleNamespace(git_version="different")), ("backends", SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX2")))):
+            with self.subTest(field=field), mock.patch.object(runtime, field, value), self.assertRaisesRegex(ValueError, "pinned PyTorch"):
+                NUMERICS.source_mean_contract(runtime, "torch_cpu_mean720_v1")
+
+    def test_export_selects_only_bound_fp32_last_axis_keepdim_geometry(self):
+        import torch
+        class Means(torch.nn.Module):
+            def forward(self, value, other):
+                return value.mean(-1, keepdim=True), value.mean(-1), value.mean(1, keepdim=True), other.mean(-1, keepdim=True)
+        for dtype in (torch.float32, torch.bfloat16):
+            inputs = (torch.arange(36000, dtype=torch.float32).reshape(1, 50, 720).to(dtype), torch.ones(1, 2, 720, dtype=dtype))
+            before = tuple(value.clone() for value in inputs)
+            with mock.patch.object(NUMERICS, "source_mean_contract", return_value={"name": "torch_cpu_mean720_v1"}):
+                table = NUMERICS.source_mean_translations(torch, "torch_cpu_mean720_v1")
+            graph = torch.onnx.export(Means().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
+            selected = [node for node in graph.graph.node if node.domain == "merlin.source_preserving"]
+            self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [("TorchMean720Fp32", 1, 1, 0)] if dtype == torch.float32 else [])
+            self.assertEqual(sum(node.op_type == "ReduceMean" for node in graph.graph.node), 3 if dtype == torch.float32 else 4)
+            self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
 
 
 class SmolVLAArithmeticDiagnosticTests(unittest.TestCase):
