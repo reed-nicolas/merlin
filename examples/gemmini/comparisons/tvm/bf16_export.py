@@ -1,4 +1,7 @@
-"""Opt-in FP32 math translations retaining fused BF16 operator boundaries.
+"""Source-faithful DOUBLE scalar constants and opt-in fused BF16 math.
+
+The independent scalar hook preserves original Python values in typed DOUBLE
+constants; other ordinary scalar dtypes use their built-in translations.
 
 Original operands and results remain BF16. FP32 internal arithmetic avoids adding
 BF16 rounding points inside a mathematical fused operation. Native linear can
@@ -72,6 +75,42 @@ def bf16_linear_error_diagnostic(input, weight, bias, torch):
         "reduction_width": width, "operation_bound": operations,
         "placement": "CPU; regular Gemmini INT8/INT32 is outside this diagnostic",
     }
+
+
+def scalar_translations(torch):
+    """Preserve original Python scalars when materializing DOUBLE constants.
+
+    The scalar attribute annotation avoids the built-in TensorType argument's
+    implicit FLOAT constant before its DOUBLE cast. Other ordinary dtypes keep
+    the built-in translation. This does not select floating arithmetic order.
+    """
+    from onnxscript import ir, opset18 as op
+    from onnxscript.function_libs.torch_lib.ops import core
+    from onnxscript.onnx_types import TensorType
+
+    def scalar_tensor(s: float, dtype: int = -1, layout: str = "", device: str = "", pin_memory: bool = False) -> TensorType:
+        # This annotation marks an attribute; the exporter retains Python int
+        # and bool arguments too. Never numerically convert those through float.
+        if type(s) not in (int, float, bool):
+            raise ValueError("Scalar translation requires an original static Python number")
+        if layout not in (None, "", 0, "strided", "torch.strided"):
+            raise ValueError("Scalar translation requires default strided layout")
+        selected_device = str(torch.get_default_device()) if device in (None, "") else str(device)
+        if selected_device not in ("cpu", "cpu:0"):
+            raise ValueError("Scalar translation requires default or explicit CPU device")
+        if pin_memory:
+            raise ValueError("Scalar translation cannot preserve pinned allocation")
+        if dtype in (None, -1):
+            defaults = {torch.float16: ir.DataType.FLOAT16, torch.bfloat16: ir.DataType.BFLOAT16, torch.float32: ir.DataType.FLOAT, torch.float64: ir.DataType.DOUBLE}
+            dtype = defaults[torch.get_default_dtype()]
+        selected = ir.DataType(dtype)
+        if selected not in (ir.DataType.FLOAT16, ir.DataType.FLOAT, ir.DataType.DOUBLE, ir.DataType.BFLOAT16, ir.DataType.INT8, ir.DataType.INT16, ir.DataType.INT32, ir.DataType.INT64, ir.DataType.UINT8, ir.DataType.BOOL):
+            raise ValueError("Scalar translation requires a supported ordinary real dtype")
+        if selected == ir.DataType.DOUBLE:
+            return op.Constant(value=ir.tensor(s, dtype=selected))
+        return core.aten_scalar_tensor(s, dtype=selected, layout=layout, device=device, pin_memory=False)
+
+    return {torch.ops.aten.scalar_tensor.default: scalar_tensor}
 
 
 def translations(torch):

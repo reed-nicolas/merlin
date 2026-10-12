@@ -331,18 +331,63 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(compiler.export_options, {})
         self.assertIsNone(compiler.translation_source)
 
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
     def test_factory_translation_options_preserve_verifier_controls(self):
         import onnx
         options = {"custom_translation_table": {self.torch.ops.aten._int_mm.default: lambda a, b: (a, b)}, "optimize": False}
         compiler = self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, exporter="dynamo", export_options=options)
-        self.assertEqual(compiler.export_options, options)
+        self.assertFalse(compiler.bf16_fused_export)
+        self.assertIn(self.torch.ops.aten.scalar_tensor.default, compiler.export_options["custom_translation_table"])
+        self.assertIs(compiler.export_options["custom_translation_table"][self.torch.ops.aten._int_mm.default], options["custom_translation_table"][self.torch.ops.aten._int_mm.default])
+        self.assertFalse(compiler.export_options["optimize"])
         options["custom_translation_table"].clear()
-        self.assertEqual(len(compiler.export_options["custom_translation_table"]), 1)
+        self.assertEqual(len(compiler.export_options["custom_translation_table"]), 2)
         for invalid in ({"dynamo": True}, {"opset_version": 22}, {"optimize": 1}, {"custom_translation_table": []}, {"custom_translation_table": {"op": 1}}):
             with self.subTest(options=invalid), self.assertRaises(ValueError):
                 self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, exporter="dynamo", export_options=invalid)
         with self.assertRaisesRegex(ValueError, "explicit dynamo"):
             self.verifier.StageCompiler(Path("unused"), "optimized", self.np, self.torch, onnx, None, export_options={"custom_translation_table": {"op": lambda: None}})
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
+    def test_dynamo_export_preserves_typed_scalar_values(self):
+        import math
+        import onnx
+        import tvm
+        torch, np = self.torch, self.np
+
+        class Scalars(torch.nn.Module):
+            def forward(self, double_input, float_input):
+                return (double_input * torch.scalar_tensor(0.004, dtype=torch.float64),
+                        double_input + torch.scalar_tensor(math.pi, dtype=torch.float64),
+                        float_input * torch.scalar_tensor(0.004, dtype=torch.float32),
+                        torch.scalar_tensor(2**53 + 1, dtype=torch.int64),
+                        torch.scalar_tensor(-(2**53 + 1), dtype=torch.int64),
+                        torch.scalar_tensor(True, dtype=torch.bool),
+                        torch.scalar_tensor(-0.0, dtype=torch.float64))
+
+        inputs = (np.array([0.25, -1.0], dtype=np.float64), np.array([0.25, -1.0], dtype=np.float32))
+        expected = (inputs[0] * np.float64(0.004), inputs[0] + np.float64(math.pi), inputs[1] * np.float32(0.004),
+                    np.array(2**53 + 1, dtype=np.int64), np.array(-(2**53 + 1), dtype=np.int64), np.array(True), np.array(-0.0, dtype=np.float64))
+        program = SimpleNamespace(name="typed_scalars", module=Scalars().eval())
+        for mode in ("baseline", "optimized"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix="tvm-session-scalars-") as temp:
+                compiler = self.verifier.StageCompiler(Path(temp), mode, np, torch, onnx, tvm, exporter="dynamo", opset=22)
+                run = compiler(program, inputs, len(expected))
+                for _ in range(2):
+                    actual = self.verifier.outputs(run(inputs), np, torch)
+                    for result, reference in zip(actual, expected):
+                        self.assertEqual((result.dtype, result.shape), (reference.dtype, reference.shape))
+                        self.assertEqual(result.tobytes(), reference.tobytes())
+                record = compiler.records[0]
+                self.assertEqual(record["translation_source"], compiler.translation_source)
+                self.assertIn("scalar_tensor_export", record)
+                self.assertNotIn("bf16_fused_arithmetic", record)
+                graph = onnx.load(str(Path(temp) / "stage_0/model.onnx"))
+                constants = [onnx.numpy_helper.to_array(tensor) for tensor in graph.graph.initializer]
+                constants += [onnx.numpy_helper.to_array(attr.t) for node in graph.graph.node if node.op_type == "Constant" for attr in node.attribute if attr.name == "value"]
+                double_words = {value.tobytes() for value in constants if value.dtype == np.float64 and value.size == 1}
+                self.assertIn(np.array(0.004, dtype=np.float64).tobytes(), double_words)
+                self.assertIn(np.array(math.pi, dtype=np.float64).tobytes(), double_words)
 
     @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")
     def test_fused_bf16_export_preserves_bias_boundary_and_attention_dtypes(self):
@@ -389,7 +434,7 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(set(parameters), {"weight", "bias"})
             self.assertTrue(all(value.data_type == onnx.TensorProto.BFLOAT16 for value in parameters.values()))
             self.assertEqual(compiler.records[0]["translation_source"], compiler.translation_source)
-            self.assertEqual(compiler.records[0]["translated_aten_operations"], {"aten.linear.default": 1, "aten.scaled_dot_product_attention.default": 1, "aten.layer_norm.default": 0})
+            self.assertEqual(compiler.records[0]["translated_aten_operations"], {"aten.scalar_tensor.default": 0, "aten.linear.default": 1, "aten.scaled_dot_product_attention.default": 1, "aten.layer_norm.default": 0})
             self.assertEqual(self.verifier.parameter_digest(module, torch), original_weights)
 
     @unittest.skipUnless(os.environ.get("TVM_SESSION_MODERN_ONNX"), "Requires explicit opt-in and onnxscript dependency")

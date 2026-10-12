@@ -581,11 +581,14 @@ class StageCompiler:
         if type(bf16_fused_export) is not bool or bf16_fused_export and (exporter != "dynamo" or self.opset < 18):
             raise ValueError("Fused BF16 export requires explicit dynamo selection and opset18 or newer")
         self.translation_source, self.export_options = None, {}
-        if bf16_fused_export:
+        self.bf16_fused_export = bf16_fused_export
+        if exporter == "dynamo":
             path = safe_path(Path(__file__).with_name("bf16_export.py"))
             self.translation_source = file_identity(path, safe_path)
             helper = load_module("tvm_session_bf16_export", path)
-            self.export_options["custom_translation_table"] = helper.translations(torch)
+            self.export_options["custom_translation_table"] = helper.scalar_translations(torch)
+        if bf16_fused_export:
+            self.export_options["custom_translation_table"].update(helper.translations(torch))
             # Preserve original initializer dtypes, including BF16 bias storage.
             self.export_options["optimize"] = False
         if export_options is not None:
@@ -598,7 +601,7 @@ class StageCompiler:
                 raise ValueError("Factory ONNX translations require explicit dynamo export")
             existing = self.export_options.get("custom_translation_table", {})
             if set(translations) & set(existing):
-                raise ValueError("Factory and BF16 ONNX translations overlap")
+                raise ValueError("Factory and verifier ONNX translations overlap")
             if translations:
                 self.export_options["custom_translation_table"] = {**existing, **translations}
             if "optimize" in export_options:
@@ -634,8 +637,10 @@ class StageCompiler:
             record["onnx_export_optimization"] = self.export_options["optimize"]
         if self.translation_source:
             if file_identity(self.translation_source["path"], safe_path) != self.translation_source:
-                raise AssertionError("Selected BF16 export translations changed")
+                raise AssertionError("Selected floating export translations changed")
             record["translation_source"] = self.translation_source
+            record["scalar_tensor_export"] = "DOUBLE preserves the original scalar in a typed Constant; other ordinary dtypes use the built-in translation"
+        if self.bf16_fused_export:
             record["bf16_fused_arithmetic"] = "original BF16 interfaces; linear, SDPA and single-output LayerNorm use FP32 math; no native reduction/layout/statistics reproduction; unchanged source gate"
             record["bf16_attention_profile"] = "fp32-math"
             record["onnx_export_optimization"] = False
