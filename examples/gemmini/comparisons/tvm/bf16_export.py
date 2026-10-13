@@ -5,6 +5,8 @@ constants; other ordinary scalar dtypes use their built-in translations.
 The Smol mean hook preserves a separately pinned native reduction order.
 The language-scale adapter preserves native FP32 scalar opmath in a copied
 export graph before ordinary ONNX preparation.
+The denoiser rotary adapter specializes the complete bounded integer-position domain
+with authenticated native tables, preserving the original RoPE operations.
 
 Original operands and results remain BF16. FP32 internal arithmetic avoids adding
 BF16 rounding points inside a mathematical fused operation. Native linear can
@@ -66,6 +68,22 @@ SOURCE_LANGUAGE_SCALE_ARTIFACTS = {
     "include/c10/util/BFloat16.h": "b403700bb442c764384d0a59c5e6eeb423a573b5c8890debcc2882f4600bc569",
 }
 
+SOURCE_ROTARY_ARTIFACTS = {
+    "lib/libtorch_cpu.so": SOURCE_MEAN_ARTIFACTS["lib/libtorch_cpu.so"],
+    "include/ATen/native/DispatchStub.h": SOURCE_MEAN_ARTIFACTS["include/ATen/native/DispatchStub.h"],
+    "include/ATen/cpu/vml.h": "fdb8944b3720b693b1f9ab63d0c4bc40e085950c4764353686b83b1905a04f4c",
+}
+
+SOURCE_ROTARY_MODEL_ARTIFACTS = {
+    "lerobot/policies/smolvla/smolvlm_with_expert.py": "b70356145870c7da1e92a2195ee4626f7e9f9387576c6bed5ba2bfefae2a38d9",
+    "lerobot/policies/smolvla/modeling_smolvla.py": "be4463140f1abc5bce61f8a8c849ba6ba23f37777d19ad9159c2e1ffff60c1c5",
+}
+
+SOURCE_ROTARY_TABLE_WORDS = {
+    "sine": "06aee69b79688669a0b603005d0a1c3a083e399e5f5f6da9edca3dcbcb1b2538",
+    "cosine": "32911b60b68ad0bdcbe7198e8fd2f8583a7ed2d34f892c69672912aa2c46b4ac",
+}
+
 def _source_cpu_bindings(torch, artifacts, operation):
     if torch.version.git_version != "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0" or torch.backends.cpu.get_cpu_capability() != "AVX512" or torch.get_num_threads() != 1:
         raise ValueError(f"{operation} requires the pinned PyTorch CPU build, AVX512 capability and one native thread")
@@ -76,6 +94,237 @@ def _source_cpu_bindings(torch, artifacts, operation):
     if any(record["sha256"] != expected for record, expected in zip(bindings, artifacts.values())):
         raise ValueError(f"{operation} requires the independently proved native library and headers")
     return bindings
+
+
+def source_rotary_contract(torch, policy="native"):
+    """Bind source domain specialization for the original bounded Smol denoiser."""
+    if policy == "native":
+        return None
+    if policy != "torch_cpu_denoise_rotary64_table_v1":
+        raise ValueError("Unknown source rotary export policy")
+    bindings = _source_cpu_bindings(torch, SOURCE_ROTARY_ARTIFACTS, "Source denoiser rotary")
+    if not torch.backends.mkl.is_available():
+        raise ValueError("Source denoiser rotary requires the pinned native MKL build")
+    from pathlib import Path
+    from verify_resnet import file_identity, safe_path
+    root = safe_path(Path(torch.__file__).parent.parent)
+    model_bindings = [file_identity(root / relative, safe_path) for relative in SOURCE_ROTARY_MODEL_ARTIFACTS]
+    if any(record["sha256"] != expected for record, expected in zip(model_bindings, SOURCE_ROTARY_MODEL_ARTIFACTS.values())):
+        raise ValueError("Source denoiser rotary requires the independently proved original model sources")
+    return {
+        "name": policy,
+        "status": "opt_in_source_preserving_export_not_policy_qualified",
+        "native": "original_CPU_FP32_D64_RoPE_with_integer_denoiser_positions",
+        "native_threads": 1,
+        "native_dispatch": "AVX2_sin_cos_registration;FP32_oneMKL_VML_HA_FTZDAZ_OFF",
+        "algorithm": "whole_domain_original_FP32_frequency_division_and_native_trig_source_domain_specialization;runtime_integer_Gather",
+        "source": "https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/aten/src/ATen/native/cpu/UnaryOpsKernel.cpp#L770",
+        "integer_position_table_domain": [-1, 226],
+        "velocity_runtime_position_domain": [0, 226],
+        "index": "original_integer_position_plus1;no_clipping_wrapping_or_fallback",
+        "source_shapes": {"prefix_mask": [1, 177], "suffix_positions": [1, 50], "trig": [1, 50, 1, 32]},
+        "table_bindings": [{"name": label, "dtype": "float32", "shape": [228, 32], "bytes": 29184, "sha256": digest} for label, digest in SOURCE_ROTARY_TABLE_WORDS.items()],
+        "constant_runtime_bytes": 58368,
+        "runtime_index_bytes": 400,
+        "runtime_trig_output_bytes": 12800,
+        "export": "copied_original_EP_plus_two_authenticated_lifted_constants;ordinary_public_ONNX_export",
+        "admission": "exact_Boolean_prefix177_sum_plus_source_ones50_cumsum_minus1;or_original_subtract_min;D64_wavelength10000_FP32_frequency_DAG",
+        "IEEE_admission": "RNE_and_FTZ_DAZ_clear_checked_in_external_proofs;adapter_does_not_set_or_guard_runtime_floating_state",
+        "external_native_context_proof": {"receipt_sha256": "f5105723be6eef825777fa558fd7ff76e1b9435299c67ae8c02a2772f5e58959", "all_Boolean_prefix_counts": [0, 177], "alignment_float_offsets": [0, 1, 7, 15], "scalar_vector_tail_controls": True},
+        "external_compiled_cut_proof": {"receipt_sha256": "2eb4b921f1199ad0b0958110f8637d70d33d508706f0354ee4b8703316a859de", "both_modes_fresh_VM_repeats": True},
+        "unchanged": ["original_EP", "original_parameters_and_constants", "RoPE_Mul_Add_Sub_BF16_stores", "prefix_trig", "FP64_time_trig", "native_reference", "acceptance_gates"],
+        "qualification": "bounded_velocity_source_specialization;not_portable_sine_algorithm_or_full_velocity_prefix_session_qualification",
+        "bindings": bindings + model_bindings,
+    }
+
+
+def _source_rotary_tables(torch):
+    """Recompute pure original source invariants; authenticate every FP32 word."""
+    import hashlib
+    exponents = (2.0 / 64) * torch.arange(32, dtype=torch.float32, device="cpu")
+    timescale = 10000 ** exponents
+    positions = torch.arange(-1, 227, dtype=torch.int64, device="cpu")
+    angles = positions[:, None].to(torch.float32) / timescale[None, :].to(torch.float32)
+    tables = {"sine": torch.sin(angles), "cosine": torch.cos(angles)}
+    for label, table in tables.items():
+        if table.dtype != torch.float32 or table.device.type != "cpu" or table.layout != torch.strided or tuple(table.shape) != (228, 32) or not table.is_contiguous():
+            raise ValueError("Native rotary table geometry changed")
+        if hashlib.sha256(table.detach().view(torch.uint8).numpy().tobytes()).hexdigest() != SOURCE_ROTARY_TABLE_WORDS[label]:
+            raise ValueError("Native rotary table words do not match the independently proved CPU dispatch")
+    return tables
+
+
+def prepare_source_rotary_export(torch, source, policy="native"):
+    """Lift native source invariants only for the exact original denoiser DAG."""
+    record = source_rotary_contract(torch, policy)
+    if record is None:
+        return source, None
+    import copy
+    import operator
+    from torch.export.graph_signature import InputKind, InputSpec, TensorArgument
+    from torch.fx.immutable_collections import immutable_list
+    if not isinstance(source, torch.export.ExportedProgram):
+        raise ValueError("Source rotary export requires an original ExportedProgram")
+
+    def tensor(node, shape, dtype):
+        value = node.meta.get("val") if isinstance(node, torch.fx.Node) else None
+        return (isinstance(value, torch.Tensor) and value.device.type == "cpu" and value.layout == torch.strided
+                and value.dtype == dtype and len(value.shape) == len(shape)
+                and all(type(actual) is int and actual == expected for actual, expected in zip(value.shape, shape))
+                and all(type(stride) is int for stride in value.stride()) and value.is_contiguous())
+
+    def call(node, target, argc=None):
+        return isinstance(node, torch.fx.Node) and node.op == "call_function" and node.target == target and not node.kwargs and (argc is None or len(node.args) == argc)
+
+    def integer(value, expected):
+        return type(value) is int and value == expected
+
+    def axis(node, target, dimension):
+        return call(node, target, 2) and integer(node.args[1], dimension)
+
+    def suffix_positions(node):
+        if not tensor(node, (1, 50), torch.int64) or not call(node, torch.ops.aten.sub.Tensor, 2):
+            return False
+        if not integer(node.args[1], 1):
+            base, minimum = node.args
+            if not call(minimum, operator.getitem, 2) or not integer(minimum.args[1], 0):
+                return False
+            reduction = minimum.args[0]
+            return call(reduction, torch.ops.aten.min.dim, 3) and reduction.args[0] is base and integer(reduction.args[1], 1) and reduction.args[2] is True and suffix_positions(base)
+        addition = node.args[0]
+        if not call(addition, torch.ops.aten.add.Tensor, 2) or not tensor(addition, (1, 50), torch.int64):
+            return False
+        count, cumulative = addition.args
+        if not axis(count, torch.ops.aten.unsqueeze.default, 1) or not tensor(count, (1, 1), torch.int64):
+            return False
+        total = count.args[0]
+        if not (call(total, torch.ops.aten.sum.dim_IntList, 2) and type(total.args[1]) in (list, immutable_list)
+                and len(total.args[1]) == 1 and integer(total.args[1][0], -1) and tensor(total, (1,), torch.int64)):
+            return False
+        mask = total.args[0]
+        if not tensor(mask, (1, 177), torch.bool) or mask.op != "placeholder":
+            return False
+        specs = [spec for spec in source.graph_signature.input_specs if isinstance(spec.arg, TensorArgument) and spec.arg.name == mask.name]
+        if len(specs) != 1 or specs[0].kind != InputKind.USER_INPUT:
+            return False
+        if not axis(cumulative, torch.ops.aten.cumsum.default, 1) or not tensor(cumulative, (1, 50), torch.int64):
+            return False
+        concatenated = cumulative.args[0]
+        if not (axis(concatenated, torch.ops.aten.cat.default, 1) and type(concatenated.args[0]) in (tuple, list, immutable_list)
+                and len(concatenated.args[0]) == 1 and tensor(concatenated, (1, 50), torch.bool)):
+            return False
+        ones = concatenated.args[0][0]
+        return (isinstance(ones, torch.fx.Node) and ones.op == "call_function" and ones.target == torch.ops.aten.ones.default
+                and len(ones.args) == 1 and type(ones.args[0]) in (tuple, list, immutable_list) and len(ones.args[0]) == 2
+                and integer(ones.args[0][0], 1) and integer(ones.args[0][1], 50)
+                and ones.kwargs == {"dtype": torch.bool, "device": torch.device("cpu"), "pin_memory": False}
+                and tensor(ones, (1, 50), torch.bool))
+
+    def position_of(trig):
+        if not (call(trig, torch.ops.aten.sin.default, 1) or call(trig, torch.ops.aten.cos.default, 1)):
+            return None
+        if not tensor(trig, (1, 50, 1, 32), torch.float32):
+            return None
+        outer = trig.args[0]
+        if not axis(outer, torch.ops.aten.unsqueeze.default, 2) or not tensor(outer, (1, 50, 1, 32), torch.float32):
+            raise ValueError("Rotary output-axis derivation changed")
+        division = outer.args[0]
+        if not call(division, torch.ops.aten.div.Tensor, 2) or not tensor(division, (1, 50, 32), torch.float32):
+            raise ValueError("Rotary angle division changed")
+        numerator, denominator = division.args
+        if any(not call(value, torch.ops.aten.to.dtype, 2) or value.args[1] != torch.float32 for value in (numerator, denominator)):
+            raise ValueError("Original FP32 angle casts changed")
+        if not tensor(numerator, (1, 50, 1), torch.float32) or not tensor(denominator, (1, 1, 32), torch.float32):
+            raise ValueError("Original FP32 angle operand geometry changed")
+        unsqueezed = numerator.args[0]
+        if not axis(unsqueezed, torch.ops.aten.unsqueeze.default, 2) or not suffix_positions(unsqueezed.args[0]):
+            raise ValueError("Unproved rotary integer-position route")
+        frequency = denominator.args[0]
+        if not axis(frequency, torch.ops.aten.unsqueeze.default, 1) or not tensor(frequency, (1, 1, 32), torch.float32):
+            raise ValueError("Rotary frequency axis changed")
+        frequency = frequency.args[0]
+        if not axis(frequency, torch.ops.aten.unsqueeze.default, 0) or not tensor(frequency, (1, 32), torch.float32):
+            raise ValueError("Rotary frequency axis changed")
+        power = frequency.args[0]
+        if not call(power, torch.ops.aten.pow.Scalar, 2) or not integer(power.args[0], 10000) or not tensor(power, (32,), torch.float32):
+            raise ValueError("Original rotary wavelength changed")
+        exponent = power.args[1]
+        if not (call(exponent, torch.ops.aten.mul.Tensor, 2) and type(exponent.args[1]) is float
+                and exponent.args[1] == 0.03125 and tensor(exponent, (32,), torch.float32)):
+            raise ValueError("Original rotary exponent changed")
+        arange = exponent.args[0]
+        if not (isinstance(arange, torch.fx.Node) and arange.op == "call_function" and arange.target == torch.ops.aten.arange.default
+                and len(arange.args) == 1 and integer(arange.args[0], 32)
+                and arange.kwargs == {"dtype": torch.float32, "device": torch.device("cpu"), "pin_memory": False}
+                and tensor(arange, (32,), torch.float32)):
+            raise ValueError("Original rotary frequency range changed")
+        return unsqueezed.args[0]
+
+    sites = [(node, position_of(node)) for node in source.graph.nodes]
+    sites = [(node, position) for node, position in sites if position is not None]
+    record.update(site_count=len(sites), added_constant_names=[], sites=[])
+    if not sites:
+        return source, record
+    if len(sites) != 48:
+        raise ValueError("Full denoiser rotary inventory changed")
+    groups = {}
+    for trig, position in sites:
+        groups.setdefault(trig.args[0], []).append(trig)
+    if len(groups) != 24 or any(len(pair) != 2 or {node.target for node in pair} != {torch.ops.aten.sin.default, torch.ops.aten.cos.default} for pair in groups.values()):
+        raise ValueError("Original rotary sin/cos pairs changed")
+    original_graph, original_signature = str(source.graph), str(source.graph_signature)
+    original_user_specs = copy.deepcopy([spec for spec in source.graph_signature.input_specs if spec.kind == InputKind.USER_INPUT])
+    original_output_specs = copy.deepcopy(source.graph_signature.output_specs)
+    original_constant_names = set(source.constants)
+    tables = _source_rotary_tables(torch)
+    prepared = copy.deepcopy(source)
+    graph = prepared.graph
+    by_name = {node.name: node for node in graph.nodes}
+    specs = copy.deepcopy(prepared.graph_signature.input_specs)
+    first_user = next(index for index, spec in enumerate(specs) if spec.kind == InputKind.USER_INPUT)
+    before = by_name[specs[first_user].arg.name]
+    fake_mode = getattr(before.meta.get("val"), "fake_mode", None)
+    if fake_mode is None:
+        raise ValueError("Original EP FakeTensor metadata missing")
+    constants = dict(prepared.constants)
+    lifted = {}
+    for label, table in tables.items():
+        name = "merlin_native_denoise_rotary64_" + label
+        if name in constants or name in prepared.state_dict or name in by_name:
+            raise ValueError("Rotary constant name collision")
+        with graph.inserting_before(before):
+            placeholder = graph.placeholder(name)
+        placeholder.meta["val"] = fake_mode.from_tensor(table)
+        specs.insert(first_user, InputSpec(InputKind.CONSTANT_TENSOR, TensorArgument(placeholder.name), name))
+        first_user += 1
+        constants[name] = table.detach().clone()
+        lifted[label] = placeholder
+    for original, position in sites:
+        node, position = by_name[original.name], by_name[position.name]
+        label = "sine" if original.target == torch.ops.aten.sin.default else "cosine"
+        with graph.inserting_before(node):
+            index = graph.call_function(torch.ops.aten.add.Tensor, (position, 1))
+            values = graph.call_function(torch.ops.aten.index.Tensor, (lifted[label], [index]))
+        with fake_mode:
+            index.meta["val"] = position.meta["val"] + 1
+            values.meta["val"] = lifted[label].meta["val"][index.meta["val"]]
+        node.target, node.args, node.kwargs = torch.ops.aten.unsqueeze.default, (values, 2), {}
+        record["sites"].append({"node": original.name, "original_target": str(original.target), "position_node": position.name, "table": label})
+    graph.lint()
+    prepared.graph_module.recompile()
+    signature = copy.deepcopy(prepared.graph_signature)
+    signature.input_specs[:] = specs
+    result = torch.export.ExportedProgram(prepared.graph_module, graph, signature, prepared.state_dict, prepared.range_constraints, prepared.module_call_graph, prepared.example_inputs, constants=constants, verifiers=prepared.verifiers)
+    result.validate()
+    added = sorted(set(constants) - original_constant_names)
+    if added != sorted("merlin_native_denoise_rotary64_" + label for label in tables):
+        raise AssertionError("Source rotary must lift exactly two authenticated constants")
+    if [spec for spec in result.graph_signature.input_specs if spec.kind == InputKind.USER_INPUT] != original_user_specs or result.graph_signature.output_specs != original_output_specs:
+        raise AssertionError("Original user/output graph signature changed")
+    if str(source.graph) != original_graph or str(source.graph_signature) != original_signature or set(source.constants) != original_constant_names:
+        raise AssertionError("Original EP changed")
+    record.update(added_constant_names=added, original_user_input_count=len(original_user_specs), original_user_and_output_specs_preserved=True)
+    return result, record
 
 
 def source_scalar_contract(torch, policy="native"):

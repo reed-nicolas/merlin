@@ -542,6 +542,150 @@ class SmolVLASourceScalarTests(unittest.TestCase):
                 del run, compiler, saved
             gc.collect()
 
+class SmolVLASourceRotaryTests(unittest.TestCase):
+    policy = "torch_cpu_denoise_rotary64_table_v1"
+
+    @staticmethod
+    def fixture(torch, dtype=None):
+        dtype = torch.float32 if dtype is None else dtype
+
+        class Rotary(torch.nn.Module):
+            def forward(self, mask):
+                base = mask.sum(-1).unsqueeze(1) + torch.cat([torch.ones([1, 50], dtype=torch.bool, device="cpu")], 1).cumsum(1) - 1
+                outputs = []
+                for index in range(24):
+                    timescale = 10000 ** (0.03125 * torch.arange(32, dtype=dtype, device="cpu"))
+                    positions = base - base.min(1, keepdim=True).values if index % 3 == 0 else base
+                    radians = positions.unsqueeze(2).to(dtype) / timescale.unsqueeze(0).unsqueeze(1).to(dtype)
+                    angles = radians.unsqueeze(2)
+                    outputs.extend((angles.sin(), angles.cos()))
+                return tuple(outputs)
+
+        return Rotary().eval()
+
+    def test_source_rotary_defaults_factory_and_export_admission(self):
+        import torch
+        from verify_session import StageCompiler
+
+        sentinel = object()
+        self.assertIsNone(NUMERICS.source_rotary_contract(None))
+        self.assertEqual(NUMERICS.prepare_source_rotary_export(None, sentinel), (sentinel, None))
+        with self.assertRaisesRegex(ValueError, "Unknown source rotary"):
+            NUMERICS.source_rotary_contract(None, "unknown")
+        for policy, exporter in (("unknown", "dynamo"), (self.policy, "legacy")):
+            with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, "source rotary|Source rotary"):
+                StageCompiler(Path("unused"), "baseline", None, torch, SimpleNamespace(), None, exporter=exporter, export_options={"source_rotary_policy": policy})
+        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
+        for change in ({"source_rotary_policy": "unknown"}, {"source_rotary_policy": self.policy}, {"source_rotary_policy": self.policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source rotary"):
+                FACTORY.get_model_and_inputs(**base, **change)
+        self.assertNotIn("source_rotary_policy", FACTORY.get_onnx_export_options(torch))
+        marker = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_rotary_policy": {"name": self.policy}}}))
+        self.assertEqual(FACTORY.get_onnx_export_options(torch, marker)["source_rotary_policy"], self.policy)
+        with mock.patch.object(torch, "get_num_threads", return_value=2):
+            with self.assertRaisesRegex(ValueError, "one native thread"):
+                NUMERICS.source_rotary_contract(torch, self.policy)
+
+    def test_source_rotary_no_site_strict_DAG_and_table_authentication(self):
+        import copy
+        import torch
+
+        mask = torch.ones(1, 177, dtype=torch.bool)
+        with mock.patch.object(NUMERICS, "source_rotary_contract", side_effect=lambda *args: {"name": self.policy}):
+            with self.assertRaisesRegex(ValueError, "ExportedProgram"):
+                NUMERICS.prepare_source_rotary_export(torch, object(), self.policy)
+            for model, inputs in ((torch.nn.Identity(), (mask,)), (self.fixture(torch, torch.float64), (mask,))):
+                source = torch.export.export(model, inputs)
+                graph, signature = str(source.graph), str(source.graph_signature)
+                prepared, record = NUMERICS.prepare_source_rotary_export(torch, source, self.policy)
+                self.assertIs(prepared, source)
+                self.assertEqual(record["site_count"], 0)
+                self.assertEqual(record["added_constant_names"], [])
+                self.assertEqual((str(source.graph), str(source.graph_signature)), (graph, signature))
+            source = torch.export.export(self.fixture(torch), (mask,))
+            mutations = [(torch.ops.aten.pow.Scalar, "wavelength", lambda n: (10001, n.args[1])),
+                         (torch.ops.aten.mul.Tensor, "exponent", lambda n: (n.args[0], 0.0312501)),
+                         (torch.ops.aten.arange.default, "frequency range", lambda n: (31,)),
+                         (torch.ops.aten.sum.dim_IntList, "integer-position", lambda n: (n.args[0], [-2]))]
+            for target, error, change in mutations:
+                changed = copy.deepcopy(source)
+                node = next(node for node in changed.graph.nodes if node.target == target)
+                node.args = change(node)
+                with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                    NUMERICS.prepare_source_rotary_export(torch, changed, self.policy)
+            for replacement, error in ((torch.ops.aten.neg.default, "inventory"), (torch.ops.aten.sin.default, "sin/cos pairs")):
+                changed = copy.deepcopy(source)
+                next(node for node in changed.graph.nodes if node.target == torch.ops.aten.cos.default).target = replacement
+                with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                    NUMERICS.prepare_source_rotary_export(torch, changed, self.policy)
+        with mock.patch.dict(NUMERICS.SOURCE_ROTARY_TABLE_WORDS, {"sine": "0" * 64}):
+            with self.assertRaisesRegex(ValueError, "table words"):
+                NUMERICS._source_rotary_tables(torch)
+
+    @unittest.skipUnless(os.environ.get("TVM_LIBRARY_PATH"), "requires opt-in pinned TVM/PyTorch CPU build")
+    def test_source_rotary_public_factory_compiler_preserves_native_words(self):
+        import gc
+        import hashlib
+        import numpy as np
+        import onnx
+        import torch
+        import tvm
+        from verify_session import StageCompiler, array, onnx_tensors
+        if torch.version.git_version != "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0" or torch.backends.cpu.get_cpu_capability() != "AVX512" or torch.get_num_threads() != 1:
+            self.skipTest("requires pinned AVX512 PyTorch CPU build and one native thread")
+
+        contract = NUMERICS.source_rotary_contract(torch, self.policy)
+        marker = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_rotary_policy": contract}}))
+        options = FACTORY.get_onnx_export_options(torch, marker)
+        model = self.fixture(torch)
+        mask = torch.arange(177).reshape(1, 177) < 129
+        source = torch.export.export(model, (mask,))
+        graph, signature = str(source.graph), str(source.graph_signature)
+        bindings = StageCompiler(Path("unused"), "baseline", np, torch, onnx, tvm)._export_bindings(source)
+        prepared, record = NUMERICS.prepare_source_rotary_export(torch, source, self.policy)
+        self.assertEqual(record["site_count"], 48)
+        self.assertEqual(len(record["added_constant_names"]), 2)
+        self.assertTrue(record["original_user_and_output_specs_preserved"])
+        self.assertEqual(StageCompiler._export_abi(prepared), StageCompiler._export_abi(source))
+        tables_before = {name: hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest() for name, value in prepared.constants.items()}
+        for count in (0, 129, 177):
+            control = torch.arange(177).reshape(1, 177) < count
+            for native, actual in zip(model(control), prepared.module()(control)):
+                self.assertEqual(native.view(torch.uint8).numpy().tobytes(), actual.view(torch.uint8).numpy().tobytes())
+        inputs = (mask.numpy().copy(),)
+        input_before = inputs[0].tobytes()
+        expected = tuple(value.numpy().copy() for value in model(mask))
+        self.assertEqual(len(expected), 48)
+        for mode in ("baseline", "optimized"):
+            for fresh in range(2):
+                with self.subTest(mode=mode, fresh=fresh), tempfile.TemporaryDirectory() as directory:
+                    compiler = StageCompiler(Path(directory), mode, np, torch, onnx, tvm, exporter="dynamo", opset=18, export_options=options)
+                    run = compiler(SimpleNamespace(name="denoise_rotary64", module=model), inputs, 48)
+                    for repeat in range(2):
+                        actual = run(inputs)
+                        self.assertEqual(len(actual), 48)
+                        for value, native in zip(actual, expected):
+                            decoded = array(value, np, torch)
+                            self.assertEqual(decoded.dtype, np.float32)
+                            self.assertEqual(decoded.shape, (1, 50, 1, 32))
+                            self.assertEqual(decoded.tobytes(), native.tobytes())
+                    receipt = compiler.records[0]["source_rotary_export"]
+                    self.assertEqual(receipt["site_count"], 48)
+                    self.assertTrue(receipt["bindings_preserved"])
+                    saved = onnx.load(compiler.records[0]["onnx_artifacts"][0]["path"])
+                    self.assertEqual([value.name for value in saved.graph.input], ["input_0"])
+                    self.assertEqual(len(saved.graph.output), 48)
+                    self.assertFalse(any(node.op_type in ("Sin", "Cos") for node in saved.graph.node))
+                    tables = [value for value in onnx_tensors(saved, onnx) if value.data_type == onnx.TensorProto.FLOAT and tuple(value.dims) == (228, 32)]
+                    self.assertEqual({hashlib.sha256(value.raw_data).hexdigest() for value in tables}, {table["sha256"] for table in contract["table_bindings"]})
+                    self.assertEqual(inputs[0].tobytes(), input_before)
+                    del run, compiler, saved
+                gc.collect()
+        self.assertEqual((str(source.graph), str(source.graph_signature)), (graph, signature))
+        self.assertEqual(StageCompiler(Path("unused"), "baseline", np, torch, onnx, tvm)._export_bindings(source), bindings)
+        self.assertEqual({name: hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest() for name, value in prepared.constants.items()}, tables_before)
+
+
 class SmolVLASourceMeanTests(unittest.TestCase):
     def test_session_hook_keeps_default_table_and_selects_only_declared_policy(self):
         import torch
