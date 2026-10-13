@@ -619,11 +619,11 @@ class StageCompiler:
         if type(bf16_fused_export) is not bool or bf16_fused_export and (exporter != "dynamo" or self.opset < 18):
             raise ValueError("Fused BF16 export requires explicit dynamo selection and opset18 or newer")
         self.translation_source, self.export_options = None, {}
-        self.source_scalar_policy, self.source_rotary_policy, self.source_flash_policy, self.export_helper = "native", "native", "native", None
+        self.source_scalar_policy, self.source_rotary_policy, self.source_flash_policy, self.source_silu_policy, self.export_helper = "native", "native", "native", "native", None
         self.bf16_fused_export = bf16_fused_export
         if export_options is not None:
-            if not isinstance(export_options, dict) or set(export_options) - {"custom_translation_table", "optimize", "source_scalar_policy", "source_rotary_policy", "source_flash_policy"}:
-                raise ValueError("Factory export options may only select translations, exporter optimization and source scalar/rotary/Flash policies")
+            if not isinstance(export_options, dict) or set(export_options) - {"custom_translation_table", "optimize", "source_scalar_policy", "source_rotary_policy", "source_flash_policy", "source_silu_policy"}:
+                raise ValueError("Factory export options may only select translations, exporter optimization and source scalar/rotary/Flash/SiLU policies")
             self.source_scalar_policy = export_options.get("source_scalar_policy", "native")
             if self.source_scalar_policy not in ("native", "torch_cpu_language_scale960_v1"):
                 raise ValueError("Unknown source scalar export policy")
@@ -639,6 +639,11 @@ class StageCompiler:
                 raise ValueError("Unknown source Flash export policy")
             if self.source_flash_policy != "native" and (exporter != "dynamo" or not bf16_fused_export):
                 raise ValueError("Source Flash preservation requires explicit dynamo and fused BF16 export")
+            self.source_silu_policy = export_options.get("source_silu_policy", "native")
+            if self.source_silu_policy not in ("native", "torch_cpu_silu_fp32_v1"):
+                raise ValueError("Unknown source SiLU export policy")
+            if self.source_silu_policy != "native" and (exporter != "dynamo" or not bf16_fused_export):
+                raise ValueError("Source SiLU preservation requires explicit dynamo and fused BF16 export")
         if exporter == "dynamo":
             path = safe_path(Path(__file__).with_name("bf16_export.py"))
             self.translation_source = file_identity(path, safe_path)
@@ -646,7 +651,7 @@ class StageCompiler:
             self.export_helper = helper
             self.export_options["custom_translation_table"] = helper.scalar_translations(torch)
         if bf16_fused_export:
-            self.export_options["custom_translation_table"].update(helper.translations(torch, source_flash_policy=self.source_flash_policy))
+            self.export_options["custom_translation_table"].update(helper.translations(torch, source_flash_policy=self.source_flash_policy, source_silu_policy=self.source_silu_policy))
             # Preserve original initializer dtypes, including BF16 bias storage.
             self.export_options["optimize"] = False
         if export_options is not None:
@@ -675,9 +680,9 @@ class StageCompiler:
         # Tracing mutates plain Python cache attributes into FakeTensor objects.
         # Export an isolated stage so subsequent source calls and resets remain real.
         export_module = copy.deepcopy(program.module)
-        scalar_record, rotary_record, flash_record, source_ep = None, None, None, None
+        scalar_record, rotary_record, flash_record, silu_record, source_ep = None, None, None, None, None
         export_source = export_module
-        if self.source_scalar_policy != "native" or self.source_rotary_policy != "native" or self.source_flash_policy != "native":
+        if self.source_scalar_policy != "native" or self.source_rotary_policy != "native" or self.source_flash_policy != "native" or self.source_silu_policy != "native":
             original_parameters = parameter_digest(program.module, self.torch)
             source_ep = self.torch.export.export(export_module, tensors, strict=False)
             original_bindings = self._export_bindings(source_ep)
@@ -686,6 +691,7 @@ class StageCompiler:
             export_source, flash_record = self.export_helper.prepare_source_flash_export(self.torch, source_ep, self.source_flash_policy)
             export_source, scalar_record = self.export_helper.prepare_source_scalar_export(self.torch, export_source, self.source_scalar_policy)
             export_source, rotary_record = self.export_helper.prepare_source_rotary_export(self.torch, export_source, self.source_rotary_policy)
+            export_source, silu_record = self.export_helper.prepare_source_silu_export(self.torch, export_source, self.source_silu_policy)
             added_constants = tuple(rotary_record["added_constant_names"]) if rotary_record else ()
             if set(export_source.constants) - set(source_ep.constants) != set(added_constants) or set(source_ep.constants) - set(export_source.constants) or set(added_constants) & set(source_ep.state_dict):
                 raise AssertionError("Prepared export changed the allowed constant inventory")
@@ -703,7 +709,7 @@ class StageCompiler:
                 raise AssertionError("Source-preserving export changed original graph or signature")
             if str(export_source.graph) != prepared_graph or str(export_source.graph_signature) != prepared_signature or self._export_abi(export_source) != original_abi:
                 raise AssertionError("ONNX export changed the prepared graph or public inputs/outputs")
-            for preservation_record in (scalar_record, rotary_record, flash_record):
+            for preservation_record in (scalar_record, rotary_record, flash_record, silu_record):
                 if preservation_record is not None:
                     preservation_record.update(original_parameters_sha256=original_parameters, original_EP_bindings_sha256=original_bindings,
                                                original_EP_graph_sha256=hashlib.sha256(original_graph.encode()).hexdigest(),
@@ -727,6 +733,8 @@ class StageCompiler:
             record["source_rotary_export"] = rotary_record
         if flash_record is not None:
             record["source_flash_export"] = flash_record
+        if silu_record is not None:
+            record["source_silu_export"] = silu_record
         if self.translation_source:
             if file_identity(self.translation_source["path"], safe_path) != self.translation_source:
                 raise AssertionError("Selected floating export translations changed")

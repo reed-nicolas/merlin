@@ -477,7 +477,7 @@ def make_policy_session(model, inputs, loader, provenance):
 def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
                          input_npz=None, fixture_kind="synthetic", input_source=None,
                          input_manifest=None, selected_cameras=None, seed=0, cpu_threads=1, precision="original",
-                         quantized=False, integer_diagnostic_dir=None, source_mean_policy="native", source_softmax_policy="native", source_layernorm_policy="native", source_conv_policy="native", source_sgemm_policy="native", source_scalar_policy="native", source_rotary_policy="native", source_flash_policy="native"):
+                         quantized=False, integer_diagnostic_dir=None, source_mean_policy="native", source_softmax_policy="native", source_layernorm_policy="native", source_conv_policy="native", source_sgemm_policy="native", source_scalar_policy="native", source_rotary_policy="native", source_flash_policy="native", source_silu_policy="native"):
     if precision != "original":
         raise ValueError("Only original LeRobot precision is supported; implicit BF16 conversion is forbidden")
     if type(cpu_threads) is not int or not 1 <= cpu_threads <= 4 or type(seed) is not int or seed < 0:
@@ -502,6 +502,8 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
         raise ValueError("Source Flash preservation requires the original-precision integer recipe and one native thread")
     if fixture_kind not in ("synthetic", "dataset") or (fixture_kind == "dataset" and (not input_npz or not input_source)):
         raise ValueError("Dataset fixtures require both a local NPZ and attributed input_source")
+    if source_silu_policy not in ("native", "torch_cpu_silu_fp32_v1") or source_silu_policy != "native" and (not quantized or cpu_threads != 1):
+        raise ValueError("Source SiLU preservation requires the original-precision integer recipe and one native thread")
     if input_manifest is not None and fixture_kind != "dataset":
         raise ValueError("A recorded observation manifest must be labeled as a dataset fixture")
     fixture_manifest = observation_manifest(input_npz, input_manifest)
@@ -562,6 +564,10 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
     if source_flash_policy != "native":
         import bf16_export
         flash_record = bf16_export.source_flash_contract(torch, source_flash_policy)
+    silu_record = None
+    if source_silu_policy != "native":
+        import bf16_export
+        silu_record = bf16_export.source_silu_contract(torch, source_silu_policy)
     config = PreTrainedConfig.from_pretrained(str(safe_path(checkpoint_dir)), local_files_only=True)
     if not isinstance(config, SmolVLAConfig):
         raise TypeError("Pinned checkpoint did not resolve to SmolVLAConfig")
@@ -611,6 +617,8 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
         files.extend([*scalar_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
     if flash_record is not None:
         files.extend([*flash_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
+    if silu_record is not None:
+        files.extend([*silu_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
     files.extend(processor_diagnostic["bindings"])
     if quantized:
         files.extend([integer_receipt, helper_identity, file_identity(diagnostic.__file__, safe_path)])
@@ -653,6 +661,8 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
         provenance["source_rotary_policy"] = rotary_record
     if flash_record is not None:
         provenance["source_flash_policy"] = flash_record
+    if silu_record is not None:
+        provenance["source_silu_policy"] = silu_record
     if quantized:
         provenance.update(precision="declared_w8a8_with_original_lerobot_float_interfaces",
                           source_precision="original_lerobot", quantized_recipe_quality_qualified=False,
@@ -707,4 +717,7 @@ def get_onnx_export_options(torch, model=None):
         flash_policy = model.session.metadata.get("provenance", {}).get("source_flash_policy", {}).get("name", "native")
         if flash_policy != "native":
             options["source_flash_policy"] = flash_policy
+        silu_policy = model.session.metadata.get("provenance", {}).get("source_silu_policy", {}).get("name", "native")
+        if silu_policy != "native":
+            options["source_silu_policy"] = silu_policy
     return options

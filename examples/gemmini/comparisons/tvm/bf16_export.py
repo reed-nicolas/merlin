@@ -107,6 +107,91 @@ SOURCE_FLASH_ARTIFACTS = {
 SOURCE_FLASH_LIBM_SHA256 = "f0734a09a0602ccde6b98ea7fbb3c9cfc62b3a4cf4a7b17ccd36d774ca22b8df"
 
 
+SOURCE_SILU_ARTIFACTS = {
+    "lib/libtorch_cpu.so": SOURCE_MEAN_ARTIFACTS["lib/libtorch_cpu.so"],
+    "include/ATen/native/DispatchStub.h": SOURCE_MEAN_ARTIFACTS["include/ATen/native/DispatchStub.h"],
+    "include/ATen/native/Activation.h": "e63501cd2f4cae15db83d8b471cd32592fe61b409360e77c17210b12aa528fd1",
+    "include/ATen/TensorIterator.h": SOURCE_LANGUAGE_SCALE_ARTIFACTS["include/ATen/TensorIterator.h"],
+    "include/ATen/native/cpu/Loops.h": SOURCE_LANGUAGE_SCALE_ARTIFACTS["include/ATen/native/cpu/Loops.h"],
+    "include/ATen/cpu/vec/vec512/vec512_float.h": SOURCE_SOFTMAX_ARTIFACTS["include/ATen/cpu/vec/vec512/vec512_float.h"],
+    "include/sleef.h": SOURCE_SOFTMAX_ARTIFACTS["include/sleef.h"],
+}
+
+
+def source_silu_contract(torch, policy="native"):
+    """Bind the pinned one-thread FP32 vector SiLU without changing native defaults."""
+    if policy == "native":
+        return None
+    if policy != "torch_cpu_silu_fp32_v1":
+        raise ValueError("Unknown source SiLU export policy")
+    import os
+    if "ATEN_CPU_CAPABILITY" in os.environ:
+        raise ValueError("Source SiLU requires original CPU dispatch without an ISA override")
+    bindings = _source_cpu_bindings(torch, SOURCE_SILU_ARTIFACTS, "Source SiLU")
+    return {
+        "name": policy,
+        "status": "opt_in_source_preserving_export_not_policy_qualified",
+        "domain": "merlin.source_preserving",
+        "version": 1,
+        "operator": "TorchSiluAvx512F32",
+        "torch_git": torch.version.git_version,
+        "cpu_capability": "AVX512",
+        "cpu_threads": 1,
+        "source": "pytorch449b_Activation.cpp_silu_kernel_FP32_branch_L1115_1125",
+        "native_loop": "positive_dense_contiguous_CPU_FP32_coalesced_flat_count_divisible32;paired16lane_vectors;no_scalar_tail",
+        "arithmetic": "pinned_SLEEF_u10_eight_explicit_FP32_FMA;separate_one_plus_exp_negative_x;direct_FP32_divide",
+        "export_admission": "original_EP_FP32_SiLU_static_positive_shape_contiguous_offset0_count_divisible32;BF16_sites_keep_existing_fused_recipe",
+        "proof_geometry": [[1, 50, 720], [640]],
+        "IEEE_admission": "ambient_RNE_FTZ_DAZ_clear_verified_per_call;not_enforced_by_export_shape_guard",
+        "proof_admission": "actual_and_controls_have_finite_source_exp_denominator_output;general_runtime_value_admission_not_enforced_by_export_shape_guard",
+        "dispatch_evidence": "actual_readonly_DispatchStubImpl_chooser_selected_AVX512_ELF8290270;not_internal_callback_trace",
+        "workspace": "original_shape_FP32_output;flatten_and_restore_views;no_private_heap_scratch",
+        "lowering": "existing_TorchSiluAvx512F32_flat_helper_explicit_llvm_fma;no_Torch_SLEEF_or_libm_runtime_callout",
+        "qualification": "bounded_actual_and_controls_only;full_prefix_policy_and_target_unqualified;no_universal_correctly_rounded_exp_claim",
+        "bindings": bindings,
+    }
+
+
+def prepare_source_silu_export(torch, source, policy="native"):
+    """Admit original FP32 operands; retain the source EP and all explicit casts."""
+    record = source_silu_contract(torch, policy)
+    if record is None:
+        return source, None
+    if not isinstance(source, torch.export.ExportedProgram):
+        raise ValueError("Source SiLU requires an original ExportedProgram")
+    sites = []
+    for node in source.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.silu.default:
+            continue
+        if len(node.args) != 1 or node.kwargs or not isinstance(node.args[0], torch.fx.Node):
+            raise ValueError("Source SiLU original operand signature changed")
+        value = node.args[0].meta.get("val")
+        if isinstance(value, torch.Tensor) and value.dtype == torch.bfloat16:
+            continue
+        if not isinstance(value, torch.Tensor) or value.dtype != torch.float32 or value.device.type != "cpu" or value.layout != torch.strided:
+            raise ValueError("Source SiLU requires original dense CPU FP32 input metadata")
+        shape = tuple(value.shape)
+        if not shape or any(type(dim) is not int or dim <= 0 for dim in shape) or not value.is_contiguous() or value.storage_offset() != 0:
+            raise ValueError("Source SiLU requires positive static contiguous input geometry with zero storage offset")
+        count = math.prod(shape)
+        if count % 32 or count > ((1 << 63) - 1) // 4:
+            raise ValueError("Source SiLU requires a paired32 element count within the FP32 byte span")
+        result = node.meta.get("val")
+        if not isinstance(result, torch.Tensor) or result.dtype != value.dtype or result.device != value.device or tuple(result.shape) != shape or not result.is_contiguous():
+            raise ValueError("Source SiLU original result metadata changed")
+        sites.append({
+            "node": node.name,
+            "input_node": node.args[0].name,
+            "shape": list(shape),
+            "dtype": "torch.float32",
+            "strides": list(value.stride()),
+            "storage_offset": value.storage_offset(),
+            "flat_count": count,
+        })
+    record.update(site_count=len(sites), sites=sites, graph_mutated=False)
+    return source, record
+
+
 def source_flash_contract(torch, policy="native"):
     """Bind the proved host-only vision Flash arithmetic and native dispatch."""
     if policy == "native":
@@ -1142,9 +1227,10 @@ def scalar_translations(torch):
     return {torch.ops.aten.scalar_tensor.default: scalar_tensor}
 
 
-def translations(torch, source_flash_policy="native"):
+def translations(torch, source_flash_policy="native", source_silu_policy="native"):
     # The StageCompiler must authenticate the original EP mask DAG before export.
     flash_record = source_flash_contract(torch, source_flash_policy)
+    silu_record = source_silu_contract(torch, source_silu_policy)
     # Optional exporter dependencies are loaded only when this recipe is selected.
     from onnxscript import ir, opset18 as op
     from onnxscript.function_libs.torch_lib.ops import nn
@@ -1163,6 +1249,24 @@ def translations(torch, source_flash_policy="native"):
             raise ValueError("Fused SiLU translation requires BF16 dispatcher input")
         widened = op.Cast(self, to=1)
         return op.Cast(op.Mul(widened, op.Sigmoid(widened)), to=16)
+
+    source_silu_op = None
+    if silu_record is not None:
+        from onnx import defs
+        from onnxscript.values import Opset, Op
+        schema = defs.OpSchema("TorchSiluAvx512F32", "merlin.source_preserving", 1, inputs=[defs.OpSchema.FormalParameter("self", "T")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(float)"], "Original FP32 vector SiLU operand")])
+        source_silu_op = Op(Opset("merlin.source_preserving", 1), "TorchSiluAvx512F32", schema)
+
+    def source_silu(self: TFloat) -> TFloat:
+        if self.dtype == ir.DataType.BFLOAT16:
+            return silu(self)
+        if self.dtype != ir.DataType.FLOAT or self.shape is None or not self.shape or any(type(dim) is not int or dim <= 0 for dim in self.shape):
+            raise ValueError("Source SiLU translation requires the admitted static FP32 tensor")
+        count = math.prod(self.shape)
+        if count % 32 or count > ((1 << 63) - 1) // 4:
+            raise ValueError("Source SiLU translation requires a paired32 element count within the FP32 byte span")
+        flat = op.Reshape(self, op.Constant(value_ints=[count]))
+        return op.Reshape(source_silu_op(flat), op.Constant(value_ints=list(self.shape)))
 
     def linear(input: TFloat, weight: TFloat, bias: Optional[TFloat] = None) -> TFloat:
         if input.dtype != ir.DataType.BFLOAT16:
@@ -1252,4 +1356,4 @@ def translations(torch, source_flash_policy="native"):
             probabilities = op.Where(blocked, 0.0, probabilities)
         return op.Cast(op.MatMul(probabilities, op.Cast(value, to=1)), to=16)
 
-    return {torch.ops.aten.linear.default: linear, torch.ops.aten.scaled_dot_product_attention.default: attention, torch.ops.aten.layer_norm.default: layer_norm, torch.ops.aten.silu.default: silu}
+    return {torch.ops.aten.linear.default: linear, torch.ops.aten.scaled_dot_product_attention.default: attention, torch.ops.aten.layer_norm.default: layer_norm, torch.ops.aten.silu.default: source_silu if silu_record is not None else silu}

@@ -952,6 +952,116 @@ class SmolVLASourceMeanTests(unittest.TestCase):
                     self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
 
 
+class SmolVLASourceSiluTests(unittest.TestCase):
+    policy = "torch_cpu_silu_fp32_v1"
+
+    def test_source_silu_defaults_contract_and_factory_refusals(self):
+        import torch
+        from verify_session import StageCompiler
+        sentinel = object()
+        self.assertIsNone(NUMERICS.source_silu_contract(None))
+        self.assertEqual(NUMERICS.prepare_source_silu_export(None, sentinel), (sentinel, None))
+        with self.assertRaisesRegex(ValueError, "Unknown source SiLU"):
+            NUMERICS.source_silu_contract(None, "unknown")
+        for policy, exporter, fused in (("unknown", "dynamo", True), (self.policy, "legacy", False), (self.policy, "dynamo", False)):
+            with self.subTest(policy=policy, exporter=exporter, fused=fused), self.assertRaisesRegex(ValueError, "[Ss]ource SiLU"):
+                StageCompiler(Path("unused"), "baseline", None, torch, SimpleNamespace(), None, exporter=exporter, bf16_fused_export=fused, export_options={"source_silu_policy": policy})
+        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
+        for change in ({"source_silu_policy": "unknown"}, {"source_silu_policy": self.policy}, {"source_silu_policy": self.policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "[Ss]ource SiLU"):
+                FACTORY.get_model_and_inputs(**base, **change)
+        self.assertNotIn("source_silu_policy", FACTORY.get_onnx_export_options(torch))
+        marker = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_silu_policy": {"name": self.policy}}}))
+        self.assertEqual(FACTORY.get_onnx_export_options(torch, marker)["source_silu_policy"], self.policy)
+        with mock.patch.object(torch, "get_num_threads", return_value=2), self.assertRaisesRegex(ValueError, "one native thread"):
+            NUMERICS.source_silu_contract(torch, self.policy)
+        with mock.patch.dict(os.environ, {"ATEN_CPU_CAPABILITY": "avx512"}), self.assertRaisesRegex(ValueError, "ISA override"):
+            NUMERICS.source_silu_contract(torch, self.policy)
+        with mock.patch.object(NUMERICS, "_source_cpu_bindings", side_effect=ValueError("independently proved native library")), self.assertRaisesRegex(ValueError, "independently proved"):
+            NUMERICS.source_silu_contract(torch, self.policy)
+
+    def test_source_silu_EP_admission_preserves_BF16_and_refuses_unproved_routes(self):
+        import copy
+        import torch
+        class Activation(torch.nn.Module):
+            def forward(self, value):
+                return torch.ops.aten.silu.default(value)
+        class Identity(torch.nn.Module):
+            def forward(self, value):
+                return value
+        with mock.patch.object(NUMERICS, "source_silu_contract", side_effect=lambda *args: {"name": self.policy}):
+            with self.assertRaisesRegex(ValueError, "ExportedProgram"):
+                NUMERICS.prepare_source_silu_export(torch, object(), self.policy)
+            for model, value, expected in ((Identity(), torch.ones(32), 0), (Activation(), torch.ones(32, dtype=torch.bfloat16), 0), (Activation(), torch.ones(1, 50, 720), 1), (Activation(), torch.ones(640), 1)):
+                source = torch.export.export(model, (value,))
+                graph, signature = str(source.graph), str(source.graph_signature)
+                prepared, record = NUMERICS.prepare_source_silu_export(torch, source, self.policy)
+                self.assertIs(prepared, source)
+                self.assertEqual(record["site_count"], expected)
+                self.assertFalse(record["graph_mutated"])
+                self.assertEqual((str(source.graph), str(source.graph_signature)), (graph, signature))
+            for value in (torch.ones(31), torch.ones(32, dtype=torch.float64), torch.ones(32, dtype=torch.float16), torch.ones(4, 8).T, torch.ones(33)[1:]):
+                source = torch.export.export(Activation(), (value,))
+                with self.subTest(shape=tuple(value.shape), dtype=value.dtype), self.assertRaisesRegex(ValueError, "Source SiLU"):
+                    NUMERICS.prepare_source_silu_export(torch, source, self.policy)
+            changed = copy.deepcopy(torch.export.export(Activation(), (torch.ones(32),)))
+            node = next(node for node in changed.graph.nodes if node.target == torch.ops.aten.silu.default)
+            with node.meta["val"].fake_mode:
+                node.meta["val"] = torch.ones(64)
+            with self.assertRaisesRegex(ValueError, "result metadata"):
+                NUMERICS.prepare_source_silu_export(torch, changed, self.policy)
+
+    @unittest.skipUnless(os.environ.get("TVM_LIBRARY_PATH"), "requires opt-in pinned TVM/PyTorch CPU build")
+    def test_source_silu_public_factory_compiler_exact_native_and_default_dtype_routes(self):
+        import hashlib
+        import numpy as np
+        import onnx
+        import torch
+        import tvm
+        from verify_session import StageCompiler, array
+        class Activation(torch.nn.Module):
+            def forward(self, value):
+                return torch.ops.aten.silu.default(value)
+        contract = NUMERICS.source_silu_contract(torch, self.policy)
+        marker = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_silu_policy": contract}}))
+        options = FACTORY.get_onnx_export_options(torch, marker)
+        value = torch.linspace(-8, 8, 36000).reshape(1, 50, 720)
+        inputs = (array(value, np, torch),)
+        before = inputs[0].tobytes()
+        expected = Activation()(value).numpy().copy()
+        source = torch.export.export(Activation(), (value,))
+        graph, signature = str(source.graph), str(source.graph_signature)
+        for mode in ("baseline", "optimized"):
+            for fresh in range(2):
+                with self.subTest(mode=mode, fresh=fresh), tempfile.TemporaryDirectory() as directory:
+                    compiler = StageCompiler(Path(directory), mode, np, torch, onnx, tvm, exporter="dynamo", opset=18, bf16_fused_export=True, export_options=options)
+                    run = compiler(SimpleNamespace(name="native_time_silu", module=Activation()), inputs, 1)
+                    for repeat in range(2):
+                        actual = array(run(inputs), np, torch)
+                        self.assertEqual(actual.dtype, np.float32)
+                        self.assertEqual(actual.tobytes(), expected.tobytes())
+                    record = compiler.records[0]
+                    self.assertEqual(record["source_silu_export"]["site_count"], 1)
+                    self.assertTrue(record["source_silu_export"]["bindings_preserved"])
+                    saved = onnx.load(record["onnx_artifacts"][0]["path"])
+                    custom = [node for node in saved.graph.node if node.op_type == "TorchSiluAvx512F32" and node.domain == "merlin.source_preserving"]
+                    self.assertEqual([(len(node.input), len(node.output), len(node.attribute)) for node in custom], [(1, 1, 0)])
+                    self.assertEqual([v.name for v in saved.graph.input], ["input_0"])
+                    self.assertEqual(saved.graph.output[0].type.tensor_type.elem_type, onnx.TensorProto.FLOAT)
+        for dtype in (torch.float32, torch.bfloat16):
+            tensor = torch.ones(32, dtype=dtype)
+            default = torch.onnx.export(Activation(), (tensor,), dynamo=True, opset_version=18, optimize=False, custom_translation_table=NUMERICS.translations(torch)).model_proto
+            self.assertFalse(any(node.op_type == "TorchSiluAvx512F32" for node in default.graph.node))
+            active = torch.onnx.export(Activation(), (tensor,), dynamo=True, opset_version=18, optimize=False, custom_translation_table=NUMERICS.translations(torch, source_silu_policy=self.policy)).model_proto
+            self.assertEqual(sum(node.op_type == "TorchSiluAvx512F32" for node in active.graph.node), int(dtype == torch.float32))
+            if dtype == torch.bfloat16:
+                self.assertEqual([node.op_type for node in active.graph.node], [node.op_type for node in default.graph.node])
+        self.assertEqual(inputs[0].tobytes(), before)
+        self.assertEqual((str(source.graph), str(source.graph_signature)), (graph, signature))
+        for binding in contract["bindings"]:
+            self.assertEqual(hashlib.sha256(Path(binding["path"]).read_bytes()).hexdigest(), binding["sha256"])
+
+
 class SmolVLASourceSoftmaxTests(unittest.TestCase):
     def test_session_hook_selects_only_declared_policy_without_mutating_defaults(self):
         import torch
