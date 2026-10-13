@@ -486,13 +486,13 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
         raise ValueError("Declared integer policy requires quantized=True and a new integer_diagnostic_dir")
     if source_mean_policy not in ("native", "torch_cpu_mean720_v1", "torch_cpu_mean720_960_v1") or source_mean_policy != "native" and (not quantized or cpu_threads != 1):
         raise ValueError("Source mean preservation requires the original-precision integer recipe and one native thread")
-    if source_softmax_policy not in ("native", "torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1") or source_softmax_policy != "native" and (not quantized or cpu_threads != 1):
+    if source_softmax_policy not in ("native", "torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1", "torch_cpu_softmax177_227_prefix_v1") or source_softmax_policy != "native" and (not quantized or cpu_threads != 1):
         raise ValueError("Source softmax preservation requires the original-precision integer recipe and one native thread")
     if source_layernorm_policy not in ("native", "torch_cpu_layernorm768_v1") or source_layernorm_policy != "native" and (not quantized or cpu_threads != 1):
         raise ValueError("Source LayerNorm preservation requires the original-precision integer recipe and one native thread")
     if source_conv_policy not in ("native", "torch_cpu_conv3x16_v1") or source_conv_policy != "native" and (not quantized or cpu_threads != 1):
         raise ValueError("Source convolution preservation requires the original-precision integer recipe and one native thread")
-    if source_sgemm_policy not in ("native", "torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1") or source_sgemm_policy != "native" and (not quantized or cpu_threads != 1):
+    if source_sgemm_policy not in ("native", "torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1", "torch_cpu_attention177_227_prefix_v1") or source_sgemm_policy != "native" and (not quantized or cpu_threads != 1):
         raise ValueError("Source SGEMM preservation requires the original-precision integer recipe and one native thread")
     if source_scalar_policy not in ("native", "torch_cpu_language_scale960_v1") or source_scalar_policy != "native" and (not quantized or cpu_threads != 1):
         raise ValueError("Source scalar preservation requires the original-precision integer recipe and one native thread")

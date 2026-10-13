@@ -78,8 +78,11 @@ class SmolVLAArtifactTests(unittest.TestCase):
 
     def test_source_softmax_requires_explicit_integer_session_and_one_native_thread(self):
         base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
-        for change in ({"source_softmax_policy": "unknown"}, {"source_softmax_policy": "torch_cpu_softmax177_v1"}, {"source_softmax_policy": "torch_cpu_softmax177_v1", "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
-            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source softmax"):
+        changes = [{"source_softmax_policy": "unknown"}]
+        for policy in ("torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1", "torch_cpu_softmax177_227_prefix_v1"):
+            changes.extend(({"source_softmax_policy": policy}, {"source_softmax_policy": policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}))
+        for change in changes:
+            with self.subTest(change=change), mock.patch.object(FACTORY, "checkpoint_artifacts", side_effect=AssertionError("Admission must precede checkpoint access")), self.assertRaisesRegex(ValueError, "Source softmax"):
                 FACTORY.get_model_and_inputs(**base, **change)
 
     def test_source_layernorm_requires_explicit_integer_session_and_one_native_thread(self):
@@ -96,8 +99,11 @@ class SmolVLAArtifactTests(unittest.TestCase):
 
     def test_source_sgemm_requires_explicit_integer_session_and_one_native_thread(self):
         base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
-        for change in ({"source_sgemm_policy": "unknown"}, {"source_sgemm_policy": "torch_cpu_sgemm177_v1"}, {"source_sgemm_policy": "torch_cpu_sgemm177_v1", "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
-            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source SGEMM"):
+        changes = [{"source_sgemm_policy": "unknown"}]
+        for policy in ("torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1", "torch_cpu_attention177_227_prefix_v1"):
+            changes.extend(({"source_sgemm_policy": policy}, {"source_sgemm_policy": policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}))
+        for change in changes:
+            with self.subTest(change=change), mock.patch.object(FACTORY, "checkpoint_artifacts", side_effect=AssertionError("Admission must precede checkpoint access")), self.assertRaisesRegex(ValueError, "Source SGEMM"):
                 FACTORY.get_model_and_inputs(**base, **change)
 
     def test_restricted_component_is_rejected_before_read(self):
@@ -998,14 +1004,52 @@ class SmolVLASourceSoftmaxTests(unittest.TestCase):
                 return short.softmax(-1), long.softmax(-1), long.softmax(2)
         for dtype in (torch.float32, torch.bfloat16):
             inputs = tuple(torch.linspace(-2, 2, 750 * width).reshape(1, 15, 50, width).to(dtype) for width in (177, 227))
-            for policy in ("torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1"):
+            for policy in ("torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1", "torch_cpu_softmax177_227_prefix_v1"):
                 with mock.patch.object(NUMERICS, "source_softmax_contract", return_value={"name": policy}):
                     table = NUMERICS.source_softmax_translations(torch, policy)
                 graph = torch.onnx.export(Softmax().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
                 selected = [node.op_type for node in graph.graph.node if node.domain == "merlin.source_preserving"]
-                expected = ["TorchSoftmaxAvx512F32LastDim177"] + (["TorchSoftmaxAvx512F32LastDim227"] if policy == "torch_cpu_softmax177_227_v1" else [])
+                expected = ["TorchSoftmaxAvx512F32LastDim177"] + (["TorchSoftmaxAvx512F32LastDim227"] if policy != "torch_cpu_softmax177_v1" else [])
                 self.assertEqual(selected, expected if dtype == torch.float32 else [])
                 self.assertEqual(sum(node.op_type == "Softmax" for node in graph.graph.node), 3 - len(selected))
+
+
+    def test_prefix_policy_preserves_old_scopes_and_both_callback_fallbacks(self):
+        import onnx
+        import torch
+        class Softmax(torch.nn.Module):
+            def forward(self, prefix, wrong):
+                return prefix.softmax(-1), torch.ops.aten._softmax.default(prefix, -1, False), prefix.softmax(2), wrong.softmax(-1)
+        policy = "torch_cpu_softmax177_227_prefix_v1"
+        with mock.patch.object(NUMERICS, "_source_cpu_bindings", return_value={"fixture": "bound"}):
+            record = NUMERICS.source_softmax_contract(torch, policy)
+        self.assertEqual(record["export_shapes"], [[1, 15, 50, 177], [1, 15, 50, 227], [1, 15, 177, 177]])
+        self.assertIn("unqualified", record["qualification"])
+        self.assertEqual(record["prefix_native_strides"], [469935, 31329, 177, 1])
+        for dtype in (torch.float32, torch.bfloat16):
+            inputs = (torch.linspace(-2, 2, 469935).reshape(1, 15, 177, 177).to(dtype), torch.ones(1, 15, 176, 177, dtype=dtype))
+            before = tuple(value.clone() for value in inputs)
+            for selected_policy in ("native", "torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1", policy):
+                with mock.patch.object(NUMERICS, "source_softmax_contract", return_value=None if selected_policy == "native" else {"name": selected_policy}):
+                    table = NUMERICS.source_softmax_translations(torch, selected_policy)
+                graph = torch.onnx.export(Softmax().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
+                selected = [node for node in graph.graph.node if node.domain == "merlin.source_preserving"]
+                expected = 2 if selected_policy == policy and dtype == torch.float32 else 0
+                self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [("TorchSoftmaxAvx512F32LastDim177", 1, 1, 0)] * expected)
+                self.assertEqual(sum(node.op_type == "Softmax" for node in graph.graph.node), 4 - expected)
+                infos = {value.name: value for value in (*graph.graph.input, *graph.graph.value_info, *graph.graph.output)}
+                for node in selected:
+                    self.assertEqual([infos[name].type.tensor_type.elem_type for name in (*node.input, *node.output)], [onnx.TensorProto.FLOAT] * 2)
+                    self.assertEqual([dim.dim_value for dim in infos[node.output[0]].type.tensor_type.shape.dim], [1, 15, 177, 177])
+                self.assertTrue(all(torch.equal(value, original) for value, original in zip(inputs, before)))
+        import bf16_export
+        import tinyllama_integer
+        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
+        model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_softmax_policy": {"name": policy}}}))
+        with mock.patch.object(tinyllama_integer, "export_options", return_value={"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_softmax_translations", return_value={torch.ops.aten.softmax.int: "selected"}) as select:
+            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, torch.ops.aten.softmax.int: "selected"})
+            select.assert_called_once_with(torch, policy)
+        self.assertNotIn(torch.ops.aten.softmax.int, original)
 
 
 class SmolVLASourceLayerNormTests(unittest.TestCase):
@@ -1176,15 +1220,60 @@ class SmolVLASourceSgemmTests(unittest.TestCase):
                 return query @ key, probability @ value, query.to(torch.bfloat16) @ key.to(torch.bfloat16), probability.float() @ value.float(), query[..., :49, :] @ key
         inputs = (torch.ones((1, 15, 50, 64)), torch.ones((1, 15, 64, 227)), torch.ones((1, 15, 50, 227), dtype=torch.bfloat16), torch.ones((1, 15, 227, 64), dtype=torch.bfloat16))
         before = tuple(value.clone() for value in inputs)
-        for policy in ("torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1"):
-            operators = ["TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177"] + (["TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227"] if policy == "torch_cpu_attention177_227_v1" else [])
+        for policy in ("torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1", "torch_cpu_attention177_227_prefix_v1"):
+            operators = ["TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177"] + (["TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227"] if policy != "torch_cpu_sgemm177_v1" else [])
+            if policy == "torch_cpu_attention177_227_prefix_v1":
+                operators.append("TorchOnednnGemmBf16PV177")
             with mock.patch.object(NUMERICS, "source_sgemm_contract", return_value={"name": policy, "operators": operators}):
                 table = NUMERICS.source_sgemm_translations(torch, policy)
             graph = torch.onnx.export(Attention().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
             selected = [node for node in graph.graph.node if node.domain == "merlin.source_preserving"]
-            self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [(name, 2, 1, 0) for name in operators[2:]])
+            self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [(name, 2, 1, 0) for name in operators[2:4]])
             self.assertEqual(sum(node.op_type == "MatMul" for node in graph.graph.node), 5 - len(selected))
             self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
+
+
+    def test_prefix_bf16_pv177_is_distinct_from_old_fp32_pv177_and_defaults(self):
+        import onnx
+        import torch
+        class Attention(torch.nn.Module):
+            def forward(self, probability, value, expert):
+                return probability @ value, probability[..., :176, :] @ value, expert.float() @ value.float()
+        policy = "torch_cpu_attention177_227_prefix_v1"
+        with mock.patch.object(NUMERICS, "_source_cpu_bindings", return_value=[]):
+            record = NUMERICS.source_sgemm_contract(torch, policy)
+            self.assertEqual(record["operators"], ["TorchMklSgemmF32QK177", "TorchMklSgemmF32PV177", "TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227", "TorchOnednnGemmBf16PV177"])
+            self.assertEqual(record["prefix_pv_native_strides"], [[469935, 31329, 177, 1], [169920, 64, 960, 1]])
+            self.assertIn("unobserved", record["prefix_pv_evidence"])
+            for overrides in ({"MKL_CBWR": "COMPATIBLE"}, {"DNNL_MAX_CPU_ISA": "AVX2"}, {"ONEDNN_DEFAULT_FPMATH_MODE": "BF16"}):
+                with mock.patch.dict(os.environ, overrides), self.assertRaises(ValueError):
+                    NUMERICS.source_sgemm_contract(torch, policy)
+            with mock.patch.object(torch.cpu, "_is_avx512_bf16_supported", return_value=True), self.assertRaisesRegex(ValueError, "software-BF16"):
+                NUMERICS.source_sgemm_contract(torch, policy)
+        for dtype in (torch.bfloat16, torch.float32):
+            inputs = (torch.ones(1, 15, 177, 177, dtype=dtype), torch.ones(1, 15, 177, 64, dtype=dtype), torch.ones(1, 15, 50, 177, dtype=dtype))
+            before = tuple(value.clone() for value in inputs)
+            for selected_policy in ("native", "torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1", policy):
+                with mock.patch.object(NUMERICS, "_source_cpu_bindings", return_value=[]):
+                    table = NUMERICS.source_sgemm_translations(torch, selected_policy)
+                graph = torch.onnx.export(Attention().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
+                selected = [node for node in graph.graph.node if node.domain == "merlin.source_preserving"]
+                expected = (["TorchOnednnGemmBf16PV177"] if selected_policy == policy and dtype == torch.bfloat16 else []) + (["TorchMklSgemmF32PV177"] if selected_policy != "native" else [])
+                self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [(name, 2, 1, 0) for name in expected])
+                self.assertEqual(sum(node.op_type == "MatMul" for node in graph.graph.node), 3 - len(expected))
+                infos = {value.name: value for value in (*graph.graph.input, *graph.graph.value_info, *graph.graph.output)}
+                for node in selected:
+                    wanted_dtype = onnx.TensorProto.BFLOAT16 if node.op_type == "TorchOnednnGemmBf16PV177" else onnx.TensorProto.FLOAT
+                    self.assertEqual([infos[name].type.tensor_type.elem_type for name in (*node.input, *node.output)], [wanted_dtype] * 3)
+                self.assertTrue(all(torch.equal(value, original) for value, original in zip(inputs, before)))
+        import bf16_export
+        import tinyllama_integer
+        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
+        model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_sgemm_policy": {"name": policy}}}))
+        with mock.patch.object(tinyllama_integer, "export_options", return_value={"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_sgemm_translations", return_value={torch.ops.aten.matmul.default: "selected"}) as select:
+            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, torch.ops.aten.matmul.default: "selected"})
+            select.assert_called_once_with(torch, policy)
+        self.assertNotIn(torch.ops.aten.matmul.default, original)
 
 
 class SmolVLAArithmeticDiagnosticTests(unittest.TestCase):

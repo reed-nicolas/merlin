@@ -808,7 +808,7 @@ def source_softmax_contract(torch, policy="native"):
     """Bind the scoped native CPU softmax; leave QK/PV and masks unchanged."""
     if policy == "native":
         return None
-    if policy not in ("torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1"):
+    if policy not in ("torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1", "torch_cpu_softmax177_227_prefix_v1"):
         raise ValueError("Unknown source softmax export policy")
     bindings = _source_cpu_bindings(torch, SOURCE_SOFTMAX_ARTIFACTS, "Source softmax")
     record = {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
@@ -821,10 +821,13 @@ def source_softmax_contract(torch, policy="native"):
             "source": "https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/aten/src/ATen/native/cpu/SoftMaxKernel.cpp",
             "unchanged": ["QK", "PV", "masks", "BF16_casts", "native_reference", "acceptance_gates"],
             "bindings": bindings}
-    if policy == "torch_cpu_softmax177_227_v1":
+    if policy in ("torch_cpu_softmax177_227_v1", "torch_cpu_softmax177_227_prefix_v1"):
         record.pop("operator")
         record.pop("export_shape")
         record.update({"operators": ["TorchSoftmaxAvx512F32LastDim177", "TorchSoftmaxAvx512F32LastDim227"], "export_shapes": [[1, 15, 50, 177], [1, 15, 50, 227]], "native": "unchanged_FP32_Smol_manual_attention_softmax_width177_or227"})
+    if policy == "torch_cpu_softmax177_227_prefix_v1":
+        record["export_shapes"].append([1, 15, 177, 177])
+        record.update({"native": "unchanged_FP32_Smol_expert_and_prefix_manual_attention_softmax", "prefix_native_strides": [469935, 31329, 177, 1], "prefix_native_storage_offset": 0, "qualification": "bounded_saved_actual_prefix_Q177_K177_and_independent_controls_raw_exact;complete_prefix_attention_and_policy_unqualified", "proof_admission": "source_contiguous_CPU_FP32;finite_logits_and_shifted_subtractions;positive_finite_sum;RNE_gradual_underflow"})
     return record
 
 
@@ -843,6 +846,8 @@ def source_softmax_translations(torch, policy="native"):
         name = f"TorchSoftmaxAvx512F32LastDim{width}"
         schema = defs.OpSchema(name, "merlin.source_preserving", 1, inputs=[defs.OpSchema.FormalParameter("a", "T")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(float)"], "Bound source FP32 softmax")])
         ops[(1, 15, 50, width)] = Op(Opset("merlin.source_preserving", 1), name, schema)
+    if policy == "torch_cpu_softmax177_227_prefix_v1":
+        ops[(1, 15, 177, 177)] = ops[(1, 15, 50, 177)]
 
     def softmax(self: FLOAT, dim: int, dtype: int = -1) -> FLOAT:
         selected = ops.get(tuple(self.shape or ()))
@@ -962,13 +967,13 @@ def source_sgemm_contract(torch, policy="native"):
     """Bind the scoped native attention kernels, leaving scaling intact."""
     if policy == "native":
         return None
-    if policy not in ("torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1"):
+    if policy not in ("torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1", "torch_cpu_attention177_227_prefix_v1"):
         raise ValueError("Unknown source SGEMM export policy")
     import os
     if not torch.backends.mkl.is_available() or torch.get_float32_matmul_precision() != "highest" or any(name in os.environ for name in ("MKL_CBWR", "MKL_ENABLE_INSTRUCTIONS", "MKL_DEBUG_CPU_TYPE", "ATEN_CPU_CAPABILITY")):
         raise ValueError("Source SGEMM requires the proved highest-precision MKL dispatch without ISA/consistency overrides")
     artifacts = SOURCE_SGEMM_ARTIFACTS
-    if policy == "torch_cpu_attention177_227_v1":
+    if policy in ("torch_cpu_attention177_227_v1", "torch_cpu_attention177_227_prefix_v1"):
         overrides = ("ONEDNN_MAX_CPU_ISA", "DNNL_MAX_CPU_ISA", "ONEDNN_DEFAULT_FPMATH_MODE", "DNNL_DEFAULT_FPMATH_MODE")
         if not torch.backends.mkldnn.is_available() or not torch.backends.mkldnn.enabled or torch.cpu._is_avx512_bf16_supported() or torch.cpu._is_amx_tile_supported() or any(name in os.environ for name in overrides):
             raise ValueError("Source attention requires the proved software-BF16 oneDNN dispatch without ISA/fpmath overrides")
@@ -985,9 +990,24 @@ def source_sgemm_contract(torch, policy="native"):
             "qualification": "bounded_actual_and_controls;finite_RNE_gradual_underflow;native_physical_layouts_bound_by_capture;complete_attention_and_policy_unqualified",
             "unchanged": ["parameters", "QK_scale", "masks", "softmax", "BF16_casts", "native_reference", "acceptance_gates", "ordinary_ONNX_MatMul"],
             "bindings": bindings}
-    if policy == "torch_cpu_attention177_227_v1":
+    if policy in ("torch_cpu_attention177_227_v1", "torch_cpu_attention177_227_prefix_v1"):
         record["operators"] += ["TorchMklSgemmF32QK227", "TorchOnednnGemmBf16PV227"]
         record.update({"native": "unchanged_manual_Smol_Q50_K177_or227_attention_contractions", "native_dispatch": "MKL_AVX512_FP32_QK177_QK227_PV177;oneDNN3.7.1_gemm_jit_software_BF16_PV227", "qk227_native_strides": [[48000, 64, 960, 1], [217920, 64, 1, 960]], "pv227_native_strides": [[170250, 11350, 227, 1], [217920, 64, 960, 1]], "pv227_algorithm": "positive_zero_then_pair_high_low_explicit_FP32_FMA;odd_tail_FMA_positive_zero_times_last_probability_then_last_product;one_BF16_RNE_store", "pv227_evidence": "all_four_installed_JIT_variants_and_isolated_copy_packing;original_selected_variant_and_internal_buffers_not_observed;driver_alpha1_beta0_inferred_from_ordinary_matmul_semantics"})
+    if policy == "torch_cpu_attention177_227_prefix_v1":
+        record["operators"].append("TorchOnednnGemmBf16PV177")
+        record.update({
+            "native": "unchanged_manual_Smol_expert_and_prefix_attention_contractions",
+            "native_dispatch": "MKL_AVX512_FP32_QK177_QK227_PV177;oneDNN3.7.1_software_BF16_source_family_PV227_and_prefix_PV177",
+            "prefix_pv_native_strides": [[469935, 31329, 177, 1], [169920, 64, 960, 1]],
+            "prefix_pv_native_storage_offsets": [0, 0],
+            "prefix_pv_shape": [[1, 15, 177, 177], [1, 15, 177, 64]],
+            "prefix_pv_value_origin": "original_cat7_BF16_1x177x5x64_unsqueeze3_expand_heads3_reshape15_permute0213",
+            "prefix_pv_algorithm": "FP32_positive_zero;88pairs_highK_then_lowK_explicit_FMA;odd_tail_FMA_positive_zero_times_last_probability_then_last_product;one_BF16_RNE_store",
+            "prefix_pv_evidence": "all_four_installed_JIT_variants_and_isolated_copy_packing;original_selected_variant_and_internal_buffers_unobserved;driver_alpha1_beta0_inferred_from_ordinary_matmul_semantics",
+            "proof_admission": "finite_BF16_operands_FP32_products_and_every_FMA_intermediate;RNE_gradual_underflow;proof_conditions_not_exported_runtime_guards",
+            "prefix_pv_layout_evidence": "captured_original_source_route_not_symbolic_IR_physical_layout_enforcement",
+            "qualification": "bounded_actual_prefix_BF16_PV177_and_controls_raw_exact;finite_RNE_gradual_underflow;captured_original_physical_layouts;complete_prefix_attention_and_policy_unqualified",
+        })
     return record
 
 
@@ -1004,7 +1024,7 @@ def source_sgemm_translations(torch, policy="native"):
     source = Opset("merlin.source_preserving", 1)
     ops = {}
     for name in record["operators"]:
-        dtype = "tensor(bfloat16)" if name == "TorchOnednnGemmBf16PV227" else "tensor(float)"
+        dtype = "tensor(bfloat16)" if name in ("TorchOnednnGemmBf16PV177", "TorchOnednnGemmBf16PV227") else "tensor(float)"
         schema = defs.OpSchema(name, source.domain, 1, inputs=[defs.OpSchema.FormalParameter(value, "T") for value in ("left", "right")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", [dtype], "Original contraction operands")])
         ops[name] = Op(source, name, schema)
     geometries = {
@@ -1012,6 +1032,7 @@ def source_sgemm_translations(torch, policy="native"):
         (ir.DataType.FLOAT, (1, 15, 50, 177), (1, 15, 177, 64)): "TorchMklSgemmF32PV177",
         (ir.DataType.FLOAT, (1, 15, 50, 64), (1, 15, 64, 227)): "TorchMklSgemmF32QK227",
         (ir.DataType.BFLOAT16, (1, 15, 50, 227), (1, 15, 227, 64)): "TorchOnednnGemmBf16PV227",
+        (ir.DataType.BFLOAT16, (1, 15, 177, 177), (1, 15, 177, 64)): "TorchOnednnGemmBf16PV177",
     }
 
     def matmul(self: TFloat, other: TFloat) -> TFloat:
