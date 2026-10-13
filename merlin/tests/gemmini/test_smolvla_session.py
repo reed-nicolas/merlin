@@ -69,8 +69,11 @@ class SmolVLAArtifactTests(unittest.TestCase):
 
     def test_source_mean_requires_explicit_integer_session_and_one_native_thread(self):
         base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
-        for change in ({"source_mean_policy": "unknown"}, {"source_mean_policy": "torch_cpu_mean720_v1"}, {"source_mean_policy": "torch_cpu_mean720_v1", "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
-            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source mean"):
+        changes = [{"source_mean_policy": "unknown"}]
+        for policy in ("torch_cpu_mean720_v1", "torch_cpu_mean720_960_v1"):
+            changes.extend(({"source_mean_policy": policy}, {"source_mean_policy": policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}))
+        for change in changes:
+            with self.subTest(change=change), mock.patch.object(FACTORY, "checkpoint_artifacts", side_effect=AssertionError("Admission must precede checkpoint access")), self.assertRaisesRegex(ValueError, "Source mean"):
                 FACTORY.get_model_and_inputs(**base, **change)
 
     def test_source_softmax_requires_explicit_integer_session_and_one_native_thread(self):
@@ -867,10 +870,14 @@ class SmolVLASourceMeanTests(unittest.TestCase):
             model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {}}))
             self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], original)
             select.assert_not_called()
-            model.session.metadata["provenance"]["source_mean_policy"] = {"name": "torch_cpu_mean720_v1"}
-            table = FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"]
-            self.assertEqual(table, {**original, torch.ops.aten.mean.dim: "selected"})
-            select.assert_called_once_with(torch, "torch_cpu_mean720_v1")
+            for policy in ("torch_cpu_mean720_v1", "torch_cpu_mean720_960_v1"):
+                with self.subTest(policy=policy):
+                    select.reset_mock()
+                    model.session.metadata["provenance"]["source_mean_policy"] = {"name": policy}
+                    table = FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"]
+                    self.assertEqual(table, {**original, torch.ops.aten.mean.dim: "selected"})
+                    select.assert_called_once_with(torch, policy)
+                    self.assertNotIn(torch.ops.aten.mean.dim, original)
 
     def test_native_policy_needs_no_source_bindings_and_unknown_policy_is_rejected(self):
         self.assertIsNone(NUMERICS.source_mean_contract(None))
@@ -880,11 +887,12 @@ class SmolVLASourceMeanTests(unittest.TestCase):
 
     def test_source_mean_refuses_unproved_runtime_and_modified_binary(self):
         runtime = SimpleNamespace(version=SimpleNamespace(git_version="449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"), backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX512")), get_num_threads=lambda: 1, __file__="/tmp/pinned-torch/__init__.py")
-        with mock.patch("verify_resnet.file_identity", return_value={"sha256": "changed"}), self.assertRaisesRegex(ValueError, "independently proved"):
-            NUMERICS.source_mean_contract(runtime, "torch_cpu_mean720_v1")
-        for field, value in (("get_num_threads", lambda: 2), ("version", SimpleNamespace(git_version="different")), ("backends", SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX2")))):
-            with self.subTest(field=field), mock.patch.object(runtime, field, value), self.assertRaisesRegex(ValueError, "pinned PyTorch"):
-                NUMERICS.source_mean_contract(runtime, "torch_cpu_mean720_v1")
+        for policy in ("torch_cpu_mean720_v1", "torch_cpu_mean720_960_v1"):
+            with self.subTest(policy=policy), mock.patch("verify_resnet.file_identity", return_value={"sha256": "changed"}), self.assertRaisesRegex(ValueError, "independently proved"):
+                NUMERICS.source_mean_contract(runtime, policy)
+            for field, value in (("get_num_threads", lambda: 2), ("version", SimpleNamespace(git_version="different")), ("backends", SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX2")))):
+                with self.subTest(policy=policy, field=field), mock.patch.object(runtime, field, value), self.assertRaisesRegex(ValueError, "pinned PyTorch"):
+                    NUMERICS.source_mean_contract(runtime, policy)
 
     def test_export_selects_only_bound_fp32_last_axis_keepdim_geometry(self):
         import torch
@@ -901,6 +909,41 @@ class SmolVLASourceMeanTests(unittest.TestCase):
             self.assertEqual([(node.op_type, len(node.input), len(node.output), len(node.attribute)) for node in selected], [("TorchMean720Fp32", 1, 1, 0)] if dtype == torch.float32 else [])
             self.assertEqual(sum(node.op_type == "ReduceMean" for node in graph.graph.node), 3 if dtype == torch.float32 else 4)
             self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
+
+    def test_real_export_extends_only_declared_mean960_geometry_and_preserves_720(self):
+        import onnx
+        import torch
+        class Means(torch.nn.Module):
+            def forward(self, short, wide, other):
+                return (short.mean(-1, keepdim=True), wide.mean(-1, keepdim=True), wide.mean(2, keepdim=True),
+                        wide.mean(-1), wide.mean(1, keepdim=True), other.mean(-1, keepdim=True),
+                        wide.mean(-1, keepdim=True, dtype=torch.float64))
+
+        for dtype in (torch.float32, torch.bfloat16):
+            inputs = tuple(torch.linspace(-1, 1, rows * width).reshape(1, rows, width).to(dtype) for rows, width in ((50, 720), (177, 960), (176, 960)))
+            before = tuple(value.clone() for value in inputs)
+            for policy in ("native", "torch_cpu_mean720_v1", "torch_cpu_mean720_960_v1"):
+                with self.subTest(dtype=dtype, policy=policy):
+                    if policy == "native":
+                        table = NUMERICS.source_mean_translations(torch, policy)
+                    else:
+                        with mock.patch.object(NUMERICS, "source_mean_contract", return_value={"name": policy}):
+                            table = NUMERICS.source_mean_translations(torch, policy)
+                    graph = torch.onnx.export(Means().eval(), inputs, dynamo=True, opset_version=18, optimize=False, custom_translation_table=table).model_proto
+                    selected = [node for node in graph.graph.node if node.domain == "merlin.source_preserving"]
+                    expected = [] if dtype != torch.float32 or policy == "native" else ["TorchMean720Fp32"]
+                    if dtype == torch.float32 and policy == "torch_cpu_mean720_960_v1":
+                        expected += ["TorchMean960Fp32"] * 2
+                    self.assertEqual([node.op_type for node in selected], expected)
+                    self.assertEqual([(len(node.input), len(node.output), len(node.attribute)) for node in selected], [(1, 1, 0)] * len(expected))
+                    self.assertEqual(sum(node.op_type == "ReduceMean" for node in graph.graph.node), 7 - len(expected))
+                    infos = {value.name: value for value in (*graph.graph.input, *graph.graph.value_info, *graph.graph.output)}
+                    for node in selected:
+                        for name in (*node.input, *node.output):
+                            self.assertEqual(infos[name].type.tensor_type.elem_type, onnx.TensorProto.FLOAT)
+                        shape = [dimension.dim_value for dimension in infos[node.output[0]].type.tensor_type.shape.dim]
+                        self.assertEqual(shape, [1, 50 if node.op_type == "TorchMean720Fp32" else 177, 1])
+                    self.assertTrue(all(torch.equal(original, value) for original, value in zip(before, inputs)))
 
 
 class SmolVLASourceSoftmaxTests(unittest.TestCase):

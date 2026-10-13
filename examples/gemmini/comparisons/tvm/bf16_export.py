@@ -751,13 +751,13 @@ def prepare_source_scalar_export(torch, source, policy="native"):
     return prepared, record
 
 def source_mean_contract(torch, policy="native"):
-    """Bind the native CPU mean used by the scoped Smol expert export."""
+    """Bind the native CPU mean used by the scoped Smol prefix/expert export."""
     if policy == "native":
         return None
-    if policy != "torch_cpu_mean720_v1":
+    if policy not in ("torch_cpu_mean720_v1", "torch_cpu_mean720_960_v1"):
         raise ValueError("Unknown source mean export policy")
     bindings = _source_cpu_bindings(torch, SOURCE_MEAN_ARTIFACTS, "Source mean")
-    return {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
+    record = {"name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
             "domain": "merlin.source_preserving", "version": 1, "operator": "TorchMean720Fp32",
             "native": "unchanged_Tensor_mean_float32_last_axis_keepdim_Smol_expert_1x50x720_contiguous",
             "native_dispatch": "pinned_AVX2_eight_lane_sum;AVX512_sum_registration_null", "native_threads": 1,
@@ -766,6 +766,14 @@ def source_mean_contract(torch, policy="native"):
             "source": "https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/aten/src/ATen/native/cpu/SumKernel.cpp",
             "unchanged": ["square", "epsilon", "rsqrt", "affine", "BF16_casts", "native_reference", "acceptance_gates"],
             "bindings": bindings}
+    if policy == "torch_cpu_mean720_960_v1":
+        record.pop("operator")
+        record.pop("export_shape")
+        record.update({"operators": ["TorchMean720Fp32", "TorchMean960Fp32"], "export_shapes": [[1, 50, 720], [1, 177, 960]],
+                       "native": "unchanged_Tensor_mean_FP32_last_axis_keepdim_contiguous_Smol_expert720_or_prefix960",
+                       "algorithm": "source_AVX2_four_stream_eight_lane_cascade;720_16plus6_groups_and_two_remainder_vectors;960_16plus14_groups_no_remainder;direct_FP32_division",
+                       "qualification": "bounded_actual_and_independent_controls;full_prefix_and_policy_unqualified"})
+    return record
 
 
 def source_mean_translations(torch, policy="native"):
@@ -778,13 +786,19 @@ def source_mean_translations(torch, policy="native"):
     from onnxscript.onnx_types import FLOAT
     from onnxscript.values import Opset, Op
     source = Opset("merlin.source_preserving", 1)
-    schema = defs.OpSchema("TorchMean720Fp32", "merlin.source_preserving", 1, inputs=[defs.OpSchema.FormalParameter("a", "T")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(float)"], "Bound source FP32 mean")])
-    mean_op = Op(source, "TorchMean720Fp32", schema)
+    geometries = {(1, 50, 720): 720}
+    if policy == "torch_cpu_mean720_960_v1":
+        geometries[(1, 177, 960)] = 960
+    operators = {}
+    for width in geometries.values():
+        name = f"TorchMean{width}Fp32"
+        schema = defs.OpSchema(name, "merlin.source_preserving", 1, inputs=[defs.OpSchema.FormalParameter("a", "T")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(float)"], "Bound source FP32 mean")])
+        operators[width] = Op(source, name, schema)
 
     def mean_dim(self: FLOAT, dim: Optional[Sequence[int]] = None, keepdim: bool = False, dtype: int = -1) -> FLOAT:
         shape = tuple(self.shape) if self.shape is not None else ()
-        if shape == (1, 50, 720) and isinstance(dim, (tuple, list)) and tuple(dim) in ((-1,), (2,)) and keepdim and dtype in (None, -1, ir.DataType.FLOAT):
-            return mean_op(self)
+        if shape in geometries and self.dtype == ir.DataType.FLOAT and isinstance(dim, (tuple, list)) and tuple(dim) in ((-1,), (2,)) and keepdim and dtype in (None, -1, ir.DataType.FLOAT):
+            return operators[geometries[shape]](self)
         return core.aten_mean_dim(self, dim, keepdim, dtype)
 
     return {torch.ops.aten.mean.dim: mean_dim}
