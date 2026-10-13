@@ -146,7 +146,7 @@ def source_silu_contract(torch, policy="native"):
         "proof_admission": "actual_and_controls_have_finite_source_exp_denominator_output;general_runtime_value_admission_not_enforced_by_export_shape_guard",
         "dispatch_evidence": "actual_readonly_DispatchStubImpl_chooser_selected_AVX512_ELF8290270;not_internal_callback_trace",
         "workspace": "original_shape_FP32_output;flatten_and_restore_views;no_private_heap_scratch",
-        "lowering": "existing_TorchSiluAvx512F32_flat_helper_explicit_llvm_fma;no_Torch_SLEEF_or_libm_runtime_callout",
+        "lowering": "existing_TorchSiluAvx512F32_flat_helper_explicit_llvm_fma;no_Torch_MKL_SLEEF_exp_or_SiLU_callout;backend_may_call_libm_fmaf_floorf;process_primitive_resolution_not_recorded",
         "qualification": "bounded_actual_and_controls_only;full_prefix_policy_and_target_unqualified;no_universal_correctly_rounded_exp_claim",
         "bindings": bindings,
     }
