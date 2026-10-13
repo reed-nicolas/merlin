@@ -370,16 +370,14 @@ class ResNetArtifactTests(unittest.TestCase):
         path = self.root / "labels.json"
         path.write_text(json.dumps(self.labels_manifest()))
         identity = {"path": str(path), "sha256": "before"}
-        with mock.patch.object(self.verifier, "file_identity", side_effect=[identity, {**identity, "sha256": "after"}]):
-            with self.assertRaisesRegex(ValueError, "changed while loading"):
-                self.verifier.load_labels(path, {"sha256": "a" * 64}, 2)
+        with mock.patch.object(self.verifier, "file_identity", side_effect=[identity, {**identity, "sha256": "after"}]), self.assertRaisesRegex(ValueError, "changed while loading"):
+            self.verifier.load_labels(path, {"sha256": "a" * 64}, 2)
 
     def test_labels_require_supplied_mode_before_output_creation(self):
         output = self.root / "output"
         argv = ["verify_resnet.py", "--model2mlir-root", str(self.root), "--tvm-source", str(self.root), "--output-dir", str(output), "--labels", str(self.root / "labels.json")]
-        with mock.patch.object(sys, "argv", argv), mock.patch("sys.stderr"):
-            with self.assertRaises(SystemExit) as error:
-                self.verifier.main()
+        with mock.patch.object(sys, "argv", argv), mock.patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+            self.verifier.main()
         self.assertEqual(error.exception.code, 2)
         self.assertFalse(output.exists())
 
@@ -487,20 +485,17 @@ class ResNetPreparationTests(unittest.TestCase):
         for name in bad_names:
             with self.subTest(name=name):
                 archive = self.archive([(name, payload)])
-                with mock.patch.object(tarfile.TarFile, "extractfile", side_effect=AssertionError("payload opened")):
-                    with self.assertRaisesRegex(ValueError, "unsafe"):
-                        self.preparer.prepare_inputs(archive, self.root / "unused")
+                with mock.patch.object(tarfile.TarFile, "extractfile", side_effect=AssertionError("payload opened")), self.assertRaisesRegex(ValueError, "unsafe"):
+                    self.preparer.prepare_inputs(archive, self.root / "unused")
         for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE):
             info = tarfile.TarInfo("imagenette2-320/train/n01440764/link.JPEG")
             info.type, info.linkname = kind, "target.JPEG"
-            with self.subTest(kind=kind):
-                with self.assertRaisesRegex(ValueError, "links and special"):
-                    self.preparer.prepare_inputs(self.archive([], info), self.root / "unused")
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "links and special"):
+                self.preparer.prepare_inputs(self.archive([], info), self.root / "unused")
         with self.assertRaisesRegex(ValueError, "duplicate archive"):
             self.preparer.prepare_inputs(self.archive(self.entries[:1] * 2), self.root / "unused")
-        with mock.patch.object(self.preparer, "MAX_IMAGE_BYTES", 1):
-            with self.assertRaisesRegex(ValueError, "image member bytes"):
-                self.preparer.prepare_inputs(self.archive(self.entries[:1]), self.root / "unused")
+        with mock.patch.object(self.preparer, "MAX_IMAGE_BYTES", 1), self.assertRaisesRegex(ValueError, "image member bytes"):
+            self.preparer.prepare_inputs(self.archive(self.entries[:1]), self.root / "unused")
         self.assertFalse((self.root / "unused").exists())
 
     def test_missing_samples_and_content_overlap_rejected(self):
@@ -523,9 +518,8 @@ class ResNetPreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "category mapping mismatch"):
             self.preparer.transform_contract(SimpleNamespace(transforms=weights.transforms, meta={"categories": categories}))
         for count in (0, -1, True, 1.5, 1000):
-            with self.subTest(count=count):
-                with self.assertRaisesRegex(ValueError, "count"):
-                    self.preparer.prepare_inputs(self.root / "missing", self.root / "unused", calibration_per_class=count)
+            with self.subTest(count=count), self.assertRaisesRegex(ValueError, "count"):
+                self.preparer.prepare_inputs(self.root / "missing", self.root / "unused", calibration_per_class=count)
 
     def test_decoded_content_overlap_and_archive_changes_rejected(self):
         entries = list(self.entries)
@@ -550,9 +544,8 @@ class ResNetPreparationTests(unittest.TestCase):
                         identity["sha256"] = "0" * 64
                 return identity
 
-            with self.subTest(target=target), mock.patch.object(self.preparer, "file_identity", side_effect=changed_identity):
-                with self.assertRaisesRegex(ValueError, message):
-                    self.preparer.prepare_inputs(archive, self.root / "unused")
+            with self.subTest(target=target), mock.patch.object(self.preparer, "file_identity", side_effect=changed_identity), self.assertRaisesRegex(ValueError, message):
+                self.preparer.prepare_inputs(archive, self.root / "unused")
         self.assertFalse((self.root / "unused").exists())
 
 

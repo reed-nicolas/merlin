@@ -323,24 +323,25 @@ class FullResNetDiagnostic(unittest.TestCase):
         with self.assertRaises(ValueError):
             recipe.reference(self.plan, self.calibration)
 
-    def test_full_semantic_cpu_graph_matches_independent_reference(self):
+    def assert_llvm_reference(self, plan, modes=("baseline", "optimized")):
         import tvm
         from verify_resnet import prepare_graph
-        mod = recipe.export_relax(self.plan, return_integer_logits=True)
-        image = recipe.quantize(self.evaluation, self.plan.input_exponent)
-        integer_expected, expected = recipe.reference(self.plan, self.evaluation, return_integer_logits=True)
-        for mode in ("baseline", "optimized"):
+        mod = recipe.export_relax(plan, return_integer_logits=True)
+        image = recipe.quantize(self.evaluation, plan.input_exponent)
+        expected = recipe.reference(plan, self.evaluation, return_integer_logits=True)
+        for mode in modes:
             with self.subTest(mode=mode):
                 _, lowered = prepare_graph(mod, mode, tvm)
-                executable = tvm.relax.build(lowered, target="llvm", pipeline=None)
-                vm = tvm.relax.VirtualMachine(executable, tvm.cpu())
-                outputs = vm["main"](tvm.nd.array(image))
-                integer_actual, actual = outputs[0].numpy(), outputs[1].numpy()
-                self.assertEqual(integer_actual.dtype, np.int32)
-                np.testing.assert_array_equal(integer_actual, integer_expected)
-                np.testing.assert_array_equal(actual, expected)
-                self.assertEqual(actual.dtype, np.float32)
-                self.assertEqual(actual.shape, (1, 1000))
+                vm = tvm.relax.VirtualMachine(tvm.relax.build(lowered, target="llvm", pipeline=None), tvm.cpu())
+                actual = vm["main"](tvm.nd.array(image))
+                self.assertEqual(len(actual), len(expected))
+                for value, oracle, dtype in zip(actual, expected, (np.int32, np.float32)):
+                    self.assertEqual(value.numpy().dtype, dtype)
+                    self.assertEqual(value.numpy().shape, (1, 1000))
+                    np.testing.assert_array_equal(value.numpy(), oracle)
+
+    def test_full_semantic_cpu_graph_matches_independent_reference(self):
+        self.assert_llvm_reference(self.plan)
 
     def test_all_contractions_reach_device_graph(self):
         for optimize in (False, True):
@@ -349,8 +350,6 @@ class FullResNetDiagnostic(unittest.TestCase):
                 self.assertEqual(coverage["device_invocations"], 54)
 
     def test_train_mse_plan_signed_observations_and_exact_cpu_graph(self):
-        import tvm
-        from verify_resnet import prepare_graph
         source = recipe.state_digest(self.model)
         plan = recipe.calibrate_resnet50(self.model, [self.calibration], calibration_ids=["synthetic-mse-training"],
                                         input_shape=self.calibration.shape, activation_estimator="mse")
@@ -366,13 +365,7 @@ class FullResNetDiagnostic(unittest.TestCase):
         for row in plan.provenance["activation_scale_checks"]:
             index = row["candidate_exponents"].index(row["selected_exponent"])
             self.assertEqual(row["mean_squared_errors"][index], min(row["mean_squared_errors"]))
-        mod = recipe.export_relax(plan, return_integer_logits=True)
-        _, lowered = prepare_graph(mod, "optimized", tvm)
-        vm = tvm.relax.VirtualMachine(tvm.relax.build(lowered, target="llvm", pipeline=None), tvm.cpu())
-        actual = vm["main"](tvm.nd.array(recipe.quantize(self.evaluation, plan.input_exponent)))
-        expected = recipe.reference(plan, self.evaluation, return_integer_logits=True)
-        for value, oracle in zip(actual, expected):
-            np.testing.assert_array_equal(value.numpy(), oracle)
+        self.assert_llvm_reference(plan, ("optimized",))
 
     def test_classifier_logits_do_not_require_an_activation_exponent(self):
         import copy
@@ -389,8 +382,6 @@ class FullResNetDiagnostic(unittest.TestCase):
 
     def test_accumulator_residual_full_reference_and_both_llvm_modes(self):
         import copy
-        import tvm
-        from verify_resnet import prepare_graph
         source = recipe.state_digest(self.model)
         plan = recipe.calibrate_resnet50(self.model, [self.calibration], calibration_ids=["synthetic-accumulator-training"],
                                         input_shape=self.calibration.shape, activation_estimator="mse", residual_policy="accumulator")
@@ -398,17 +389,10 @@ class FullResNetDiagnostic(unittest.TestCase):
         self.assertEqual(sum(site.retain_accumulator for site in plan.sites), 20)
         manifest = plan.manifest()
         self.assertEqual(len(manifest['residual_integer_proofs']), 16)
-        mod = recipe.export_relax(plan, return_integer_logits=True)
-        expected = recipe.reference(plan, self.evaluation, return_integer_logits=True)
-        for mode in ("baseline", "optimized"):
-            with self.subTest(mode=mode):
-                _, lowered = prepare_graph(mod, mode, tvm)
-                vm = tvm.relax.VirtualMachine(tvm.relax.build(lowered, target="llvm", pipeline=None), tvm.cpu())
-                actual = vm["main"](tvm.nd.array(recipe.quantize(self.evaluation, plan.input_exponent)))
-                for value, oracle in zip(actual, expected):
-                    np.testing.assert_array_equal(value.numpy(), oracle)
-                _, _, coverage = recipe.prepare_device_graph(plan, optimize=mode == "optimized")
-                self.assertEqual(coverage['device_invocations'], 54)
+        self.assert_llvm_reference(plan)
+        for optimize in (False, True):
+            _, _, coverage = recipe.prepare_device_graph(plan, optimize=optimize)
+            self.assertEqual(coverage["device_invocations"], 54)
         invalid = copy.deepcopy(plan)
         next(site for site in invalid.sites if site.kind == 'conv2d').retain_accumulator = True
         with self.assertRaisesRegex(ValueError, "unique Identity chain"):

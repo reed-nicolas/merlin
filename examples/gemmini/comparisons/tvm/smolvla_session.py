@@ -39,6 +39,45 @@ GEOMETRY = {
 }
 
 
+# Keep policy admission, source closure and export selection in the same order.
+SOURCE_POLICIES = {
+    "mean": ("mean", ("native", "torch_cpu_mean720_v1", "torch_cpu_mean720_960_v1")),
+    "softmax": ("softmax", ("native", "torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1", "torch_cpu_softmax177_227_prefix_v1")),
+    "layernorm": ("LayerNorm", ("native", "torch_cpu_layernorm768_v1")),
+    "conv": ("convolution", ("native", "torch_cpu_conv3x16_v1")),
+    "sgemm": ("SGEMM", ("native", "torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1", "torch_cpu_attention177_227_prefix_v1")),
+    "scalar": ("scalar", ("native", "torch_cpu_language_scale960_v1")),
+    "rotary": ("rotary", ("native", "torch_cpu_denoise_rotary64_table_v1")),
+    "flash": ("Flash", ("native", "torch_cpu_flash_bf16_vision1024_v1")),
+    "silu": ("SiLU", ("native", "torch_cpu_silu_fp32_v1")),
+}
+
+
+def validate_source_policy(name, policy, quantized, cpu_threads):
+    label, choices = SOURCE_POLICIES[name]
+    if policy not in choices or policy != "native" and (not quantized or cpu_threads != 1):
+        raise ValueError(f"Source {label} preservation requires the original-precision integer recipe and one native thread")
+
+
+def source_policy_records(torch, policies):
+    """Bind every selected source contract before constructing the policy model."""
+    records = {}
+    for name, policy in policies.items():
+        if policy != "native":
+            import bf16_export
+            records[f"source_{name}_policy"] = getattr(bf16_export, f"source_{name}_contract")(torch, policy)
+    return records
+
+
+def source_policy_artifacts(records):
+    """Include every active contract's bindings and its shared implementation."""
+    if not records:
+        return []
+    import bf16_export
+    return [identity for record in records.values() for identity in record["bindings"]] + [
+        file_identity(bf16_export.__file__, safe_path)]
+
+
 def directory_artifacts(directory):
     """Hash a supplied model directory, pruning prohibited names before traversal."""
     root = safe_path(directory)
@@ -484,26 +523,19 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
         raise ValueError("Invalid explicit CPU thread/fixture seed budget")
     if type(quantized) is not bool or quantized != (integer_diagnostic_dir is not None):
         raise ValueError("Declared integer policy requires quantized=True and a new integer_diagnostic_dir")
-    if source_mean_policy not in ("native", "torch_cpu_mean720_v1", "torch_cpu_mean720_960_v1") or source_mean_policy != "native" and (not quantized or cpu_threads != 1):
-        raise ValueError("Source mean preservation requires the original-precision integer recipe and one native thread")
-    if source_softmax_policy not in ("native", "torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1", "torch_cpu_softmax177_227_prefix_v1") or source_softmax_policy != "native" and (not quantized or cpu_threads != 1):
-        raise ValueError("Source softmax preservation requires the original-precision integer recipe and one native thread")
-    if source_layernorm_policy not in ("native", "torch_cpu_layernorm768_v1") or source_layernorm_policy != "native" and (not quantized or cpu_threads != 1):
-        raise ValueError("Source LayerNorm preservation requires the original-precision integer recipe and one native thread")
-    if source_conv_policy not in ("native", "torch_cpu_conv3x16_v1") or source_conv_policy != "native" and (not quantized or cpu_threads != 1):
-        raise ValueError("Source convolution preservation requires the original-precision integer recipe and one native thread")
-    if source_sgemm_policy not in ("native", "torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1", "torch_cpu_attention177_227_prefix_v1") or source_sgemm_policy != "native" and (not quantized or cpu_threads != 1):
-        raise ValueError("Source SGEMM preservation requires the original-precision integer recipe and one native thread")
-    if source_scalar_policy not in ("native", "torch_cpu_language_scale960_v1") or source_scalar_policy != "native" and (not quantized or cpu_threads != 1):
-        raise ValueError("Source scalar preservation requires the original-precision integer recipe and one native thread")
-    if source_rotary_policy not in ("native", "torch_cpu_denoise_rotary64_table_v1") or source_rotary_policy != "native" and (not quantized or cpu_threads != 1):
-        raise ValueError("Source rotary preservation requires the original-precision integer recipe and one native thread")
-    if source_flash_policy not in ("native", "torch_cpu_flash_bf16_vision1024_v1") or source_flash_policy != "native" and (not quantized or cpu_threads != 1):
-        raise ValueError("Source Flash preservation requires the original-precision integer recipe and one native thread")
+    source_policies = {
+        "mean": source_mean_policy, "softmax": source_softmax_policy,
+        "layernorm": source_layernorm_policy, "conv": source_conv_policy,
+        "sgemm": source_sgemm_policy, "scalar": source_scalar_policy,
+        "rotary": source_rotary_policy, "flash": source_flash_policy,
+        "silu": source_silu_policy,
+    }
+    for name, policy in source_policies.items():
+        if name != "silu":
+            validate_source_policy(name, policy, quantized, cpu_threads)
     if fixture_kind not in ("synthetic", "dataset") or (fixture_kind == "dataset" and (not input_npz or not input_source)):
         raise ValueError("Dataset fixtures require both a local NPZ and attributed input_source")
-    if source_silu_policy not in ("native", "torch_cpu_silu_fp32_v1") or source_silu_policy != "native" and (not quantized or cpu_threads != 1):
-        raise ValueError("Source SiLU preservation requires the original-precision integer recipe and one native thread")
+    validate_source_policy("silu", source_silu_policy, quantized, cpu_threads)
     if input_manifest is not None and fixture_kind != "dataset":
         raise ValueError("A recorded observation manifest must be labeled as a dataset fixture")
     fixture_manifest = observation_manifest(input_npz, input_manifest)
@@ -532,42 +564,7 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
     from lerobot.policies.smolvla import smolvlm_with_expert
 
     torch.set_num_threads(cpu_threads)
-    mean_record = None
-    if source_mean_policy != "native":
-        import bf16_export
-        mean_record = bf16_export.source_mean_contract(torch, source_mean_policy)
-    softmax_record = None
-    if source_softmax_policy != "native":
-        import bf16_export
-        softmax_record = bf16_export.source_softmax_contract(torch, source_softmax_policy)
-    layernorm_record = None
-    if source_layernorm_policy != "native":
-        import bf16_export
-        layernorm_record = bf16_export.source_layernorm_contract(torch, source_layernorm_policy)
-    conv_record = None
-    if source_conv_policy != "native":
-        import bf16_export
-        conv_record = bf16_export.source_conv_contract(torch, source_conv_policy)
-    sgemm_record = None
-    if source_sgemm_policy != "native":
-        import bf16_export
-        sgemm_record = bf16_export.source_sgemm_contract(torch, source_sgemm_policy)
-    scalar_record = None
-    if source_scalar_policy != "native":
-        import bf16_export
-        scalar_record = bf16_export.source_scalar_contract(torch, source_scalar_policy)
-    rotary_record = None
-    if source_rotary_policy != "native":
-        import bf16_export
-        rotary_record = bf16_export.source_rotary_contract(torch, source_rotary_policy)
-    flash_record = None
-    if source_flash_policy != "native":
-        import bf16_export
-        flash_record = bf16_export.source_flash_contract(torch, source_flash_policy)
-    silu_record = None
-    if source_silu_policy != "native":
-        import bf16_export
-        silu_record = bf16_export.source_silu_contract(torch, source_silu_policy)
+    policy_records = source_policy_records(torch, source_policies)
     config = PreTrainedConfig.from_pretrained(str(safe_path(checkpoint_dir)), local_files_only=True)
     if not isinstance(config, SmolVLAConfig):
         raise TypeError("Pinned checkpoint did not resolve to SmolVLAConfig")
@@ -603,22 +600,7 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
         sys.modules[SmolVLAConfig.__module__].__file__, smolvlm_with_expert.__file__,
         sys.modules[PreTrainedConfig.__module__].__file__)]
     files = checkpoint_files + backbone_files + sources
-    if mean_record is not None:
-        files.extend([*mean_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
-    if softmax_record is not None:
-        files.extend([*softmax_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
-    if layernorm_record is not None:
-        files.extend([*layernorm_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
-    if conv_record is not None:
-        files.extend([*conv_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
-    if sgemm_record is not None:
-        files.extend([*sgemm_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
-    if scalar_record is not None:
-        files.extend([*scalar_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
-    if flash_record is not None:
-        files.extend([*flash_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
-    if silu_record is not None:
-        files.extend([*silu_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
+    files.extend(source_policy_artifacts(policy_records))
     files.extend(processor_diagnostic["bindings"])
     if quantized:
         files.extend([integer_receipt, helper_identity, file_identity(diagnostic.__file__, safe_path)])
@@ -645,24 +627,7 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
                   "model_state_bytes_by_dtype": dtype_bytes, "model_quality_qualified": False,
                   "source_closure_verified": False}
     provenance["original_processor_diagnostic"] = processor_diagnostic
-    if mean_record is not None:
-        provenance["source_mean_policy"] = mean_record
-    if softmax_record is not None:
-        provenance["source_softmax_policy"] = softmax_record
-    if layernorm_record is not None:
-        provenance["source_layernorm_policy"] = layernorm_record
-    if conv_record is not None:
-        provenance["source_conv_policy"] = conv_record
-    if sgemm_record is not None:
-        provenance["source_sgemm_policy"] = sgemm_record
-    if scalar_record is not None:
-        provenance["source_scalar_policy"] = scalar_record
-    if rotary_record is not None:
-        provenance["source_rotary_policy"] = rotary_record
-    if flash_record is not None:
-        provenance["source_flash_policy"] = flash_record
-    if silu_record is not None:
-        provenance["source_silu_policy"] = silu_record
+    provenance.update(policy_records)
     if quantized:
         provenance.update(precision="declared_w8a8_with_original_lerobot_float_interfaces",
                           source_precision="original_lerobot", quantized_recipe_quality_qualified=False,
@@ -688,36 +653,16 @@ def get_onnx_export_options(torch, model=None):
         raise ValueError("Shared integer projection helper differs from the selected comparison source")
     options = shared.export_options(torch)
     if model is not None:
-        policy = model.session.metadata.get("provenance", {}).get("source_mean_policy", {}).get("name", "native")
-        if policy != "native":
-            import bf16_export
-            options["custom_translation_table"].update(bf16_export.source_mean_translations(torch, policy))
-        softmax_policy = model.session.metadata.get("provenance", {}).get("source_softmax_policy", {}).get("name", "native")
-        if softmax_policy != "native":
-            import bf16_export
-            options["custom_translation_table"].update(bf16_export.source_softmax_translations(torch, softmax_policy))
-        layernorm_policy = model.session.metadata.get("provenance", {}).get("source_layernorm_policy", {}).get("name", "native")
-        if layernorm_policy != "native":
-            import bf16_export
-            options["custom_translation_table"].update(bf16_export.source_layernorm_translations(torch, layernorm_policy))
-        conv_policy = model.session.metadata.get("provenance", {}).get("source_conv_policy", {}).get("name", "native")
-        if conv_policy != "native":
-            import bf16_export
-            options["custom_translation_table"].update(bf16_export.source_conv_translations(torch, conv_policy))
-        sgemm_policy = model.session.metadata.get("provenance", {}).get("source_sgemm_policy", {}).get("name", "native")
-        if sgemm_policy != "native":
-            import bf16_export
-            options["custom_translation_table"].update(bf16_export.source_sgemm_translations(torch, sgemm_policy))
-        scalar_policy = model.session.metadata.get("provenance", {}).get("source_scalar_policy", {}).get("name", "native")
-        if scalar_policy != "native":
-            options["source_scalar_policy"] = scalar_policy
-        rotary_policy = model.session.metadata.get("provenance", {}).get("source_rotary_policy", {}).get("name", "native")
-        if rotary_policy != "native":
-            options["source_rotary_policy"] = rotary_policy
-        flash_policy = model.session.metadata.get("provenance", {}).get("source_flash_policy", {}).get("name", "native")
-        if flash_policy != "native":
-            options["source_flash_policy"] = flash_policy
-        silu_policy = model.session.metadata.get("provenance", {}).get("source_silu_policy", {}).get("name", "native")
-        if silu_policy != "native":
-            options["source_silu_policy"] = silu_policy
+        provenance = model.session.metadata.get("provenance", {})
+        for name in SOURCE_POLICIES:
+            key = f"source_{name}_policy"
+            policy = provenance.get(key, {}).get("name", "native")
+            if policy == "native":
+                continue
+            if name in ("scalar", "rotary", "flash", "silu"):
+                options[key] = policy
+            else:
+                import bf16_export
+                options["custom_translation_table"].update(
+                    getattr(bf16_export, f"source_{name}_translations")(torch, policy))
     return options

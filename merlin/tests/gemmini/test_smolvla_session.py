@@ -38,9 +38,8 @@ class SmolVLAArtifactTests(unittest.TestCase):
                 "output_features": {"action": {"type": "ACTION", "shape": [6]}}}
 
     def test_absent_checkpoint_fails_before_framework_loading(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaises(FileNotFoundError):
-                FACTORY.checkpoint_artifacts(directory)
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(FileNotFoundError):
+            FACTORY.checkpoint_artifacts(directory)
 
     def test_nonofficial_weights_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -57,53 +56,13 @@ class SmolVLAArtifactTests(unittest.TestCase):
                 (root / "config.json").write_text(json.dumps({**self.config(), **change}))
                 (root / "model.safetensors").write_text("fixture only; never a model")
                 identity = {"path": str(root / "model.safetensors"), "sha256": FACTORY.WEIGHT_SHA256}
-                with mock.patch.object(FACTORY, "file_identity", return_value=identity):
-                    with self.assertRaisesRegex(ValueError, "complete pinned"):
-                        FACTORY.checkpoint_artifacts(root)
+                with mock.patch.object(FACTORY, "file_identity", return_value=identity), self.assertRaisesRegex(ValueError, "complete pinned"):
+                    FACTORY.checkpoint_artifacts(root)
 
     def test_unsupported_precision_and_unattributed_dataset_fail_early(self):
         base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
         for change in ({"precision": "float32"}, {"cpu_threads": 32}, {"fixture_kind": "dataset"}):
             with self.subTest(change=change), self.assertRaises(ValueError):
-                FACTORY.get_model_and_inputs(**base, **change)
-
-    def test_source_mean_requires_explicit_integer_session_and_one_native_thread(self):
-        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
-        changes = [{"source_mean_policy": "unknown"}]
-        for policy in ("torch_cpu_mean720_v1", "torch_cpu_mean720_960_v1"):
-            changes.extend(({"source_mean_policy": policy}, {"source_mean_policy": policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}))
-        for change in changes:
-            with self.subTest(change=change), mock.patch.object(FACTORY, "checkpoint_artifacts", side_effect=AssertionError("Admission must precede checkpoint access")), self.assertRaisesRegex(ValueError, "Source mean"):
-                FACTORY.get_model_and_inputs(**base, **change)
-
-    def test_source_softmax_requires_explicit_integer_session_and_one_native_thread(self):
-        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
-        changes = [{"source_softmax_policy": "unknown"}]
-        for policy in ("torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1", "torch_cpu_softmax177_227_prefix_v1"):
-            changes.extend(({"source_softmax_policy": policy}, {"source_softmax_policy": policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}))
-        for change in changes:
-            with self.subTest(change=change), mock.patch.object(FACTORY, "checkpoint_artifacts", side_effect=AssertionError("Admission must precede checkpoint access")), self.assertRaisesRegex(ValueError, "Source softmax"):
-                FACTORY.get_model_and_inputs(**base, **change)
-
-    def test_source_layernorm_requires_explicit_integer_session_and_one_native_thread(self):
-        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
-        for change in ({"source_layernorm_policy": "unknown"}, {"source_layernorm_policy": "torch_cpu_layernorm768_v1"}, {"source_layernorm_policy": "torch_cpu_layernorm768_v1", "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
-            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source LayerNorm"):
-                FACTORY.get_model_and_inputs(**base, **change)
-
-    def test_source_conv_requires_explicit_integer_session_and_one_native_thread(self):
-        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
-        for change in ({"source_conv_policy": "unknown"}, {"source_conv_policy": "torch_cpu_conv3x16_v1"}, {"source_conv_policy": "torch_cpu_conv3x16_v1", "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
-            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source convolution"):
-                FACTORY.get_model_and_inputs(**base, **change)
-
-    def test_source_sgemm_requires_explicit_integer_session_and_one_native_thread(self):
-        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
-        changes = [{"source_sgemm_policy": "unknown"}]
-        for policy in ("torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1", "torch_cpu_attention177_227_prefix_v1"):
-            changes.extend(({"source_sgemm_policy": policy}, {"source_sgemm_policy": policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}))
-        for change in changes:
-            with self.subTest(change=change), mock.patch.object(FACTORY, "checkpoint_artifacts", side_effect=AssertionError("Admission must precede checkpoint access")), self.assertRaisesRegex(ValueError, "Source SGEMM"):
                 FACTORY.get_model_and_inputs(**base, **change)
 
     def test_restricted_component_is_rejected_before_read(self):
@@ -309,18 +268,10 @@ class SmolVLASourceScalarTests(unittest.TestCase):
         import torch
 
         sentinel = object()
-        self.assertIsNone(NUMERICS.source_scalar_contract(None))
-        self.assertEqual(NUMERICS.prepare_source_scalar_export(None, sentinel), (sentinel, None))
-        with self.assertRaisesRegex(ValueError, "Unknown source scalar"):
-            NUMERICS.source_scalar_contract(None, "unknown")
         from verify_session import StageCompiler
         for options, exporter in (({"source_scalar_policy": "unknown"}, "dynamo"), ({"source_scalar_policy": "torch_cpu_language_scale960_v1"}, "legacy")):
             with self.subTest(options=options, exporter=exporter), self.assertRaisesRegex(ValueError, "source scalar|Source scalar"):
                 StageCompiler(Path("unused"), "baseline", None, torch, SimpleNamespace(), None, exporter=exporter, export_options=options)
-        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
-        for change in ({"source_scalar_policy": "unknown"}, {"source_scalar_policy": "torch_cpu_language_scale960_v1"}, {"source_scalar_policy": "torch_cpu_language_scale960_v1", "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
-            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source scalar"):
-                FACTORY.get_model_and_inputs(**base, **change)
 
         class Language(torch.nn.Module):
             def __init__(self, duplicate=False):
@@ -576,24 +527,14 @@ class SmolVLASourceRotaryTests(unittest.TestCase):
         import torch
         from verify_session import StageCompiler
 
-        sentinel = object()
-        self.assertIsNone(NUMERICS.source_rotary_contract(None))
-        self.assertEqual(NUMERICS.prepare_source_rotary_export(None, sentinel), (sentinel, None))
-        with self.assertRaisesRegex(ValueError, "Unknown source rotary"):
-            NUMERICS.source_rotary_contract(None, "unknown")
         for policy, exporter in (("unknown", "dynamo"), (self.policy, "legacy")):
             with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, "source rotary|Source rotary"):
                 StageCompiler(Path("unused"), "baseline", None, torch, SimpleNamespace(), None, exporter=exporter, export_options={"source_rotary_policy": policy})
-        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
-        for change in ({"source_rotary_policy": "unknown"}, {"source_rotary_policy": self.policy}, {"source_rotary_policy": self.policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
-            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source rotary"):
-                FACTORY.get_model_and_inputs(**base, **change)
         self.assertNotIn("source_rotary_policy", FACTORY.get_onnx_export_options(torch))
         marker = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_rotary_policy": {"name": self.policy}}}))
         self.assertEqual(FACTORY.get_onnx_export_options(torch, marker)["source_rotary_policy"], self.policy)
-        with mock.patch.object(torch, "get_num_threads", return_value=2):
-            with self.assertRaisesRegex(ValueError, "one native thread"):
-                NUMERICS.source_rotary_contract(torch, self.policy)
+        with mock.patch.object(torch, "get_num_threads", return_value=2), self.assertRaisesRegex(ValueError, "one native thread"):
+            NUMERICS.source_rotary_contract(torch, self.policy)
 
     def test_source_rotary_no_site_strict_DAG_and_table_authentication(self):
         import copy
@@ -627,9 +568,8 @@ class SmolVLASourceRotaryTests(unittest.TestCase):
                 next(node for node in changed.graph.nodes if node.target == torch.ops.aten.cos.default).target = replacement
                 with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
                     NUMERICS.prepare_source_rotary_export(torch, changed, self.policy)
-        with mock.patch.dict(NUMERICS.SOURCE_ROTARY_TABLE_WORDS, {"sine": "0" * 64}):
-            with self.assertRaisesRegex(ValueError, "table words"):
-                NUMERICS._source_rotary_tables(torch)
+        with mock.patch.dict(NUMERICS.SOURCE_ROTARY_TABLE_WORDS, {"sine": "0" * 64}), self.assertRaisesRegex(ValueError, "table words"):
+            NUMERICS._source_rotary_tables(torch)
 
     @unittest.skipUnless(os.environ.get("TVM_LIBRARY_PATH"), "requires opt-in pinned TVM/PyTorch CPU build")
     def test_source_rotary_public_factory_compiler_preserves_native_words(self):
@@ -737,18 +677,9 @@ class SmolVLASourceFlashTests(unittest.TestCase):
         import torch
         from verify_session import StageCompiler
 
-        sentinel = object()
-        self.assertIsNone(NUMERICS.source_flash_contract(None))
-        self.assertEqual(NUMERICS.prepare_source_flash_export(None, sentinel), (sentinel, None))
-        with self.assertRaisesRegex(ValueError, "[Ff]lash"):
-            NUMERICS.source_flash_contract(None, "unknown")
         for policy, exporter, fused in (("unknown", "dynamo", True), (self.policy, "legacy", False), (self.policy, "dynamo", False)):
             with self.subTest(policy=policy, exporter=exporter, fused=fused), self.assertRaisesRegex(ValueError, "[Ff]lash"):
                 StageCompiler(Path("unused"), "baseline", None, torch, SimpleNamespace(), None, exporter=exporter, bf16_fused_export=fused, export_options={"source_flash_policy": policy})
-        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
-        for change in ({"source_flash_policy": "unknown"}, {"source_flash_policy": self.policy}, {"source_flash_policy": self.policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
-            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "[Ff]lash"):
-                FACTORY.get_model_and_inputs(**base, **change)
         self.assertNotIn("source_flash_policy", FACTORY.get_onnx_export_options(torch))
         marker = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_flash_policy": {"name": self.policy}}}))
         self.assertEqual(FACTORY.get_onnx_export_options(torch, marker)["source_flash_policy"], self.policy)
@@ -865,41 +796,108 @@ class SmolVLASourceFlashTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(Path(binding["path"]).read_bytes()).hexdigest(), binding["sha256"])
 
 
-class SmolVLASourceMeanTests(unittest.TestCase):
-    def test_session_hook_keeps_default_table_and_selects_only_declared_policy(self):
+class SmolVLASourcePolicyTests(unittest.TestCase):
+    policies = {
+        "mean": ("Source mean", ("torch_cpu_mean720_v1", "torch_cpu_mean720_960_v1")),
+        "softmax": ("Source softmax", ("torch_cpu_softmax177_v1", "torch_cpu_softmax177_227_v1", "torch_cpu_softmax177_227_prefix_v1")),
+        "layernorm": ("Source LayerNorm", ("torch_cpu_layernorm768_v1",)),
+        "conv": ("Source convolution", ("torch_cpu_conv3x16_v1",)),
+        "sgemm": ("Source SGEMM", ("torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1", "torch_cpu_attention177_227_prefix_v1")),
+        "scalar": ("Source scalar", ("torch_cpu_language_scale960_v1",)),
+        "rotary": ("Source rotary", ("torch_cpu_denoise_rotary64_table_v1",)),
+        "flash": ("[Ff]lash", ("torch_cpu_flash_bf16_vision1024_v1",)),
+        "silu": ("[Ss]ource SiLU", ("torch_cpu_silu_fp32_v1",)),
+    }
+
+    def test_native_source_policies_need_no_bindings_and_unknown_policies_fail(self):
+        sentinel = object()
+        for kind, (error, _) in self.policies.items():
+            with self.subTest(kind=kind):
+                contract = getattr(NUMERICS, "source_" + kind + "_contract")
+                self.assertIsNone(contract(None))
+                if kind in ("scalar", "rotary", "flash", "silu"):
+                    self.assertEqual(getattr(NUMERICS, "prepare_source_" + kind + "_export")(None, sentinel), (sentinel, None))
+                else:
+                    self.assertEqual(getattr(NUMERICS, "source_" + kind + "_translations")(None), {})
+                unknown_error = "Unknown source SiLU" if kind == "silu" else error.replace("Source ", "Unknown source ")
+                with self.assertRaisesRegex(ValueError, unknown_error):
+                    contract(None, "unknown")
+
+    def test_reduction_contracts_refuse_unproved_runtime_and_modified_binary(self):
+        runtime = SimpleNamespace(version=SimpleNamespace(git_version="449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"), backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX512")), get_num_threads=lambda: 1, __file__="/tmp/pinned-torch/__init__.py")
+        for kind in ("mean", "softmax", "layernorm"):
+            contract = getattr(NUMERICS, "source_" + kind + "_contract")
+            for policy in self.policies[kind][1]:
+                with self.subTest(kind=kind, policy=policy), mock.patch("verify_resnet.file_identity", return_value={"sha256": "changed"}), self.assertRaisesRegex(ValueError, "independently proved"):
+                    contract(runtime, policy)
+                for field, value in (("get_num_threads", lambda: 2), ("version", SimpleNamespace(git_version="different")), ("backends", SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX2")))):
+                    with self.subTest(kind=kind, policy=policy, field=field), mock.patch.object(runtime, field, value), self.assertRaisesRegex(ValueError, "pinned PyTorch"):
+                        contract(runtime, policy)
+
+    def test_source_closure_includes_rotary_and_every_active_policy_binding(self):
+        import bf16_export
+        torch = object()
+        policies = {kind: choices[0] for kind, (_, choices) in self.policies.items()}
+        records = {kind: {"name": policy, "bindings": [{"path": "/tmp/" + kind + ".bin", "sha256": kind}]} for kind, policy in policies.items()}
+        contracts = {"source_" + kind + "_contract": mock.Mock(return_value=records[kind]) for kind in policies}
+        implementation = {"path": bf16_export.__file__, "sha256": "implementation"}
+        with mock.patch.multiple(bf16_export, **contracts), mock.patch.object(FACTORY, "file_identity", return_value=implementation) as identify:
+            self.assertEqual(FACTORY.source_policy_records(torch, dict.fromkeys(policies, "native")), {})
+            self.assertEqual(FACTORY.source_policy_artifacts({}), [])
+            identify.assert_not_called()
+            for contract in contracts.values():
+                contract.assert_not_called()
+            for selected in ({"rotary": policies["rotary"]}, policies):
+                with self.subTest(policies=tuple(selected)):
+                    identify.reset_mock()
+                    for contract in contracts.values():
+                        contract.reset_mock()
+                    actual = FACTORY.source_policy_records(torch, selected)
+                    self.assertEqual(actual, {"source_" + kind + "_policy": records[kind] for kind in selected})
+                    self.assertEqual(FACTORY.source_policy_artifacts(actual), [binding for kind in selected for binding in records[kind]["bindings"]] + [implementation])
+                    identify.assert_called_once_with(bf16_export.__file__, FACTORY.safe_path)
+                    for kind, policy in policies.items():
+                        contract = contracts["source_" + kind + "_contract"]
+                        if kind in selected:
+                            contract.assert_called_once_with(torch, policy)
+                        else:
+                            contract.assert_not_called()
+
+    def test_source_policies_require_integer_session_and_one_thread_before_checkpoint_access(self):
+        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
+        for kind, (error, policies) in self.policies.items():
+            key = "source_" + kind + "_policy"
+            changes = [{key: "unknown"}]
+            for policy in policies:
+                changes.extend(({key: policy}, {key: policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}))
+            for change in changes:
+                with self.subTest(kind=kind, change=change), mock.patch.object(FACTORY, "checkpoint_artifacts", side_effect=AssertionError("Admission must precede checkpoint access")), self.assertRaisesRegex(ValueError, error):
+                    FACTORY.get_model_and_inputs(**base, **change)
+
+    def test_session_hooks_select_only_declared_policies_and_preserve_default_table(self):
         import torch
         import bf16_export
         import tinyllama_integer
         original = tinyllama_integer.export_options(torch)["custom_translation_table"]
-        with mock.patch.object(tinyllama_integer, "export_options", side_effect=lambda _: {"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_mean_translations", return_value={torch.ops.aten.mean.dim: "selected"}) as select:
-            self.assertEqual(FACTORY.get_onnx_export_options(torch)["custom_translation_table"], original)
-            model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {}}))
-            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], original)
-            select.assert_not_called()
-            for policy in ("torch_cpu_mean720_v1", "torch_cpu_mean720_960_v1"):
-                with self.subTest(policy=policy):
-                    select.reset_mock()
-                    model.session.metadata["provenance"]["source_mean_policy"] = {"name": policy}
-                    table = FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"]
-                    self.assertEqual(table, {**original, torch.ops.aten.mean.dim: "selected"})
-                    select.assert_called_once_with(torch, policy)
-                    self.assertNotIn(torch.ops.aten.mean.dim, original)
+        operators = {"mean": torch.ops.aten.mean.dim, "softmax": torch.ops.aten.softmax.int,
+                     "layernorm": torch.ops.aten.layer_norm.default, "conv": torch.ops.aten.convolution.default,
+                     "sgemm": torch.ops.aten.matmul.default}
+        for kind, operator in operators.items():
+            with self.subTest(kind=kind), mock.patch.object(tinyllama_integer, "export_options", side_effect=lambda _: {"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_" + kind + "_translations", return_value={operator: "selected"}) as select:
+                self.assertEqual(FACTORY.get_onnx_export_options(torch)["custom_translation_table"], original)
+                model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {}}))
+                self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], original)
+                select.assert_not_called()
+                for policy in self.policies[kind][1]:
+                    with self.subTest(policy=policy):
+                        select.reset_mock()
+                        model.session.metadata["provenance"]["source_" + kind + "_policy"] = {"name": policy}
+                        self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, operator: "selected"})
+                        select.assert_called_once_with(torch, policy)
+                        self.assertNotIn(operator, original)
 
-    def test_native_policy_needs_no_source_bindings_and_unknown_policy_is_rejected(self):
-        self.assertIsNone(NUMERICS.source_mean_contract(None))
-        self.assertEqual(NUMERICS.source_mean_translations(None), {})
-        with self.assertRaisesRegex(ValueError, "Unknown source mean"):
-            NUMERICS.source_mean_contract(None, "unknown")
 
-    def test_source_mean_refuses_unproved_runtime_and_modified_binary(self):
-        runtime = SimpleNamespace(version=SimpleNamespace(git_version="449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"), backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX512")), get_num_threads=lambda: 1, __file__="/tmp/pinned-torch/__init__.py")
-        for policy in ("torch_cpu_mean720_v1", "torch_cpu_mean720_960_v1"):
-            with self.subTest(policy=policy), mock.patch("verify_resnet.file_identity", return_value={"sha256": "changed"}), self.assertRaisesRegex(ValueError, "independently proved"):
-                NUMERICS.source_mean_contract(runtime, policy)
-            for field, value in (("get_num_threads", lambda: 2), ("version", SimpleNamespace(git_version="different")), ("backends", SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX2")))):
-                with self.subTest(policy=policy, field=field), mock.patch.object(runtime, field, value), self.assertRaisesRegex(ValueError, "pinned PyTorch"):
-                    NUMERICS.source_mean_contract(runtime, policy)
-
+class SmolVLASourceMeanTests(unittest.TestCase):
     def test_export_selects_only_bound_fp32_last_axis_keepdim_geometry(self):
         import torch
         class Means(torch.nn.Module):
@@ -958,18 +956,9 @@ class SmolVLASourceSiluTests(unittest.TestCase):
     def test_source_silu_defaults_contract_and_factory_refusals(self):
         import torch
         from verify_session import StageCompiler
-        sentinel = object()
-        self.assertIsNone(NUMERICS.source_silu_contract(None))
-        self.assertEqual(NUMERICS.prepare_source_silu_export(None, sentinel), (sentinel, None))
-        with self.assertRaisesRegex(ValueError, "Unknown source SiLU"):
-            NUMERICS.source_silu_contract(None, "unknown")
         for policy, exporter, fused in (("unknown", "dynamo", True), (self.policy, "legacy", False), (self.policy, "dynamo", False)):
             with self.subTest(policy=policy, exporter=exporter, fused=fused), self.assertRaisesRegex(ValueError, "[Ss]ource SiLU"):
                 StageCompiler(Path("unused"), "baseline", None, torch, SimpleNamespace(), None, exporter=exporter, bf16_fused_export=fused, export_options={"source_silu_policy": policy})
-        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
-        for change in ({"source_silu_policy": "unknown"}, {"source_silu_policy": self.policy}, {"source_silu_policy": self.policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
-            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "[Ss]ource SiLU"):
-                FACTORY.get_model_and_inputs(**base, **change)
         self.assertNotIn("source_silu_policy", FACTORY.get_onnx_export_options(torch))
         marker = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_silu_policy": {"name": self.policy}}}))
         self.assertEqual(FACTORY.get_onnx_export_options(torch, marker)["source_silu_policy"], self.policy)
@@ -1063,33 +1052,6 @@ class SmolVLASourceSiluTests(unittest.TestCase):
 
 
 class SmolVLASourceSoftmaxTests(unittest.TestCase):
-    def test_session_hook_selects_only_declared_policy_without_mutating_defaults(self):
-        import torch
-        import bf16_export
-        import tinyllama_integer
-        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
-        with mock.patch.object(tinyllama_integer, "export_options", side_effect=lambda _: {"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_softmax_translations", return_value={torch.ops.aten.softmax.int: "selected"}) as select:
-            self.assertEqual(FACTORY.get_onnx_export_options(torch)["custom_translation_table"], original)
-            model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {}}))
-            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], original)
-            select.assert_not_called()
-            model.session.metadata["provenance"]["source_softmax_policy"] = {"name": "torch_cpu_softmax177_v1"}
-            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, torch.ops.aten.softmax.int: "selected"})
-            self.assertNotIn(torch.ops.aten.softmax.int, original)
-            select.assert_called_once_with(torch, "torch_cpu_softmax177_v1")
-
-    def test_contract_refuses_unproved_runtime_and_modified_binary(self):
-        self.assertIsNone(NUMERICS.source_softmax_contract(None))
-        self.assertEqual(NUMERICS.source_softmax_translations(None), {})
-        with self.assertRaisesRegex(ValueError, "Unknown source softmax"):
-            NUMERICS.source_softmax_contract(None, "unknown")
-        runtime = SimpleNamespace(version=SimpleNamespace(git_version="449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"), backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX512")), get_num_threads=lambda: 1, __file__="/tmp/pinned-torch/__init__.py")
-        with mock.patch("verify_resnet.file_identity", return_value={"sha256": "changed"}), self.assertRaisesRegex(ValueError, "independently proved"):
-            NUMERICS.source_softmax_contract(runtime, "torch_cpu_softmax177_v1")
-        for field, value in (("get_num_threads", lambda: 2), ("version", SimpleNamespace(git_version="different")), ("backends", SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX2")))):
-            with self.subTest(field=field), mock.patch.object(runtime, field, value), self.assertRaisesRegex(ValueError, "pinned PyTorch"):
-                NUMERICS.source_softmax_contract(runtime, "torch_cpu_softmax177_v1")
-
     def test_export_selects_only_bound_fp32_shape_and_axis(self):
         import torch
         class Softmax(torch.nn.Module):
@@ -1152,42 +1114,10 @@ class SmolVLASourceSoftmaxTests(unittest.TestCase):
                     self.assertEqual([infos[name].type.tensor_type.elem_type for name in (*node.input, *node.output)], [onnx.TensorProto.FLOAT] * 2)
                     self.assertEqual([dim.dim_value for dim in infos[node.output[0]].type.tensor_type.shape.dim], [1, 15, 177, 177])
                 self.assertTrue(all(torch.equal(value, original) for value, original in zip(inputs, before)))
-        import bf16_export
-        import tinyllama_integer
-        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
-        model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_softmax_policy": {"name": policy}}}))
-        with mock.patch.object(tinyllama_integer, "export_options", return_value={"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_softmax_translations", return_value={torch.ops.aten.softmax.int: "selected"}) as select:
-            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, torch.ops.aten.softmax.int: "selected"})
-            select.assert_called_once_with(torch, policy)
-        self.assertNotIn(torch.ops.aten.softmax.int, original)
+
 
 
 class SmolVLASourceLayerNormTests(unittest.TestCase):
-    def test_session_hook_selects_only_declared_policy(self):
-        import torch
-        import bf16_export
-        import tinyllama_integer
-        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
-        with mock.patch.object(tinyllama_integer, "export_options", side_effect=lambda _: {"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_layernorm_translations", return_value={torch.ops.aten.layer_norm.default: "selected"}) as select:
-            self.assertEqual(FACTORY.get_onnx_export_options(torch)["custom_translation_table"], original)
-            model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {}}))
-            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], original)
-            select.assert_not_called()
-            model.session.metadata["provenance"]["source_layernorm_policy"] = {"name": "torch_cpu_layernorm768_v1"}
-            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, torch.ops.aten.layer_norm.default: "selected"})
-            select.assert_called_once_with(torch, "torch_cpu_layernorm768_v1")
-
-    def test_contract_refuses_unproved_runtime_and_modified_binary(self):
-        self.assertIsNone(NUMERICS.source_layernorm_contract(None))
-        self.assertEqual(NUMERICS.source_layernorm_translations(None), {})
-        with self.assertRaisesRegex(ValueError, "Unknown source LayerNorm"):
-            NUMERICS.source_layernorm_contract(None, "unknown")
-        runtime = SimpleNamespace(version=SimpleNamespace(git_version="449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"), backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX512")), get_num_threads=lambda: 1, __file__="/tmp/pinned-torch/__init__.py")
-        with mock.patch("verify_resnet.file_identity", return_value={"sha256": "changed"}), self.assertRaisesRegex(ValueError, "independently proved"):
-            NUMERICS.source_layernorm_contract(runtime, "torch_cpu_layernorm768_v1")
-        with mock.patch.object(runtime, "get_num_threads", return_value=2), self.assertRaisesRegex(ValueError, "pinned PyTorch"):
-            NUMERICS.source_layernorm_contract(runtime, "torch_cpu_layernorm768_v1")
-
     def test_export_selects_original_bf16_affines_shape_and_epsilon(self):
         import torch
         class LayerNorm(torch.nn.Module):
@@ -1209,25 +1139,7 @@ class SmolVLASourceLayerNormTests(unittest.TestCase):
 
 
 class SmolVLASourceConvTests(unittest.TestCase):
-    def test_session_hook_selects_only_declared_policy(self):
-        import torch
-        import bf16_export
-        import tinyllama_integer
-        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
-        with mock.patch.object(tinyllama_integer, "export_options", side_effect=lambda _: {"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_conv_translations", return_value={torch.ops.aten.convolution.default: "selected"}) as select:
-            self.assertEqual(FACTORY.get_onnx_export_options(torch)["custom_translation_table"], original)
-            model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {}}))
-            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], original)
-            select.assert_not_called()
-            model.session.metadata["provenance"]["source_conv_policy"] = {"name": "torch_cpu_conv3x16_v1"}
-            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, torch.ops.aten.convolution.default: "selected"})
-            select.assert_called_once_with(torch, "torch_cpu_conv3x16_v1")
-
     def test_contract_refuses_other_dispatch_and_modified_binary(self):
-        self.assertIsNone(NUMERICS.source_conv_contract(None))
-        self.assertEqual(NUMERICS.source_conv_translations(None), {})
-        with self.assertRaisesRegex(ValueError, "Unknown source convolution"):
-            NUMERICS.source_conv_contract(None, "unknown")
         import torch
         with mock.patch.object(NUMERICS, "_source_cpu_bindings", return_value=[]) as bindings:
             record = NUMERICS.source_conv_contract(torch, "torch_cpu_conv3x16_v1")
@@ -1261,25 +1173,7 @@ class SmolVLASourceConvTests(unittest.TestCase):
 
 
 class SmolVLASourceSgemmTests(unittest.TestCase):
-    def test_session_hook_selects_only_declared_policy(self):
-        import torch
-        import bf16_export
-        import tinyllama_integer
-        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
-        with mock.patch.object(tinyllama_integer, "export_options", side_effect=lambda _: {"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_sgemm_translations", return_value={torch.ops.aten.matmul.default: "selected"}) as select:
-            self.assertEqual(FACTORY.get_onnx_export_options(torch)["custom_translation_table"], original)
-            model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {}}))
-            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], original)
-            select.assert_not_called()
-            model.session.metadata["provenance"]["source_sgemm_policy"] = {"name": "torch_cpu_sgemm177_v1"}
-            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, torch.ops.aten.matmul.default: "selected"})
-            select.assert_called_once_with(torch, "torch_cpu_sgemm177_v1")
-
     def test_contract_refuses_other_precision_dispatch_and_modified_binary(self):
-        self.assertIsNone(NUMERICS.source_sgemm_contract(None))
-        self.assertEqual(NUMERICS.source_sgemm_translations(None), {})
-        with self.assertRaisesRegex(ValueError, "Unknown source SGEMM"):
-            NUMERICS.source_sgemm_contract(None, "unknown")
         runtime = SimpleNamespace(version=SimpleNamespace(git_version="449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"), backends=SimpleNamespace(cpu=SimpleNamespace(get_cpu_capability=lambda: "AVX512"), mkl=SimpleNamespace(is_available=lambda: True)), get_num_threads=lambda: 1, get_float32_matmul_precision=lambda: "highest", __file__="/tmp/pinned-torch/__init__.py")
         with mock.patch.object(NUMERICS, "_source_cpu_bindings", return_value=[]):
             record = NUMERICS.source_sgemm_contract(runtime, "torch_cpu_sgemm177_v1")
@@ -1376,14 +1270,7 @@ class SmolVLASourceSgemmTests(unittest.TestCase):
                     wanted_dtype = onnx.TensorProto.BFLOAT16 if node.op_type == "TorchOnednnGemmBf16PV177" else onnx.TensorProto.FLOAT
                     self.assertEqual([infos[name].type.tensor_type.elem_type for name in (*node.input, *node.output)], [wanted_dtype] * 3)
                 self.assertTrue(all(torch.equal(value, original) for value, original in zip(inputs, before)))
-        import bf16_export
-        import tinyllama_integer
-        original = tinyllama_integer.export_options(torch)["custom_translation_table"]
-        model = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_sgemm_policy": {"name": policy}}}))
-        with mock.patch.object(tinyllama_integer, "export_options", return_value={"custom_translation_table": dict(original)}), mock.patch.object(bf16_export, "source_sgemm_translations", return_value={torch.ops.aten.matmul.default: "selected"}) as select:
-            self.assertEqual(FACTORY.get_onnx_export_options(torch, model)["custom_translation_table"], {**original, torch.ops.aten.matmul.default: "selected"})
-            select.assert_called_once_with(torch, policy)
-        self.assertNotIn(torch.ops.aten.matmul.default, original)
+
 
 
 class SmolVLAArithmeticDiagnosticTests(unittest.TestCase):

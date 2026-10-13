@@ -32,9 +32,8 @@ class TinyLlamaArtifactTests(unittest.TestCase):
         return {"path": str(path), "sha256": FACTORY.WEIGHT_SHA256}
 
     def test_absent_checkpoint_fails_before_framework_imports(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaises(FileNotFoundError):
-                FACTORY.checkpoint_artifacts(directory)
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(FileNotFoundError):
+            FACTORY.checkpoint_artifacts(directory)
 
     def test_nonofficial_weights_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -48,9 +47,8 @@ class TinyLlamaArtifactTests(unittest.TestCase):
             root = Path(directory)
             self.write_artifacts(root, {**FACTORY.MODEL_SEMANTICS, "num_hidden_layers": 2,
                                         "torch_dtype": "bfloat16"})
-            with mock.patch.object(FACTORY, "file_identity", self.pinned_identity):
-                with self.assertRaisesRegex(ValueError, "complete pinned model geometry"):
-                    FACTORY.checkpoint_artifacts(root)
+            with mock.patch.object(FACTORY, "file_identity", self.pinned_identity), self.assertRaisesRegex(ValueError, "complete pinned model geometry"):
+                FACTORY.checkpoint_artifacts(root)
 
     def test_precision_and_recurrence_require_explicit_valid_choices(self):
         base = {"checkpoint_dir": "/missing", "model2mlir_root": "/missing",
@@ -483,9 +481,8 @@ assert modules[0]._FIXED_TREE_OPS==modules[1]._FIXED_TREE_OPS
                 INTEGER.check_projection(projection, value, rows=rows, columns=columns)
         codes, scales = INTEGER.quantize_rows(value)
         codes[0, 1] = 1
-        with mock.patch.object(INTEGER, "quantize_rows", return_value=(codes, scales)):
-            with self.assertRaisesRegex(AssertionError, "rounding/clipping"):
-                INTEGER.check_projection(projection, value)
+        with mock.patch.object(INTEGER, "quantize_rows", return_value=(codes, scales)), self.assertRaisesRegex(AssertionError, "rounding/clipping"):
+            INTEGER.check_projection(projection, value)
 
     def test_bounded_pair_isolates_boundary_crossing_from_local_encoding(self):
         source = np.asarray([[.9921875, .0664062425494194]], dtype=np.float32)
@@ -522,10 +519,9 @@ assert modules[0]._FIXED_TREE_OPS==modules[1]._FIXED_TREE_OPS
 
     def test_capture_hooks_remove_on_failure_and_attention_checks_refuse_wrong_state(self):
         projection = INTEGER.IntegerProjection(torch.ones(2, 3), "power_of_two")
-        with self.assertRaisesRegex(RuntimeError, "intentional"):
-            with FACTORY.capture_last_token_inputs(projection):
-                projection(torch.ones(1, 3))
-                raise RuntimeError("intentional")
+        with self.assertRaisesRegex(RuntimeError, "intentional"), FACTORY.capture_last_token_inputs(projection):
+            projection(torch.ones(1, 3))
+            raise RuntimeError("intentional")
         self.assertEqual(len(projection._forward_pre_hooks), 0)
         source = {"mask": torch.zeros(1, 1, 1, 3), "rope": (torch.ones(1, 1, 2), torch.zeros(1, 1, 2))}
         actual = {"mask": torch.tensor([[[[0., 0., 0., -torch.inf]]]]), "rope": source["rope"]}
@@ -715,69 +711,53 @@ assert modules[0]._FIXED_TREE_OPS==modules[1]._FIXED_TREE_OPS
             self.assertEqual(checked["checked_codes"], values.size)
             self.assertEqual(codes[2].tolist(), [127, 8, 9, -9])
 
-    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODEL2MLIR"), "Optional pinned cache-wrapper integration disabled")
-    def test_real_hf_fixed_tree_cache_dispatch_and_unchanged_gate(self):
+    def hf_cache_fixture(self, arithmetic_policy=None):
         from transformers import LlamaConfig, LlamaForCausalLM
         from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaAttention
-        from types import SimpleNamespace
-        path = FACTORY.safe_path(Path(os.environ["TVM_SESSION_MODEL2MLIR"]) / "m2m/capture/causal_session.py")
-        spec = importlib.util.spec_from_file_location("tinyllama_candidate_test_causal_session", path)
-        causal = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(causal)
-        torch.manual_seed(194)
-        config = LlamaConfig(hidden_size=64, intermediate_size=96, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, vocab_size=128)
-        config._attn_implementation = "eager"
-        lm = LlamaForCausalLM(config).eval().requires_grad_(False)
-        for name, module in list(lm.named_modules()):
-            if isinstance(module, LlamaRMSNorm):
-                parent, _, leaf = name.rpartition(".")
-                setattr(lm.get_submodule(parent), leaf, INTEGER.FixedTreeRMSNorm(module))
-            elif isinstance(module, LlamaAttention):
-                parent, _, leaf = name.rpartition(".")
-                setattr(lm.get_submodule(parent), leaf, INTEGER.FixedTreeAttention(module))
-        capture = SimpleNamespace(lm=lm, tokens=torch.arange(12).reshape(1, -1), prefill_tokens=4, decode_tokens=8, provenance={"arithmetic_policy": INTEGER.arithmetic_contract("fixed_tree_fp32_v1")})
-        with mock.patch.object(INTEGER, "fixed_tree_dot", wraps=INTEGER.fixed_tree_dot) as observed:
-            result = FACTORY.validate_reference_stages(capture, causal, torch)
-        self.assertEqual(observed.call_count, 36)
-        self.assertEqual(result["reference"], "candidate_full_sequence_hf_use_cache_false")
-        self.assertEqual((result["rtol"], result["atol"]), (1e-4, 1e-4))
-        self.assertEqual(len(result["checks"]), 9)
-        self.assertTrue(all(check["attention"]["active_mask_exact"] and check["attention"]["last_token_rope_exact"] for check in result["checks"]))
-        torch.manual_seed(194)
-        v2_lm = LlamaForCausalLM(config).eval().requires_grad_(False)
-        for name, module in list(v2_lm.named_modules()):
-            if isinstance(module, LlamaRMSNorm):
-                parent, _, leaf = name.rpartition(".")
-                setattr(v2_lm.get_submodule(parent), leaf, INTEGER.FixedTreeRMSNorm(module))
-            elif isinstance(module, LlamaAttention):
-                parent, _, leaf = name.rpartition(".")
-                setattr(v2_lm.get_submodule(parent), leaf, INTEGER.FixedTreeAttention(module, "fixed_tree_fp32_v2_pv"))
-        capture = SimpleNamespace(lm=v2_lm, tokens=torch.arange(12).reshape(1, -1), prefill_tokens=4, decode_tokens=8, provenance={"arithmetic_policy": INTEGER.arithmetic_contract("fixed_tree_fp32_v2_pv")})
-        with mock.patch.object(INTEGER, "fixed_tree_dot", wraps=INTEGER.fixed_tree_dot) as observed:
-            result = FACTORY.validate_reference_stages(capture, causal, torch)
-        pv_calls = [call for call in observed.call_args_list if call.args[0].shape[-1] == 256]
-        self.assertTrue(pv_calls)
-        self.assertTrue(all(call.args[0].shape[-1] == call.args[1].shape[-1] == 256 for call in pv_calls))
-        self.assertTrue({1, 4, 12}.issubset({call.args[0].shape[-2] for call in pv_calls}))
-        self.assertEqual(result["reference"], "candidate_full_sequence_hf_use_cache_false")
-        self.assertEqual((result["rtol"], result["atol"]), (1e-4, 1e-4))
-        self.assertEqual(len(result["checks"]), 9)
-        self.assertTrue(all(check["attention"]["active_mask_exact"] and check["attention"]["last_token_rope_exact"] for check in result["checks"]))
-
-    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODEL2MLIR"), "Optional pinned cache-wrapper integration disabled")
-    def test_real_hf_fixed_cache_matches_positions_masks_and_full_sequence(self):
-        from transformers import LlamaConfig, LlamaForCausalLM
         from types import SimpleNamespace
         path = FACTORY.safe_path(Path(os.environ["TVM_SESSION_MODEL2MLIR"]) / "m2m/capture/causal_session.py")
         spec = importlib.util.spec_from_file_location("tinyllama_test_causal_session", path)
         causal = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(causal)
         torch.manual_seed(194)
-        config = LlamaConfig(hidden_size=64, intermediate_size=96, num_hidden_layers=2,
-                             num_attention_heads=4, num_key_value_heads=2, vocab_size=128)
+        config = LlamaConfig(hidden_size=64, intermediate_size=96, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, vocab_size=128)
         config._attn_implementation = "eager"
         lm = LlamaForCausalLM(config).eval().requires_grad_(False)
-        capture = SimpleNamespace(lm=lm, tokens=torch.arange(12).reshape(1, -1), prefill_tokens=4, decode_tokens=8, provenance={})
+        provenance = {}
+        if arithmetic_policy:
+            provenance["arithmetic_policy"] = INTEGER.arithmetic_contract(arithmetic_policy)
+            attention_options = {} if arithmetic_policy == "fixed_tree_fp32_v1" else {"arithmetic_policy": arithmetic_policy}
+            for name, module in list(lm.named_modules()):
+                if isinstance(module, (LlamaRMSNorm, LlamaAttention)):
+                    parent, _, leaf = name.rpartition(".")
+                    replacement = INTEGER.FixedTreeRMSNorm(module) if isinstance(module, LlamaRMSNorm) else INTEGER.FixedTreeAttention(module, **attention_options)
+                    setattr(lm.get_submodule(parent), leaf, replacement)
+        capture = SimpleNamespace(lm=lm, tokens=torch.arange(12).reshape(1, -1), prefill_tokens=4, decode_tokens=8, provenance=provenance)
+        return causal, capture
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODEL2MLIR"), "Optional pinned cache-wrapper integration disabled")
+    def test_real_hf_fixed_tree_cache_dispatch_and_unchanged_gate(self):
+        for policy in ("fixed_tree_fp32_v1", "fixed_tree_fp32_v2_pv"):
+            with self.subTest(policy=policy):
+                causal, capture = self.hf_cache_fixture(policy)
+                with mock.patch.object(INTEGER, "fixed_tree_dot", wraps=INTEGER.fixed_tree_dot) as observed:
+                    result = FACTORY.validate_reference_stages(capture, causal, torch)
+                if policy == "fixed_tree_fp32_v1":
+                    self.assertEqual(observed.call_count, 36)
+                else:
+                    pv_calls = [call for call in observed.call_args_list if call.args[0].shape[-1] == 256]
+                    self.assertTrue(pv_calls)
+                    self.assertTrue(all(call.args[0].shape[-1] == call.args[1].shape[-1] == 256 for call in pv_calls))
+                    self.assertTrue({1, 4, 12}.issubset({call.args[0].shape[-2] for call in pv_calls}))
+                self.assertEqual(result["reference"], "candidate_full_sequence_hf_use_cache_false")
+                self.assertEqual((result["rtol"], result["atol"]), (1e-4, 1e-4))
+                self.assertEqual(len(result["checks"]), 9)
+                self.assertTrue(all(check["attention"]["active_mask_exact"] and check["attention"]["last_token_rope_exact"] for check in result["checks"]))
+
+    @unittest.skipUnless(os.environ.get("TVM_SESSION_MODEL2MLIR"), "Optional pinned cache-wrapper integration disabled")
+    def test_real_hf_fixed_cache_matches_positions_masks_and_full_sequence(self):
+        causal, capture = self.hf_cache_fixture()
+        lm = capture.lm
         result = FACTORY.validate_reference_stages(capture, causal, torch)
         self.assertTrue(result["passed"])
         self.assertEqual(len(result["checks"]), 9)
@@ -787,9 +767,8 @@ assert modules[0]._FIXED_TREE_OPS==modules[1]._FIXED_TREE_OPS
         def wrong_decode(stage, *args):
             logits, cache, position = original_decode(stage, *args)
             return logits + .01, cache, position
-        with mock.patch.object(causal.FixedCacheDecodeStep, "forward", wrong_decode):
-            with self.assertRaisesRegex(AssertionError, "cache gate failed at 5"):
-                FACTORY.validate_reference_stages(capture, causal, torch)
+        with mock.patch.object(causal.FixedCacheDecodeStep, "forward", wrong_decode), self.assertRaisesRegex(AssertionError, "cache gate failed at 5"):
+            FACTORY.validate_reference_stages(capture, causal, torch)
         diagnostic = capture.provenance["functional_cache_reference"]
         self.assertFalse(diagnostic["passed"])
         self.assertEqual((diagnostic["rtol"], diagnostic["atol"]), (1e-4, 1e-4))
