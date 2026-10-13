@@ -95,6 +95,298 @@ def _source_cpu_bindings(torch, artifacts, operation):
         raise ValueError(f"{operation} requires the independently proved native library and headers")
     return bindings
 
+SOURCE_FLASH_ARTIFACTS = {
+    "lib/libtorch_cpu.so": SOURCE_MEAN_ARTIFACTS["lib/libtorch_cpu.so"],
+    "include/ATen/native/DispatchStub.h": SOURCE_MEAN_ARTIFACTS["include/ATen/native/DispatchStub.h"],
+    "include/ATen/native/CPUBlas.h": SOURCE_SGEMM_ARTIFACTS["include/ATen/native/CPUBlas.h"],
+    "include/ATen/native/transformers/attention.h": "33d9145503bdd5a37cde7e6925668745cd098312bb7ac792eaf579f27c223852",
+    "include/ATen/cpu/vec/vec512/vec512_float.h": SOURCE_SOFTMAX_ARTIFACTS["include/ATen/cpu/vec/vec512/vec512_float.h"],
+    "include/ATen/cpu/vec/functional_base.h": SOURCE_SOFTMAX_ARTIFACTS["include/ATen/cpu/vec/functional_base.h"],
+    "include/c10/util/BFloat16.h": SOURCE_LANGUAGE_SCALE_ARTIFACTS["include/c10/util/BFloat16.h"],
+}
+SOURCE_FLASH_LIBM_SHA256 = "f0734a09a0602ccde6b98ea7fbb3c9cfc62b3a4cf4a7b17ccd36d774ca22b8df"
+
+
+def source_flash_contract(torch, policy="native"):
+    """Bind the proved host-only vision Flash arithmetic and native dispatch."""
+    if policy == "native":
+        return None
+    if policy != "torch_cpu_flash_bf16_vision1024_v1":
+        raise ValueError("Unknown source Flash export policy")
+    import ctypes
+    import os
+    from pathlib import Path
+    from verify_resnet import file_identity, safe_path
+    overrides = ("MKL_CBWR", "MKL_ENABLE_INSTRUCTIONS", "MKL_DEBUG_CPU_TYPE", "ATEN_CPU_CAPABILITY", "ONEDNN_MAX_CPU_ISA", "DNNL_MAX_CPU_ISA", "ONEDNN_DEFAULT_FPMATH_MODE", "DNNL_DEFAULT_FPMATH_MODE")
+    if not torch.backends.mkl.is_available() or not torch.backends.mkldnn.is_available() or not torch.backends.mkldnn.enabled or torch.get_float32_matmul_precision() != "highest" or any(name in os.environ for name in overrides):
+        raise ValueError("Source Flash requires original highest-precision MKL/oneDNN dispatch without ISA or consistency overrides")
+    if torch.cpu._is_avx512_bf16_supported() or torch.cpu._is_amx_tile_supported():
+        raise ValueError("Source Flash requires the proved AVX512 software-BF16 CPU family")
+    bindings = _source_cpu_bindings(torch, SOURCE_FLASH_ARTIFACTS, "Source vision Flash")
+    root = safe_path(Path(torch.__file__).parent.parent)
+    model_bindings = [file_identity(root / relative, safe_path) for relative in SOURCE_ROTARY_MODEL_ARTIFACTS]
+    if any(record["sha256"] != expected for record, expected in zip(model_bindings, SOURCE_ROTARY_MODEL_ARTIFACTS.values())):
+        raise ValueError("Source Flash requires the independently bound original Smol model sources")
+    cpu = ctypes.CDLL(bindings[0]["path"])
+    packing = getattr(cpu, "_ZN2at6native7cpublas10could_packEN3c1010ScalarTypeE")
+    packing.argtypes, packing.restype = [ctypes.c_int8], ctypes.c_bool
+    version = cpu.mkl_blas_avx512_get_bkernel_api_version
+    version.argtypes, version.restype = [], ctypes.c_int
+    consistency = cpu.mkl_serv_cbwr_get
+    consistency.argtypes, consistency.restype = [ctypes.c_int], ctypes.c_int
+    if packing(15) or version() != 1 or consistency(-1) != 1:
+        raise ValueError("Source Flash requires original nonpacking software-BF16 MKL dispatch and default CBWR")
+
+    class DlInfo(ctypes.Structure):
+        _fields_ = [("fname", ctypes.c_char_p), ("fbase", ctypes.c_void_p), ("sname", ctypes.c_char_p), ("saddr", ctypes.c_void_p)]
+
+    loader = ctypes.CDLL(None)
+    loader.dladdr.argtypes, loader.dladdr.restype = [ctypes.c_void_p, ctypes.POINTER(DlInfo)], ctypes.c_int
+    loader.dlvsym.argtypes, loader.dlvsym.restype = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p], ctypes.c_void_p
+    owner = DlInfo()
+    anchor = ctypes.cast(cpu.cblas_gemm_bf16bf16f32, ctypes.c_void_p).value
+    if not loader.dladdr(anchor, ctypes.byref(owner)) or safe_path(owner.fname.decode()) != safe_path(bindings[0]["path"]) or anchor - owner.fbase != 0x90af260:
+        raise ValueError("Source Flash native library symbol ownership changed")
+    original_expf = ctypes.c_void_p.from_address(owner.fbase + 0x14d515f8).value
+    exp_owner = DlInfo()
+    if not original_expf or not loader.dladdr(original_expf, ctypes.byref(exp_owner)):
+        raise ValueError("Source Flash original expf binding is unavailable")
+    libm_path = safe_path(exp_owner.fname.decode())
+    libm_binding = file_identity(libm_path, safe_path)
+    if libm_binding["sha256"] != SOURCE_FLASH_LIBM_SHA256:
+        raise ValueError("Source Flash requires the independently proved host libm")
+    libm = ctypes.CDLL(str(libm_path))
+    expf_symbols = (loader.dlvsym(libm._handle, b"expf", b"GLIBC_2.27"), ctypes.cast(libm.expf, ctypes.c_void_p).value, ctypes.cast(loader.expf, ctypes.c_void_p).value)
+    if any(address != original_expf for address in expf_symbols):
+        raise ValueError("Source Flash requires the original GLIBC_2.27 expf family")
+    return {
+        "name": policy, "status": "opt_in_source_preserving_export_not_policy_qualified",
+        "domain": "merlin.source_preserving", "version": 1, "operator": "TorchFlashBf16Vision1024",
+        "native": "original_BF16_CPU_vision_Flash_QKV_1x12x1024x64_positive_zero_mask",
+        "native_threads": 1, "native_qkv_strides": [786432, 64, 768, 1],
+        "source_shapes": {"qkv": [1, 12, 1024, 64], "mask": [1, 1, 1024, 1024]},
+        "native_dispatch": "AVX512_Flash_query256_key512_with_pack_false;MKL_software_BF16_widen_to_FP32_SGEMM;default_CBWR",
+        "algorithm": "QK64_serial_FP32_FMA;source_scale_mask_FMA;source_fexp_u20_BF16_probability_store;16lane_max_sum;online_expf_rescale;PV512_two256_serial_FMA_partials_with_per_partial_beta_blend;FP32_reciprocal_product_oneBF16_RNE_store",
+        "scratch": {"fp32_words": 180832, "bf16_words": 131072, "bytes": 985472, "explicit_call_tir_tuple_outputs": True, "reuse": "serial_head_query_tiles"},
+        "source": "https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/aten/src/ATen/native/cpu/FlashAttentionKernel.cpp",
+        "expf": {"version": "GLIBC_2.27", "original_caller_GOT_and_default_symbol_equal": True, "library": libm_binding},
+        "source_admission": "original_static_CPU_BF16_QKV_geometry_stride_offset0;dropout0_noncausal_noGQA_scaleNone_or0.125;bounded_input_independent_original_constant_mask_DAG_all_positive_zero",
+        "wholeprefix_expected_site_count": 24,
+        "IEEE_admission": "finite_source_intermediates_RNE_FTZ_DAZ_clear_checked_by_external_proofs;no_runtime_value_or_IEEE_state_guard_and_no_floating_state_setters",
+        "external_full_kernel_proof_sha256": "e139164d14961170dadd88968d9d2a463be4eb129305c7e6a17260db7fe8e6bb",
+        "external_QK_proof_sha256": "a6de37875c1e4f7e471747f904b2a840a6e08d518937ab7fb062ff855ac3ac01",
+        "external_PV_proof_sha256": "72068427b43f3cf02c91af6fd3887fd9f766eb07f882e131cfeea3c8b7fb06e7",
+        "limits": ["private_MKL_selected_inner_entry_and_internal_packing_not_observed;code_conditioned_route_and_bounded_word_proofs", "host_only;fullprefix_session_trajectory_policy_quality_and_target_unqualified", "unsupported_dynamic_nonzero_or_negative_zero_mask_source_refused"],
+        "unchanged": ["original_EP", "masks", "parameters", "public_inputs_outputs", "generic_attention_elsewhere", "native_reference", "acceptance_gates"],
+        "bindings": bindings + model_bindings + [libm_binding],
+    }
+
+
+def source_flash_sites(torch, program, expected_count=None):
+    """Prove the original bounded constant-zero mask without changing the EP."""
+    if expected_count is not None and (type(expected_count) is not int or expected_count < 0):
+        raise ValueError("Source Flash expected site count must be a nonnegative integer")
+    from torch.export.graph_signature import InputKind, TensorArgument
+    if not isinstance(program, torch.export.ExportedProgram):
+        raise ValueError('Source Flash requires an original ExportedProgram')
+    geometry = (1, 12, 1024, 64)
+    source_stride = (786432, 64, 768, 1)
+    specs = {spec.arg.name: spec for spec in program.graph_signature.input_specs if isinstance(spec.arg, TensorArgument)}
+    constructors = {torch.ops.aten.ones.default, torch.ops.aten.zeros.default}
+    operations = constructors | {torch.ops.aten.to.device, torch.ops.aten.to.dtype, torch.ops.aten.view.default, torch.ops.aten.unsqueeze.default, torch.ops.aten.expand.default, torch.ops.aten.lift_fresh_copy.default, torch.ops.aten.detach_.default, torch.ops.aten.sub.Tensor, torch.ops.aten.masked_fill.Scalar, torch.ops.aten.alias.default}
+    cached = {}
+
+    # Producer evaluation alone cannot prove a mask if an off-path writer changes
+    # its storage. Track schema aliases across the whole graph, then check writes
+    # before each attention call against the mask and all of its producer inputs.
+    import operator
+    nodes = list(program.graph.nodes)
+    order = {node: index for index, node in enumerate(nodes)}
+    parents = {node: node for node in nodes}
+    writes = []
+    unknown_aliases = []
+
+    def root(node):
+        while parents[node] is not node:
+            parents[node] = parents[parents[node]]
+            node = parents[node]
+        return node
+
+    def merge(left, right):
+        parents[root(left)] = root(right)
+
+    def tensor_nodes(value):
+        if isinstance(value, torch.fx.Node):
+            return [value]
+        if isinstance(value, (tuple, list)):
+            return [node for item in value for node in tensor_nodes(item)]
+        if isinstance(value, dict):
+            return [node for item in value.values() for node in tensor_nodes(item)]
+        return []
+
+    # Distinct lifted names can still refer to the same bound storage.
+    storages = {}
+    for node in nodes:
+        if node.op != 'placeholder':
+            continue
+        spec = specs.get(node.name)
+        value = program.constants.get(spec.target) if spec is not None and spec.kind == InputKind.CONSTANT_TENSOR else program.state_dict.get(spec.target) if spec is not None else None
+        if isinstance(value, torch.Tensor) and value.device.type == 'cpu' and value.layout == torch.strided:
+            storage = value.untyped_storage()._cdata
+            if storage in storages:
+                merge(node, storages[storage])
+            else:
+                storages[storage] = node
+
+    for node in nodes:
+        if node.op in ('placeholder', 'output', 'get_attr'):
+            continue
+        arguments = tensor_nodes((node.args, node.kwargs))
+        if node.op == 'call_function' and node.target is operator.getitem:
+            for argument in tensor_nodes(node.args[0]):
+                merge(node, argument)
+            continue
+        schema = getattr(node.target, '_schema', None) if node.op == 'call_function' else None
+        if schema is None:
+            for argument in arguments:
+                merge(node, argument)
+            unknown_aliases.append((node, arguments))
+            continue
+        bindings = [(argument, node.args[index] if index < len(node.args) else node.kwargs.get(argument.name)) for index, argument in enumerate(schema.arguments)]
+        aliases = [(argument.alias_info, tensor_nodes(actual)) for argument, actual in bindings if argument.alias_info is not None]
+        for info, actual_nodes in aliases:
+            if info.is_write and node.target != torch.ops.aten.detach_.default:
+                writes.append((node, actual_nodes))
+        for returned in schema.returns:
+            info = returned.alias_info
+            if info is None:
+                continue
+            labels = info.before_set | info.after_set
+            # Tensor-list annotations and wildcard aliases lack a unique label;
+            # conservatively include every input storage rather than assume fresh.
+            for argument_info, actual_nodes in aliases:
+                argument_labels = argument_info.before_set | argument_info.after_set
+                if not labels or not argument_labels or '*' in labels or '*' in argument_labels or labels & argument_labels:
+                    for argument in actual_nodes:
+                        merge(node, argument)
+            if not aliases:
+                for argument in arguments:
+                    merge(node, argument)
+                unknown_aliases.append((node, arguments))
+
+    def prove_no_mask_writes(mask_node, attention_node):
+        closure = set()
+        pending = [mask_node]
+        while pending:
+            node = pending.pop()
+            if not isinstance(node, torch.fx.Node) or node in closure:
+                continue
+            closure.add(node)
+            pending.extend(node.all_input_nodes)
+        families = {root(node) for node in closure}
+        for writer, targets in writes + unknown_aliases:
+            if order[writer] < order[attention_node] and any(root(target) in families for target in targets):
+                raise ValueError('Source Flash mask has an unproved writable or unknown storage alias')
+
+    def meta(node):
+        return node.meta.get('val') if isinstance(node, torch.fx.Node) else None
+
+    def evaluate(value):
+        if not isinstance(value, torch.fx.Node):
+            if isinstance(value, (tuple, list)):
+                return type(value)(evaluate(item) for item in value)
+            if value is None or type(value) in (int, float, bool, str) or isinstance(value, (torch.dtype, torch.device, torch.layout)):
+                return value
+            raise ValueError('Source Flash masks reject inline tensors or nonprimitive literals')
+        if value in cached:
+            return cached[value]
+        info = meta(value)
+        if not isinstance(info, torch.Tensor) or info.device.type != 'cpu' or info.layout != torch.strided or info.dtype not in (torch.bool, torch.float32, torch.bfloat16) or any(type(dim) is not int for dim in info.shape) or math.prod(info.shape) > 1048576:
+            raise ValueError('Unproved source Flash mask metadata')
+        if value.op == 'placeholder':
+            spec = specs.get(value.name)
+            constant = program.constants.get(spec.target) if spec is not None and spec.kind == InputKind.CONSTANT_TENSOR else None
+            if not isinstance(constant, torch.Tensor) or constant.device.type != 'cpu' or constant.layout != torch.strided or constant.dtype != torch.bfloat16 or constant.shape != () or int(constant.view(torch.uint16)) != 0x3f80:
+                raise ValueError('Source Flash masks require original scalar-one constants')
+            result = constant.detach().clone()
+        elif value.op == 'call_function' and value.target in operations:
+            args = evaluate(value.args)
+            kwargs = {name: evaluate(item) for name, item in value.kwargs.items()}
+            if value.target in constructors:
+                shape = args[0]
+                if not isinstance(shape, (tuple, list)) or any(type(dim) is not int or dim <= 0 for dim in shape) or math.prod(shape) > 1048576:
+                    raise ValueError('Source Flash mask constructor is not bounded')
+                kwargs.setdefault('dtype', info.dtype)
+                if kwargs['dtype'] != info.dtype or kwargs.get('layout', torch.strided) != torch.strided or kwargs.get('requires_grad', False) is not False:
+                    raise ValueError('Source Flash mask constructor dtype/layout changed')
+                if kwargs.get('device', torch.device('cpu')) != torch.device('cpu') or kwargs.get('pin_memory', False) is not False:
+                    raise ValueError('Source Flash masks require ordinary CPU constants')
+            if value.target == torch.ops.aten.to.device and (len(args) < 3 or args[1] != torch.device('cpu') or args[2] not in (torch.bool, torch.float32, torch.bfloat16)):
+                raise ValueError('Source Flash mask cast requires the original CPU dtype')
+            if value.target == torch.ops.aten.to.dtype and (len(args) < 2 or args[1] not in (torch.bool, torch.float32, torch.bfloat16)):
+                raise ValueError('Source Flash mask cast dtype changed')
+            if value.target == torch.ops.aten.expand.default:
+                if any(type(dim) is not int or dim <= 0 for dim in args[1]) or math.prod(args[1]) > 1048576:
+                    raise ValueError('Source Flash mask expansion is not bounded')
+            result = value.target(*args, **kwargs)
+        else:
+            raise ValueError('Source Flash mask must be derived solely from original constants')
+        if not isinstance(result, torch.Tensor) or result.device.type != 'cpu' or result.dtype != info.dtype or tuple(result.shape) != tuple(info.shape):
+            raise ValueError('Source Flash mask result differs from original metadata')
+        cached[value] = result
+        return result
+
+    records = []
+    with torch.no_grad():
+        for node in program.graph.nodes:
+            if node.op != 'call_function' or node.target != torch.ops.aten.scaled_dot_product_attention.default:
+                continue
+            q = meta(node.args[0])
+            if not isinstance(q, torch.Tensor) or q.dtype != torch.bfloat16:
+                continue
+            if any(type(dim) is not int for dim in q.shape):
+                raise ValueError('Source Flash requires static query dimensions')
+            if tuple(q.shape) != geometry:
+                continue
+            schema = node.target._schema.arguments
+            if len(node.args) > sum(not argument.kwarg_only for argument in schema):
+                raise ValueError('Source Flash positional argument inventory changed')
+            bound = {argument.name: argument.default_value for argument in schema if argument.has_default_value()}
+            for argument, actual in zip(schema, node.args):
+                if argument.kwarg_only:
+                    raise ValueError('Source Flash argument signature changed')
+                bound[argument.name] = actual
+            for name, actual in node.kwargs.items():
+                if name not in {argument.name for argument in schema} or name in {argument.name for argument in schema[:len(node.args)]}:
+                    raise ValueError('Source Flash argument signature changed')
+                bound[name] = actual
+            if not {'query', 'key', 'value'} <= set(bound) or type(bound.get('dropout_p')) not in (int, float) or type(bound.get('is_causal')) is not bool or type(bound.get('enable_gqa')) is not bool or bound.get('scale') is not None and type(bound['scale']) is not float:
+                raise ValueError('Source Flash flags must be original compile-time literals')
+            if bound.get('dropout_p') != 0.0 or bound.get('is_causal') is not False or bound.get('enable_gqa') is not False or bound.get('scale') not in (None, 0.125):
+                raise ValueError('Source Flash requires original inference flags and scale')
+            for name in ('query', 'key', 'value'):
+                operand = meta(bound[name])
+                if not isinstance(operand, torch.Tensor) or operand.device.type != 'cpu' or operand.layout != torch.strided or operand.dtype != torch.bfloat16 or any(type(dim) is not int for dim in (*operand.shape, *operand.stride())) or type(operand.storage_offset()) is not int or operand.storage_offset() != 0 or tuple(operand.shape) != geometry or tuple(operand.stride()) != source_stride:
+                    raise ValueError('Source Flash requires original vision Q/K/V geometry and strides')
+            prove_no_mask_writes(bound.get('attn_mask'), node)
+            mask = evaluate(bound.get('attn_mask'))
+            if not isinstance(mask, torch.Tensor) or mask.dtype != torch.bfloat16 or tuple(mask.shape) != (1, 1, 1024, 1024) or bool(torch.any(mask.contiguous().view(torch.uint16) != 0)):
+                raise ValueError('Source Flash requires a proved original positive-zero mask')
+            records.append({'node': node.name, 'mask': bound['attn_mask'].name, 'mask_proof': 'bounded_input_independent_original_constant_DAG_positive_zero', 'preceding_mask_alias_writes_refused': True, 'native_qkv_strides': list(source_stride)})
+    if expected_count is not None and len(records) != expected_count:
+        raise ValueError('Original vision Flash inventory changed')
+    return records
+
+
+def prepare_source_flash_export(torch, source, policy="native", expected_count=None):
+    """Validate the original Flash source before any policy translation is used."""
+    record = source_flash_contract(torch, policy)
+    if record is None:
+        return source, None
+    sites = source_flash_sites(torch, source, expected_count)
+    record.update(site_count=len(sites), sites=sites, source_EP_mask_proof=True)
+    return source, record
+
 
 def source_rotary_contract(torch, policy="native"):
     """Bind source domain specialization for the original bounded Smol denoiser."""
@@ -815,12 +1107,20 @@ def scalar_translations(torch):
     return {torch.ops.aten.scalar_tensor.default: scalar_tensor}
 
 
-def translations(torch):
+def translations(torch, source_flash_policy="native"):
+    # The StageCompiler must authenticate the original EP mask DAG before export.
+    flash_record = source_flash_contract(torch, source_flash_policy)
     # Optional exporter dependencies are loaded only when this recipe is selected.
     from onnxscript import ir, opset18 as op
     from onnxscript.function_libs.torch_lib.ops import nn
     from onnxscript.function_libs.torch_lib.tensor_typing import TFloat
     from onnxscript.onnx_types import BFLOAT16, TensorType
+    flash_op = None
+    if flash_record is not None:
+        from onnx import defs
+        from onnxscript.values import Opset, Op
+        schema = defs.OpSchema("TorchFlashBf16Vision1024", "merlin.source_preserving", 1, inputs=[defs.OpSchema.FormalParameter(name, "T") for name in ("query", "key", "value", "mask")], outputs=[defs.OpSchema.FormalParameter("result", "T")], type_constraints=[("T", ["tensor(bfloat16)"], "Original BF16 vision Flash operands")])
+        flash_op = Op(Opset("merlin.source_preserving", 1), "TorchFlashBf16Vision1024", schema)
 
     def silu(self: BFLOAT16) -> BFLOAT16:
         # Fused BF16 SiLU has one logical output cast, not a BF16 sigmoid store.
@@ -877,6 +1177,12 @@ def translations(torch):
             return nn.aten_scaled_dot_product_attention(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa)
         if key.dtype != query.dtype or value.dtype != query.dtype:
             raise ValueError("Fused BF16 attention requires matching Q/K/V dtypes")
+        if flash_record is not None and query.shape is not None and tuple(query.shape) == (1, 12, 1024, 64):
+            if any(tensor.shape is None or tuple(tensor.shape) != (1, 12, 1024, 64) for tensor in (key, value)) or attn_mask is None or attn_mask.dtype != ir.DataType.BFLOAT16 or tuple(attn_mask.shape) != (1, 1, 1024, 1024):
+                raise ValueError("Source Flash requires proved vision operands and the original zero-mask geometry")
+            if dropout_p != 0.0 or is_causal or enable_gqa or scale not in (None, 0.125):
+                raise ValueError("Source Flash inference flags or scale changed")
+            return flash_op(query, key, value, attn_mask)
         if any(len(tensor.shape) != 4 for tensor in (query, key, value)):
             raise ValueError("Fused BF16 attention requires rank-four Q/K/V")
         if dropout_p != 0.0 or enable_gqa:

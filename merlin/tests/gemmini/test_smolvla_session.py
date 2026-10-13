@@ -686,6 +686,176 @@ class SmolVLASourceRotaryTests(unittest.TestCase):
         self.assertEqual({name: hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest() for name, value in prepared.constants.items()}, tables_before)
 
 
+class SmolVLASourceFlashTests(unittest.TestCase):
+    policy = "torch_cpu_flash_bf16_vision1024_v1"
+
+    @staticmethod
+    def inputs(torch, length=1024):
+        shape = (1, 12, length, 64)
+        rows = torch.arange(length).reshape(1, 1, length, 1)
+        columns = torch.arange(64).reshape(1, 1, 1, 64)
+        heads = torch.arange(12).reshape(1, 12, 1, 1)
+        return tuple(torch.empty_strided(shape, (12 * length * 64, 64, 768, 1), dtype=torch.bfloat16).copy_(((rows * 3 + columns * 5 + heads * 7 + index) % 29 - 14).float() / 32) for index in range(3))
+
+    @staticmethod
+    def fixture(torch, mask_kind="zeros", length=1024, normalize=True, scalar=1.0):
+        class ToyNativeVisionBF16QKV(torch.nn.Module):
+            def forward(self, query, key, value, supplied_mask=None):
+                if normalize:
+                    query, key, value = (tensor.transpose(1, 2).contiguous().transpose(1, 2) for tensor in (query, key, value))
+                shape = (1, 1, length, length)
+                if mask_kind == "original":
+                    ones = torch.ones([1, 32, 32], dtype=torch.float32, device="cpu").to(device="cpu", dtype=torch.bool)
+                    ones = ones.view(1, 1024).unsqueeze(1).unsqueeze(2).expand(shape).to(torch.bfloat16)
+                    inverse = torch.tensor(scalar, dtype=torch.bfloat16, device="cpu") - ones
+                    mask = inverse.masked_fill(inverse.to(torch.bool), torch.finfo(torch.bfloat16).min)
+                elif mask_kind == "dynamic":
+                    mask = supplied_mask
+                elif mask_kind == "nonzero":
+                    mask = torch.ones(shape, dtype=torch.bfloat16, device="cpu")
+                else:
+                    mask = torch.zeros(shape, dtype=torch.bfloat16, device="cpu")
+                    if mask_kind == "negativezero":
+                        mask = mask.masked_fill(torch.ones(shape, dtype=torch.bool, device="cpu"), -0.0)
+                if mask_kind == "unrelated_mutation":
+                    positions = torch.zeros(1, 48, dtype=torch.int64)
+                    positions[torch.ones(1, 48, dtype=torch.bool)] = 1
+                result = torch.nn.functional.scaled_dot_product_attention(query, key, value, mask, dropout_p=0.0, is_causal=False, scale=0.125)
+                return (result, positions) if mask_kind == "unrelated_mutation" else result
+        return ToyNativeVisionBF16QKV().eval()
+
+    def test_source_flash_defaults_and_factory_export_refusals(self):
+        import torch
+        from verify_session import StageCompiler
+
+        sentinel = object()
+        self.assertIsNone(NUMERICS.source_flash_contract(None))
+        self.assertEqual(NUMERICS.prepare_source_flash_export(None, sentinel), (sentinel, None))
+        with self.assertRaisesRegex(ValueError, "[Ff]lash"):
+            NUMERICS.source_flash_contract(None, "unknown")
+        for policy, exporter, fused in (("unknown", "dynamo", True), (self.policy, "legacy", False), (self.policy, "dynamo", False)):
+            with self.subTest(policy=policy, exporter=exporter, fused=fused), self.assertRaisesRegex(ValueError, "[Ff]lash"):
+                StageCompiler(Path("unused"), "baseline", None, torch, SimpleNamespace(), None, exporter=exporter, bf16_fused_export=fused, export_options={"source_flash_policy": policy})
+        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
+        for change in ({"source_flash_policy": "unknown"}, {"source_flash_policy": self.policy}, {"source_flash_policy": self.policy, "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "[Ff]lash"):
+                FACTORY.get_model_and_inputs(**base, **change)
+        self.assertNotIn("source_flash_policy", FACTORY.get_onnx_export_options(torch))
+        marker = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_flash_policy": {"name": self.policy}}}))
+        self.assertEqual(FACTORY.get_onnx_export_options(torch, marker)["source_flash_policy"], self.policy)
+        with mock.patch.object(torch, "get_num_threads", return_value=2), self.assertRaisesRegex(ValueError, "one native thread"):
+            NUMERICS.source_flash_contract(torch, self.policy)
+
+    def test_source_flash_requires_original_zero_mask_DAG_layout_and_flags(self):
+        import copy
+        import torch
+
+        inputs = self.inputs(torch)
+        with mock.patch.object(NUMERICS, "source_flash_contract", side_effect=lambda *args: {"name": self.policy}):
+            for kind in ("zeros", "original", "unrelated_mutation"):
+                source = torch.export.export(self.fixture(torch, kind), inputs)
+                graph, signature = str(source.graph), str(source.graph_signature)
+                constants = {name: value.clone() for name, value in source.constants.items()}
+                prepared, record = NUMERICS.prepare_source_flash_export(torch, source, self.policy, expected_count=1)
+                self.assertIs(prepared, source)
+                self.assertEqual(record["site_count"], 1)
+                self.assertEqual((str(source.graph), str(source.graph_signature)), (graph, signature))
+                self.assertTrue(all(torch.equal(source.constants[name], original) for name, original in constants.items()))
+            for kind in ("dynamic", "nonzero", "negativezero"):
+                arguments = inputs + (torch.zeros(1, 1, 1024, 1024, dtype=torch.bfloat16),) if kind == "dynamic" else inputs
+                changed = torch.export.export(self.fixture(torch, kind), arguments)
+                with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "[Ff]lash"):
+                    NUMERICS.prepare_source_flash_export(torch, changed, self.policy)
+            changed = torch.export.export(self.fixture(torch, "original", scalar=0.0), inputs)
+            with self.assertRaisesRegex(ValueError, "scalar-one"):
+                NUMERICS.prepare_source_flash_export(torch, changed, self.policy)
+            changed = torch.export.export(self.fixture(torch, normalize=False), tuple(value.contiguous() for value in inputs))
+            with self.assertRaisesRegex(ValueError, "strides"):
+                NUMERICS.prepare_source_flash_export(torch, changed, self.policy)
+            source = torch.export.export(self.fixture(torch), inputs)
+            mutated = copy.deepcopy(source)
+            attention = next(node for node in mutated.graph.nodes if node.target == torch.ops.aten.scaled_dot_product_attention.default)
+            mask = attention.args[3]
+            with mutated.graph.inserting_before(attention):
+                alias = mutated.graph.call_function(torch.ops.aten.alias.default, (mask,))
+                writer = mutated.graph.call_function(torch.ops.aten.fill_.Scalar, (alias, 1.0))
+            alias.meta["val"] = writer.meta["val"] = mask.meta["val"]
+            mutated.graph.lint()
+            with self.assertRaisesRegex(ValueError, "[Ff]lash"):
+                NUMERICS.prepare_source_flash_export(torch, mutated, self.policy)
+            for flags in ({"scale": 0.25}, {"dropout_p": 0.1}, {"is_causal": True}, {"enable_gqa": True}):
+                changed = copy.deepcopy(source)
+                node = next(node for node in changed.graph.nodes if node.target == torch.ops.aten.scaled_dot_product_attention.default)
+                node.kwargs = {**node.kwargs, **flags}
+                with self.subTest(flags=flags), self.assertRaisesRegex(ValueError, "[Ff]lash"):
+                    NUMERICS.prepare_source_flash_export(torch, changed, self.policy)
+            changed = copy.deepcopy(source)
+            node = next(node for node in changed.graph.nodes if node.target == torch.ops.aten.scaled_dot_product_attention.default)
+            key = node.args[1]
+            with key.meta["val"].fake_mode:
+                key.meta["val"] = torch.empty_strided((1, 12, 1024, 32), (393216, 32, 384, 1), dtype=torch.bfloat16)
+            with self.assertRaisesRegex(ValueError, "geometry"):
+                NUMERICS.prepare_source_flash_export(torch, changed, self.policy)
+            small = torch.export.export(self.fixture(torch, length=4), self.inputs(torch, 4))
+            prepared, record = NUMERICS.prepare_source_flash_export(torch, small, self.policy)
+            self.assertIs(prepared, small)
+            self.assertEqual(record["site_count"], 0)
+            with self.assertRaisesRegex(ValueError, "inventory"):
+                NUMERICS.prepare_source_flash_export(torch, small, self.policy, expected_count=1)
+
+    @unittest.skipUnless(os.environ.get("TVM_LIBRARY_PATH"), "requires opt-in pinned TVM/PyTorch CPU build")
+    def test_source_flash_public_factory_compiler_and_ordinary_fallback(self):
+        import hashlib
+        import numpy as np
+        import onnx
+        import torch
+        import tvm
+        from verify_session import StageCompiler, array
+        if torch.version.git_version != "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0" or torch.backends.cpu.get_cpu_capability() != "AVX512" or torch.get_num_threads() != 1:
+            self.skipTest("requires pinned AVX512 PyTorch CPU build and one native thread")
+
+        contract = NUMERICS.source_flash_contract(torch, self.policy)
+        marker = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_flash_policy": contract}}))
+        options = FACTORY.get_onnx_export_options(torch, marker)
+        bindings = contract["bindings"]
+        for mode, length, selected in (("baseline", 1024, True), ("optimized", 1024, True), ("baseline", 4, True), ("baseline", 4, False)):
+            model, tensors = self.fixture(torch, length=length), self.inputs(torch, length)
+            if length == 4:
+                tensors[0].zero_()
+                tensors[1].zero_()
+                tensors[2].fill_(1)
+            inputs = tuple(array(value, np, torch) for value in tensors)
+            before = [value.tobytes() for value in inputs]
+            expected = model(*tensors).contiguous().view(torch.uint16).numpy().copy()
+            source = torch.export.export(model, tensors)
+            graph, signature = str(source.graph), str(source.graph_signature)
+            prepared, admitted = NUMERICS.prepare_source_flash_export(torch, source, self.policy)
+            self.assertIs(prepared, source)
+            self.assertEqual(admitted["site_count"], int(length == 1024))
+            with self.subTest(mode=mode, length=length, selected=selected), tempfile.TemporaryDirectory() as directory:
+                compiler = StageCompiler(Path(directory), mode, np, torch, onnx, tvm, exporter="dynamo", opset=22, bf16_fused_export=True, export_options=options if selected else {"optimize": False})
+                run = compiler(SimpleNamespace(name="native_vision_flash", module=model), inputs, 1)
+                for repeat in range(2):
+                    actual = array(run(inputs), np, torch)
+                    self.assertEqual(actual.dtype.name, "bfloat16")
+                    self.assertEqual(actual.view(np.uint16).tobytes(), expected.tobytes())
+                record = compiler.records[0]
+                if selected:
+                    self.assertEqual(record["source_flash_export"]["site_count"], int(length == 1024))
+                    self.assertTrue(record["source_flash_export"]["bindings_preserved"])
+                else:
+                    self.assertNotIn("source_flash_export", record)
+                saved = onnx.load(record["onnx_artifacts"][0]["path"])
+                custom = [node for node in saved.graph.node if node.domain == "merlin.source_preserving" and node.op_type == "TorchFlashBf16Vision1024"]
+                self.assertEqual([(len(node.input), len(node.output), len(node.attribute)) for node in custom], [(4, 1, 0)] if length == 1024 else [])
+                self.assertEqual(saved.graph.output[0].type.tensor_type.elem_type, onnx.TensorProto.BFLOAT16)
+                self.assertEqual([value.name for value in saved.graph.input], ["input_0", "input_1", "input_2"])
+                self.assertEqual([value.tobytes() for value in inputs], before)
+                self.assertEqual((str(source.graph), str(source.graph_signature)), (graph, signature))
+        for binding in bindings:
+            self.assertEqual(hashlib.sha256(Path(binding["path"]).read_bytes()).hexdigest(), binding["sha256"])
+
+
 class SmolVLASourceMeanTests(unittest.TestCase):
     def test_session_hook_keeps_default_table_and_selects_only_declared_policy(self):
         import torch
