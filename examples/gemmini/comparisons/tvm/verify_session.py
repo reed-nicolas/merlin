@@ -619,19 +619,26 @@ class StageCompiler:
         if type(bf16_fused_export) is not bool or bf16_fused_export and (exporter != "dynamo" or self.opset < 18):
             raise ValueError("Fused BF16 export requires explicit dynamo selection and opset18 or newer")
         self.translation_source, self.export_options = None, {}
+        self.source_scalar_policy, self.export_helper = "native", None
         self.bf16_fused_export = bf16_fused_export
         if exporter == "dynamo":
             path = safe_path(Path(__file__).with_name("bf16_export.py"))
             self.translation_source = file_identity(path, safe_path)
             helper = load_module("tvm_session_bf16_export", path)
+            self.export_helper = helper
             self.export_options["custom_translation_table"] = helper.scalar_translations(torch)
         if bf16_fused_export:
             self.export_options["custom_translation_table"].update(helper.translations(torch))
             # Preserve original initializer dtypes, including BF16 bias storage.
             self.export_options["optimize"] = False
         if export_options is not None:
-            if not isinstance(export_options, dict) or set(export_options) - {"custom_translation_table", "optimize"}:
-                raise ValueError("Factory export options may only select translations and exporter optimization")
+            if not isinstance(export_options, dict) or set(export_options) - {"custom_translation_table", "optimize", "source_scalar_policy"}:
+                raise ValueError("Factory export options may only select translations, exporter optimization and source scalar policy")
+            self.source_scalar_policy = export_options.get("source_scalar_policy", "native")
+            if self.source_scalar_policy not in ("native", "torch_cpu_language_scale960_v1"):
+                raise ValueError("Unknown source scalar export policy")
+            if self.source_scalar_policy != "native" and exporter != "dynamo":
+                raise ValueError("Source scalar preservation requires explicit dynamo export")
             translations = export_options.get("custom_translation_table", {})
             if not isinstance(translations, dict) or any(not callable(value) for value in translations.values()):
                 raise ValueError("Factory ONNX translations must be a dictionary of callables")
@@ -657,10 +664,30 @@ class StageCompiler:
         # Tracing mutates plain Python cache attributes into FakeTensor objects.
         # Export an isolated stage so subsequent source calls and resets remain real.
         export_module = copy.deepcopy(program.module)
-        exported = self.torch.onnx.export(export_module, tensors, str(graph_path), input_names=names,
+        scalar_record, source_ep = None, None
+        export_source = export_module
+        if self.source_scalar_policy != "native":
+            original_parameters = parameter_digest(program.module, self.torch)
+            source_ep = self.torch.export.export(export_module, tensors, strict=False)
+            original_bindings = self._export_bindings(source_ep)
+            original_graph, original_signature = str(source_ep.graph), str(source_ep.graph_signature)
+            export_source, scalar_record = self.export_helper.prepare_source_scalar_export(self.torch, source_ep, self.source_scalar_policy)
+            if self._export_bindings(export_source) != original_bindings:
+                raise AssertionError("Prepared scalar export changed parameters or constants")
+        exported = self.torch.onnx.export(export_source, tensors, str(graph_path), input_names=names,
                                          output_names=["output_" + str(index) for index in range(output_count)],
                                          opset_version=self.opset, dynamo=self.exporter == "dynamo", external_data=True, do_constant_folding=True, **self.export_options)
-        del export_module
+        if scalar_record is not None:
+            if self._export_bindings(source_ep) != original_bindings or self._export_bindings(export_source) != original_bindings or parameter_digest(program.module, self.torch) != original_parameters:
+                raise AssertionError("Scalar export changed original parameters or constants")
+            if str(source_ep.graph) != original_graph or str(source_ep.graph_signature) != original_signature:
+                raise AssertionError("Scalar export changed original graph or signature")
+            scalar_record["original_parameters_sha256"] = original_parameters
+            scalar_record["original_EP_bindings_sha256"] = original_bindings
+            scalar_record["original_EP_graph_sha256"] = hashlib.sha256(original_graph.encode()).hexdigest()
+            scalar_record["original_EP_signature_sha256"] = hashlib.sha256(original_signature.encode()).hexdigest()
+            scalar_record["bindings_preserved"] = True
+        del export_module, export_source, source_ep
         graph, artifacts = load_onnx_graph(graph_path, self.onnx)
         from tvm.relax.frontend.onnx import from_onnx
         mod = from_onnx(graph, shape_dict={name: list(value.shape) for name, value in zip(names, inputs)}, keep_params_in_input=False)
@@ -673,6 +700,8 @@ class StageCompiler:
             record["translated_aten_operations"] = {str(target): sum(node.op == "call_function" and node.target == target for node in exported.exported_program.graph.nodes) for target in targets}
         if "optimize" in self.export_options:
             record["onnx_export_optimization"] = self.export_options["optimize"]
+        if scalar_record is not None:
+            record["source_scalar_export"] = scalar_record
         if self.translation_source:
             if file_identity(self.translation_source["path"], safe_path) != self.translation_source:
                 raise AssertionError("Selected floating export translations changed")
@@ -697,6 +726,16 @@ class StageCompiler:
                 raise AssertionError("TVM stage mutated caller inputs")
             return result
         return run
+
+    def _export_bindings(self, program):
+        digest = hashlib.sha256()
+        for scope, values in (("state", program.state_dict), ("constant", program.constants)):
+            for name, value in sorted(values.items()):
+                if not isinstance(value, self.torch.Tensor) or value.device.type != "cpu" or value.layout != self.torch.strided:
+                    raise ValueError("Source scalar export requires dense CPU tensor bindings")
+                digest.update(json.dumps([scope, name, str(value.dtype), list(value.shape), list(value.stride()), value.storage_offset()]).encode())
+                digest.update(value.detach().contiguous().reshape(-1).view(self.torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
 
 
     def export_stages(self, output_dir, *, memory_limit_bytes, target=None, adapter_trace=None, reference_sources=()):

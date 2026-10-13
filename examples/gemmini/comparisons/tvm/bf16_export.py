@@ -3,6 +3,8 @@
 The independent scalar hook preserves original Python values in typed DOUBLE
 constants; other ordinary scalar dtypes use their built-in translations.
 The Smol mean hook preserves a separately pinned native reduction order.
+The language-scale adapter preserves native FP32 scalar opmath in a copied
+export graph before ordinary ONNX preparation.
 
 Original operands and results remain BF16. FP32 internal arithmetic avoids adding
 BF16 rounding points inside a mathematical fused operation. Native linear can
@@ -56,6 +58,14 @@ SOURCE_SGEMM_ARTIFACTS = {
 }
 
 
+SOURCE_LANGUAGE_SCALE_ARTIFACTS = {
+    "lib/libtorch_cpu.so": SOURCE_MEAN_ARTIFACTS["lib/libtorch_cpu.so"],
+    "include/ATen/TensorIterator.h": "06a7456c42b538e2e40429ffb194e9ad1b786735092814a9e242fd8d40877712",
+    "include/ATen/OpMathType.h": "0d978d4f2e9b1ecba574b24b2e59ea1ddff96ad09262ddc15c1c359bf6dad5cc",
+    "include/ATen/native/cpu/Loops.h": "a6f2ab2e6e7175454f1c4226994177cd2e934d844fe89b09dc049e7a77a7872d",
+    "include/c10/util/BFloat16.h": "b403700bb442c764384d0a59c5e6eeb423a573b5c8890debcc2882f4600bc569",
+}
+
 def _source_cpu_bindings(torch, artifacts, operation):
     if torch.version.git_version != "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0" or torch.backends.cpu.get_cpu_capability() != "AVX512" or torch.get_num_threads() != 1:
         raise ValueError(f"{operation} requires the pinned PyTorch CPU build, AVX512 capability and one native thread")
@@ -67,6 +77,137 @@ def _source_cpu_bindings(torch, artifacts, operation):
         raise ValueError(f"{operation} requires the independently proved native library and headers")
     return bindings
 
+
+def source_scalar_contract(torch, policy="native"):
+    """Bind the narrowly proved original CPU language scalar multiplication."""
+    if policy == "native":
+        return None
+    if policy != "torch_cpu_language_scale960_v1":
+        raise ValueError("Unknown source scalar export policy")
+    bindings = _source_cpu_bindings(torch, SOURCE_LANGUAGE_SCALE_ARTIFACTS, "Source language scale")
+    return {
+        "name": policy,
+        "status": "opt_in_source_preserving_export_not_policy_qualified",
+        "native": "original_BF16_CPU_embedding_1x48x960_times_original_Pythonfloat_sqrt960",
+        "native_threads": 1,
+        "export_shape": [1, 48, 960],
+        "original_scalar_FP32_word": "0x41f7def6",
+        "algorithm": "original_scalar_value_float_opmath;BF16_input_widen_FP32_Mul_single_BF16_store",
+        "source": "https://github.com/pytorch/pytorch/blob/449b1768410104d3ed79d3bcfe4ba1d65c7f22c0/aten/src/ATen/native/cpu/BinaryOpsKernel.cpp#L131-L147",
+        "export": "copied_original_EP_explicit_opmath_then_ordinary_public_ONNX_export",
+        "unchanged": ["original_EP", "parameters", "Tensor_other", "original_explicit_casts", "native_reference", "acceptance_gates"],
+        "qualification": "actual_saved_language_branch_only;fullprefix_and_policy_unqualified",
+        "value_admission": "finite_original_language_rows_checked_by_external_receipt;metadata_guard_does_not_check_runtime_values",
+        "bindings": bindings,
+    }
+
+
+def prepare_source_scalar_export(torch, source, policy="native"):
+    """Copy only the admitted language scalar site; keep native/no-site EPs."""
+    record = source_scalar_contract(torch, policy)
+    if record is None:
+        return source, None
+    if not isinstance(source, torch.export.ExportedProgram):
+        raise ValueError("Source scalar export requires an original ExportedProgram")
+    sites = []
+    for node in source.graph_module.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.mul.Tensor:
+            continue
+        if len(node.args) != 2 or node.kwargs or type(node.args[1]) is not float or node.args[1] != math.sqrt(960):
+            continue
+        left = node.args[0]
+        operand = left.meta.get("val") if isinstance(left, torch.fx.Node) else None
+        if isinstance(operand, torch.Tensor) and operand.dtype == torch.bfloat16 and operand.device.type == "cpu" and tuple(operand.shape) == (1, 48, 960):
+            sites.append(node)
+    if len(sites) > 1:
+        raise ValueError("Ambiguous source language scalar sites")
+    record.update({
+        "site_count": len(sites),
+        "sites": [],
+    })
+    if not sites:
+        return source, record
+    original = sites[0]
+    embedding = original.args[0]
+    if embedding.op != "call_function" or embedding.target != torch.ops.aten.embedding.default or len(embedding.args) < 2:
+        raise ValueError("Source language scale requires the original embedding producer")
+    weight_node, token_node = embedding.args[:2]
+    weight = weight_node.meta.get("val") if isinstance(weight_node, torch.fx.Node) else None
+    tokens = token_node.meta.get("val") if isinstance(token_node, torch.fx.Node) else None
+    if not (isinstance(weight, torch.Tensor) and weight.dtype == torch.bfloat16 and weight.device.type == "cpu" and tuple(weight.shape) == (49280, 960)
+            and isinstance(tokens, torch.Tensor) and tokens.dtype == torch.int64 and tokens.device.type == "cpu" and tuple(tokens.shape) == (1, 48)):
+        raise ValueError("Source language embedding operand geometry changed")
+    original_result = original.meta.get("val")
+    original_operand = embedding.meta.get("val")
+    if not (isinstance(original_result, torch.Tensor) and original_result.dtype == torch.bfloat16
+            and original_result.device == original_operand.device and tuple(original_result.shape) == tuple(original_operand.shape)):
+        raise ValueError("Original BF16 scalar Mul result metadata changed")
+    original_mode = getattr(original_operand, "fake_mode", None)
+    if original_mode is None or getattr(original_result, "fake_mode", None) is not original_mode:
+        raise ValueError("Qualified original EP FakeTensor metadata missing")
+
+    import copy
+    original_graph = str(source.graph_module.graph)
+    original_signature = str(source.graph_signature)
+    prepared = copy.deepcopy(source)
+    graph = prepared.graph_module.graph
+    copied = [node for node in graph.nodes if node.name == original.name]
+    if len(copied) != 1:
+        raise ValueError("Copied source language scalar site inventory changed")
+    node = copied[0]
+    if node.op != "call_function" or node.target != original.target or node.kwargs or len(node.args) != 2:
+        raise ValueError("Copied source language scalar operation changed")
+    left, literal = node.args
+    if not isinstance(left, torch.fx.Node) or left.name != embedding.name or type(literal) is not float or literal != original.args[1]:
+        raise ValueError("Copied source language scalar operands changed")
+    operand = left.meta.get("val")
+    result = node.meta.get("val")
+    fake_mode = getattr(operand, "fake_mode", None)
+    if not (isinstance(operand, torch.Tensor) and operand.dtype == original_operand.dtype and operand.device == original_operand.device
+            and tuple(operand.shape) == tuple(original_operand.shape) and isinstance(result, torch.Tensor)
+            and result.dtype == original_result.dtype and result.device == original_result.device and tuple(result.shape) == tuple(original_result.shape)):
+        raise ValueError("Copied source language scalar metadata changed")
+    if fake_mode is None or getattr(result, "fake_mode", None) is not fake_mode:
+        raise ValueError("Copied EP FakeTensor mode changed")
+    users = tuple(node.users)
+    with graph.inserting_before(node):
+        widened = graph.call_function(torch.ops.aten._to_copy.default, (left,), {"dtype": torch.float32})
+        scalar = graph.call_function(torch.ops.aten.scalar_tensor.default, (literal,), {
+            "dtype": torch.float32,
+            "device": operand.device,
+        })
+        product = graph.call_function(torch.ops.aten.mul.Tensor, (widened, scalar))
+    with fake_mode:
+        widened.meta["val"] = operand.to(torch.float32)
+        scalar.meta["val"] = torch.scalar_tensor(literal, dtype=torch.float32, device=operand.device)
+        product.meta["val"] = widened.meta["val"] * scalar.meta["val"]
+    for inserted in (widened, scalar, product):
+        for key in ("stack_trace", "nn_module_stack", "source_fn_stack"):
+            if key in node.meta:
+                inserted.meta[key] = copy.deepcopy(node.meta[key])
+    # Retain the original BF16 result node and its users.
+    node.target = torch.ops.aten._to_copy.default
+    node.args = (product,)
+    node.kwargs = {"dtype": torch.bfloat16}
+    if tuple(node.users) != users or widened.args[0] is not left:
+        raise ValueError("Original source language scalar users changed")
+    record["sites"].append({
+        "original_mul": node.name,
+        "original_left_producer": left.name,
+        "original_literal": literal,
+        "original_users": [user.name for user in users],
+        "original_explicit_cast_removed": False,
+        "original_output_name_preserved": True,
+        "inserted": [widened.name, scalar.name, product.name],
+    })
+    graph.lint()
+    prepared.graph_module.recompile()
+    prepared.validate()
+    if str(source.graph_module.graph) != original_graph or str(source.graph_signature) != original_signature:
+        raise ValueError("Source EP changed")
+    if str(prepared.graph_signature) != original_signature:
+        raise ValueError("Copied EP signature changed")
+    return prepared, record
 
 def source_mean_contract(torch, policy="native"):
     """Bind the native CPU mean used by the scoped Smol expert export."""

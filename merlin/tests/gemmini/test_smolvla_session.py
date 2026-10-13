@@ -293,6 +293,255 @@ class SmolVLAObservationTests(unittest.TestCase):
                 FACTORY.observation_manifest(fixture, path)
 
 
+class SmolVLASourceScalarTests(unittest.TestCase):
+    def test_source_scalar_defaults_and_fail_closed_sites(self):
+        import copy
+        import math
+        import torch
+
+        sentinel = object()
+        self.assertIsNone(NUMERICS.source_scalar_contract(None))
+        self.assertEqual(NUMERICS.prepare_source_scalar_export(None, sentinel), (sentinel, None))
+        with self.assertRaisesRegex(ValueError, "Unknown source scalar"):
+            NUMERICS.source_scalar_contract(None, "unknown")
+        from verify_session import StageCompiler
+        for options, exporter in (({"source_scalar_policy": "unknown"}, "dynamo"), ({"source_scalar_policy": "torch_cpu_language_scale960_v1"}, "legacy")):
+            with self.subTest(options=options, exporter=exporter), self.assertRaisesRegex(ValueError, "source scalar|Source scalar"):
+                StageCompiler(Path("unused"), "baseline", None, torch, SimpleNamespace(), None, exporter=exporter, export_options=options)
+        base = {"checkpoint_dir": "/missing", "backbone_dir": "/missing", "model2mlir_root": "/missing"}
+        for change in ({"source_scalar_policy": "unknown"}, {"source_scalar_policy": "torch_cpu_language_scale960_v1"}, {"source_scalar_policy": "torch_cpu_language_scale960_v1", "quantized": True, "integer_diagnostic_dir": "/missing", "cpu_threads": 2}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Source scalar"):
+                FACTORY.get_model_and_inputs(**base, **change)
+
+        class Language(torch.nn.Module):
+            def __init__(self, duplicate=False):
+                super().__init__()
+                self.register_buffer("weight", torch.zeros(49280, 960, dtype=torch.bfloat16))
+                self.duplicate = duplicate
+
+            def forward(self, tokens):
+                value = torch.nn.functional.embedding(tokens, self.weight)
+                if self.duplicate:
+                    return value * math.sqrt(960), value * math.sqrt(960)
+                return (value * math.sqrt(960)).float()
+
+        class BadProducer(torch.nn.Module):
+            def forward(self, value):
+                return value * math.sqrt(960)
+
+        policy = "torch_cpu_language_scale960_v1"
+        tokens = torch.zeros(1, 48, dtype=torch.int64)
+        with mock.patch.object(NUMERICS, "source_scalar_contract", side_effect=lambda *args: {"name": policy}):
+            with self.assertRaisesRegex(ValueError, "ExportedProgram"):
+                NUMERICS.prepare_source_scalar_export(torch, sentinel, policy)
+            ambiguous = torch.export.export(Language(duplicate=True), (tokens,))
+            with self.assertRaisesRegex(ValueError, "Ambiguous"):
+                NUMERICS.prepare_source_scalar_export(torch, ambiguous, policy)
+            bad = torch.export.export(BadProducer(), (torch.ones(1, 48, 960, dtype=torch.bfloat16),))
+            with self.assertRaisesRegex(ValueError, "original embedding producer"):
+                NUMERICS.prepare_source_scalar_export(torch, bad, policy)
+            source = torch.export.export(Language(), (tokens,))
+            for dtype, shape in ((torch.float32, (1, 48, 960)), (torch.bfloat16, (1, 47, 960))):
+                changed = copy.deepcopy(source)
+                node = next(node for node in changed.graph.nodes if node.target == torch.ops.aten.mul.Tensor)
+                with node.meta["val"].fake_mode:
+                    node.meta["val"] = torch.empty(shape, dtype=dtype)
+                with self.subTest(dtype=dtype, shape=shape), self.assertRaisesRegex(ValueError, "result metadata"):
+                    NUMERICS.prepare_source_scalar_export(torch, changed, policy)
+            missing_mode = copy.deepcopy(source)
+            node = next(node for node in missing_mode.graph.nodes if node.target == torch.ops.aten.mul.Tensor)
+            node.meta["val"] = torch.empty(1, 48, 960, dtype=torch.bfloat16)
+            with self.assertRaisesRegex(ValueError, "FakeTensor metadata"):
+                NUMERICS.prepare_source_scalar_export(torch, missing_mode, policy)
+
+    def test_source_scalar_no_site_preserves_original_EP_and_explicit_casts(self):
+        import math
+        import torch
+
+        class Controls(torch.nn.Module):
+            def __init__(self, case):
+                super().__init__()
+                self.case = case
+
+            def forward(self, value, other):
+                if self.case == "Tensor_other":
+                    return (value * other).float()
+                if self.case == "integer":
+                    return (value * 2).float()
+                if self.case == "nearby_float":
+                    return (value * (math.sqrt(960) + 1e-9)).float()
+                if self.case == "explicit_cast_Tensor_other":
+                    return (value.float().bfloat16() * other).float()
+                return (value * math.sqrt(960)).float()
+
+        policy = "torch_cpu_language_scale960_v1"
+        cases = [("Tensor_other", torch.bfloat16, (1, 48, 960)), ("FP32", torch.float32, (1, 48, 960)),
+                 ("integer", torch.bfloat16, (1, 48, 960)), ("nearby_float", torch.bfloat16, (1, 48, 960)),
+                 ("explicit_cast_Tensor_other", torch.bfloat16, (1, 48, 960)), ("wrong_shape", torch.bfloat16, (1, 47, 960))]
+        for case, dtype, shape in cases:
+            inputs = (torch.ones(shape, dtype=dtype), torch.full(shape, 31, dtype=dtype))
+            source = torch.export.export(Controls(case), inputs)
+            original_graph = str(source.graph)
+            original_signature = str(source.graph_signature)
+            with self.subTest(case=case), mock.patch.object(NUMERICS, "source_scalar_contract", side_effect=lambda *args: {"name": policy}):
+                prepared, record = NUMERICS.prepare_source_scalar_export(torch, source, policy)
+            self.assertIs(prepared, source)
+            self.assertEqual(record["site_count"], 0)
+            self.assertEqual(record["sites"], [])
+            self.assertEqual(str(source.graph), original_graph)
+            self.assertEqual(str(source.graph_signature), original_signature)
+
+    @unittest.skipUnless(os.environ.get("TVM_LIBRARY_PATH"), "requires opt-in pinned TVM/PyTorch CPU build")
+    def test_source_scalar_real_public_export_and_strict_LLVM_grid(self):
+        import gc
+        import hashlib
+        import math
+        import re
+        import numpy as np
+        import onnx
+        import torch
+        if torch.version.git_version != "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0" or torch.backends.cpu.get_cpu_capability() != "AVX512" or torch.get_num_threads() != 1:
+            self.skipTest("requires pinned AVX512 PyTorch CPU build and one native thread")
+        import tvm
+        from tvm import relax
+        from tvm.relax.frontend.onnx import from_onnx
+        from verify_resnet import prepare_graph
+
+        class Language(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("weight", torch.zeros(49280, 960, dtype=torch.bfloat16))
+
+            def forward(self, tokens):
+                return (torch.nn.functional.embedding(tokens, self.weight) * math.sqrt(960)).float()
+
+        # Finite independent grid includes signed zero and tiny BF16 operands.
+        grid = np.array([0, 0x8000, 1, 0x8001, 0x0080, 0x8080, 0x3f00, 0xbf00, 0x3f80, 0xbf80, 0x3f81, 0xbf81, 0x4001, 0xc001, 0x3f90, 0xbf90], dtype=np.uint16)
+        model = Language().eval()
+        row_words = np.resize(grid, 960).copy()
+        model.weight[0].copy_(torch.from_numpy(row_words).view(torch.bfloat16))
+        tokens = torch.zeros(1, 48, dtype=torch.int64)
+        source_value = model(tokens).numpy().copy()
+        self.assertEqual(source_value.dtype, np.float32)
+        self.assertEqual(source_value.shape, (1, 48, 960))
+        gathered = torch.nn.functional.embedding(tokens, model.weight)
+        rounded_scalar = torch.tensor(math.sqrt(960), dtype=torch.bfloat16)
+        rounded_control = (gathered * rounded_scalar).float().numpy().copy()
+        self.assertEqual(int(rounded_scalar.view(torch.uint16)), 0x41f8)
+        self.assertTrue(np.any(source_value.view(np.uint32) != rounded_control.view(np.uint32)))
+        # ±1.125 distinguish native original-scalar opmath from narrowing to31.
+        for word in (0x3f90, 0xbf90):
+            column = int(np.flatnonzero(row_words == word)[0])
+            self.assertNotEqual(source_value[0, 0, column], rounded_control[0, 0, column])
+        tokens_before = tokens.numpy().tobytes()
+        weight_before = hashlib.sha256(model.weight.view(torch.uint16).numpy().tobytes()).hexdigest()
+        source = torch.export.export(model, (tokens,))
+        original_graph = str(source.graph)
+        original_signature = str(source.graph_signature)
+        prepared, record = NUMERICS.prepare_source_scalar_export(torch, source, "torch_cpu_language_scale960_v1")
+        self.assertIsNot(prepared, source)
+        self.assertEqual(record["site_count"], 1)
+        self.assertEqual(len(record["sites"]), 1)
+        self.assertEqual(str(source.graph), original_graph)
+        self.assertEqual(str(source.graph_signature), original_signature)
+        self.assertEqual(str(prepared.graph_signature), original_signature)
+        for exported in (source, prepared):
+            self.assertEqual(hashlib.sha256(exported.state_dict["weight"].view(torch.uint16).numpy().tobytes()).hexdigest(), weight_before)
+        graph = torch.onnx.export(prepared, dynamo=True, opset_version=18, optimize=False).model_proto
+        weight = graph.graph.initializer[0]
+        self.assertEqual(weight.data_type, onnx.TensorProto.BFLOAT16)
+        self.assertEqual(list(weight.dims), [49280, 960])
+        self.assertEqual(hashlib.sha256(weight.raw_data).hexdigest(), weight_before)
+        graph_before = hashlib.sha256(graph.SerializeToString()).hexdigest()
+        casts = [next(attr.i for attr in node.attribute if attr.name == "to") for node in graph.graph.node if node.op_type == "Cast"]
+        self.assertEqual(casts, [onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT, onnx.TensorProto.BFLOAT16, onnx.TensorProto.FLOAT])
+        scalar = onnx.numpy_helper.to_array(next(attr.t for node in graph.graph.node if node.op_type == "Constant" for attr in node.attribute if attr.type == onnx.AttributeProto.TENSOR))
+        self.assertEqual(scalar.dtype, np.float32)
+        self.assertEqual(scalar.shape, ())
+        self.assertEqual(int(scalar.view(np.uint32)), 0x41f7def6)
+        types = {value.name: value.type.tensor_type.elem_type for value in list(graph.graph.value_info) + list(graph.graph.input) + list(graph.graph.output)}
+        product = next(node for node in graph.graph.node if node.op_type == "Mul")
+        self.assertEqual([types[name] for name in product.input], [onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT])
+        self.assertEqual(types[product.output[0]], onnx.TensorProto.FLOAT)
+        imported = from_onnx(graph, keep_params_in_input=False)
+        for mode in ("baseline", "optimized"):
+            _, lowered = prepare_graph(imported, mode, tvm)
+            executable = relax.build(lowered, "llvm", pipeline=None)
+            pending = [executable.mod]
+            modules = []
+            seen = set()
+            while pending:
+                module = pending.pop()
+                if module.handle.value in seen:
+                    continue
+                seen.add(module.handle.value)
+                if module.type_key == "llvm":
+                    modules.append(module)
+                pending.extend(module.imported_modules)
+            llvm = "\n".join(module.get_source("ll") for module in modules)
+            operations = [line for line in llvm.splitlines() if re.search(r"\b(?:fadd|fmul|fsub|fdiv|fcmp|fneg|fptrunc|fpext)\b", line)]
+            self.assertTrue(operations)
+            self.assertRegex(llvm, r"\bfmul\b")
+            self.assertNotIn("llvm.fma", llvm)
+            self.assertNotIn("llvm.fmuladd", llvm)
+            self.assertFalse(any(re.search(r"\b(?:fast|reassoc|contract|arcp|afn|nsz|nnan|ninf|double)\b", line) for line in operations))
+            for fresh in range(2):
+                vm = relax.VirtualMachine(executable, tvm.cpu())
+                supplied = tvm.nd.array(tokens.numpy().copy())
+                for repeat in range(2):
+                    with self.subTest(mode=mode, fresh=fresh, repeat=repeat):
+                        actual = vm["main"](supplied).numpy()
+                        self.assertEqual(actual.dtype, np.float32)
+                        self.assertEqual(actual.shape, (1, 48, 960))
+                        self.assertEqual(actual.tobytes(), source_value.tobytes())
+                        self.assertEqual(supplied.numpy().tobytes(), tokens.numpy().tobytes())
+                del vm, supplied
+            del executable, modules, lowered
+            gc.collect()
+        self.assertEqual(str(source.graph), original_graph)
+        self.assertEqual(str(source.graph_signature), original_signature)
+        self.assertEqual(str(prepared.graph_signature), original_signature)
+        self.assertEqual(tokens.numpy().tobytes(), tokens_before)
+        for exported in (source, prepared):
+            self.assertEqual(hashlib.sha256(exported.state_dict["weight"].view(torch.uint16).numpy().tobytes()).hexdigest(), weight_before)
+        self.assertEqual(hashlib.sha256(model.weight.view(torch.uint16).numpy().tobytes()).hexdigest(), weight_before)
+        self.assertEqual(hashlib.sha256(weight.raw_data).hexdigest(), weight_before)
+        self.assertEqual(hashlib.sha256(graph.SerializeToString()).hexdigest(), graph_before)
+        scalar_after = onnx.numpy_helper.to_array(next(attr.t for node in graph.graph.node if node.op_type == "Constant" for attr in node.attribute if attr.type == onnx.AttributeProto.TENSOR))
+        self.assertEqual(scalar_after.dtype, np.float32)
+        self.assertEqual(int(scalar_after.view(np.uint32)), 0x41f7def6)
+        del graph, imported, prepared, source, weight
+        gc.collect()
+
+        # Exercise actual factory selection and StageCompiler, including the default control.
+        from verify_session import StageCompiler, array
+        policy = NUMERICS.source_scalar_contract(torch, "torch_cpu_language_scale960_v1")
+        marker = SimpleNamespace(session=SimpleNamespace(metadata={"provenance": {"source_scalar_policy": policy}}))
+        options = FACTORY.get_onnx_export_options(torch, marker)
+        self.assertEqual(options["source_scalar_policy"], policy["name"])
+        self.assertNotIn("source_scalar_policy", FACTORY.get_onnx_export_options(torch))
+        inputs = (tokens.numpy().copy(),)
+        for mode, selected in (("baseline", True), ("optimized", True), ("baseline", False)):
+            with self.subTest(mode=mode, selected=selected), tempfile.TemporaryDirectory() as directory:
+                compiler = StageCompiler(Path(directory), mode, np, torch, onnx, tvm, exporter="dynamo", opset=18, export_options=options if selected else {"optimize": False})
+                run = compiler(SimpleNamespace(name="language_scale960", module=model), inputs, 1)
+                expected = source_value if selected else rounded_control
+                for repeat in range(2):
+                    self.assertEqual(array(run(inputs), np, torch).tobytes(), expected.tobytes())
+                record = compiler.records[0]
+                if selected:
+                    self.assertEqual(record["source_scalar_export"]["name"], policy["name"])
+                    self.assertEqual(record["source_scalar_export"]["site_count"], 1)
+                    self.assertTrue(record["source_scalar_export"]["bindings_preserved"])
+                else:
+                    self.assertNotIn("source_scalar_export", record)
+                saved = onnx.load(record["onnx_artifacts"][0]["path"])
+                self.assertEqual(hashlib.sha256(saved.graph.initializer[0].raw_data).hexdigest(), weight_before)
+                self.assertEqual(tokens.numpy().tobytes(), tokens_before)
+                self.assertEqual(hashlib.sha256(model.weight.view(torch.uint16).numpy().tobytes()).hexdigest(), weight_before)
+                del run, compiler, saved
+            gc.collect()
+
 class SmolVLASourceMeanTests(unittest.TestCase):
     def test_session_hook_keeps_default_table_and_selects_only_declared_policy(self):
         import torch

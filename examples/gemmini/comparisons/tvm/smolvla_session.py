@@ -477,7 +477,7 @@ def make_policy_session(model, inputs, loader, provenance):
 def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
                          input_npz=None, fixture_kind="synthetic", input_source=None,
                          input_manifest=None, selected_cameras=None, seed=0, cpu_threads=1, precision="original",
-                         quantized=False, integer_diagnostic_dir=None, source_mean_policy="native", source_softmax_policy="native", source_layernorm_policy="native", source_conv_policy="native", source_sgemm_policy="native"):
+                         quantized=False, integer_diagnostic_dir=None, source_mean_policy="native", source_softmax_policy="native", source_layernorm_policy="native", source_conv_policy="native", source_sgemm_policy="native", source_scalar_policy="native"):
     if precision != "original":
         raise ValueError("Only original LeRobot precision is supported; implicit BF16 conversion is forbidden")
     if type(cpu_threads) is not int or not 1 <= cpu_threads <= 4 or type(seed) is not int or seed < 0:
@@ -494,6 +494,8 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
         raise ValueError("Source convolution preservation requires the original-precision integer recipe and one native thread")
     if source_sgemm_policy not in ("native", "torch_cpu_sgemm177_v1", "torch_cpu_attention177_227_v1") or source_sgemm_policy != "native" and (not quantized or cpu_threads != 1):
         raise ValueError("Source SGEMM preservation requires the original-precision integer recipe and one native thread")
+    if source_scalar_policy not in ("native", "torch_cpu_language_scale960_v1") or source_scalar_policy != "native" and (not quantized or cpu_threads != 1):
+        raise ValueError("Source scalar preservation requires the original-precision integer recipe and one native thread")
     if fixture_kind not in ("synthetic", "dataset") or (fixture_kind == "dataset" and (not input_npz or not input_source)):
         raise ValueError("Dataset fixtures require both a local NPZ and attributed input_source")
     if input_manifest is not None and fixture_kind != "dataset":
@@ -544,6 +546,10 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
     if source_sgemm_policy != "native":
         import bf16_export
         sgemm_record = bf16_export.source_sgemm_contract(torch, source_sgemm_policy)
+    scalar_record = None
+    if source_scalar_policy != "native":
+        import bf16_export
+        scalar_record = bf16_export.source_scalar_contract(torch, source_scalar_policy)
     config = PreTrainedConfig.from_pretrained(str(safe_path(checkpoint_dir)), local_files_only=True)
     if not isinstance(config, SmolVLAConfig):
         raise TypeError("Pinned checkpoint did not resolve to SmolVLAConfig")
@@ -589,6 +595,8 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
         files.extend([*conv_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
     if sgemm_record is not None:
         files.extend([*sgemm_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
+    if scalar_record is not None:
+        files.extend([*scalar_record["bindings"], file_identity(bf16_export.__file__, safe_path)])
     files.extend(processor_diagnostic["bindings"])
     if quantized:
         files.extend([integer_receipt, helper_identity, file_identity(diagnostic.__file__, safe_path)])
@@ -625,6 +633,8 @@ def get_model_and_inputs(*, checkpoint_dir, backbone_dir, model2mlir_root,
         provenance["source_conv_policy"] = conv_record
     if sgemm_record is not None:
         provenance["source_sgemm_policy"] = sgemm_record
+    if scalar_record is not None:
+        provenance["source_scalar_policy"] = scalar_record
     if quantized:
         provenance.update(precision="declared_w8a8_with_original_lerobot_float_interfaces",
                           source_precision="original_lerobot", quantized_recipe_quality_qualified=False,
@@ -670,4 +680,7 @@ def get_onnx_export_options(torch, model=None):
         if sgemm_policy != "native":
             import bf16_export
             options["custom_translation_table"].update(bf16_export.source_sgemm_translations(torch, sgemm_policy))
+        scalar_policy = model.session.metadata.get("provenance", {}).get("source_scalar_policy", {}).get("name", "native")
+        if scalar_policy != "native":
+            options["source_scalar_policy"] = scalar_policy
     return options
