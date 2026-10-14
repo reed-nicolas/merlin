@@ -108,3 +108,38 @@ def boolean_feature_gate(target: str) -> dict[str, str] | None:
     if not isinstance(gate, dict) or any(not isinstance(gate.get(key), str) or not gate[key] for key in required):
         raise ValueError(f"boolean_feature_gate needs nonempty {', '.join(required)}")
     return {key: gate[key] for key in required}
+
+
+def op_timing_source(target: str) -> dict[str, Any] | None:
+    """The provider-owned timing source, or None when undeclared; malformed declarations refuse."""
+    from .op_timing import SCHEMA
+
+    return _operation_source(target, "op_timing", SCHEMA)
+
+
+def op_pairs_source(target: str) -> dict[str, Any] | None:
+    """The provider-owned pair source, with the same declaration shape as operation timing."""
+    from .op_pairs import SCHEMA
+
+    return _operation_source(target, "op_pairs", SCHEMA)
+
+
+def _operation_source(target: str, key: str, schema: str) -> dict[str, Any] | None:
+    """Validate one provider-owned operation-facts declaration without interpreting its strings."""
+    block = _rtl_extraction(target).get(key)
+    if block is None:
+        return None
+    if not isinstance(block, dict) or set(block) != {"schema", "producer", "spec_set", "hw_ir"}:
+        raise ValueError(f"{key} must be a mapping with exactly schema, producer, spec_set and hw_ir")
+    if block["schema"] != schema:
+        raise ValueError(f"{key}.schema must be {schema!r}, found {block['schema']!r}")
+    if any(not isinstance(block[field], str) or not block[field].strip() for field in ("producer", "spec_set")):
+        raise ValueError(f"{key} needs nonempty producer and spec_set strings")
+    ir = block["hw_ir"]
+    requires = ir.get("requires") if isinstance(ir, dict) else None
+    if (
+        not isinstance(ir, dict) or set(ir) != {"requires"} or not isinstance(requires, list) or not requires
+        or any(not isinstance(item, str) or not item.strip() for item in requires)
+    ):
+        raise ValueError(f"{key}.hw_ir must be {{requires: [nonempty strings]}}")
+    return {**block, "hw_ir": {"requires": list(requires)}}

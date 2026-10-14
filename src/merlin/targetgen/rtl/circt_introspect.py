@@ -1349,11 +1349,23 @@ def _build_facts(
 def dump_facts(out_path: Path | str | None = None, **kw) -> dict[str, Any]:
     """Build facts and write the GENERATED artifact to ``out_path`` (default: the purgeable cache dir,
     NOT merlin/); cache-hit (no rebuild) when input SHAs are unchanged. This is the writer
-    :func:`merlin.targetgen.rtl.facts.ensure_facts` calls to fill a cold cache."""
+    :func:`merlin.targetgen.rtl.facts.ensure_facts` calls to fill a cold cache.
+    ``op_timing_document`` and ``op_pairs_document`` merge external facts in that order, with matching
+    provenance; dropping a section on regeneration triggers the downgrade guard."""
+    op_timing_document = kw.pop("op_timing_document", None)
+    op_pairs_document = kw.pop("op_pairs_document", None)
     out = Path(out_path) if out_path is not None else rtl_cache_dir(kw["target"]) / "facts.json"
     if kw.get("source_bundle") is not None:
         kw.setdefault("generic_output", out.parent / "core.hw.generic.mlir")
     rec = build_facts(**kw)
+    if op_timing_document is not None:
+        from .op_timing import merge_document
+
+        rec = merge_document(rec, op_timing_document, target=rec["inputs"]["target"])
+    if op_pairs_document is not None:
+        from .op_pairs import merge_document
+
+        rec = merge_document(rec, op_pairs_document, target=rec["inputs"]["target"])
     if out.is_file():
         try:
             old = json.loads(out.read_text())

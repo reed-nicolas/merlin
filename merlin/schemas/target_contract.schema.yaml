@@ -47,6 +47,10 @@ validation_notes: >-
   `boolean_feature_gate` has `feature`, `module`, `node`, `dynamic_operand_contains`, and
   `config_field`; the literal build-gate value is still read from exact elaborated FIRRTL.
   Missing declarations disable their optional reader, while malformed declarations fail closed.
+  `op_timing` and `op_pairs` declare exactly `schema` (`merlin.<section>.v1`), nonempty `producer`,
+  `spec_set`, and `hw_ir: {requires: [nonempty strings]}`; unknown keys and schemas fail closed.
+  Documents replace the declared section whole: timing is a named-block list, pairs retain sources,
+  timing/HW IR pins and capacity witnesses together. Their observations remain conditional evidence.
 
   OPTIONAL `operation_capabilities`: the common operation registry shared by generated target
   dialects, RVV or other instruction sets, and target-specific machine dialects. Shape:

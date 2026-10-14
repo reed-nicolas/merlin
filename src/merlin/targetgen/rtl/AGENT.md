@@ -18,6 +18,8 @@ merlin-rtl-introspect: extract structure-only facts from elaborated RTL (CIRCT/F
 - `introspect.py` — merlin-rtl-introspect — structure-only FIRRTL census and selected target-declared role probes.
 - `hw_observations.py` — Observe exact HW input slices and equality constants without assigning ISA roles.
 - `muon_introspect.py` — Deterministic, no-LLM extraction of Muon (RadianceMuonConfig) hardware facts from the real RTL.
+- `op_pairs.py` — Validate and merge complete externally produced operation-pair facts with timing and source provenance.
+- `op_timing.py` — Per-operation timing computed from RTL control logic, merged into the facts body as `op_timing`.
 - `replay_json_to_h.py` — Convert a RoCC replay spec JSON (gen_rocc_replay) into a C header the arc replay harness #includes.
 
 <!-- Purpose/Modules derived from docstrings via build_tools/scripts/gen_package_docs.py.
@@ -132,3 +134,6 @@ no exponential endpoints are materialized. Domain containment is conditional
 on defined known bits and unsigned indexing. Noncontained domains remain
 unproved; address definedness, state/clock validity, memory history, physical
 capacity, roles and effects remain required. Original T records stay unchanged.
+
+`op_timing` validates external operation ages before replacing its named blocks; unresolved events have no ages.
+`op_pairs` replaces the whole pair document only when its timing and HW IR pins match; capacity remains conditional.

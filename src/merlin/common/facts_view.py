@@ -70,6 +70,17 @@ def timing(body: Mapping[str, Any] | None) -> tuple[dict[str, Any], ...]:
     return _blocks(body, "timing")
 
 
+def op_timing(body: Mapping[str, Any] | None) -> tuple[dict[str, Any], ...]:
+    """Operation ages under stated assumptions; events None means unresolved, unlike module timing."""
+    return _blocks(body, "op_timing")
+
+
+def op_pairs(body: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The complete pair document, keeping capacity and provenance together, or None when absent/malformed."""
+    block = (body or {}).get("op_pairs")
+    return block if isinstance(block, Mapping) else None
+
+
 def simt(body: Mapping[str, Any] | None) -> dict[str, Any] | None:
     """The SIMT geometry block, or ``None`` on a body that declares none."""
     block = (body or {}).get("simt")

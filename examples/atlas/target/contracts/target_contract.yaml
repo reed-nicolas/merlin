@@ -63,6 +63,23 @@ runner:
   dtype: fp8_e4m3
   fourth_output_name: kernel.S
   model_ext: npu_model
+# Provider-owned timing and pair extractors share the debug HW IR requirements.
+rtl_extraction:
+  op_timing:
+    schema: merlin.op_timing.v1
+    producer: atlas-mlir python -m rtl_extract
+    spec_set: atlas-mlir tools/rtl_extract/specs/
+    hw_ir: &operation_hw_ir
+      requires:
+        - firtool lowering with -O=debug --preserve-values=named, so control signals keep their names
+        - on-chip memories left inline (no --repl-seq-mem), so scratchpad reads stay seq.firmem
+  # Assertion-checked pair/sequence sweeps retain their timing and source identities together.
+  op_pairs:
+    schema: merlin.op_pairs.v1
+    producer: atlas-mlir python -m rtl_extract.pairfacts
+    spec_set: atlas-mlir tools/rtl_extract/specs/
+    hw_ir: *operation_hw_ir
+
 provenance: >-
   Candidate compute format and MXU intent from the curated Atlas MxuParams.scala,
   PE.scala and software-spec.yaml; geometry, storage and decoder facts require
