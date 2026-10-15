@@ -76,6 +76,28 @@ def verify_native_publication(
         or (manifest.get("request_digest") != request_digest or manifest.get("target_identity") != target_identity)
     ):
         raise ValueError("native emitted artifact identity differs from checked request or target")
+    stage_artifacts = manifest.get("stage_artifacts")
+    if stage_artifacts is not None:
+        if not isinstance(stage_artifacts, dict) or not stage_artifacts:
+            raise ValueError("native stage artifacts need a nonempty path-to-digest map")
+        for relative, digest in stage_artifacts.items():
+            if not isinstance(relative, str) or not relative:
+                raise ValueError("native stage artifact has an unsafe path")
+            path = Path(relative)
+            if (
+                path.is_absolute() or not path.parts or path.as_posix() != relative
+                or "\\" in relative or ".." in path.parts
+                or relative == "manifest.json"
+            ):
+                raise ValueError("native stage artifact has an unsafe path")
+            artifact = staged / path
+            if (
+                not isinstance(digest, str) or artifact.is_symlink()
+                or not artifact.is_file()
+                or not artifact.resolve().is_relative_to(staged.resolve())
+                or hashlib.sha256(artifact.read_bytes()).hexdigest() != digest
+            ):
+                raise ValueError(f"native stage artifact changed or is missing: {relative}")
     if manifest.get("artifact_kind") == "program_set":
         if (staged / "program.bin").exists() or (staged / "execution_plan.json").exists():
             raise ValueError("program set must not masquerade as one native binary")

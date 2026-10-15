@@ -187,6 +187,10 @@ def codes_to_f32(codes, fmt: str) -> np.ndarray:
     u = np.asarray(codes, dtype=np.int64) & np.int64(mask)
     if bits >= 32:
         return np.ascontiguousarray(u.astype(np.uint32)).view(np.float32).copy()
+    if t == "bf16":
+        # Widen the stored pattern directly. Arithmetic reconstruction would
+        # canonicalize NaNs and lose their sign or payload bits.
+        return np.ascontiguousarray(u.astype(np.uint32) << 16).view(np.float32).copy()
     return _decode(u.astype(np.uint32), t)
 
 
