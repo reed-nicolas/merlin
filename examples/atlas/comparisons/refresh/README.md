@@ -14,6 +14,8 @@ An installed Merlin checkout requires Python 3.12 or later. Historical native ca
 
 Smol projection-chain replay also requires the external `patch` command. Its exact current base replay and bundled patch are hash-pinned, applied with zero fuzz, and checked against the expected generated source hash before import. Use the current `evaluate_smolvla_retained_prefix.py` as `--base-replay` for this release. Earlier source epochs require their own frozen helper bytes and must not be relabeled as the current source.
 
+ResNet uses the local `resnet_native.py` checkpoint/image admission helper without a TVM checkout or runtime. New reports keep the pinned historical `verifier_source` declaration separate from the current helper identity in `native_admission`, bookend current helper bytes, and retain every existing source/preparation binding, including historical helpers declared by older captures.
+
 All inputs use physical paths without symlink components or parent traversal. Archive member metadata is admitted before content hashing or member loading. Every output directory must be fresh and beneath the configured `artifacts_dir()`; inputs and historical results remain untouched. Workload execution needs a separately supervised CPU, RSS and wall-time budget.
 
 ## Capture and replay boundaries
@@ -68,6 +70,7 @@ The source-only controls exercise path/archive admission, pre-import binding, so
 ```sh
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q --noconftest -o addopts='' \
   merlin/tests/infra/test_native_capture_paths.py merlin/tests/infra/test_native_admission.py \
+  merlin/tests/infra/test_resnet_native_admission.py \
   merlin/tests/infra/test_native_query_bounds.py merlin/tests/infra/test_native_attention_linkage.py \
   merlin/tests/infra/test_native_kv_capture.py merlin/tests/infra/test_native_qkv_attention.py \
   merlin/tests/infra/test_native_session.py

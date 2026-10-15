@@ -25,6 +25,9 @@ from capture_tinyllama_native import identity, safe_path
 
 RECEIPT = "out/build/baselines/tvm-gemmini/resnet50-residual-accumulator-v6-development20-finalsource-20261010/results.json"
 RECEIPT_SHA256 = "7630b69889495a657a2396fcfe2cee0a909cd6f6b7aa92e5390095e47c1d9f8a"
+# This identifies the historical verifier declared by the frozen receipt. It is
+# separate from the current native helper source identity recorded at admission.
+HISTORICAL_VERIFIER_SHA256 = "5ca2ca510969d9f8237183ae028d49bb9a8d1ba9c7fbfb8cff11e4ffbe8a406b"
 PREPARATION_SHA256 = "8c0876d4092485b3e6686500c0dd2b833767861acfba75f452926ec3ceff1c85"
 
 
@@ -40,6 +43,21 @@ def load_module(name, path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_native_admission(receipt, records, report):
+    """Preserve historical receipt provenance and bind the current native helper."""
+    historical = receipt["verifier_source"]
+    if historical["sha256"] != HISTORICAL_VERIFIER_SHA256:
+        raise ValueError("Frozen receipt declares a different historical verifier")
+    helper_path = Path(__file__).with_name("resnet_native.py")
+    helper_id = identity(helper_path)
+    helper = load_module("atlas_resnet_native_admission", helper_path)
+    require_identity(helper_id)
+    records.append(helper_id)
+    report["native_admission"] = {"historical_verifier_source": dict(historical),
+                                "current_helper": helper_id}
+    return helper
 
 
 def git_head(path):
@@ -71,10 +89,7 @@ def capture(args, report):
     records = [receipt_id, preparation_id, identity(__file__)]
     records += [require_identity(receipt["artifacts"][name]) for name in ("checkpoint", "inputs", "labels")]
     records += [require_identity(receipt[name]) for name in ("loader_source", "torchvision_resnet_source")]
-    # Existing generic checkpoint admission is reused without importing TVM.
-    helper_path = repo_root() / "examples/gemmini/comparisons/tvm/verify_resnet.py"
-    records.append(require_identity({"path": str(helper_path), "sha256": receipt["verifier_source"]["sha256"]}))
-    helper = load_module("refresh_resnet_admission", helper_path)
+    helper = load_native_admission(receipt, records, report)
     import numpy as np
     import torch
     import torchvision

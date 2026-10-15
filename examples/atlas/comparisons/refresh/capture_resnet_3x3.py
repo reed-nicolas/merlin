@@ -16,7 +16,7 @@ import traceback
 
 from merlin.common.paths import artifacts_dir, repo_root
 from capture_resnet import (RECEIPT_SHA256, identity, require_identity, safe_path,
-                            load_module, tensor_identity, git_head, write_manifest)
+                            load_module, load_native_admission, tensor_identity, git_head, write_manifest)
 
 
 def patch_rows(activation, start, count, np, padding=1):
@@ -76,9 +76,7 @@ def capture(args, report):
     records = [source_id, receipt_id, identity(__file__), identity(Path(__file__).with_name("capture_resnet.py"))]
     records += [require_identity(record) for record in source["immutable_bindings"]]
     records += [require_identity(record) for record in source["original_preparation_bindings"]]
-    helper_path = repo_root() / "examples/gemmini/comparisons/tvm/verify_resnet.py"
-    records.append(require_identity({"path": str(helper_path), "sha256": receipt["verifier_source"]["sha256"]}))
-    helper = load_module("resnet_3x3_native_admission", helper_path)
+    helper = load_native_admission(receipt, records, report)
     import torch
     import torchvision
     import torchvision.models.resnet as implementation
