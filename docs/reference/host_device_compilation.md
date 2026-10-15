@@ -3,7 +3,7 @@ title: Host and device compilation
 kind: reference
 status: current
 owner: runtime
-last_verified: 2026-10-06
+last_verified: 2026-10-15
 related: [runtime, zephyr, adding_a_target, experiment_abi]
 code_refs: [src/merlin/targetgen/contract/build_recipe.py, src/merlin/targetgen/contract/build_service.py, src/merlin/targetgen/contract/compile.py, src/merlin/runtime/backends/base.py, merlin/runtime/c]
 ---
@@ -33,6 +33,16 @@ must not quietly move a failed required-native region to host computation.
 Runtime input tensors are passed at invocation; expected outputs and grading
 data belong only to the evaluator.
 
+For layout-dependent native selection, a v4 semantic kernel request records
+the physical extent and element order of every input and constant, plus the
+required element order of each output. Instruction descriptions record their
+operand and result layouts. A no-copy reshape, slice, or concat view is
+eligible only when its sources have the declared contiguous representation;
+the allocation checker then verifies the shared addresses and offsets.
+Older requests without physical layouts remain readable, but cannot select
+these views. Layout names must be backed by the selected target's actual
+packing rules before such a view is qualified on hardware.
+
 This diagram is the intended whole-model boundary, not a claim that all
 adapters are connected today. `MerlinProgram` carries a target-independent
 dispatch and memory plan, but its C replay consumer is absent and the builder
@@ -41,6 +51,36 @@ describes one diagnostic kernel, not a mixed host/device model invocation.
 The existing whole-model Zephyr route compiles RVV host work; it does not yet
 load and schedule Atlas device programs. A combined artifact builder and
 compiled mixed-route replay still need implementation and qualification.
+
+`native-probe-model-regions` also retains `host-bridge.mlir`: the outlined
+host graph with each emitted native region replaced by a typed external function
+declaration. Its manifest records the exact source region, symbol, argument and
+result types, and native request digest. The remaining region bodies stay in the
+IR for inspection; the manifest lists them as unmet required-native work. This
+diagnostic artifact has no linked device callback or execution evidence and is
+never a strict-native model result.
+
+For a native compilation that selected an entire static tensor graph, use
+`merlin-targetgen native-bridge-graph` with the exact source Linalg file and
+compiled artifact directory. It checks the published binary, execution plan,
+selected graph, precision plan, source hash, and ordered output count, then
+writes `host-bridge.mlir` and a status manifest. The bridge retains the source
+function's typed arguments and result order but replaces its body with one
+external device call. It is still a diagnostic declaration: the target package
+must provide that call, input/output conversion, launch, wait, and readback.
+
+```sh
+merlin-targetgen native-bridge-graph --linalg /absolute/source.mlir \
+  --entry forward --compiled /absolute/native-program \
+  --device-symbol selected_graph --out /absolute/fresh-host-bridge
+```
+
+After MLIR bufferization, the public `forward` C interface takes source input
+memref descriptors followed by preallocated result destinations. The external
+selected-graph callback has a different ABI: one pointer to an aggregate of
+result descriptors followed by input descriptor pointers. A target callback
+must use the lowered symbol and verified ABI; matching only the number of
+pointers can silently swap inputs and outputs.
 
 ## Shared build boundary
 

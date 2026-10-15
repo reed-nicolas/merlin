@@ -96,11 +96,10 @@ independent comparator and is not a substitute for Merlin-generated signatures
 and verifiers. Keep the ledger and generated compiler outside this example
 directory.
 
-The current descriptor selects `AtlasRocketConfig`. If the campaign instead
-targets `EE290SimConfig`, create a new selected source bundle and Phase 0 run
-with that exact elaboration and simulator identity. Existing receipts must not
-be relabeled as evidence for the new SoC configuration.
-For that new campaign, use the generic
+The current descriptor selects `EE290SimConfig` in the pinned
+`bringup-chipyard` source. Earlier `AtlasRocketConfig` receipts remain
+historical evidence and must not be relabeled for this SoC configuration.
+For the selected campaign, use the generic
 [`rtl.elaboration` receipt](../../../docs/guides/phase0_specification.md#bind-the-selected-configuration-to-its-elaborated-source)
 to bind the exact `EE290SimConfig` invocation to fresh FIRRTL, then supply
 `--elaboration-receipt` when producing `source-selection.json`. The selected
