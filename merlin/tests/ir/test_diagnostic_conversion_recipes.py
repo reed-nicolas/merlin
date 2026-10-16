@@ -44,6 +44,22 @@ class ConversionRecipeExampleTest(unittest.TestCase):
                 if scale <= 246:
                     self.assertEqual(dict(recipe.nodes[1].attrs)["bits"], ((scale + 8) << 7) | 96)
 
+    def test_declared_sign_clamp_semantics_propagate_finite_and_nonnegative(self):
+        request = fixture()
+        relu = SemanticNode("relu", "relu", ("value",), TensorType(_example.TILE, "bf16", "raw-bit-pattern"),
+            attrs=(("input_domain", "finite-normal-or-zero-bf16"), ("numeric_semantics", "bf16-sign-clamp-v1")),
+            index_maps=pointwise_identity_maps(2, 1))
+        pack = replace(request.nodes[-1], inputs=("relu",))
+        request = replace(request, nodes=(*request.nodes[:-1], relu, pack))
+        proof = _example.prove_finite(request, "relu")
+        self.assertTrue(proof.nonnegative)
+        recipe = _example.make_recipe(request, "pack", 0)
+        self.assertEqual(len(recipe.nodes), 4)
+        _example.validator({"pack": proof})(request, recipe)
+        changed = replace(request, nodes=(*request.nodes[:-2], replace(relu,
+            attrs=(("numeric_semantics", "unknown"),)), pack))
+        self.assertIsNone(_example.prove_finite(changed, "relu"))
+
     def test_duplicate_equivalent_sites_refuse_colliding_recipe_names(self):
         request = fixture()
         duplicate = replace(request.nodes[-1], id="duplicate_pack")

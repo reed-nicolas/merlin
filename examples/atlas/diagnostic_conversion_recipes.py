@@ -77,7 +77,10 @@ def prove_finite(request: KernelRequest, value: str) -> FiniteProof | None:
                            for index in range(0, len(payload), 2)):
                         reason = "finite exact BF16 constant bytes"
             elif (node.op in {"identity", "mov", "relu"} and len(node.inputs) == 1
-                  and not node.attrs and node.type.numerical_policy in {"raw-bit-pattern", *FINITE_RESET_POLICIES}
+                  and (not node.attrs or node.op == "relu" and attrs == {
+                      "input_domain": "finite-normal-or-zero-bf16",
+                      "numeric_semantics": "bf16-sign-clamp-v1",
+                  }) and node.type.numerical_policy in {"raw-bit-pattern", *FINITE_RESET_POLICIES}
                   and node.index_maps in ((), pointwise_identity_maps(2, 1)) and visit(node.inputs[0])):
                 reason = "finite bit-preserving copy or sign clamp"
             elif (node.op == "matmul" and node.type.numerical_policy in FINITE_RESET_POLICIES
