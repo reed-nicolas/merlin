@@ -5,6 +5,7 @@ import sys
 import unittest
 
 from merlin.common.paths import repo_root
+from merlin.semantic_compiler.diagnostic_recipes import build_diagnostic_recipe_program
 from merlin.semantic_compiler.model import KernelRequest, SemanticNode, TensorType, pointwise_identity_maps
 
 _path = repo_root() / "examples/atlas/diagnostic_conversion_recipes.py"
@@ -42,6 +43,17 @@ class ConversionRecipeExampleTest(unittest.TestCase):
                 self.assertEqual(len(recipe.nodes), 6 if scale <= 246 else 2)
                 if scale <= 246:
                     self.assertEqual(dict(recipe.nodes[1].attrs)["bits"], ((scale + 8) << 7) | 96)
+
+    def test_duplicate_equivalent_sites_refuse_colliding_recipe_names(self):
+        request = fixture()
+        duplicate = replace(request.nodes[-1], id="duplicate_pack")
+        request = replace(request, nodes=(*request.nodes, duplicate))
+        recipes = tuple(_example.make_recipe(request, site, 0) for site in ("pack", "duplicate_pack"))
+        self.assertEqual(recipes[0].nodes, recipes[1].nodes)
+        proof = _example.prove_finite(request, "value")
+        with self.assertRaisesRegex(ValueError, "fresh, pure"):
+            build_diagnostic_recipe_program(request, (), recipes,
+                admit=_example.validator({"pack": proof, "duplicate_pack": proof}))
 
     def test_unknown_or_nan_capable_and_stale_facts_fail_closed(self):
         request = fixture()
