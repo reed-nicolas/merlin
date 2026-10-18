@@ -271,10 +271,11 @@ def float_to_codes(values, fmt: str) -> np.ndarray:
         even_hi = (codes[hi] & 1) == 0
         pick = np.where(tie, np.where(even_hi, hi, lo), pick)
     result = codes[pick].copy()
-    zeros = a == 0
+    zeros = (result & ((1 << (bits - 1)) - 1)) == 0
     if zeros.any():
         # The ordered grid contains both zero codes at the same numerical
-        # position. Preserve the input's sign explicitly for byte preloads.
+        # position. Preserve the input's sign both for exact zeros and values
+        # that round to zero; stable grid ordering cannot choose that sign.
         result[zeros] = np.where(np.signbit(a[zeros]), 1 << (bits - 1), 0)
     return result
 

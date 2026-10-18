@@ -194,7 +194,12 @@ class ConstantBinding:
 
     def __post_init__(self) -> None:
         if not self.node_id or self.encoding not in {
-            "i8", "i32-le", "i64-le", "fp8_e4m3-raw", "bf16-le-raw", "f32-le-raw",
+            "i8",
+            "i32-le",
+            "i64-le",
+            "fp8_e4m3-raw",
+            "bf16-le-raw",
+            "f32-le-raw",
         }:
             raise ValueError("constant needs a named, admitted byte encoding")
         if len(self.data_hex) % 2 or any(char not in "0123456789abcdef" for char in self.data_hex):
@@ -229,7 +234,7 @@ class KernelRequest:
     nodes: tuple[SemanticNode, ...]
     outputs: tuple[str, ...]
     output_storages: tuple[str, ...]
-    input_storages: tuple[tuple[str, str], ...]
+    input_storages: tuple[tuple[str, str], ...]  # Ordered boundary ports, not a set.
     target_identity: str
     lowering_policy: str = "strict-native"
     source_identity: str = ""
@@ -332,10 +337,18 @@ class KernelRequest:
         return dict(self.boundary_layouts).get(node_id, "")
 
     def record(self) -> dict[str, Any]:
+        # Older records only contain a storage map, whose canonical key order is
+        # lexical. Preserve an explicit calling convention when it differs.
+        ordered_inputs = self.input_storages != tuple(sorted(self.input_storages))
         record = {
             "schema": (
-                "merlin.semantic_kernel.v4" if self.boundary_layouts else
-                "merlin.semantic_kernel.v3" if self.physical_extents else "merlin.semantic_kernel.v2"
+                "merlin.semantic_kernel.v5"
+                if ordered_inputs
+                else "merlin.semantic_kernel.v4"
+                if self.boundary_layouts
+                else "merlin.semantic_kernel.v3"
+                if self.physical_extents
+                else "merlin.semantic_kernel.v2"
             ),
             "nodes": [node.record() for node in self.nodes],
             "outputs": list(self.outputs),
@@ -351,6 +364,13 @@ class KernelRequest:
         if self.boundary_layouts:
             record["boundary_layouts"] = dict(self.boundary_layouts)
             record["output_layouts"] = list(self.output_layouts)
+        if ordered_inputs:
+            record.update(
+                input_order=[key for key, _ in self.input_storages],
+                physical_extents=dict(self.physical_extents),
+                boundary_layouts=dict(self.boundary_layouts),
+                output_layouts=list(self.output_layouts),
+            )
         return record
 
     def digest(self) -> str:
@@ -370,7 +390,9 @@ class KernelRequest:
             "constants",
         }
         schema = row.get("schema")
-        if schema == "merlin.semantic_kernel.v4":
+        if schema == "merlin.semantic_kernel.v5":
+            expected.update({"input_order", "boundary_layouts", "output_layouts", "physical_extents"})
+        elif schema == "merlin.semantic_kernel.v4":
             expected.update({"boundary_layouts", "output_layouts", "physical_extents"})
         elif schema == "merlin.semantic_kernel.v3":
             expected.add("physical_extents")
@@ -380,26 +402,35 @@ class KernelRequest:
             raise ValueError("unexpected semantic kernel schema or fields")
         if not isinstance(row["nodes"], list) or not isinstance(row["input_storages"], dict):
             raise ValueError("semantic kernel graph or boundary has invalid structure")
-        if schema in {"merlin.semantic_kernel.v3", "merlin.semantic_kernel.v4"} and (
-            not isinstance(row["physical_extents"], dict) or not row["physical_extents"]
+        has_extents = schema in {"merlin.semantic_kernel.v3", "merlin.semantic_kernel.v4", "merlin.semantic_kernel.v5"}
+        has_layouts = schema in {"merlin.semantic_kernel.v4", "merlin.semantic_kernel.v5"}
+        if has_extents and (
+            not isinstance(row["physical_extents"], dict)
+            or (schema != "merlin.semantic_kernel.v5" and not row["physical_extents"])
         ):
             raise ValueError("semantic kernel physical extents have invalid structure")
-        if schema == "merlin.semantic_kernel.v4" and (
+        if has_layouts and (
             not isinstance(row["boundary_layouts"], dict) or not isinstance(row["output_layouts"], list)
         ):
             raise ValueError("semantic kernel physical layouts have invalid structure")
+        input_order = row.get("input_order", sorted(row["input_storages"]))
+        if (
+            not isinstance(input_order, list)
+            or any(not isinstance(key, str) for key in input_order)
+            or len(input_order) != len(row["input_storages"])
+            or set(input_order) != set(row["input_storages"])
+        ):
+            raise ValueError("semantic kernel input order must cover each boundary exactly once")
         return cls(
             nodes=tuple(SemanticNode.from_record(node) for node in row["nodes"]),
             outputs=tuple(row["outputs"]),
             output_storages=tuple(row["output_storages"]),
-            input_storages=tuple(sorted(row["input_storages"].items())),
+            input_storages=tuple((key, row["input_storages"][key]) for key in input_order),
             target_identity=row["target_identity"],
             lowering_policy=row["lowering_policy"],
             source_identity=row["source_identity"],
             constants=tuple(ConstantBinding.from_record(item) for item in row["constants"]),
-            physical_extents=tuple(sorted(row["physical_extents"].items())) if schema in {
-                "merlin.semantic_kernel.v3", "merlin.semantic_kernel.v4"
-            } else (),
-            boundary_layouts=tuple(sorted(row["boundary_layouts"].items())) if schema.endswith("v4") else (),
-            output_layouts=tuple(row["output_layouts"]) if schema.endswith("v4") else (),
+            physical_extents=tuple(sorted(row["physical_extents"].items())) if has_extents else (),
+            boundary_layouts=tuple(sorted(row["boundary_layouts"].items())) if has_layouts else (),
+            output_layouts=tuple(row["output_layouts"]) if has_layouts else (),
         )

@@ -20,6 +20,18 @@ from merlin.runtime.fp8_formats import (
 )
 
 
+def contraction_restore_exponent(lhs_encode_exponent: int, rhs_encode_exponent: int) -> int:
+    """Restore units after a dot of operands encoded with constant binary scales.
+
+    Encoding x*2**a and y*2**b scales their products by 2**(a+b).
+    The returned exponent undoes that scale after the reduction. Quantization,
+    accumulator rounding and the target's rescale range remain explicit.
+    """
+    if any(type(value) is not int or not -32 <= value <= 32 for value in (lhs_encode_exponent, rhs_encode_exponent)):
+        raise ValueError("operand encoding exponents must be integers in [-32, 32]")
+    return -lhs_encode_exponent - rhs_encode_exponent
+
+
 @dataclass(frozen=True)
 class FloatBoundarySpec:
     """One explicit value conversion; pre-encode scaling is exact before clipping."""
@@ -33,6 +45,7 @@ class FloatBoundarySpec:
     admitted_code_ranges: tuple[tuple[int, int], ...] = ()
     pre_encode_scale_exponent: int = 0  # Multiply source by 2**e before encoding.
     canonicalize_negative_zero: bool = False  # Explicit lossy source-boundary choice.
+    post_decode_scale_exponent: int = 0  # Restore logical units after a scaled contraction.
 
     def __post_init__(self) -> None:
         if not self.policy or self.direction not in {"encode", "decode"}:
@@ -63,6 +76,10 @@ class FloatBoundarySpec:
             raise ValueError("decode cannot canonicalize encoded negative zero")
         if self.direction == "decode" and self.pre_encode_scale_exponent:
             raise ValueError("decode cannot have a pre-encode scale")
+        if type(self.post_decode_scale_exponent) is not int or not -64 <= self.post_decode_scale_exponent <= 64:
+            raise ValueError("post-decode scale exponent must be an integer in [-64, 64]")
+        if self.direction == "encode" and self.post_decode_scale_exponent:
+            raise ValueError("encode cannot have a post-decode scale")
         bit_max = (1 << storage_bits(self.format)) - 1
         previous = -1
         for low, high in self.admitted_code_ranges:
@@ -86,6 +103,8 @@ class FloatBoundarySpec:
             record["pre_encode_scale_exponent"] = self.pre_encode_scale_exponent
         if self.canonicalize_negative_zero:
             record["canonicalize_negative_zero"] = True
+        if self.post_decode_scale_exponent:
+            record["post_decode_scale_exponent"] = self.post_decode_scale_exponent
         return record
 
     def encode(self, source: np.ndarray) -> np.ndarray:
@@ -96,8 +115,11 @@ class FloatBoundarySpec:
             raise ValueError("nonfinite source is outside the selected boundary policy")
         eb, mb, bias, scheme = float_format_params(self.format)
         top = (1 << eb) - 1
-        maximum = (top - 1 if scheme == "ieee" else top) if self.max_normal_exponent_code is None \
+        maximum = (
+            (top - 1 if scheme == "ieee" else top)
+            if self.max_normal_exponent_code is None
             else self.max_normal_exponent_code
+        )
         largest_mantissa = (1 << mb) - 2 if scheme == "e4m3fn" and maximum == top else (1 << mb) - 1
         max_value = (1.0 + largest_mantissa / (1 << mb)) * 2.0 ** (maximum - bias)
         # A finite binary32 value times 2**e is exact in binary64 for this
@@ -124,9 +146,21 @@ class FloatBoundarySpec:
     def decode(self, codes: np.ndarray) -> np.ndarray:
         """Decode logical code elements; the target must separately check its result domain."""
         if (
-            self.direction != "decode" or not isinstance(codes, np.ndarray)
-            or codes.dtype.kind != "u" or codes.dtype.itemsize * 8 < storage_bits(self.format)
+            self.direction != "decode"
+            or not isinstance(codes, np.ndarray)
+            or codes.dtype.kind != "u"
+            or codes.dtype.itemsize * 8 < storage_bits(self.format)
             or (codes >= (1 << storage_bits(self.format))).any()
         ):
             raise ValueError("decode requires unsigned in-range code elements and a decode policy")
-        return codes_to_f32(codes, self.format).reshape(codes.shape)
+        decoded = codes_to_f32(codes, self.format).reshape(codes.shape)
+        if self.post_decode_scale_exponent:
+            # Scale finite values in binary64, then round once to binary32.
+            # Exceptional values retain their original sign/payload bits.
+            finite = np.isfinite(decoded)
+            decoded = decoded.copy()
+            with np.errstate(over="ignore", under="ignore"):
+                decoded[finite] = np.ldexp(decoded[finite].astype(np.float64), self.post_decode_scale_exponent).astype(
+                    np.float32
+                )
+        return decoded
