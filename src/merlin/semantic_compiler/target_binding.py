@@ -41,6 +41,9 @@ class NativeCompilationError(RuntimeError):
 
 
 class NativeTargetBinding(Protocol):
+    # Providers may additionally implement plan_boundary_abi(request) for
+    # explicit --abi auto requests. It returns fixed_inputs/fixed_outputs in
+    # provider units and must check its storage/layout requirements.
     @staticmethod
     def profile() -> NativeTargetProfile: ...
 
@@ -85,14 +88,18 @@ def verify_native_publication(
                 raise ValueError("native stage artifact has an unsafe path")
             path = Path(relative)
             if (
-                path.is_absolute() or not path.parts or path.as_posix() != relative
-                or "\\" in relative or ".." in path.parts
+                path.is_absolute()
+                or not path.parts
+                or path.as_posix() != relative
+                or "\\" in relative
+                or ".." in path.parts
                 or relative == "manifest.json"
             ):
                 raise ValueError("native stage artifact has an unsafe path")
             artifact = staged / path
             if (
-                not isinstance(digest, str) or artifact.is_symlink()
+                not isinstance(digest, str)
+                or artifact.is_symlink()
                 or not artifact.is_file()
                 or not artifact.resolve().is_relative_to(staged.resolve())
                 or hashlib.sha256(artifact.read_bytes()).hexdigest() != digest

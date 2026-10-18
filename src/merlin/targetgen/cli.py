@@ -311,33 +311,52 @@ def _load_selected_native_request(args: argparse.Namespace, *, target_identity: 
 
     region_id = getattr(args, "diagnostic_region", None)
     tile_index = getattr(args, "diagnostic_tile_index", None)
+    whole = getattr(args, "whole_contraction", False)
     graph_policy = getattr(args, "diagnostic_graph_policy", None)
     if graph_policy is not None:
-        if region_id is not None or tile_index is not None or not args.linalg or not args.linalg_entry:
-            raise LinalgBridgeError("graph precision policy requires --linalg and --linalg-entry only")
+        if whole or region_id is not None or tile_index is not None:
+            raise LinalgBridgeError("graph precision policy cannot select a contraction or tile")
         if mode != "diagnostic" or binding is None:
             raise LinalgBridgeError("graph precision policy requires diagnostic mode and target support")
         prepare = getattr(binding, "prepare_precision_graph", None)
         if not callable(prepare):
             raise LinalgBridgeError("selected target support has no graph precision lowering")
-        source = Path(args.linalg).read_text()
         policy = json.loads(Path(graph_policy).read_text())
-        plan = prepare(source, entry=args.linalg_entry, policy=policy)
+        staged_graph = bool(args.compile_inputs)
+        if staged_graph:
+            staged = load_compile_inputs(args.compile_inputs)
+            if staged.precision_policy != policy or args.linalg or args.linalg_entry:
+                raise LinalgBridgeError("staged graph precision must match its compiler-input policy and entry")
+            plan = prepare(
+                staged.program, entry=staged.entry, policy=policy, original_source_sha256=staged.original_source_sha256
+            )
+        else:
+            if not args.linalg or not args.linalg_entry:
+                raise LinalgBridgeError("graph precision policy requires --linalg/--linalg-entry or --compile-inputs")
+            source = Path(args.linalg).read_text()
+            plan = prepare(source, entry=args.linalg_entry, policy=policy)
         prepared_request = getattr(plan, "request", None)
         source_operations = getattr(plan, "source_operations", None)
-        if (not isinstance(prepared_request, KernelRequest)
-                or prepared_request.target_identity != target_identity
-                or prepared_request.lowering_policy != "diagnostic"
-                or not isinstance(source_operations, tuple)
-                or not all(isinstance(operation, str) for operation in source_operations)
-                or not callable(getattr(plan, "record", None))):
+        if (
+            not isinstance(prepared_request, KernelRequest)
+            or prepared_request.target_identity != target_identity
+            or prepared_request.lowering_policy != "diagnostic"
+            or not isinstance(source_operations, tuple)
+            or not all(isinstance(operation, str) for operation in source_operations)
+            or not callable(getattr(plan, "record", None))
+        ):
             raise LinalgBridgeError("target graph precision lowering returned an invalid request")
-        return prepared_request, "source_bound_diagnostic_graph", source_operations, plan
+        kind = "source_bound_diagnostic_staged_graph" if staged_graph else "source_bound_diagnostic_graph"
+        return prepared_request, kind, source_operations, plan
     if region_id is None:
+        if whole:
+            raise LinalgBridgeError("--whole-contraction requires --diagnostic-region")
         if tile_index is not None:
             raise LinalgBridgeError("--diagnostic-tile-index requires --diagnostic-region")
         request, source_kind, operations = _load_native_request(
-            args, target_identity=target_identity, mode=mode,
+            args,
+            target_identity=target_identity,
+            mode=mode,
         )
         return request, source_kind, operations, None
     if not args.compile_inputs or mode != "diagnostic" or binding is None:
@@ -350,15 +369,23 @@ def _load_selected_native_request(args: argparse.Namespace, *, target_identity: 
     prepare = getattr(binding, "prepare_precision_tile", None)
     if not callable(prepare):
         raise LinalgBridgeError("selected target support has no source-bound precision tile")
-    plan = prepare(staged, region_id) if tile_index is None else prepare(
-        staged, region_id, tile_index=tile_index,
-    )
+    if whole and tile_index is not None:
+        raise LinalgBridgeError("whole-contraction lowering cannot select an output tile index")
+    if whole:
+        plan = prepare(staged, region_id, whole_contraction=True)
+    elif tile_index is None:
+        plan = prepare(staged, region_id)
+    else:
+        plan = prepare(staged, region_id, tile_index=tile_index)
     if not isinstance(plan, DiagnosticMatmulTile) or plan.request.target_identity != target_identity:
         raise LinalgBridgeError("target precision tile returned an invalid request or target identity")
     if plan.request.lowering_policy != "diagnostic":
         raise LinalgBridgeError("source-bound precision tile must stay diagnostic")
     source_op = "linalg.generic" if plan.batch_index is not None else "linalg.matmul"
-    return plan.request, "source_bound_diagnostic_tile", (source_op,), plan
+    if plan.whole_contraction != whole:
+        raise LinalgBridgeError("target precision lowering changed the requested contraction scope")
+    kind = "source_bound_diagnostic_contraction" if whole else "source_bound_diagnostic_tile"
+    return plan.request, kind, (source_op,), plan
 
 
 def _bind_native_physical_layouts(args: argparse.Namespace, request, precision_plan):
@@ -373,8 +400,12 @@ def _bind_native_physical_layouts(args: argparse.Namespace, request, precision_p
         raise ValueError("physical layouts require parsed Linalg without ordered tile transformations")
     row = json.loads(Path(path).read_text())
     fields = {
-        "schema", "target_identity", "source_identity", "physical_extents",
-        "boundary_layouts", "output_layouts",
+        "schema",
+        "target_identity",
+        "source_identity",
+        "physical_extents",
+        "boundary_layouts",
+        "output_layouts",
     }
     schema = row.get("schema") if isinstance(row, dict) else None
     if schema not in {"merlin.physical_boundary_layouts.v1", "merlin.physical_boundary_layouts.v2"} or (
@@ -388,9 +419,12 @@ def _bind_native_physical_layouts(args: argparse.Namespace, request, precision_p
     if row["target_identity"] != request.target_identity or row["source_identity"] != request.source_identity:
         raise ValueError("physical layouts differ from the parsed source or selected target")
     if (
-        not isinstance(row["physical_extents"], dict) or not row["physical_extents"]
-        or not isinstance(row["boundary_layouts"], dict) or not row["boundary_layouts"]
-        or not isinstance(row["output_layouts"], list) or not row["output_layouts"]
+        not isinstance(row["physical_extents"], dict)
+        or not row["physical_extents"]
+        or not isinstance(row["boundary_layouts"], dict)
+        or not row["boundary_layouts"]
+        or not isinstance(row["output_layouts"], list)
+        or not row["output_layouts"]
     ):
         raise ValueError("physical layouts need typed extents, input layouts, and ordered output layouts")
     bound = replace(
@@ -399,10 +433,54 @@ def _bind_native_physical_layouts(args: argparse.Namespace, request, precision_p
         boundary_layouts=tuple(sorted(row["boundary_layouts"].items())),
         output_layouts=tuple(row["output_layouts"]),
     )
-    canonical = {**row, "physical_extents": dict(bound.physical_extents),
-                 "boundary_layouts": dict(bound.boundary_layouts),
-                 "output_layouts": list(bound.output_layouts)}
+    canonical = {
+        **row,
+        "physical_extents": dict(bound.physical_extents),
+        "boundary_layouts": dict(bound.boundary_layouts),
+        "output_layouts": list(bound.output_layouts),
+    }
     return bound, (json.dumps(canonical, sort_keys=True, indent=2) + "\n").encode()
+
+
+def _prepare_native_row_softmax(args: argparse.Namespace, binding, source_request):
+    """Select one row group while retaining every column of its normalization."""
+    from merlin.semantic_compiler.target_binding import NativeCompilationError
+    from merlin.semantic_compiler.tiled_softmax import RowSoftmaxTiling
+
+    index = getattr(args, "row_softmax_tile_index", None)
+    if index is None:
+        return source_request, None
+    if any(
+        getattr(args, name, None) is not None
+        for name in (
+            "ordered_k_tile",
+            "ordered_m_tile",
+            "ordered_n_tile",
+            "outer_tile_index",
+            "diagnostic_region",
+            "physical_layouts",
+        )
+    ):
+        raise ValueError("row softmax tiling cannot combine with another precision or tile transformation")
+    prepare = getattr(binding, "prepare_row_softmax", None) if binding is not None else None
+    if not callable(prepare):
+        raise NativeCompilationError("unsupported_semantics", "selected support has no row softmax decomposition")
+    plan = prepare(source_request)
+    if (
+        not isinstance(plan, RowSoftmaxTiling)
+        or plan.source != source_request
+        or type(index) is not int
+        or not 0 <= index < len(plan.regions)
+    ):
+        raise ValueError("row softmax decomposition or row-group index differs from source")
+    selected = plan.regions[index].request
+    if (
+        selected.target_identity != source_request.target_identity
+        or selected.lowering_policy != source_request.lowering_policy
+    ):
+        raise ValueError("row softmax decomposition changed target or compile mode")
+    record = {**plan.record(), "selected_row_index": index, "selected_request_digest": selected.digest()}
+    return selected, (json.dumps(record, sort_keys=True, indent=2) + "\n").encode()
 
 
 def _prepare_native_ordered_k(args: argparse.Namespace, binding, source_request):
@@ -451,7 +529,8 @@ def _prepare_native_ordered_mn(args: argparse.Namespace, binding, source_request
     if (
         not isinstance(prepared, OrderedMNTiling)
         or prepared.source.digest() != source_request.digest()
-        or type(index) is not int or not 0 <= index < len(prepared.tiles)
+        or type(index) is not int
+        or not 0 <= index < len(prepared.tiles)
     ):
         raise ValueError("target returned an invalid ordered M/N partition or tile index")
     selected = prepared.tiles[index].request
@@ -481,9 +560,7 @@ def _prepared_static_inputs(binding, plan, staged_root: Path, execution_plan: di
         raise ValueError("target returned malformed source-bound static inputs")
     roles = [item.role for item in prepared]
     allowed_roles = {conversion.source_role for conversion in plan.inputs}
-    if len(set(roles)) != len(roles) or any(
-        role not in allowed_roles for role in roles
-    ):
+    if len(set(roles)) != len(roles) or any(role not in allowed_roles for role in roles):
         raise ValueError("target returned repeated or unknown source-bound input roles")
     return prepared
 
@@ -525,9 +602,16 @@ def _cmd_native_select(args: argparse.Namespace) -> int:
     output = Path(args.out)
     try:
         snapshot = open_native_snapshot(Path(args.snapshot))
-        binding = load_native_target_binding(args.support) if (
-            args.diagnostic_region or args.diagnostic_graph_policy
-        ) and args.support else None
+        binding = (
+            load_native_target_binding(args.support)
+            if (
+                args.diagnostic_region
+                or args.diagnostic_graph_policy
+                or getattr(args, "row_softmax_tile_index", None) is not None
+            )
+            and args.support
+            else None
+        )
         if binding is not None and snapshot.profile.digest() != binding.profile().digest():
             raise ValueError("native snapshot differs from selected support profile")
         request, source_kind, source_operations, precision_plan = _load_selected_native_request(
@@ -537,6 +621,7 @@ def _cmd_native_select(args: argparse.Namespace) -> int:
             binding=binding,
         )
         request, _ = _bind_native_physical_layouts(args, request, precision_plan)
+        request, softmax_record = _prepare_native_row_softmax(args, binding, request)
         if request.lowering_policy != args.mode:
             raise ValueError("explicit selection mode differs from typed request")
         fixed_inputs, fixed_outputs, reservations = _load_native_select_abi(args.abi)
@@ -592,6 +677,8 @@ def _cmd_native_select(args: argparse.Namespace) -> int:
         }
         if precision_plan is not None:
             report["precision_plan"] = precision_plan.record()
+        if softmax_record is not None:
+            report["row_softmax_tiling"] = json.loads(softmax_record)
         if result.status == "unsupported_semantics" and result.graph is None:
             report.pop("selected_graph")
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, ImportError, UnicodeError) as error:
@@ -599,8 +686,10 @@ def _cmd_native_select(args: argparse.Namespace) -> int:
             "schema": "merlin.native_selection_result.v1",
             "engine": args.engine,
             "status": (
-                "unsupported_semantics" if isinstance(error, LinalgBridgeError)
-                else error.status if isinstance(error, NativeCompilationError)
+                "unsupported_semantics"
+                if isinstance(error, LinalgBridgeError)
+                else error.status
+                if isinstance(error, NativeCompilationError)
                 else "compile_error"
             ),
             "scope": "selection_only",
@@ -622,10 +711,22 @@ def _native_compile_report(args: argparse.Namespace) -> dict:
     )
 
     try:
+        if getattr(args, "application_state", None) and not getattr(args, "application", False):
+            raise ValueError("--application-state requires --application")
         binding = load_native_target_binding(args.support)
         snapshot = open_native_snapshot(Path(args.snapshot))
         if snapshot.profile.digest() != binding.profile().digest():
             raise ValueError("native snapshot differs from selected support profile")
+        if getattr(args, "application", False):
+            from .native_application import compile_application_report
+
+            return compile_application_report(
+                args,
+                binding=binding,
+                snapshot=snapshot,
+                limits=_load_native_search_limits(args.search_limits),
+                write_status=_write_status,
+            )
         request, source_kind, source_operations, precision_plan = _load_selected_native_request(
             args,
             target_identity=snapshot.profile.target_identity,
@@ -634,6 +735,7 @@ def _native_compile_report(args: argparse.Namespace) -> dict:
         )
         request, layout_document = _bind_native_physical_layouts(args, request, precision_plan)
         source_request = request
+        request, softmax_record = _prepare_native_row_softmax(args, binding, request)
         if precision_plan is not None and (
             getattr(args, "ordered_k_tile", None) is not None
             or getattr(args, "ordered_m_tile", None) is not None
@@ -649,7 +751,15 @@ def _native_compile_report(args: argparse.Namespace) -> dict:
         output = Path(args.out)
         if args.status_file and Path(args.status_file).resolve().is_relative_to(output.resolve()):
             raise ValueError("native compile status file must be outside the artifact directory")
-        abi = json.loads(Path(args.abi).read_text())
+        if args.abi == "auto":
+            planner = getattr(binding, "plan_boundary_abi", None)
+            if planner is None:
+                raise NativeCompilationError(
+                    "unsupported_semantics", "selected support has no automatic boundary layout"
+                )
+            abi = planner(request)
+        else:
+            abi = json.loads(Path(args.abi).read_text())
         if (
             set(abi) != {"fixed_inputs", "fixed_outputs"}
             or not isinstance(abi["fixed_inputs"], dict)
@@ -675,6 +785,18 @@ def _native_compile_report(args: argparse.Namespace) -> dict:
                 destination=staged,
                 limits=limits,
             )
+            if softmax_record is not None:
+                name = "row-softmax-tiling.json"
+                tracked = manifest.get("stage_artifacts")
+                if not isinstance(tracked, dict) or name in tracked or (staged / name).exists():
+                    raise ValueError("target manifest cannot track row softmax decomposition")
+                (staged / name).write_bytes(softmax_record)
+                manifest = {
+                    **manifest,
+                    "softmax_source_request_digest": source_request.digest(),
+                    "stage_artifacts": {**tracked, name: hashlib.sha256(softmax_record).hexdigest()},
+                }
+                (staged / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
             if layout_document is not None:
                 tracked = manifest.get("stage_artifacts")
                 name = "physical-boundary-layouts.json"
@@ -682,9 +804,13 @@ def _native_compile_report(args: argparse.Namespace) -> dict:
                     raise ValueError("target manifest cannot track physical boundary layouts")
                 payload = layout_document
                 (staged / name).write_bytes(payload)
-                manifest = {**manifest, "stage_artifacts": {
-                    **tracked, name: hashlib.sha256(payload).hexdigest(),
-                }}
+                manifest = {
+                    **manifest,
+                    "stage_artifacts": {
+                        **tracked,
+                        name: hashlib.sha256(payload).hexdigest(),
+                    },
+                }
                 (staged / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
             if precision_plan is not None:
                 execution_plan = json.loads((staged / "execution_plan.json").read_text())
@@ -693,13 +819,15 @@ def _native_compile_report(args: argparse.Namespace) -> dict:
                 tile_plan = isinstance(precision_plan, DiagnosticMatmulTile)
                 static_inputs = (
                     _prepared_static_inputs(binding, precision_plan, Path(args.compile_inputs), execution_plan)
-                    if tile_plan else ()
+                    if tile_plan
+                    else ()
                 )
                 raw_plan = (json.dumps(precision_plan.record(), sort_keys=True, indent=2) + "\n").encode()
                 (staged / "precision-plan.json").write_bytes(raw_plan)
                 tracked = manifest.get("stage_artifacts")
                 if (
-                    not isinstance(tracked, dict) or "precision-plan.json" in tracked
+                    not isinstance(tracked, dict)
+                    or "precision-plan.json" in tracked
                     or (tile_plan and "constant_inputs" in manifest)
                 ):
                     raise ValueError("target manifest cannot track the source precision plan")
@@ -716,10 +844,14 @@ def _native_compile_report(args: argparse.Namespace) -> dict:
                         raise ValueError("target manifest already tracks a source constant")
                     destination.write_bytes(item.payload)
                     constant_artifacts[relative] = hashlib.sha256(item.payload).hexdigest()
-                manifest = {**manifest, "stage_artifacts": {
-                    **tracked, "precision-plan.json": hashlib.sha256(raw_plan).hexdigest(),
-                    **constant_artifacts,
-                }}
+                manifest = {
+                    **manifest,
+                    "stage_artifacts": {
+                        **tracked,
+                        "precision-plan.json": hashlib.sha256(raw_plan).hexdigest(),
+                        **constant_artifacts,
+                    },
+                }
                 if tile_plan:
                     manifest["constant_inputs"] = [item.record() for item in static_inputs]
                 (staged / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
@@ -818,7 +950,9 @@ def _cmd_native_probe_model_regions(args: argparse.Namespace) -> int:
     from .model_region_probe import probe_model_regions
 
     return probe_model_regions(
-        args, compile_report=_native_compile_report, load_limits=_load_native_search_limits,
+        args,
+        compile_report=_native_compile_report,
+        load_limits=_load_native_search_limits,
     )
 
 
@@ -833,9 +967,12 @@ def _cmd_native_check_host_object(args: argparse.Namespace) -> int:
     output.mkdir(parents=True)
     try:
         report = check_compiled_host_object(
-            probe_dir=Path(args.probe), compile_inputs=Path(args.compile_inputs),
-            lowered_dir=Path(args.lowered), object_path=Path(args.object),
-            nm=Path(args.nm), mlir_opt=Path(args.mlir_opt),
+            probe_dir=Path(args.probe),
+            compile_inputs=Path(args.compile_inputs),
+            lowered_dir=Path(args.lowered),
+            object_path=Path(args.object),
+            nm=Path(args.nm),
+            mlir_opt=Path(args.mlir_opt),
         )
     except (OSError, ValueError, RuntimeError, TypeError, KeyError, UnicodeError, subprocess.TimeoutExpired) as error:
         report = {"schema": "merlin.native_host_object_check.v1", "status": "compile_error", "reason": str(error)}
@@ -857,8 +994,11 @@ def _cmd_native_bridge_graph(args: argparse.Namespace) -> int:
     # Refuse before anything is written: the error manifest below must never
     # land inside the compiled artifact it failed to bridge.
     if output.resolve().is_relative_to(compiled.resolve()):
-        print(json.dumps({"status": "compile_error",
-                          "reason": "host bridge output must be outside the native compilation"}))
+        print(
+            json.dumps(
+                {"status": "compile_error", "reason": "host bridge output must be outside the native compilation"}
+            )
+        )
         return 2
     try:
         manifest_path = compiled / "manifest.json"
@@ -868,7 +1008,9 @@ def _cmd_native_bridge_graph(args: argparse.Namespace) -> int:
         if not isinstance(compilation, dict):
             raise ValueError("native compilation manifest must be an object")
         verify_native_publication(
-            compiled, compilation, engine="merlin_native",
+            compiled,
+            compilation,
+            engine="merlin_native",
             request_digest=compilation.get("request_digest"),
             target_identity=compilation.get("target_identity"),
         )
@@ -886,10 +1028,14 @@ def _cmd_native_bridge_graph(args: argparse.Namespace) -> int:
             json.loads((compiled / layouts_name).read_text()) if layouts_name in stage_artifacts else None
         )
         record, text = diagnostic_whole_graph_host_bridge(
-            Path(args.linalg).read_text(), args.entry,
-            device_symbol=args.device_symbol, compilation=compilation,
-            selection=selection, precision_plan=precision_plan,
-            execution_plan=execution_plan, physical_layouts=physical_layouts,
+            Path(args.linalg).read_text(),
+            args.entry,
+            device_symbol=args.device_symbol,
+            compilation=compilation,
+            selection=selection,
+            precision_plan=precision_plan,
+            execution_plan=execution_plan,
+            physical_layouts=physical_layouts,
         )
         output.mkdir(parents=True)
         (output / "host-bridge.mlir").write_text(text)
@@ -900,17 +1046,28 @@ def _cmd_native_bridge_graph(args: argparse.Namespace) -> int:
         return 0
     except (OSError, ValueError, RuntimeError, TypeError, KeyError, UnicodeError) as error:
         output.mkdir(parents=True, exist_ok=True)
-        (output / "manifest.json").write_text(json.dumps({
-            "schema": "merlin.diagnostic_whole_graph_host_bridge.v1",
-            "status": "compile_error", "reason": str(error),
-        }, sort_keys=True, indent=2) + "\n")
-        print(json.dumps({"status": "compile_error", "reason": str(error), "out": str(output)},
-                         sort_keys=True))
+        (output / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema": "merlin.diagnostic_whole_graph_host_bridge.v1",
+                    "status": "compile_error",
+                    "reason": str(error),
+                },
+                sort_keys=True,
+                indent=2,
+            )
+            + "\n"
+        )
+        print(json.dumps({"status": "compile_error", "reason": str(error), "out": str(output)}, sort_keys=True))
         return 2
 
 
 def _cmd_native_verify(args: argparse.Namespace) -> int:
     """Reopen a native package against its source and snapshot identities."""
+    if getattr(args, "application", False):
+        from .native_application import verify_application_command
+
+        return verify_application_command(args, _write_status)
     from merlin.semantic_compiler.linalg_bridge import LinalgBridgeError
     from merlin.semantic_compiler.snapshot import open_native_snapshot
     from merlin.semantic_compiler.target_binding import (
@@ -926,27 +1083,41 @@ def _cmd_native_verify(args: argparse.Namespace) -> int:
         or status_path.resolve().is_relative_to(Path(args.snapshot).resolve())
     )
     try:
+        if getattr(args, "application_state", None):
+            raise ValueError("--application-state requires --application")
         if not safe_status:
             raise ValueError("native verification status must be outside the artifact and snapshot directories")
         snapshot = open_native_snapshot(Path(args.snapshot))
-        binding = (load_native_target_binding(args.support)
-                   if args.support and (
-                       args.diagnostic_region or args.diagnostic_graph_policy
-                       or args.ordered_k_tile is not None
-                       or args.ordered_m_tile is not None or args.ordered_n_tile is not None
-                       or args.outer_tile_index is not None
-                   )
-                   else None)
+        binding = (
+            load_native_target_binding(args.support)
+            if args.support
+            and (
+                args.diagnostic_region
+                or args.diagnostic_graph_policy
+                or args.ordered_k_tile is not None
+                or args.ordered_m_tile is not None
+                or args.ordered_n_tile is not None
+                or args.outer_tile_index is not None
+                or args.row_softmax_tile_index is not None
+            )
+            else None
+        )
         if binding is not None and snapshot.profile.digest() != binding.profile().digest():
             raise ValueError("native snapshot differs from selected support profile")
         request, source_kind, _, precision_plan = _load_selected_native_request(
-            args, target_identity=snapshot.profile.target_identity, mode=args.mode, binding=binding,
+            args,
+            target_identity=snapshot.profile.target_identity,
+            mode=args.mode,
+            binding=binding,
         )
         request, layout_document = _bind_native_physical_layouts(args, request, precision_plan)
         source_request = request
+        request, softmax_record = _prepare_native_row_softmax(args, binding, request)
         if precision_plan is not None and (
-            args.ordered_k_tile is not None or args.ordered_m_tile is not None
-            or args.ordered_n_tile is not None or args.outer_tile_index is not None
+            args.ordered_k_tile is not None
+            or args.ordered_m_tile is not None
+            or args.ordered_n_tile is not None
+            or args.outer_tile_index is not None
         ):
             raise ValueError("source-bound precision tiles cannot also use ordered matrix partitioning")
         request, ordered_mn_record = _prepare_native_ordered_mn(args, binding, request)
@@ -958,6 +1129,17 @@ def _cmd_native_verify(args: argparse.Namespace) -> int:
         manifest = json.loads(manifest_bytes)
         if not isinstance(manifest, dict):
             raise ValueError("native artifact manifest must be an object")
+        softmax_path = artifact / "row-softmax-tiling.json"
+        if softmax_record is None:
+            if softmax_path.exists() or softmax_path.is_symlink() or "softmax_source_request_digest" in manifest:
+                raise ValueError("native artifact has an unrequested row softmax decomposition")
+        elif (
+            manifest.get("softmax_source_request_digest") != source_request.digest()
+            or softmax_path.is_symlink()
+            or not softmax_path.is_file()
+            or softmax_path.read_bytes() != softmax_record
+        ):
+            raise ValueError("row softmax decomposition differs from original source")
         snapshot_digest = hashlib.sha256((snapshot.root / "manifest.json").read_bytes()).hexdigest()
         if manifest.get("native_snapshot_sha256") != snapshot_digest:
             raise ValueError("native artifact snapshot identity differs")
@@ -986,14 +1168,15 @@ def _cmd_native_verify(args: argparse.Namespace) -> int:
         ):
             raise ValueError("ordered-M/N partition differs from the original source")
         verify_native_publication(
-            artifact, manifest, engine=args.engine, request_digest=request.digest(),
+            artifact,
+            manifest,
+            engine=args.engine,
+            request_digest=request.digest(),
             target_identity=snapshot.profile.target_identity,
         )
         layout_path = artifact / "physical-boundary-layouts.json"
         if layout_document is not None:
-            if layout_path.is_symlink() or not layout_path.is_file() or (
-                layout_path.read_bytes() != layout_document
-            ):
+            if layout_path.is_symlink() or not layout_path.is_file() or (layout_path.read_bytes() != layout_document):
                 raise ValueError("physical boundary layouts differ from parsed source")
         elif layout_path.exists() or layout_path.is_symlink():
             raise ValueError("native artifact has undeclared physical boundary layouts")
@@ -1007,7 +1190,8 @@ def _cmd_native_verify(args: argparse.Namespace) -> int:
 
             static_inputs = (
                 _prepared_static_inputs(binding, precision_plan, Path(args.compile_inputs), execution_plan)
-                if isinstance(precision_plan, DiagnosticMatmulTile) else ()
+                if isinstance(precision_plan, DiagnosticMatmulTile)
+                else ()
             )
             if isinstance(precision_plan, DiagnosticMatmulTile) and (
                 manifest.get("constant_inputs") != [item.record() for item in static_inputs]
@@ -1054,8 +1238,10 @@ def _cmd_native_verify(args: argparse.Namespace) -> int:
         report = {
             "schema": "merlin.native_artifact_verification.v1",
             "status": (
-                "unsupported_semantics" if isinstance(error, LinalgBridgeError)
-                else error.status if isinstance(error, NativeCompilationError)
+                "unsupported_semantics"
+                if isinstance(error, LinalgBridgeError)
+                else error.status
+                if isinstance(error, NativeCompilationError)
                 else "compile_error"
             ),
             "scope": "source_snapshot_declared_artifact_identity",
@@ -1070,7 +1256,6 @@ def _cmd_native_verify(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    from merlin.semantic_compiler.search import SearchAblations
 
     parser = argparse.ArgumentParser(prog="merlin-targetgen", description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1154,134 +1339,19 @@ def build_parser() -> argparse.ArgumentParser:
     native_build.add_argument("--out", required=True, help="fresh snapshot directory")
     native_build.set_defaults(func=_cmd_native_build)
 
-    native_select = sub.add_parser("native-select", help="select and allocate one typed kernel; no target emission")
-    native_select.add_argument("--engine", choices=("merlin_native",), required=True)
-    native_select.add_argument("--snapshot", required=True)
-    select_source = native_select.add_mutually_exclusive_group(required=True)
-    select_source.add_argument("--request", help="typed semantic kernel JSON")
-    select_source.add_argument("--linalg", help="parsed Linalg MLIR input; admitted semantic subset")
-    select_source.add_argument("--compile-inputs", help="verified compiler-only staged capture directory")
-    native_select.add_argument("--linalg-entry", help="entry function name for --linalg")
-    native_select.add_argument("--physical-layouts", help="source-bound physical layouts for parsed Linalg")
-    native_select.add_argument("--support", help="installed target support for a source-bound diagnostic region")
-    native_select.add_argument("--diagnostic-region", help="source-bound matmul region; requires --compile-inputs")
-    native_select.add_argument("--diagnostic-graph-policy", help="explicit precision policy for a parsed Linalg graph")
-    native_select.add_argument("--diagnostic-tile-index", type=int,
-                               help="row-major M/N output tile of a source-bound region")
-    native_select.add_argument("--mode", choices=("strict-native", "hybrid", "diagnostic"), default="strict-native")
-    native_select.add_argument(
-        "--abi",
-        help="optional fixed_inputs/fixed_outputs JSON with optional reserved physical intervals; no runtime samples",
-    )
-    native_select.add_argument("--search-limits", help="complete versioned native search-limit JSON")
-    native_select.add_argument(
-        "--ablation",
-        action="append",
-        default=[],
-        choices=tuple(vars(SearchAblations())),
-        help="diagnostic-only native mechanism removal; repeat for multiple ablations",
-    )
-    native_select.add_argument("--out", required=True, help="selection result JSON")
-    native_select.set_defaults(func=_cmd_native_select)
+    from .native_codegen_cli import add_native_codegen_commands
 
-    native_compile = sub.add_parser("native-compile", help="compile one typed native region with selected OOT support")
-    native_compile.add_argument("--engine", choices=("merlin_native",), required=True)
-    native_compile.add_argument("--support", required=True, help="installed target support entry point")
-    native_compile.add_argument("--snapshot", required=True)
-    compile_source = native_compile.add_mutually_exclusive_group(required=True)
-    compile_source.add_argument("--request", help="typed semantic kernel JSON")
-    compile_source.add_argument("--linalg", help="parsed Linalg MLIR input; admitted semantic subset")
-    compile_source.add_argument("--compile-inputs", help="verified compiler-only staged capture directory")
-    native_compile.add_argument("--linalg-entry", help="entry function name for --linalg")
-    native_compile.add_argument("--physical-layouts", help="source-bound physical layouts for parsed Linalg")
-    native_compile.add_argument("--diagnostic-region", help="source-bound matmul region; requires --compile-inputs")
-    native_compile.add_argument("--diagnostic-graph-policy", help="explicit precision policy for a parsed Linalg graph")
-    native_compile.add_argument("--diagnostic-tile-index", type=int,
-                                help="row-major M/N output tile of a source-bound region")
-    native_compile.add_argument(
-        "--ordered-k-tile", type=int,
-        help="ask selected support to partition one annotated ordered reduction into exact K tiles",
+    add_native_codegen_commands(
+        sub,
+        {
+            "native_select": _cmd_native_select,
+            "native_compile": _cmd_native_compile,
+            "native_probe_model_regions": _cmd_native_probe_model_regions,
+            "native_check_host_object": _cmd_native_check_host_object,
+            "native_bridge_graph": _cmd_native_bridge_graph,
+            "native_verify": _cmd_native_verify,
+        },
     )
-    native_compile.add_argument("--ordered-m-tile", type=int, help="qualified exact output-row tile size")
-    native_compile.add_argument("--ordered-n-tile", type=int, help="qualified exact output-column tile size")
-    native_compile.add_argument(
-        "--outer-tile-index", type=int,
-        help="row-major output tile to compile; requires both M/N tile sizes",
-    )
-    native_compile.add_argument("--abi", required=True, help="fixed_inputs/fixed_outputs JSON")
-    native_compile.add_argument("--search-limits", help="complete versioned native search-limit JSON")
-    native_compile.add_argument("--target-source", required=True, help="selected target source checkout")
-    native_compile.add_argument("--mode", choices=("strict-native", "hybrid", "diagnostic"), required=True)
-    native_compile.add_argument("--out", required=True, help="fresh compilation output directory")
-    native_compile.add_argument("--status-file", help="invocation-owned machine-readable status JSON")
-    native_compile.set_defaults(func=_cmd_native_compile)
-
-    model_regions = sub.add_parser(
-        "native-probe-model-regions",
-        help="diagnose all source-bound native regions without claiming model composition",
-    )
-    model_regions.add_argument("--engine", choices=("merlin_native",), required=True)
-    model_regions.add_argument("--support", required=True, help="installed target support entry point")
-    model_regions.add_argument("--snapshot", required=True)
-    model_regions.add_argument("--compile-inputs", required=True, help="verified compiler-only staged capture")
-    model_regions_abi = model_regions.add_mutually_exclusive_group(required=True)
-    model_regions_abi.add_argument("--abi", help="exact fixed input/output addresses for every tile")
-    model_regions_abi.add_argument("--abi-pool", help="diagnostic input/output slot pool for per-tile ABIs")
-    model_regions.add_argument("--search-limits", help="complete versioned native search-limit JSON")
-    model_regions.add_argument("--max-named-tiles", type=int, default=256,
-                               help="maximum source-bound named tiles attempted in this diagnostic")
-    model_regions.add_argument("--max-batched-tiles", type=int, default=256,
-                               help="maximum source-bound batched tiles attempted in this diagnostic")
-    model_regions.add_argument("--target-source", required=True, help="selected target source checkout")
-    model_regions.add_argument("--out", required=True, help="fresh diagnostic artifact directory")
-    model_regions.set_defaults(func=_cmd_native_probe_model_regions)
-
-    host_object = sub.add_parser(
-        "native-check-host-object",
-        help="check a lowered host object's calls against an exact native model probe",
-    )
-    host_object.add_argument("--probe", required=True, help="source-bound native model probe directory")
-    host_object.add_argument("--compile-inputs", required=True, help="same verified compiler-only capture")
-    host_object.add_argument("--lowered", required=True, help="fresh Merlin host lowering directory")
-    host_object.add_argument("--object", required=True, help="host ELF object within --lowered")
-    host_object.add_argument("--nm", required=True, help="selected object symbol inspection tool")
-    host_object.add_argument("--mlir-opt", required=True, help="selected MLIR tool for audited entry ABI")
-    host_object.add_argument("--out", required=True, help="fresh object check artifact directory")
-    host_object.set_defaults(func=_cmd_native_check_host_object)
-
-    graph_bridge = sub.add_parser(
-        "native-bridge-graph",
-        help="outline one exact native whole graph as a typed external host call",
-    )
-    graph_bridge.add_argument("--linalg", required=True, help="exact source Linalg module")
-    graph_bridge.add_argument("--entry", required=True, help="source function to externalize")
-    graph_bridge.add_argument("--compiled", required=True, help="native whole-graph compilation directory")
-    graph_bridge.add_argument("--device-symbol", required=True, help="C-compatible target callback symbol")
-    graph_bridge.add_argument("--out", required=True, help="fresh typed host bridge output directory")
-    graph_bridge.set_defaults(func=_cmd_native_bridge_graph)
-
-    native_verify = sub.add_parser("native-verify", help="recheck native source, snapshot and published artifact bytes")
-    native_verify.add_argument("--engine", choices=("merlin_native",), required=True)
-    native_verify.add_argument("--snapshot", required=True)
-    verify_source = native_verify.add_mutually_exclusive_group(required=True)
-    verify_source.add_argument("--request", help="original typed semantic kernel JSON")
-    verify_source.add_argument("--linalg", help="original parsed Linalg MLIR input")
-    verify_source.add_argument("--compile-inputs", help="verified compiler-only staged capture directory")
-    native_verify.add_argument("--linalg-entry", help="entry function name for --linalg")
-    native_verify.add_argument("--physical-layouts", help="source-bound physical layouts for parsed Linalg")
-    native_verify.add_argument("--support", help="installed target support for a source-bound diagnostic region")
-    native_verify.add_argument("--diagnostic-region", help="source-bound matmul region; requires --compile-inputs")
-    native_verify.add_argument("--diagnostic-graph-policy", help="explicit precision policy for a parsed Linalg graph")
-    native_verify.add_argument("--diagnostic-tile-index", type=int,
-                               help="recheck the selected row-major M/N source tile")
-    native_verify.add_argument("--ordered-k-tile", type=int, help="recheck the selected exact-K source partition")
-    native_verify.add_argument("--ordered-m-tile", type=int, help="recheck exact output-row tile size")
-    native_verify.add_argument("--ordered-n-tile", type=int, help="recheck exact output-column tile size")
-    native_verify.add_argument("--outer-tile-index", type=int, help="recheck selected row-major output tile")
-    native_verify.add_argument("--mode", choices=("strict-native", "hybrid", "diagnostic"), required=True)
-    native_verify.add_argument("--artifact", required=True, help="published native compilation directory")
-    native_verify.add_argument("--out", required=True, help="verification status JSON outside the artifact")
-    native_verify.set_defaults(func=_cmd_native_verify)
 
     return parser
 

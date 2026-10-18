@@ -133,6 +133,17 @@ def _storage_nbytes(arr: np.ndarray, dt: str) -> int:
     return int(arr.size) * DT_BYTES[dt]
 
 
+def embed_array(arr: np.ndarray, dtype: str) -> str:
+    """Render C initializer values using the runtime's storage representation.
+
+    Floating values retain their signs and exceptional-value payloads. This
+    formats an explicitly supplied array; it reads no capture or runtime data.
+    """
+    if dtype not in C_OF:
+        raise ValueError(f"unsupported C array storage type: {dtype}")
+    return _embed_array(arr, dtype)
+
+
 def generate(
     model_dir: str | Path,
     out_dir: str | Path,
