@@ -6,6 +6,11 @@ Compile machinery behind ``merlin-compile``: bundles, the host lane, capacity, a
 
 ## Modules
 
+- `application_plan.py` — Select complete compatible source regions from provider-admitted alternatives.
+- `c_sources.py` — Package explicitly selected C sources into a standalone C/H pair.
+- `c_parameters.py` — Embed declared immutable model parameters in a C call.
+- `c_conversions.py` — Render checked source float conversions and operand axis order.
+- `c_tiling.py` — Render byte-preserving C packing for checked contraction and row-softmax tiling.
 - `bundles.py` — Capture bundles for the RVV whole-model lane, and the scalar datatype a bundle's IR carries.
 - `capacity.py` — Operand and accumulator capacity of a target's matrix unit, and the tile that fits it.
 - `command.py` — The `merlin-compile` command line: its arguments, the combinations it refuses, and its report.
