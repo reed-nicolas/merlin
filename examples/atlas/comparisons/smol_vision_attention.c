@@ -5,6 +5,74 @@
 #include <float.h>
 #include <math.h>
 
+/* Negative-domain expf adaptation of Arm optimized-routines v25.01,
+ * math/expf.c and math/exp2f_data.c, Copyright (c) 2017-2024 Arm Limited.
+ * The installed native GLIBC_2.27 expf contracts range reduction and the
+ * polynomial into the explicit double FMAs below. This helper needs neither
+ * arbitrary-input guest expf nor a learned-input lookup table.
+ *
+ * Copyright (c) 1999-2022, Arm Limited.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+static double vision_fma64(double left, double right, double addend) {
+#if defined(__riscv)
+    double result;
+    __asm__("fmadd.d %0,%1,%2,%3" : "=f"(result)
+            : "f"(left), "f"(right), "f"(addend));
+    return result;
+#else
+    return fma(left, right, addend);
+#endif
+}
+
+static float vision_prior_exp(float value) {
+    /* Running maxima only request nonpositive inputs, including -infinity. */
+    if (value < -0x1.9fe368p6f) return 0.0f;
+    static const uint64_t table[32] = {
+    UINT64_C(0x3ff0000000000000), UINT64_C(0x3fefd9b0d3158574), UINT64_C(0x3fefb5586cf9890f), UINT64_C(0x3fef9301d0125b51),
+    UINT64_C(0x3fef72b83c7d517b), UINT64_C(0x3fef54873168b9aa), UINT64_C(0x3fef387a6e756238), UINT64_C(0x3fef1e9df51fdee1),
+    UINT64_C(0x3fef06fe0a31b715), UINT64_C(0x3feef1a7373aa9cb), UINT64_C(0x3feedea64c123422), UINT64_C(0x3feece086061892d),
+    UINT64_C(0x3feebfdad5362a27), UINT64_C(0x3feeb42b569d4f82), UINT64_C(0x3feeab07dd485429), UINT64_C(0x3feea47eb03a5585),
+    UINT64_C(0x3feea09e667f3bcd), UINT64_C(0x3fee9f75e8ec5f74), UINT64_C(0x3feea11473eb0187), UINT64_C(0x3feea589994cce13),
+    UINT64_C(0x3feeace5422aa0db), UINT64_C(0x3feeb737b0cdc5e5), UINT64_C(0x3feec49182a3f090), UINT64_C(0x3feed503b23e255d),
+    UINT64_C(0x3feee89f995ad3ad), UINT64_C(0x3feeff76f2fb5e47), UINT64_C(0x3fef199bdd85529c), UINT64_C(0x3fef3720dcef9069),
+    UINT64_C(0x3fef5818dcfba487), UINT64_C(0x3fef7c97337b9b5f), UINT64_C(0x3fefa4afa2a490da), UINT64_C(0x3fefd0765b6e4540),
+    };
+    const double inverse_log = 0x1.71547652b82fep5;
+    const double shift = 0x1.8p52;
+    double rounded = vision_fma64(inverse_log, (double)value, shift);
+    uint64_t bits;
+    memcpy(&bits, &rounded, sizeof(bits));
+    rounded -= shift;
+    double remainder = vision_fma64(inverse_log, (double)value, -rounded);
+    uint64_t scale_bits = table[bits % 32] + (bits << 47);
+    double scale;
+    memcpy(&scale, &scale_bits, sizeof(scale));
+    double polynomial = vision_fma64(0x1.c6af84b912394p-20, remainder,
+                                    0x1.ebfce50fac4f3p-13);
+    double square = remainder * remainder;
+    double result = vision_fma64(0x1.62e42ff0c52d6p-6, remainder, 1.0);
+    result = vision_fma64(polynomial, square, result);
+    return (float)(result * scale);
+}
+
 /* Arithmetic contract: PyTorch2.10 CPU FlashAttentionKernel, BF16 CPU16.
  * Retain512-key running-max blocks, FLOAT lane sums, BF16 unnormalized
  * exponentials, and final FLOAT normalization. This is not eager attention.
@@ -16,7 +84,9 @@ static float vision_exp(float value) {
     float log2e;
     memcpy(&log2e, &log_bits, sizeof(log2e));
     float source = value * log2e;
-    float fraction = source - floorf(source);
+    int whole = (int)source;
+    float floor_value = source == 0.0f ? source : (float)(whole - (source < (float)whole));
+    float fraction = source - floor_value;
     float correction = fmaf(fraction, -0.079204240219773236f, -0.22433836478672356f);
     correction = fmaf(fraction, correction, 0.30354260500649682f);
     correction = fmaf(fraction, correction, 0.00010703434948458272f);
@@ -41,6 +111,7 @@ int smol_vision_attention_cpu16_bf16(
     if (!query || !key || !value || !output || !rows || rows > 1024
         || !keys || keys > 1024 || keys % 16 || !heads || heads > 12
         || FLT_RADIX != 2 || FLT_MANT_DIG != 24 || sizeof(float) != 4
+        || DBL_MANT_DIG != 53 || sizeof(double) != 8
         || fegetround() != FE_TONEAREST) return -1;
     size_t width = heads * 64, q_words = rows * width, kv_words = keys * width;
     if (overlap(output, q_words, query, q_words)
@@ -55,7 +126,7 @@ int smol_vision_attention_cpu16_bf16(
     }
     for (size_t head = 0; head < heads; ++head) {
         for (size_t row = 0; row < rows; ++row) {
-            float maximum = -INFINITY, denominator = 0.0f, accumulator[64] = {0};
+            float maximum = bf16_to_float(UINT16_C(0xff80)), denominator = 0.0f, accumulator[64] = {0};
             for (size_t block = 0; block < keys; block += 512) {
                 size_t count = keys - block < 512 ? keys - block : 512;
                 float scores[512], lane_sums[16] = {0};
@@ -84,7 +155,7 @@ int smol_vision_attention_cpu16_bf16(
                         lane_sums[lane] += lane_sums[lane + stride];
                     }
                 }
-                float prior_scale = expf(maximum - next_maximum);
+                float prior_scale = vision_prior_exp(maximum - next_maximum);
                 /* Native AVX512 contracts the running-sum update into one FMA. */
                 denominator = fmaf(prior_scale, denominator, lane_sums[0]);
                 maximum = next_maximum;

@@ -24,9 +24,14 @@ class VisionAttentionTest(unittest.TestCase):
         cls.source_files = [root / name for name in ("smol_vision_attention.c", "smol_vision_attention.h", "smol_host_bits.h")]
         cls.source_hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in cls.source_files}
         cls.library = cls.out / "attention.so"
+        shim = cls.out / "attention-test.c"
+        shim.write_text('#include "smol_vision_attention.c"\n'
+                        'void smol_test_prior_exp(const float *x, float *y, float *native, size_t count) {\n'
+                        '  for (size_t i=0; i<count; ++i) { y[i]=vision_prior_exp(x[i]); native[i]=expf(x[i]); }\n'
+                        '}\n')
         subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-O2", "-fPIC", "-shared",
                         "-fno-fast-math", "-ffp-contract=off", "-Wall", "-Wextra", "-Werror",
-                        "-I", str(root), str(root / "smol_vision_attention.c"), "-lm",
+                        "-I", str(root), str(shim), "-lm",
                         "-o", str(cls.library)], check=True, timeout=90, capture_output=True)
         cls.loaded = ctypes.CDLL(str(cls.library))
         cls.function = cls.loaded.smol_vision_attention_cpu16_bf16
@@ -51,6 +56,35 @@ class VisionAttentionTest(unittest.TestCase):
         result, actual = self.run_c(*arrays)
         self.assertEqual(result, 0)
         np.testing.assert_array_equal(actual, expected[0].transpose(0, 1).contiguous().view(torch.uint16).numpy())
+
+    def test_negative_fp32_prior_exp_matches_native_libm_bits(self):
+        generator = np.random.default_rng(731)
+        random_bits = generator.integers(0, 0x42d00000, 131072, dtype=np.uint32) | np.uint32(0x80000000)
+        incoming = np.concatenate((np.linspace(-104, 0, 262144, dtype=np.float32),
+                                   random_bits.view(np.float32), np.array([-np.inf, -0.0, 0.0], np.float32)))
+        actual, expected = np.empty_like(incoming), np.empty_like(incoming)
+        pointer = ctypes.POINTER(ctypes.c_float)
+        function = self.loaded.smol_test_prior_exp
+        function.argtypes = [pointer, pointer, pointer, ctypes.c_size_t]
+        function.restype = None
+        function(*[array.ctypes.data_as(pointer) for array in (incoming, actual, expected)], incoming.size)
+        np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+
+    @unittest.skipUnless(os.environ.get("SMOL_RV64_CC") and os.environ.get("SMOL_RV64_SUPPORT"),
+                         "external freestanding toolchain/support fixture required")
+    def test_actual_freestanding_headers_accept_attention(self):
+        compiler = physical_path(os.environ["SMOL_RV64_CC"])
+        support = physical_path(os.environ["SMOL_RV64_SUPPORT"])
+        resource = subprocess.run([str(compiler), "-print-resource-dir"], check=True,
+                                  capture_output=True, text=True, timeout=30).stdout.strip()
+        includes = physical_path(Path(resource) / "include")
+        root = physical_path(Path(__file__).absolute().parent)
+        result = subprocess.run([str(compiler), "--target=riscv64-unknown-elf", "-march=rv64gc", "-mabi=lp64d",
+                        "-std=c11", "-O2", "-ffp-contract=off", "-fno-fast-math", "-ffreestanding",
+                        "-fno-builtin", "-nostdinc", "-isystem", str(includes), "-I", str(support / "include"),
+                        "-Wall", "-Wextra", "-Werror", "-c", str(root / "smol_vision_attention.c"),
+                        "-o", str(self.out / "attention-rv64.o")], capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_one_key_block_matches_cpu_sdpa(self):
         self.check_torch(2, 16, 8)
