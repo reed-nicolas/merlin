@@ -14,6 +14,8 @@ import torch
 from source_relocation import physical_path as safe
 
 
+@unittest.skipUnless(os.environ.get('SMOL_NATIVE_CAPTURE') and os.environ.get('SMOL_CHECKPOINT'),
+                     'Optional native vision fixtures are not configured')
 class VisionOpsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

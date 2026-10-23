@@ -12,6 +12,7 @@ import torch
 from source_relocation import physical_path as safe
 
 
+@unittest.skipUnless(os.environ.get('SMOL_ATTENTION_HEADERS'), 'Optional attention headers are not configured')
 class VisionLayoutTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

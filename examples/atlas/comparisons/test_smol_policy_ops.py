@@ -41,6 +41,7 @@ class PolicyOpsTest(unittest.TestCase):
         print(json.dumps({'policy_silu_words': a.size, 'mismatches': mismatch}), flush=True)
         self.assertEqual(mismatch, 0)
 
+    @unittest.skipUnless(os.environ.get('SMOL_NATIVE_CAPTURE'), 'Optional native policy fixture is not configured')
     def test_silu_actual_action_time_boundary_raw_exact(self):
         root = safe(os.environ['SMOL_NATIVE_CAPTURE'])
         receipt = json.loads(safe(root / 'receipt.json').read_bytes())
