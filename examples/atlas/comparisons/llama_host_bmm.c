@@ -39,6 +39,30 @@ static float decode_qk_dot64(const uint16_t *left, const uint16_t *right) {
     return lanes[0];
 }
 
+/* oneDNN's nontransposed BF16 GEMV accumulates at most eight reduction
+ * members locally, then adds that block to the prior FP32 output. Its
+ * remaining blocks have lengths4,2,1, each with the same upper/lower pairs. */
+static float decode_pv_dot(const uint16_t *left, const uint16_t *right,
+                           size_t reduction, size_t stride) {
+    float total = 0.0f;
+    size_t start = 0;
+    for (size_t block = 8; block; block /= 2) {
+        while (reduction - start >= block) {
+            float partial = 0.0f;
+            for (size_t pair = start; pair < start + block; pair += 2) {
+                if (pair + 1 < start + block)
+                    partial = fmaf(bf16_to_float(left[pair + 1]),
+                                   bf16_to_float(right[(pair + 1) * stride]), partial);
+                partial = fmaf(bf16_to_float(left[pair]),
+                               bf16_to_float(right[pair * stride]), partial);
+            }
+            total += partial;
+            start += block;
+        }
+    }
+    return total;
+}
+
 int llama_host_bmm_bf16_pair(const uint16_t *left, const uint16_t *right,
                             uint16_t *output, size_t batches, size_t rows,
                             size_t reduction, size_t columns, int right_transposed) {
@@ -55,6 +79,9 @@ int llama_host_bmm_bf16_pair(const uint16_t *left, const uint16_t *right,
                 if (rows == 1 && right_transposed && reduction == 64) {
                     total = decode_qk_dot64(left + batch * reduction,
                         right + batch * reduction * columns + column * reduction);
+                } else if (rows == 1 && !right_transposed && columns == 64) {
+                    total = decode_pv_dot(left + batch * reduction,
+                        right + batch * reduction * columns + column, reduction, columns);
                 } else for (size_t pair = 0; pair < reduction; pair += 2) {
                     if (pair + 1 < reduction) {
                         size_t r = right_transposed ? column * reduction + pair + 1
