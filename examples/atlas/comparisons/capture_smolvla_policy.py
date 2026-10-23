@@ -1,4 +1,4 @@
-"""Capture fresh-vision SmolVLA policy operators and close the native reference.
+"""Capture fresh-vision SmolVLA policy or replay Atlas projection arithmetic.
 
 This is source-native capture, not Atlas execution or a quality qualification.
 Every Linear and Conv2d invocation records its actual incoming tensor. Parameters
@@ -41,6 +41,9 @@ def main():
     parser.add_argument("--source-receipt", type=safe_path, required=True)
     parser.add_argument("--observation-input", type=safe_path, required=True)
     parser.add_argument("--out", type=safe_path, required=True)
+    parser.add_argument("--atlas-tools", type=safe_path)
+    parser.add_argument("--native-capture", type=safe_path)
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
@@ -71,6 +74,18 @@ def main():
         if parent["status"] != "passed_dynamic_block_model_and_retained_policy_continuation":
             raise ValueError("Require retained authenticated selected-block source")
         source = parent["source"]
+        if args.atlas_tools is not None:
+            if args.native_capture is None:
+                raise ValueError("Atlas replay requires the completed fresh native capture")
+            report["native_capture"] = pin(args.native_capture)
+            native_capture = json.loads(args.native_capture.read_text())
+            if (native_capture.get("status") != "PASS_FRESH_VISION_NATIVE_POLICY_CAPTURE"
+                    or native_capture.get("all_archived_fields_raw_exact") is not True
+                    or native_capture.get("input_state_rng_bookends_equal") is not True
+                    or len(native_capture.get("calls", [])) != 1421
+                    or native_capture["source"]["weights"] != source["weights"]):
+                raise ValueError("Incomplete or different native capture")
+            pin(native_capture["trajectory"]["path"], native_capture["trajectory"]["sha256"])
         verify_declared_sources(source)
         for item in parent["source_bookends"]:
             pin(item["path"], item["sha256"])
@@ -95,11 +110,21 @@ def main():
         policy = SmolVLAPolicy.from_pretrained(str(policy_dir), config=config,
                                               local_files_only=True, strict=True).eval().requires_grad_(False)
         model = policy.model
+        vlm = model.vlm_with_expert.get_vlm_model()
+        report["native_dispatch"] = {
+            "vision_attention": vlm.vision_model.config._attn_implementation,
+            "text_attention": vlm.text_model.config._attn_implementation,
+            "vision_type": type(vlm.vision_model).__name__,
+        }
         if model._rtc_enabled() or config.compile_model or state_sha(model, torch) != STATE_SHA:
             raise ValueError("Native state or execution mode changed")
         before = {name: tensor_id(value, torch) for name, value in inputs.items()}
         rng = torch.random.get_rng_state().clone()
         parameters, calls, captures = {}, [], {}
+        projection = None
+        if args.atlas_tools is not None:
+            from smol_policy_projection import AtlasProjection
+            projection = AtlasProjection(args.atlas_tools, args.out / "atlas-kernels", args.workers)
         (args.out / "parameters").mkdir()
         (args.out / "calls").mkdir()
 
@@ -119,6 +144,8 @@ def main():
                 if len(incoming) != 1 or not isinstance(output, torch.Tensor):
                     raise ValueError("Unexpected matrix operator ABI: " + name)
                 index = len(calls)
+                if projection is not None:
+                    output = projection.apply(name, module, incoming[0], output.dtype)
                 if name not in parameters:
                     stem = f"{len(parameters):04d}"
                     item = {"name": name, "kind": type(module).__name__,
@@ -134,7 +161,8 @@ def main():
                               "input": save_tensor(args.out / "calls" / (stem + "-input.bin"), incoming[0]),
                               "output": save_tensor(args.out / "calls" / (stem + "-output.bin"), output)})
                 if index % 100 == 0:
-                    print(json.dumps({"milestone": "native_operator", "index": index, "module": name}), flush=True)
+                    print(json.dumps({"milestone": "native_operator" if projection is None else "Atlas_arithmetic_operator", "index": index, "module": name}), flush=True)
+                return output if projection is not None else None
             return capture
 
         for name, module in model.named_modules():
@@ -147,9 +175,10 @@ def main():
             result = original_embed(*arguments, **kwargs)
             for name, value in zip(("prefix_embeddings", "prefix_pad_mask", "prefix_attention_mask"), result):
                 captures[name] = save_array(value)
-                require_equal(captures[name], reference[name], name)
+                if projection is None:
+                    require_equal(captures[name], reference[name], name)
             report["fresh_vision_executed"] = True
-            print(json.dumps({"milestone": "fresh_vision_prefix_raw_exact", "operators": len(calls)}), flush=True)
+            print(json.dumps({"milestone": "fresh_vision_prefix_raw_exact" if projection is None else "Atlas_arithmetic_vision_prefix", "operators": len(calls)}), flush=True)
             return result
 
         def forward(*arguments, **kwargs):
@@ -158,7 +187,8 @@ def main():
                 for field in ("key_states", "value_states"):
                     name = "prefix_" + field.replace("states", "cache")
                     captures[name] = save_array(torch.stack([result[1][i][field] for i in range(16)]))
-                    require_equal(captures[name], reference[name], name)
+                    if projection is None:
+                        require_equal(captures[name], reference[name], name)
             return result
 
         def denoise(*arguments, **kwargs):
@@ -169,7 +199,7 @@ def main():
             result = original_denoise(*arguments, **kwargs)
             captures[stem + "_velocity"] = save_array(result)
             steps.append(index)
-            print(json.dumps({"milestone": "native_denoising_step", "step": index, "operators": len(calls)}), flush=True)
+            print(json.dumps({"milestone": "native_denoising_step" if projection is None else "Atlas_arithmetic_denoising_step", "step": index, "operators": len(calls)}), flush=True)
             return result
 
         model.embed_prefix, model.vlm_with_expert.forward, model.denoise_step = embed, forward, denoise
@@ -187,17 +217,31 @@ def main():
             raise ValueError("Incomplete denoising trajectory")
         for index in steps:
             captures[f"step_{index:02d}_output_state"] = captures[f"step_{index + 1:02d}_input_state"].copy() if index < 9 else captures["final_full_state"].copy()
-        validate_trajectory(captures, reference, steps)
+        if projection is None:
+            validate_trajectory(captures, reference, steps)
+        else:
+            if len(calls) != 1421 or set(captures) != set(reference):
+                raise ValueError("Incomplete full-policy Atlas arithmetic traversal")
+            for name, actual in captures.items():
+                if actual.dtype != reference[name].dtype or actual.shape != reference[name].shape:
+                    raise ValueError("Target trajectory geometry changed: " + name)
+                if not np.isfinite(actual).all():
+                    raise ValueError("Nonfinite target trajectory: " + name)
+            for index in steps:
+                stem = f"step_{index:02d}"
+                update = torch.from_numpy(captures[stem + "_input_state"]) + (-1.0 / 10) * torch.from_numpy(captures[stem + "_velocity"])
+                require_equal(captures[stem + "_output_state"], update.numpy(), stem + " own Euler update")
+            report["projection_reference"] = projection.finish()
         if (before != {name: tensor_id(value, torch) for name, value in inputs.items()}
                 or not torch.equal(rng, torch.random.get_rng_state()) or state_sha(model, torch) != STATE_SHA):
             raise ValueError("Native input, RNG or state mutated")
         for item in tuple(pins):
             identity(item["path"], item["sha256"])
         np.savez(args.out / "trajectory.npz", **captures)
-        report.update(status="PASS_FRESH_VISION_NATIVE_POLICY_CAPTURE", source=source,
+        report.update(status="PASS_FRESH_VISION_NATIVE_POLICY_CAPTURE" if projection is None else "PASS_ATLAS_ARITHMETIC_FULL_POLICY_REPLAY", source=source,
                       source_bookends=pins, versions=versions, parameters=parameters, calls=calls,
                       trajectory=identity(args.out / "trajectory.npz"),
-                      all_archived_fields_raw_exact=True, input_state_rng_bookends_equal=True,
+                      all_archived_fields_raw_exact=projection is None, input_state_rng_bookends_equal=True,
                       parameter_bytes=sum(item["weight"]["bytes"] + item.get("bias", {}).get("bytes", 0) for item in parameters.values()),
                       invocation_bytes=sum(item["input"]["bytes"] + item["output"]["bytes"] for item in calls))
     except Exception as error:
