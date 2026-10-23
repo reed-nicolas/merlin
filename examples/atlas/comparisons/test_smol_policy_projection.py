@@ -44,7 +44,7 @@ class ProjectionTest(unittest.TestCase):
             self.assertFalse(provider.finish()['fresh_model_executed'])
 
     def test_patch_convolution_preserves_channel_row_column_order(self):
-        module = torch.nn.Conv2d(3, 2, 16, stride=16, bias=False).to(torch.bfloat16).requires_grad_(False)
+        module = torch.nn.Conv2d(3, 2, 16, stride=16, padding='valid', bias=False).to(torch.bfloat16).requires_grad_(False)
         module.weight.zero_()
         module.weight[0, 0, 0, 0] = 1
         module.weight[1, 2, 15, 15] = 1

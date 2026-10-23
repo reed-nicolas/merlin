@@ -42,7 +42,8 @@ class AtlasProjection:
         import torch
         if isinstance(module, torch.nn.Conv2d):
             if (tuple(module.kernel_size) != (16, 16) or tuple(module.stride) != (16, 16)
-                    or tuple(module.padding) != (0, 0) or tuple(module.dilation) != (1, 1) or module.groups != 1):
+                    or (module.padding != 'valid' and tuple(module.padding) != (0, 0))
+                    or tuple(module.dilation) != (1, 1) or module.groups != 1):
                 raise ValueError('Unadmitted vision patch convolution')
             batch, channels, height, width = incoming.shape
             if height % 16 or width % 16:

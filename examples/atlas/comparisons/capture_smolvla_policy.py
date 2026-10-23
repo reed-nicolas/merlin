@@ -153,7 +153,7 @@ def main():
                     if module.bias is not None:
                         item["bias"] = save_tensor(args.out / "parameters" / (stem + "-bias.bin"), module.bias)
                     if isinstance(module, torch.nn.Conv2d):
-                        item.update(stride=list(module.stride), padding=list(module.padding),
+                        item.update(stride=list(module.stride), padding=module.padding if isinstance(module.padding, str) else list(module.padding),
                                     dilation=list(module.dilation), groups=module.groups)
                     parameters[name] = item
                 stem = f"{index:05d}"
