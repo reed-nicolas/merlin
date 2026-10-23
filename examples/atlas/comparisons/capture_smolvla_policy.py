@@ -36,6 +36,20 @@ def validate_trajectory(captures, reference, steps):
         require_equal(actual, reference[name], name)
 
 
+def validate_target_geometry(captures, reference):
+    if set(captures) != set(reference):
+        raise ValueError("Target trajectory field set changed")
+    for name, actual in captures.items():
+        if actual.dtype != reference[name].dtype or actual.shape != reference[name].shape:
+            raise ValueError("Target trajectory geometry changed: " + name)
+        if actual.dtype == np.uint16:
+            finite = not np.any((actual & np.uint16(0x7f80)) == np.uint16(0x7f80))
+        else:
+            finite = np.isfinite(actual).all()
+        if not finite:
+            raise ValueError("Nonfinite target trajectory: " + name)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-receipt", type=safe_path, required=True)
@@ -222,11 +236,7 @@ def main():
         else:
             if len(calls) != 1421 or set(captures) != set(reference):
                 raise ValueError("Incomplete full-policy Atlas arithmetic traversal")
-            for name, actual in captures.items():
-                if actual.dtype != reference[name].dtype or actual.shape != reference[name].shape:
-                    raise ValueError("Target trajectory geometry changed: " + name)
-                if not np.isfinite(actual).all():
-                    raise ValueError("Nonfinite target trajectory: " + name)
+            validate_target_geometry(captures, reference)
             for index in steps:
                 stem = f"step_{index:02d}"
                 update = torch.from_numpy(captures[stem + "_input_state"]) + (-1.0 / 10) * torch.from_numpy(captures[stem + "_velocity"])

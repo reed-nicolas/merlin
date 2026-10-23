@@ -4,11 +4,23 @@ from unittest.mock import patch
 
 import numpy as np
 
-from capture_smolvla_policy import validate_trajectory
+from capture_smolvla_policy import validate_trajectory, validate_target_geometry
 from source_relocation import physical_path
 
 
 class CaptureClosureTest(unittest.TestCase):
+    def test_bf16_and_float_nonfinite_target_refused(self):
+        reference = {'cache': np.array([0x3f80], np.uint16), 'state': np.array([1.0], np.float32)}
+        validate_target_geometry(reference, reference)
+        for word in (0x7f80, 0xff80, 0x7fc0, 0xffc1):
+            changed = {**reference, 'cache': np.array([word], np.uint16)}
+            with self.assertRaises(ValueError):
+                validate_target_geometry(changed, reference)
+        for value in (np.inf, -np.inf, np.nan):
+            changed = {**reference, 'state': np.array([value], np.float32)}
+            with self.assertRaises(ValueError):
+                validate_target_geometry(changed, reference)
+
     def test_restricted_components_refused_before_filesystem_access(self):
         with patch('source_relocation.os.lstat') as probe:
             for name in ('/allowed/HaMmEr-child/file', 'relative/VlSi-child/file'):
