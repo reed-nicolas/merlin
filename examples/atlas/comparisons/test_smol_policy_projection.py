@@ -13,6 +13,8 @@ import torch
 from smol_policy_projection import AtlasProjection
 from tiny_fp8_pack import encode
 
+if not os.environ.get('SMOL_ATLAS_TOOLS'):
+    raise unittest.SkipTest('Optional Atlas tools directory is not configured')
 TOOLS = Path(os.environ['SMOL_ATLAS_TOOLS'])
 sys.path.insert(0, str(TOOLS))
 from atlas_tile_arithmetic import mxu0_dot, rescale_bf16
