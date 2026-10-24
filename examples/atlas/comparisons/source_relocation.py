@@ -24,8 +24,6 @@ def absolute_path(value):
 
 def physical_path(value):
     original = Path(value)
-    if any(word in part.lower() for part in original.parts for word in ('hammer', 'vlsi')):
-        raise ValueError('restricted path component')
     # Screen relative components before making an absolute path or any stat.
     if any(word in part.lower() for part in original.parts for word in ('hammer', 'vlsi')):
         raise ValueError('restricted path component')
