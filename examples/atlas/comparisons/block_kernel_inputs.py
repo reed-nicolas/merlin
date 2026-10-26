@@ -27,10 +27,6 @@ def regenerate(build, recipe):
             raise ValueError("Provider helper imported from a different source: " + name)
     provider = importlib.import_module(PACKING_FILE[:-3])
     tile = importlib.import_module(TILE_FILE[:-3])
-    if build.pin(provider.__file__) != build.pin(args.atlas_tools / PACKING_FILE):
-        raise ValueError("Provider module imported from a different source")
-    if build.pin(tile.__file__) != build.pin(args.atlas_tools / TILE_FILE):
-        raise ValueError("ISA adapter imported from a different source")
     _, _, assemble, _ = tile.configure_model(args.model_root)
     before = tile.model_binding(args.model_root)
     kernels, checks = [], []

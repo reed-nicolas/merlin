@@ -27,7 +27,6 @@ for value in (args.capture_receipt_sha256, args.rope_tables_receipt_sha256):
         raise ValueError('Require an explicit lowercase SHA256')
 OUT = checked(args.output)
 SOURCE = ROOT
-sys.path.insert(0, str(ROOT))
 from workload_replay_admission import admit_executable
 ROLES =('self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.o_proj', 'mlp.gate_proj', 'mlp.up_proj',
     'mlp.down_proj')
