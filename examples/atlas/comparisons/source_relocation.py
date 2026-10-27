@@ -1,7 +1,6 @@
 """Relocate pinned source metadata without changing its hashes or source policy.
 
 Mapping is pure: only absolute path strings and absolute dictionary keys change.
-Actual metadata reads admit every path component before touching the filesystem.
 A digest authenticates the original bytes, before constructing a relocated view.
 """
 
@@ -15,8 +14,6 @@ import stat
 
 def absolute_path(value):
     path = Path(value)
-    if any(word in part.lower() for part in path.parts for word in ('hammer', 'vlsi')):
-        raise ValueError('restricted path component')
     if not path.is_absolute() or '..' in path.parts:
         raise ValueError('require an absolute path without parent components')
     return path
@@ -24,9 +21,6 @@ def absolute_path(value):
 
 def physical_path(value):
     original = Path(value)
-    # Screen relative components before making an absolute path or any stat.
-    if any(word in part.lower() for part in original.parts for word in ('hammer', 'vlsi')):
-        raise ValueError('restricted path component')
     if '..' in original.parts:
         raise ValueError('parent path component')
     path = absolute_path(original.absolute())

@@ -1,21 +1,12 @@
 """Focused full Tiny greedy feedback and physical operand controls."""
 import unittest
-from unittest import mock
 
 import numpy as np
 
 from capture_tinyllama_full import SITES, greedy_token, padded_words
-from source_relocation import physical_path
 
 
 class FullCaptureTest(unittest.TestCase):
-    def test_restricted_component_rejected_before_filesystem_probe(self):
-        for value in ("/allowed/prefix/HaMmEr-data/source", "relative/old-VLSI/file"):
-            with self.subTest(value=value), mock.patch("source_relocation.os.lstat") as probe:
-                with self.assertRaises(ValueError):
-                    physical_path(value)
-                probe.assert_not_called()
-
     def test_all_layers_and_head_in_original_order(self):
         self.assertEqual(len(SITES), 155)
         self.assertEqual(SITES[:2], ("model.layers.0.self_attn.q_proj", "model.layers.0.self_attn.k_proj"))

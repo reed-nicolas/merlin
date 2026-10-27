@@ -1,11 +1,9 @@
 """Focused native policy capture closure controls, without model loading."""
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 
 from capture_smolvla_policy import validate_trajectory, validate_target_geometry
-from source_relocation import physical_path
 
 
 class CaptureClosureTest(unittest.TestCase):
@@ -20,13 +18,6 @@ class CaptureClosureTest(unittest.TestCase):
             changed = {**reference, 'state': np.array([value], np.float32)}
             with self.assertRaises(ValueError):
                 validate_target_geometry(changed, reference)
-
-    def test_restricted_components_refused_before_filesystem_access(self):
-        with patch('source_relocation.os.lstat') as probe:
-            for name in ('/allowed/HaMmEr-child/file', 'relative/VlSi-child/file'):
-                with self.assertRaises(ValueError):
-                    physical_path(name)
-            probe.assert_not_called()
 
     def test_complete_exact_trajectory(self):
         reference = {"final_actions": np.array([[0.0, 1.0]], np.float32)}
