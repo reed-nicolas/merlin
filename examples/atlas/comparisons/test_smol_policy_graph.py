@@ -67,6 +67,12 @@ class PolicyGraphTest(unittest.TestCase):
         self.assertEqual(json.loads(receipt_raw), receipt)
         pins[str(receipt_path)] = hashlib.sha256(receipt_raw).hexdigest()
         pins[str(fixture.checkpoint)] = receipt['source']['weights']['sha256']
+        torch_library = safe(Path(torch.__file__).parent/'lib/libtorch_cpu.so')
+        with torch_library.open('rb') as stream:
+            torch_digest = hashlib.file_digest(stream,'sha256').hexdigest()
+        self.assertEqual(torch_digest,receipt['source']['torch_cpu_library']['sha256'])
+        pins[str(torch_library)] = torch_digest
+        pins[str(safe(torch.__file__))] = hashlib.sha256(safe(torch.__file__).read_bytes()).hexdigest()
         pins[str(safe(receipt['trajectory']['path']))] = receipt['trajectory']['sha256']
         rope_path = safe(os.environ['SMOL_ROPE_CONTRACT'])
         rope_raw = rope_path.read_bytes()
@@ -101,8 +107,10 @@ class PolicyGraphTest(unittest.TestCase):
                     keep(fixture.weight(module, 'input_layernorm')), keep(fixture.weight(module, 'post_attention_layernorm')),
                     1e-5, 1e-5, cosine.ctypes.data, sine.ctypes.data, fixture.first_position, cosine.shape[0])
         command = receipt['command']
-        observation_path = safe(command[command.index('--observation-input')+1])
-        observation_digest = next(item['sha256'] for item in receipt['source_bookends'] if item['path'] == str(observation_path))
+        original_observation = command[command.index('--observation-input')+1]
+        observation_path = safe(os.environ.get('SMOL_OBSERVATION',original_observation))
+        observation_digest = next(item['sha256'] for item in receipt['source_bookends']
+                                  if item['path'] == original_observation)
         with observation_path.open('rb') as stream:
             self.assertEqual(hashlib.file_digest(stream, 'sha256').hexdigest(), observation_digest)
         pins[str(observation_path)] = observation_digest
@@ -205,6 +213,13 @@ class PolicyGraphTest(unittest.TestCase):
         for path, digest in pins.items():
             with safe(path).open('rb') as stream:
                 self.assertEqual(hashlib.file_digest(stream, 'sha256').hexdigest(), digest)
+        if os.environ.get('SMOL_POLICY_REPLAY_REPORT'):
+            safe(os.environ['SMOL_POLICY_REPLAY_REPORT']).write_text(json.dumps(dict(
+                status='PASS_NATIVE_C_POLICY_CAPTURED_REPLIES',predecessors=events,
+                steps=int(state.steps),projections=int(state.projections),all_prefix_cache_exact=True,
+                final_actions_exact=True,source_sha256=pins,source_bookends_verified=True,
+                observation_original_path=original_observation,observation_actual_path=str(observation_path),
+                device_execution=False,raw_adapter_included=False,vision_inputs_captured=True),indent=2)+'\n')
 
 
 if __name__ == '__main__':
