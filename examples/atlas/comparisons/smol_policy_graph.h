@@ -45,4 +45,14 @@ int smol_policy_prefix(const uint16_t *image0, const uint16_t *image1,
 int smol_policy_step(const float *input_state, float timestep, float *next_state,
     const uint8_t *prefix_pad, const smol_policy_parameters *, const smol_policy_frame *,
     smol_policy_state *, smol_policy_graph_project, void *);
+/* Complete semantic layer phases. Initialization is folded into layer0 and
+ * final normalization/head/Euler into layer15. Counts reject skipped/repeated
+ * layers; masks and positions regenerate from fixed pad/attention on each call.
+ * Retain block.output, all prefix KV, current Euler input and published history. */
+int smol_policy_prefix_layer(const uint16_t *, const uint16_t *, const float *,
+    const uint8_t *, const uint8_t *, const smol_policy_parameters *, const smol_policy_frame *,
+    smol_policy_state *, smol_policy_graph_project, void *, unsigned layer);
+int smol_policy_step_layer(const float *, float, float *, const uint8_t *,
+    const smol_policy_parameters *, const smol_policy_frame *, smol_policy_state *,
+    smol_policy_graph_project, void *, unsigned layer);
 #endif

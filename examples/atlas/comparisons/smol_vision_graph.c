@@ -40,10 +40,11 @@ static int project(smol_vision_state *s, smol_vision_project callback, void *con
     return 0;
 }
 
-int smol_vision_image(const uint16_t *image, const smol_vision_parameters *p,
+int smol_vision_image_layer(const uint16_t *image, const smol_vision_parameters *p,
     const smol_vision_frame *w, smol_vision_state *s, smol_vision_project callback,
-    void *context) {
-    if (!image || !p || !w || !s || !callback || s->started || s->projections || s->complete
+    void *context, unsigned layer) {
+    if (!image || !p || !w || !s || !callback || layer >= 12 || s->started != (layer != 0)
+        || s->projections != (layer ? 1 + 6 * layer : 0) || s->complete
         || s->error || !p->position || !p->post_weight || !p->post_bias || !p->gelu
         || !isfinite(p->epsilon) || p->epsilon <= 0 || !w->tokens || !w->normalized
         || !w->query || !w->key || !w->value || !w->attended || !w->projected
@@ -51,12 +52,14 @@ int smol_vision_image(const uint16_t *image, const smol_vision_parameters *p,
     for (size_t layer = 0; layer < 12; ++layer)
         if (!p->layers[layer].norm1_weight || !p->layers[layer].norm1_bias
             || !p->layers[layer].norm2_weight || !p->layers[layer].norm2_bias) return 1;
+    if (layer == 0) {
     s->started = 1;
     if (smol_vision_patch16(image, w->large)
         || project(s, callback, context, 0, SMOL_VISION_PATCH, w->large, 1024, 768, w->tokens, 768)
         || smol_host_residual_bf16(w->tokens, p->position, w->normalized, 1024 * 768)) goto failed;
     for (size_t i = 0; i < 1024 * 768; ++i) w->tokens[i] = w->normalized[i];
-    for (unsigned layer = 0; layer < 12; ++layer) {
+    }
+    {
         const smol_vision_layer *q = &p->layers[layer];
         if (smol_vision_layernorm_bf16(w->tokens, q->norm1_weight, q->norm1_bias, p->epsilon, w->normalized, 1024)
             || project(s, callback, context, layer, SMOL_VISION_Q, w->normalized, 1024, 768, w->query, 768)
@@ -73,6 +76,7 @@ int smol_vision_image(const uint16_t *image, const smol_vision_parameters *p,
             || smol_host_residual_bf16(w->tokens, w->projected, w->normalized, 1024 * 768)) goto failed;
         for (size_t i = 0; i < 1024 * 768; ++i) w->tokens[i] = w->normalized[i];
     }
+    if (layer == 11) {
     if (smol_vision_layernorm_bf16(w->tokens, p->post_weight, p->post_bias, p->epsilon, w->normalized, 1024)
         || smol_vision_shuffle4(w->normalized, w->shuffle)
         || project(s, callback, context, 12, SMOL_VISION_CONNECTOR, w->shuffle, 64, 12288, w->output, 960)) goto failed;
@@ -81,8 +85,19 @@ int smol_vision_image(const uint16_t *image, const smol_vision_parameters *p,
         w->output[i] = float_to_bf16(bf16_to_float(w->output[i]) * 31.0f);
     if (s->projections != 74) goto failed;
     s->complete = 1;
+    }
     return 0;
 failed:
     if (!s->error) s->error = 1;
     return 2;
+}
+
+int smol_vision_image(const uint16_t *image, const smol_vision_parameters *p,
+    const smol_vision_frame *w, smol_vision_state *s, smol_vision_project callback,
+    void *context) {
+    for (unsigned layer = 0; layer < 12; ++layer) {
+        int code = smol_vision_image_layer(image, p, w, s, callback, context, layer);
+        if (code) return code;
+    }
+    return 0;
 }

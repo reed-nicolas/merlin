@@ -41,6 +41,12 @@ typedef struct { unsigned started, projections, complete, error; } smol_vision_s
 int smol_vision_image(const uint16_t *, const smol_vision_parameters *,
     const smol_vision_frame *, smol_vision_state *, smol_vision_project, void *);
 
+/* One complete layer, folding image initialization into layer0 and postnorm,
+ * shuffle, connector and scaling into layer11. Projection counts enforce order.
+ * Only tokens and published output remain live between successful phases. */
+int smol_vision_image_layer(const uint16_t *, const smol_vision_parameters *,
+    const smol_vision_frame *, smol_vision_state *, smol_vision_project, void *, unsigned layer);
+
 /* Source pixel_shuffle(scale_factor4), kept public for focused layout controls. */
 int smol_vision_shuffle4(const uint16_t *, uint16_t *);
 int smol_vision_patch16(const uint16_t *, uint16_t *);
