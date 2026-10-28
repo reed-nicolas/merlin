@@ -13,9 +13,13 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
+import test_smol_policy_graph as graph
 import torch
+from source_relocation import SourceRelocation
 from source_relocation import physical_path as safe
 
 
@@ -261,6 +265,96 @@ class PolicyVisionReplayTest(unittest.TestCase):
                         source_bookends_verified=True,
                         device_execution=False,
                         raw_adapter_included=False,
+                    ),
+                    indent=2,
+                )
+                + "\n"
+            )
+
+
+class PolicyGraphReplayTest(graph.PolicyGraphTest):
+    """Authenticate relocation and reporting around the unchanged graph control."""
+
+    __test__ = False
+
+    def test_actual_prefix_and_all_ten_expert_euler_updates(self):
+        root = safe(os.environ["SMOL_REPLAY"])
+        receipt_path = safe(root / "receipt.json")
+        receipt_raw = receipt_path.read_bytes()
+        receipt = json.loads(receipt_raw)
+        command = receipt["command"]
+        original = command[command.index("--observation-input") + 1]
+        observation = safe(os.environ.get("SMOL_OBSERVATION", original))
+        relocation = SourceRelocation([original + "=" + str(observation)])
+        metadata = SimpleNamespace(loads=lambda raw: relocation.apply(json.loads(raw)), dumps=json.dumps)
+        pins = {str(receipt_path): hashlib.sha256(receipt_raw).hexdigest()}
+
+        def pin(path, expected=None):
+            path = safe(path)
+            with path.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            self.assertEqual(digest, expected if expected is not None else digest, str(path))
+            self.assertEqual(pins.get(str(path), digest), digest, str(path))
+            pins[str(path)] = digest
+
+        observation_digest = next(row["sha256"] for row in receipt["source_bookends"] if row["path"] == original)
+        pin(observation, observation_digest)
+        pin(safe(Path(torch.__file__).parent / "lib/libtorch_cpu.so"), receipt["source"]["torch_cpu_library"]["sha256"])
+        stems = (
+            "smol_policy_graph",
+            "smol_policy_block",
+            "smol_policy_ops",
+            "smol_host_ops",
+            "smol_host_controls",
+            "smol_host_rope",
+            "smol_host_attention",
+            "smol_host_softmax",
+        )
+        here = safe(__file__).parent
+        for path in [
+            *[here / (stem + suffix) for stem in stems for suffix in (".c", ".h")],
+            here / "smol_host_bits.h",
+            safe(__file__),
+            safe(graph.__file__),
+            safe(graph.block.__file__),
+            safe(torch.__file__),
+        ]:
+            pin(path)
+        pins[str(safe(os.environ["SMOL_CHECKPOINT"]))] = receipt["source"]["weights"]["sha256"]
+        pins[str(safe(receipt["trajectory"]["path"]))] = receipt["trajectory"]["sha256"]
+        rope_path = safe(os.environ["SMOL_ROPE_CONTRACT"])
+        pin(rope_path)
+        rope = json.loads(rope_path.read_bytes())
+        for name in ("cosine", "sine"):
+            row = rope["assets"][name]["file"]
+            pins[str(safe(row["path"]))] = row["sha256"]
+        import lerobot.policies.smolvla.modeling_smolvla as native
+
+        pin(safe(native.__file__))
+        # Only parsed metadata changes; the baseline authenticates the original receipt bytes.
+        with patch.object(graph, "json", metadata), patch.object(graph.block, "json", metadata):
+            super().test_actual_prefix_and_all_ten_expert_euler_updates()
+        for path, digest in tuple(pins.items()):
+            pin(path, digest)
+        calls = receipt["calls"][148:]
+        self.assertEqual(len(calls), 1273)
+        if os.environ.get("SMOL_POLICY_REPLAY_REPORT"):
+            safe(os.environ["SMOL_POLICY_REPLAY_REPORT"]).write_text(
+                json.dumps(
+                    dict(
+                        status="PASS_NATIVE_C_POLICY_CAPTURED_REPLIES",
+                        predecessors=[dict(call=row["index"], module=row["module"], mismatches=0) for row in calls],
+                        steps=10,
+                        projections=1273,
+                        all_prefix_cache_exact=True,
+                        final_actions_exact=True,
+                        source_sha256=pins,
+                        source_bookends_verified=True,
+                        observation_original_path=original,
+                        observation_actual_path=str(observation),
+                        device_execution=False,
+                        raw_adapter_included=False,
+                        vision_inputs_captured=True,
                     ),
                     indent=2,
                 )
