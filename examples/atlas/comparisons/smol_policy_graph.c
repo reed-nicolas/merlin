@@ -60,15 +60,15 @@ int smol_policy_prefix_layer(const uint16_t *image0, const uint16_t *image1,
     if (smol_host_prefix_controls(pad, attention, 177, w->groups, w->prefix_mask, w->positions)) return 1;
     context c = {callback, user, s, SMOL_STATE_PROJECT, 0};
     if (layer == 0) {
-    if (project(&c, 0, SMOL_F32, state, 1, 32, SMOL_F32, w->state_projection, 960)) return failed(s);
-    for (size_t i = 0; i < 64 * 960; ++i) {
-        w->prefix_input[i] = bf16_to_float(image0[i]);
-        w->prefix_input[64 * 960 + i] = bf16_to_float(image1[i]);
-    }
-    for (size_t i = 0; i < 48 * 960; ++i)
-        w->prefix_input[128 * 960 + i] = bf16_to_float(float_to_bf16(
-            bf16_to_float(p->language_embedding[i]) * p->language_scale));
-    for (size_t i = 0; i < 960; ++i) w->prefix_input[176 * 960 + i] = w->state_projection[i];
+        if (project(&c, 0, SMOL_F32, state, 1, 32, SMOL_F32, w->state_projection, 960)) return failed(s);
+        for (size_t i = 0; i < 64 * 960; ++i) {
+            w->prefix_input[i] = bf16_to_float(image0[i]);
+            w->prefix_input[64 * 960 + i] = bf16_to_float(image1[i]);
+        }
+        for (size_t i = 0; i < 48 * 960; ++i)
+            w->prefix_input[128 * 960 + i] = bf16_to_float(float_to_bf16(
+                bf16_to_float(p->language_embedding[i]) * p->language_scale));
+        for (size_t i = 0; i < 960; ++i) w->prefix_input[176 * 960 + i] = w->state_projection[i];
     }
     const void *input = layer ? (const void *)w->block.output : (const void *)w->prefix_input;
     {
@@ -81,9 +81,9 @@ int smol_policy_prefix_layer(const uint16_t *image0, const uint16_t *image1,
         input = w->block.output;
     }
     if (layer == 15) {
-    if (smol_host_rmsnorm_bf16(input, p->prefix_final_weight, p->final_epsilon,
-                             w->prefix_final, 177, 960) || s->projections != 113) return failed(s);
-    s->prefix_ready = 1;
+        if (smol_host_rmsnorm_bf16(input, p->prefix_final_weight, p->final_epsilon,
+                                 w->prefix_final, 177, 960) || s->projections != 113) return failed(s);
+        s->prefix_ready = 1;
     }
     return 0;
 }
@@ -105,18 +105,18 @@ int smol_policy_step_layer(const float *input_state, float timestep, float *next
     }
     context c = {callback, user, s, SMOL_ACTION_IN, 0};
     if (layer == 0) {
-    if (project(&c, 0, SMOL_F32, input_state, 50, 32, SMOL_F32, w->action_embedding, 720)) return failed(s);
-    const float *time = p->time_embedding + s->steps * 720;
-    for (size_t row = 0; row < 50; ++row)
-        for (size_t column = 0; column < 720; ++column) {
-            w->action_time[row * 1440 + column] = w->action_embedding[row * 720 + column];
-            w->action_time[row * 1440 + 720 + column] = time[column];
-        }
-    c.site = SMOL_TIME_IN;
-    if (project(&c, 0, SMOL_F32, w->action_time, 50, 1440, SMOL_F32, w->time_hidden, 720)
-        || smol_policy_silu_f32(w->time_hidden, w->time_activated, 50 * 720)) return failed(s);
-    c.site = SMOL_TIME_OUT;
-    if (project(&c, 0, SMOL_F32, w->time_activated, 50, 720, SMOL_F32, w->suffix_input, 720)) return failed(s);
+        if (project(&c, 0, SMOL_F32, input_state, 50, 32, SMOL_F32, w->action_embedding, 720)) return failed(s);
+        const float *time = p->time_embedding + s->steps * 720;
+        for (size_t row = 0; row < 50; ++row)
+            for (size_t column = 0; column < 720; ++column) {
+                w->action_time[row * 1440 + column] = w->action_embedding[row * 720 + column];
+                w->action_time[row * 1440 + 720 + column] = time[column];
+            }
+        c.site = SMOL_TIME_IN;
+        if (project(&c, 0, SMOL_F32, w->action_time, 50, 1440, SMOL_F32, w->time_hidden, 720)
+            || smol_policy_silu_f32(w->time_hidden, w->time_activated, 50 * 720)) return failed(s);
+        c.site = SMOL_TIME_OUT;
+        if (project(&c, 0, SMOL_F32, w->time_activated, 50, 720, SMOL_F32, w->suffix_input, 720)) return failed(s);
     }
     const void *input = layer ? (const void *)w->block.output : (const void *)w->suffix_input;
     {
@@ -130,14 +130,14 @@ int smol_policy_step_layer(const float *input_state, float timestep, float *next
         input = w->block.output;
     }
     if (layer == 15) {
-    if (smol_host_rmsnorm_bf16(input, p->expert_final_weight, p->final_epsilon,
-                             w->expert_final, 50, 720)) return failed(s);
-    for (size_t i = 0; i < 50 * 720; ++i) w->action_embedding[i] = bf16_to_float(w->expert_final[i]);
-    c.site = SMOL_ACTION_OUT;
-    c.layer = 0;
-    if (project(&c, 0, SMOL_F32, w->action_embedding, 50, 720, SMOL_F32, w->velocity, 32)
-        || smol_host_euler_f32(input_state, w->velocity, -0.1f, next_state, 50 * 32)) return failed(s);
-    ++s->steps;
+        if (smol_host_rmsnorm_bf16(input, p->expert_final_weight, p->final_epsilon,
+                                 w->expert_final, 50, 720)) return failed(s);
+        for (size_t i = 0; i < 50 * 720; ++i) w->action_embedding[i] = bf16_to_float(w->expert_final[i]);
+        c.site = SMOL_ACTION_OUT;
+        c.layer = 0;
+        if (project(&c, 0, SMOL_F32, w->action_embedding, 50, 720, SMOL_F32, w->velocity, 32)
+            || smol_host_euler_f32(input_state, w->velocity, -0.1f, next_state, 50 * 32)) return failed(s);
+        ++s->steps;
     }
     return 0;
 }
