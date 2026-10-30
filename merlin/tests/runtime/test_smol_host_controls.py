@@ -1,23 +1,18 @@
 """Source-native prefix/suffix mask and position ownership contracts."""
 import ctypes
-import subprocess
 
 import numpy as np
 import pytest
 
-from merlin.common.paths import repo_root
+from smol_host_helpers import load_host_library, pointer
 
 pytestmark = pytest.mark.target("atlas")
 
 
 @pytest.fixture(scope = "module")
 def controls(tmp_path_factory):
-    source = repo_root() / "examples/atlas/comparisons/smol_host_controls.c"
-    library = tmp_path_factory.mktemp("controls") / "controls.so"
-    subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                    "-fPIC", "-shared", str(source), "-o", str(library)],
-                   check = True, capture_output = True, text = True)
-    owner = ctypes.CDLL(str(library))
+    owner = load_host_library(tmp_path_factory.mktemp("controls"), "controls",
+                              "smol_host_controls.c", strict_fp=False, math=False)
     prefix = owner.smol_host_prefix_controls
     prefix.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
@@ -25,10 +20,6 @@ def controls(tmp_path_factory):
     suffix.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p,
                        ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
     return owner, prefix, suffix
-
-
-def pointer(array):
-    return array.ctypes.data_as(ctypes.c_void_p)
 
 
 def outputs(rows, keys):

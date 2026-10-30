@@ -1,36 +1,25 @@
 """Finite full-axis softmax contracts and refusal-before-write controls."""
 import ctypes
-import subprocess
 
 import numpy as np
 import pytest
 
-from merlin.common.paths import repo_root
+from smol_host_helpers import load_host_library, pointer
 
 pytestmark = pytest.mark.target("atlas")
 
 
 @pytest.fixture(scope="module")
 def softmax(tmp_path_factory):
-    source = repo_root() / "examples/atlas/comparisons/smol_host_softmax.c"
     directory = tmp_path_factory.mktemp("softmax")
     rounding = directory / "rounding.c"
     rounding.write_text("#include <fenv.h>\nint test_down(void) { return fesetround(FE_DOWNWARD); }\n"
                         "int test_nearest(void) { return fesetround(FE_TONEAREST); }\n")
-    library = directory / "softmax.so"
-    subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                    "-ffp-contract=off", "-fno-fast-math", "-fPIC", "-shared", str(source),
-                    str(rounding), "-lm", "-o", str(library)],
-                   check=True, capture_output=True, text=True)
-    owner = ctypes.CDLL(str(library))
+    owner = load_host_library(directory, "softmax", "smol_host_softmax.c", rounding)
     function = owner.smol_host_softmax_cpu16_bf16
     function.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
                          ctypes.c_void_p, ctypes.c_void_p]
     return owner, function
-
-
-def pointer(array):
-    return array.ctypes.data_as(ctypes.c_void_p)
 
 
 def test_full_axis_uniform_including_fully_masked_finite_row(softmax):

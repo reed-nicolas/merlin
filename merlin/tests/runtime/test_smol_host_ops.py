@@ -1,25 +1,17 @@
 """Portable C host primitive contracts and arithmetic rounding boundaries."""
 import ctypes
-from pathlib import Path
-import subprocess
 
 import numpy as np
 import pytest
 
-from merlin.common.paths import repo_root
+from smol_host_helpers import load_host_library, pointer
 
 pytestmark = pytest.mark.target("atlas")
 
 
 @pytest.fixture(scope="module")
 def host_ops(tmp_path_factory):
-    source = repo_root() / "examples/atlas/comparisons"
-    output = tmp_path_factory.mktemp("smol-host") / "host.so"
-    command = ["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-pedantic",
-               "-ffp-contract=off", "-fno-fast-math", "-fPIC", "-shared",
-               str(source / "smol_host_ops.c"), "-lm", "-o", str(output)]
-    subprocess.run(command, capture_output=True, text=True, check=True)
-    library = ctypes.CDLL(str(output))
+    library = load_host_library(tmp_path_factory.mktemp("smol-host"), "host", "smol_host_ops.c")
     library.smol_host_euler_f32.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float,
                                           ctypes.c_void_p, ctypes.c_size_t]
     for name in ("smol_host_residual_bf16", "smol_host_residual_bf16_f32", "smol_host_silu_mul_bf16"):
@@ -30,18 +22,9 @@ def host_ops(tmp_path_factory):
     return library
 
 
-def pointer(array):
-    return array.ctypes.data_as(ctypes.c_void_p)
-
-
 def test_bounded_configuration_omits_only_mixed_residual(tmp_path, host_ops):
-    source = repo_root() / "examples/atlas/comparisons/smol_host_ops.c"
-    output = tmp_path / "bounded.so"
-    subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                    "-ffp-contract=off", "-fno-fast-math", "-fPIC", "-shared",
-                    "-DSMOL_HOST_EXCLUDE_MIXED_RESIDUAL", str(source), "-lm", "-o", str(output)],
-                   capture_output=True, text=True, check=True)
-    bounded = ctypes.CDLL(str(output))
+    bounded = load_host_library(tmp_path, "bounded", "smol_host_ops.c",
+                                flags=("-DSMOL_HOST_EXCLUDE_MIXED_RESIDUAL",))
     with pytest.raises(AttributeError):
         bounded.smol_host_residual_bf16_f32
     values = np.array([0x3f80, 0xbf80, 0x8000], np.uint16)

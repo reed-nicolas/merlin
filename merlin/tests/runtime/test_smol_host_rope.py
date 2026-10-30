@@ -1,34 +1,20 @@
 """Source-native half-split rotary tables use runtime positions with checked bounds."""
 import ctypes
-import subprocess
 
 import numpy as np
 import pytest
 
-from merlin.common.paths import repo_root
+from smol_host_helpers import load_host_library, pointer, words
 
 pytestmark = pytest.mark.target("atlas")
 
 
 @pytest.fixture(scope="module")
 def rope(tmp_path_factory):
-    source = repo_root() / "examples/atlas/comparisons/smol_host_rope.c"
-    library = tmp_path_factory.mktemp("rope") / "rope.so"
-    subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                    "-ffp-contract=off", "-fno-fast-math", "-fPIC", "-shared", str(source),
-                    "-o", str(library)], check=True, capture_output=True, text=True)
-    owner = ctypes.CDLL(str(library))
+    owner = load_host_library(tmp_path_factory.mktemp("rope"), "rope", "smol_host_rope.c", math=False)
     function = owner.smol_host_rope_bf16
     function.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int64] + [ctypes.c_size_t] * 4 + [ctypes.c_void_p]
     return owner, function
-
-
-def pointer(array):
-    return array.ctypes.data_as(ctypes.c_void_p)
-
-
-def words(array):
-    return (np.asarray(array, np.float32).view(np.uint32) >> 16).astype(np.uint16)
 
 
 def test_runtime_positions_half_split_heads_and_negative_lower_bound(rope):

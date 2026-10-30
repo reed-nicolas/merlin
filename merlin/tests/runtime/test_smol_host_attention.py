@@ -1,36 +1,21 @@
 """GQA head ownership, finite masks and checked portable host attention buffers."""
 import ctypes
-import subprocess
 
 import numpy as np
 import pytest
 
-from merlin.common.paths import repo_root
+from smol_host_helpers import load_host_library, pointer, words
 
 pytestmark = pytest.mark.target("atlas")
 
 
 @pytest.fixture(scope="module")
 def attention(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("attention")
-    source = repo_root() / "examples/atlas/comparisons"
-    library = directory / "attention.so"
-    subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                    "-ffp-contract=off", "-fno-fast-math", "-fPIC", "-shared",
-                    str(source / "smol_host_attention.c"), str(source / "smol_host_softmax.c"),
-                    "-lm", "-o", str(library)], check=True, capture_output=True, text=True)
-    owner = ctypes.CDLL(str(library))
+    owner = load_host_library(tmp_path_factory.mktemp("attention"), "attention",
+                              "smol_host_attention.c", "smol_host_softmax.c")
     function = owner.smol_host_attention_cpu16_bf16
     function.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_size_t] * 5 + [ctypes.c_void_p] * 4
     return owner, function
-
-
-def pointer(array):
-    return array.ctypes.data_as(ctypes.c_void_p)
-
-
-def words(array):
-    return (np.asarray(array, np.float32).view(np.uint32) >> 16).astype(np.uint16)
 
 
 def buffers(rows=2, keys=2, heads=4, kv=2, dimension=2):
