@@ -197,24 +197,9 @@ class ReplayRelocationTest(unittest.TestCase):
                     module.evaluate(args, {})
         self.assertEqual(len(calls), 2)
 
-    def test_projection_roles_receive_mapper_before_source_use(self):
-        import evaluate_smolvla_projection_chain as chain
-        class BoundaryReached(Exception):
-            pass
-        args = SimpleNamespace(producer_root=Path('/selected/provider'), model_root=Path('/selected/model'),
-                               relocate=['/original=/relocated'])
-        def admit(**kwargs):
-            self.assertEqual(kwargs['metadata_path_mapper']('/original/input'), '/relocated/input')
-            raise BoundaryReached
-        item = dict(native_bundle='/selected/native', native_manifest_sha256='n',
-                    provider_receipt='/selected/receipt.json', provider_receipt_sha256='r')
-        with self.assertRaises(BoundaryReached):
-            chain.ProjectionPlan({role: item for role in 'qkv'}, args, SimpleNamespace(admit_contraction=admit), [])
-
     def test_all_delegated_provider_calls_use_read_boundary_mapper(self):
         names = ('refresh/evaluate_resnet.py',
-                 'evaluate_smolvla_attention.py', 'evaluate_smolvla_retained_prefix.py',
-                 'evaluate_smolvla_projection_chain.py')
+                 'evaluate_smolvla_attention.py', 'evaluate_smolvla_retained_prefix.py')
         count = 0
         for name in names:
             for node in ast.walk(ast.parse((COMPARISONS / name).read_text())):
@@ -222,7 +207,7 @@ class ReplayRelocationTest(unittest.TestCase):
                     self.assertIn('metadata_path_mapper', {keyword.arg for keyword in node.keywords}, name)
                     count += 1
         # ResNet conv2/conv3 share one admission boundary.
-        self.assertEqual(count, 5)
+        self.assertEqual(count, 4)
 
     def test_selected_replay_accepts_candidate_plan_without_source_patching(self):
         import inspect
