@@ -1,5 +1,10 @@
 """Focused full Tiny greedy feedback and physical operand controls."""
 import unittest
+import sys
+
+from merlin.common.paths import repo_root
+
+sys.path.insert(0, str(repo_root() / "examples/atlas/comparisons"))
 
 import numpy as np
 
