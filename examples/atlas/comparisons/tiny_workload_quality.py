@@ -1,9 +1,5 @@
 """Informational logit quality against distinct BF16 and FP32 native references."""
-from merlin.common.jsonio import write_pretty_json
-import argparse
 import json
-from pathlib import Path
-import sys
 import zipfile
 import numpy as np
 from capture_tinyllama_native import safe_path, identity, array_identity, TOKEN_SHA
@@ -72,68 +68,3 @@ def comparison(actual, reference):
             'unchanged_original_rtol_atol_1e4_passed': bool(np.all(np.abs(delta) <= tolerance)),
             'violating_original_1e4_values': int(np.count_nonzero(np.abs(delta) > tolerance)),
             'mean_KL_reference_to_actual': float(kl.mean()), 'per_token_KL_reference_to_actual': kl.tolist()}
-
-
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    for name in ('native', 'fp32', 'out'):
-        p.add_argument('--' + name, type=safe_path, required=True)
-    p.add_argument('--candidate', type=safe_path)
-    a = p.parse_args()
-    if a.out.exists():
-        raise ValueError('fresh quality output required')
-    native, n, records = read_session(a.native, 'passed_frozen_native_BF16_session', {'logits_bf16', 'tokens', 'entry_bf16'})
-    fp32, f, more = read_session(a.fp32, 'passed_separate_FP32_reference', {'logits', 'tokens'})
-    records += more
-    b = logits(n['logits_bf16'], True)
-    r = logits(f['logits'], False)
-    if not np.array_equal(n['tokens'], f['tokens']):
-        raise ValueError('references use different tokens')
-    report = {'status': 'reported_informational_quality_original_gates_unchanged', 'command': sys.argv,
-            'scope': (
-                'same frozen raw-text 128-prefill + 32-teacher-forced inputs; 32 scored distributions; '
-                'final 33rd distribution unscored'
-            ),
-            'reference_policies': {'native': 'unchanged original BF16 full model',
-                                  'FP32': (
-                                      'all same immutable BF16 checkpoint weights exactly cast FP32 and complete model '
-                                      'arithmetic FP32; not a recovered FP32 training checkpoint'
-                                  )},
-            'original_BF16_vs_FP32': comparison(b, r), 'original_BF16_scoring': score(b, n['tokens']),
-            'FP32_scoring': score(r, n['tokens']), 'original_Torch_FP32_NLL': {'BF16': native['metrics']['mean_nll'],
-        'FP32': fp32[
-        'metrics']['mean_nll']},
-            'quality_is_explicit_relaxation': True, 'canonical_language_quality_claim': False,
-        'new_prompt_or_chat_template': False}
-    if a.candidate:
-        candidate, c, more = read_session(a.candidate, 'passed_exact_target_model_block_with_informational_native_quality', {
-            'original_bf16', 'candidate_bf16', 'tokens'}, 'session_logits')
-        records += more
-        if (candidate.get('prefill_device_logical_ops') != 7 or candidate.get('prefill_device_programs') != 12
-                or candidate.get('parameters_buffers_tokens_preserved') is not True or candidate.get(
-            'native_restoration_exact') is not True
-                or len(candidate.get('target_programs', [])) != 12 or not np.array_equal(c['tokens'], n[
-            'tokens']) or not np.array_equal(c['original_bf16'], n['logits_bf16'])):
-            raise ValueError('incomplete/wrong native+target firstblock session')
-        values = logits(c['candidate_bf16'], True)
-        report.update(actual_target_firstblock_vs_original_BF16=comparison(values, b),
-            actual_target_firstblock_vs_FP32=comparison(
-            values, r),
-                      actual_target_firstblock_scoring=score(values, n['tokens']), candidate_original_Torch_FP32_NLL=candidate[
-            'candidate_metrics']['mean_nll'],
-                      target_execution_scope=(
-                          'seven firstblock logical projections,12 device programs, unchanged host/native '
-                          'full suffix and 32 decode steps'
-                      ))
-        for call in candidate['target_programs']:
-            rec = call['child']['receipt']
-            records.append(identity(rec['path'], rec['sha256']))
-    records.append(identity(__file__))
-    for rec in records:
-        identity(rec['path'], rec['sha256'])
-    report['input_records'] = records
-    report['source_bookends_verified'] = True
-    write_pretty_json(a.out, report, allow_nan=False, sort_keys=False)
-    print(json.dumps({'status': report['status'], 'original_BF16_vs_FP32': report['original_BF16_vs_FP32']}))
-if __name__ == '__main__':
-    main()
