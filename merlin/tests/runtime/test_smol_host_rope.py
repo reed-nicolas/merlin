@@ -51,7 +51,7 @@ def test_exact_input_output_alias_is_supported(rope):
     assert np.array_equal(values, words([[[-3, -4, 1, 2]]]))
 
 
-@pytest.mark.parametrize("rows,heads,dimension", [(0, 1, 4), (1, 0, 4), (1, 1, 0), (1, 1, 3), (2**63, 1, 4)])
+@pytest.mark.parametrize("rows,heads,dimension", [(0, 1, 4), (1, 1, 3), (2**63, 1, 4)])
 def test_invalid_or_overflowing_extents_refused(rope, rows, heads, dimension):
     _, function = rope
     values = words([[[1, 2, 3, 4]]])

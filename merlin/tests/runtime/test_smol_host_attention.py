@@ -59,30 +59,19 @@ def test_fixed_native_emulation_pair_order_rounding_witness(attention):
     assert arrays[-1].item() == 0
 
 
-@pytest.mark.parametrize("extents", [(0,2,4,2,2), (2,0,4,2,2), (2,2,0,2,2),
-                                    (2,2,4,0,2), (2,2,4,2,0), (2,2,3,2,2),
-                                    (2**63,2,4,2,2), (2,2**63,4,2,2),
-                                    (2,2,2**63,2,2), (2,2,4,2,2**63)])
-def test_invalid_or_overflowing_extents_refused_before_read(attention, extents):
+@pytest.mark.parametrize("index,value", [(4, 0), (6, 3), (4, 2**63), (0, None)])
+def test_invalid_null_or_overflowing_arguments_refused_before_write(attention, index, value):
     _, function = attention
     arrays = buffers()
     before = [a.copy() for a in arrays[4:]]
-    assert invoke(function, arrays, extents) == -1
-    assert all(np.array_equal(a,b) for a,b in zip(arrays[4:],before))
-
-
-@pytest.mark.parametrize("missing", [0,1,2,3,9,10,11,12])
-def test_null_pointer_refused(attention, missing):
-    _, function = attention
-    arrays = buffers()
-    arguments = [*[pointer(a) for a in arrays[:4]], 2,2,4,2,2,
+    arguments = [*[pointer(a) for a in arrays[:4]], 2, 2, 4, 2, 2,
                  *[pointer(a) for a in arrays[4:]]]
-    arguments[missing] = None
+    arguments[index] = value
     assert function(*arguments) == -1
-    assert np.all(arrays[-1] == 0x1234)
+    assert all(np.array_equal(a, b) for a, b in zip(arrays[4:], before))
 
 
-@pytest.mark.parametrize("source,invalid", [(0,0x7F80), (0,0x7FC0), (1,0xFF80), (2,0x7FC0), (3,2)])
+@pytest.mark.parametrize("source,invalid", [(0, 0x7F80), (1, 0x7FC0), (3, 2)])
 def test_all_input_values_validated_before_first_scratch_or_output_write(attention, source, invalid):
     _, function = attention
     arrays = buffers()

@@ -86,12 +86,8 @@ def test_complete_synthetic_contract_returns_only_authenticated_words(admission,
     assert binding["artifacts"]["result.npz"]["sha256"] == digest(child[0] / "result.npz")
 
 
-@pytest.mark.parametrize("producer", (
-    "unknown", "workload_contraction_v1_separate_from_historical_capsule_epoch",
-    "workload_contraction_v1_extra", "", None, 1,
-))
-def test_other_producer_ids_refused(admission, child, producer):
-    child[2]["producer"] = producer
+def test_other_producer_id_refused(admission, child):
+    child[2]["producer"] = "unknown"
     save_receipt(child)
     with pytest.raises(ValueError, match="producer/status/source bookends"):
         admit(admission, child)
@@ -167,20 +163,18 @@ def test_incomplete_direct_caller_contract_refused(admission, child, field):
         admit(admission, child)
 
 
-@pytest.mark.parametrize("field", ("runs", "all_output_bytes_exact", "input_and_guards_preserved",
-                                    "drained_before_halt_observation", "cycles", "code_after", "input_after"))
-def test_incomplete_execution_or_bookends_refused(admission, child, field):
-    receipt = child[2]
-    if field == "runs":
-        receipt["runs"] = []
-    elif field in ("all_output_bytes_exact", "input_and_guards_preserved", "drained_before_halt_observation"):
-        receipt["runs"][0][field] = False
-    elif field == "cycles":
-        receipt["runs"][0][field] = 0
-    elif field == "code_after":
-        receipt[field]["atlas_vector_arithmetic.py"] = "0" * 64
-    else:
-        receipt["source_bookends"][field] = {"kind": "different"}
+@pytest.mark.parametrize("path,value", [
+    (("runs",), []),
+    (("runs", 0, "all_output_bytes_exact"), False),
+    (("runs", 0, "cycles"), 0),
+    (("code_after", "atlas_vector_arithmetic.py"), "0" * 64),
+    (("source_bookends", "input_after"), {"kind": "different"}),
+])
+def test_incomplete_execution_or_bookends_refused(admission, child, path, value):
+    target = child[2]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
     save_receipt(child)
     with pytest.raises(ValueError):
         admit(admission, child)

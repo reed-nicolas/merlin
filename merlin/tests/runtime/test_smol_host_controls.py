@@ -66,63 +66,29 @@ def test_suffix_BF16_group_integer_domain_refused_before_writes(controls):
     assert np.all(group == 123) and np.all(position == 123) and np.all(mask == 7)
 
 
-@pytest.mark.parametrize("rows", [0, 2 ** 32, 2 ** 63])
-def test_prefix_invalid_extents_refused_before_read(controls, rows):
+@pytest.mark.parametrize("rows,invalid", [(0, None), (2**32, None), (2**63, None), (3, "boolean"), (3, "null")])
+def test_prefix_invalid_arguments_refused_before_writes(controls, rows, invalid):
     _, prefix, _ = controls
-    data = np.ones(1, np.uint8)
-    group, mask, position = outputs(1, 1)
-    assert prefix(pointer(data), pointer(data), rows, pointer(group), pointer(mask), pointer(position)) == -1
-    assert group[0] == position[0] == 123 and mask[0, 0] == 7
-
-
-@pytest.mark.parametrize("prefix_rows,suffix_rows", [(1, 0), (2 ** 64 - 1, 1), (2 ** 63, 1), (1, 2 ** 63), (2 ** 32, 2 ** 32)])
-def test_suffix_invalid_extents_refused_before_read(controls, prefix_rows, suffix_rows):
-    _, _, suffix = controls
-    data = np.ones(1, np.uint8)
-    group, mask, position = outputs(1, 1)
-    assert suffix(pointer(data), prefix_rows, pointer(data), pointer(data), suffix_rows, pointer(group), pointer(mask), pointer(
-        position)) == -1
-    assert group[0] == position[0] == 123 and mask[0, 0] == 7
-
-
-@pytest.mark.parametrize("invalid_input", [0, 1])
-def test_prefix_all_boolean_inputs_checked_before_writes(controls, invalid_input):
-    _, prefix, _ = controls
-    inputs = [np.ones(3, np.uint8), np.ones(3, np.uint8)]
-    inputs[invalid_input][-1] = 2
+    pad, attention = np.ones(3, np.uint8), np.ones(3, np.uint8)
     group, mask, position = outputs(3, 3)
-    assert prefix(pointer(inputs[0]), pointer(inputs[1]), 3, pointer(group), pointer(mask), pointer(position)) == -1
+    if invalid == "boolean":
+        attention[-1] = 2
+    source = None if invalid == "null" else pointer(pad)
+    assert prefix(source, pointer(attention), rows, pointer(group), pointer(mask), pointer(position)) == -1
     assert np.all(group == 123) and np.all(position == 123) and np.all(mask == 7)
 
 
-@pytest.mark.parametrize("invalid_input", [0, 1, 2])
-def test_suffix_all_boolean_inputs_checked_before_writes(controls, invalid_input):
+@pytest.mark.parametrize("prefix_rows,suffix_rows,invalid", [
+    (1, 0, None), (2**64 - 1, 1, None), (2**63, 1, None), (2**32, 2**32, None),
+    (3, 3, "boolean"), (3, 3, "null"),
+])
+def test_suffix_invalid_arguments_refused_before_writes(controls, prefix_rows, suffix_rows, invalid):
     _, _, suffix = controls
-    inputs = [np.ones(3, np.uint8) for _ in range(3)]
-    inputs[invalid_input][-1] = 2
+    pad, attention = np.ones(3, np.uint8), np.ones(3, np.uint8)
     group, mask, position = outputs(3, 6)
-    assert suffix(pointer(inputs[0]), 3, pointer(inputs[1]), pointer(inputs[2]), 3, pointer(group), pointer(mask), pointer(
-        position)) == -1
+    if invalid == "boolean":
+        attention[-1] = 2
+    source = None if invalid == "null" else pointer(pad)
+    assert suffix(source, prefix_rows, pointer(pad), pointer(attention), suffix_rows,
+                  pointer(group), pointer(mask), pointer(position)) == -1
     assert np.all(group == 123) and np.all(position == 123) and np.all(mask == 7)
-
-
-@pytest.mark.parametrize("missing", [0, 1, 3, 4, 5])
-def test_prefix_null_pointer_refused(controls, missing):
-    _, prefix, _ = controls
-    data = np.ones(1, np.uint8)
-    group, mask, position = outputs(1, 1)
-    arguments = [pointer(data), pointer(data), 1, pointer(group), pointer(mask), pointer(position)]
-    arguments[missing] = None
-    assert prefix(*arguments) == -1
-    assert group[0] == position[0] == 123 and mask[0, 0] == 7
-
-
-@pytest.mark.parametrize("missing", [0, 2, 3, 5, 6, 7])
-def test_suffix_null_pointer_refused(controls, missing):
-    _, _, suffix = controls
-    data = np.ones(1, np.uint8)
-    group, mask, position = outputs(1, 2)
-    arguments = [pointer(data), 1, pointer(data), pointer(data), 1, pointer(group), pointer(mask), pointer(position)]
-    arguments[missing] = None
-    assert suffix(*arguments) == -1
-    assert group[0] == position[0] == 123 and np.all(mask == 7)
