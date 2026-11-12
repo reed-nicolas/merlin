@@ -13,6 +13,7 @@ from merlin.compile.c_sources import c_source_pair
 from merlin.targetgen.host_linkage_contract import validate_linkage_contract
 
 PRODUCTION_ARCHIVE = '0626df7b1ce6426945820fd03dbd6752931c7594676c94f2043d5673588d178b'
+OPERATIONS = {'source_f32_sin_unqualified': ('f32', 'sinf'), 'source_f32_cos_unqualified': ('f32', 'cosf')}
 
 
 def _hash(data):
@@ -124,7 +125,25 @@ def prepare_execution_host_math(manifest, production_package: Path, execution_pa
             or production_package.resolve().is_relative_to(execution_package.resolve())):
         raise ValueError('validation package must be separate from production')
     selection, angles = _selection(manifest, equivalence_receipt, archive, rv64_output)
-    expected = selection['production_linkage'][0]
+    source_name, original, selected, components, seen = replace_unary_components(
+        manifest, production_package, selection['production_linkage'][0], OPERATIONS,
+        lambda name, symbol, count, dtype: _native_source(name, symbol, count, angles))
+    if seen != {'cosf', 'sinf'}:
+        raise ValueError('execution selection must cover both qualified unary symbols')
+    destination = _member(execution_package, source_name)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(selected.encode())
+    return {**selection, 'scope': 'validation-only native host unary component text replacement', 'source': source_name,
+            'production_source_sha256': _hash(original), 'execution_source_sha256': _hash(selected.encode()),
+            'components': components}
+
+
+def replace_unary_components(manifest, production_package: Path, expected, operations, native_source):
+    """Validate each selected-math component and substitute ``native_source`` text for it in memory.
+
+    ``operations`` maps a source intrinsic to its (dtype, symbol); ``native_source(name, symbol, count,
+    dtype)`` returns the replacement C. Nothing is written; the caller checks coverage and writes.
+    """
     source_name = manifest['application_interface']['source']
     original = _member(production_package, source_name).read_bytes()
     inventory = manifest['stage_artifacts']
@@ -141,7 +160,7 @@ def prepare_execution_host_math(manifest, production_package: Path, execution_pa
         if desc.get('arithmetic') != 'selected-library-source-math':
             continue
         op = desc.get('source_intrinsic')
-        symbol = {'source_f32_sin_unqualified': 'sinf', 'source_f32_cos_unqualified': 'cosf'}.get(op)
+        dtype, symbol = operations.get(op, (None, None))
         if (symbol is None or region['placement'] != 'host' or region['native_programs']
                 or desc.get('host_isa') != 'rv64gc' or desc.get('host_abi') != 'lp64d'
                 or desc.get('numeric_policy') != 'selected-libm-rne-finite-v1'
@@ -154,10 +173,10 @@ def prepare_execution_host_math(manifest, production_package: Path, execution_pa
             raise ValueError('invalid unary region ABI')
         node = nodes[region['outputs'][0]]
         if (node['op'] != op or node['inputs'] != region['inputs'] or len(node['inputs']) != 1
-                or node['type']['dtype'] != 'f32' or node['type'] != nodes[node['inputs'][0]]['type']):
+                or node['type']['dtype'] != dtype or node['type'] != nodes[node['inputs'][0]]['type']):
             raise ValueError('unary source request differs')
         count = prod(node['type']['shape'])
-        if count <= 0 or count * 4 > 2**63 - 1:
+        if count <= 0 or count * {'f32': 4, 'f64': 8}[dtype] > 2**63 - 1:
             raise ValueError('invalid unary source extent')
         member = f'regions/{name}/{name}.c'
         header = f'regions/{name}/{name}.h'
@@ -172,10 +191,9 @@ def prepare_execution_host_math(manifest, production_package: Path, execution_pa
         flattened = packed[packed.index(marker):].removesuffix('\n\n')
         if selected.count(flattened) != 1:
             raise ValueError('production component does not match combined C exactly')
-        native_source = _native_source(name, symbol, count, angles)
         logical = f'validation-native/{name}.c'
         replacement_pack = c_source_pair('validation_component', public_headers={}, private_headers={},
-                                         sources={logical: native_source})['validation_component.c']
+                                         sources={logical: native_source(name, symbol, count, dtype)})['validation_component.c']
         replacement_marker = '#line 1 ' + json.dumps(logical) + '\n'
         replacement = replacement_pack[replacement_pack.index(replacement_marker):].removesuffix('\n\n')
         selected = selected.replace(flattened, replacement, 1)
@@ -186,11 +204,4 @@ def prepare_execution_host_math(manifest, production_package: Path, execution_pa
                            'execution_source_request_digest': region['source_request_digest'], 'elements': count,
                            'symbol': symbol})
         seen.add(symbol)
-    if seen != {'cosf', 'sinf'}:
-        raise ValueError('execution selection must cover both qualified unary symbols')
-    destination = _member(execution_package, source_name)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(selected.encode())
-    return {**selection, 'scope': 'validation-only native host unary component text replacement', 'source': source_name,
-            'production_source_sha256': _hash(original), 'execution_source_sha256': _hash(selected.encode()),
-            'components': components}
+    return source_name, original, selected, components, seen
