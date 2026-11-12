@@ -182,7 +182,8 @@ def get_model_and_inputs():
         root.mkdir(parents=True, exist_ok=True)
         tensors = {f"input_{index}": value for index, value in enumerate(arguments)}
         save_file(tensors, str(root / "inputs.safetensors"))
-        source = dict(kind="smolvla_flow_loss", fixture_case=case, fixture_names=names,
+        source = dict(kind="smolvla_flow_loss", model_sha256=manifest["files"]["model.safetensors"]["sha256"],
+                      fixture_case=case, fixture_names=names,
                       input_keys=list(tensors), tensors={key: _record(value) for key, value in tensors.items()},
                       contract_sha256=expected_contract, policy_sha256=expected_policy,
                       removed_derived_buffers=removed, removed_uncalled_sites=uncalled,
