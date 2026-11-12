@@ -9,10 +9,38 @@ from math import prod
 
 from .model import TensorType, pointwise_identity_maps
 
-OPERATIONS = frozenset({"identity", "reshape", "gather", "ordered_f32_scan_f64"})
+OPERATIONS = frozenset({"identity", "reshape", "gather", "ordered_f32_scan_f64", "concat"})
+
+
+def _concat(node, operands, payloads):
+    """Byte-exact concatenation of constant operands along one declared axis."""
+    axis = dict(node.attrs).get("axis")
+    shape, rank = node.type.shape, len(node.type.shape)
+    if (
+        len(operands) < 2 or len(payloads) != len(operands) or node.index_maps
+        or type(axis) is not int or not 0 <= axis < rank or node.attrs != (("axis", axis),)
+        or any((item.type.dtype, item.type.numerical_policy) != (node.type.dtype, node.type.numerical_policy)
+               or len(item.type.shape) != rank
+               or any(n != shape[dim] for dim, n in enumerate(item.type.shape) if dim != axis)
+               for item in operands)
+        or sum(item.type.shape[axis] for item in operands) != shape[axis]
+    ):
+        raise ValueError("constant concat axis, types or source dimensions differ from its output")
+    width = len(payloads[0]) // prod(operands[0].type.shape)
+    if not width or any(len(data) != width * prod(item.type.shape) for item, data in zip(operands, payloads)):
+        raise ValueError("constant concat has an invalid element width")
+    outer = prod(shape[:axis])
+    chunks = [width * prod(item.type.shape[axis:]) for item in operands]
+    result = bytearray()
+    for index in range(outer):
+        for data, chunk in zip(payloads, chunks, strict=True):
+            result.extend(data[index * chunk:(index + 1) * chunk])
+    return bytes(result)
 
 
 def fold_tensor(node, operands, payloads):
+    if node.op == "concat":
+        return _concat(node, operands, payloads)
     if len(operands) != 1 or len(payloads) != 1:
         raise ValueError("constant tensor operation needs one operand")
     source, data = operands[0], payloads[0]

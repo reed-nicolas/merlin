@@ -115,3 +115,22 @@ def test_scan_signed_zero_subnormal_and_output_overflow():
     values = _evaluate(folded)[0].elements
     assert values[0] == 0 and values[1] == 1 and values[4] == 0x7F800000 and values[5] == 0x7F7FFFFF
     assert verify_constant_folding(folded, record).digest() == source.digest()
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_concat_folds_byte_exact_along_its_axis(axis):
+    left = np.arange(6, dtype="<u4").reshape(2, 3) | np.uint32(0x7FC00000)  # NaN payloads must survive
+    shape = (2, 2) if axis else (1, 3)
+    right = np.arange(10, 10 + shape[0] * shape[1], dtype="<u4").reshape(shape)
+    nodes, bindings = [], []
+    for name, value in (("a", left), ("b", right)):
+        nodes.append(SemanticNode(name, "constant", (), TensorType(value.shape, "f32", "raw-bit-pattern"), effect="constant"))
+        bindings.append(ConstantBinding(name, "f32-le-raw", value.tobytes().hex()))
+    expected = np.concatenate([left, right], axis=axis)
+    result = SemanticNode("cat", "concat", ("a", "b"), TensorType(expected.shape, "f32", "raw-bit-pattern"),
+                          (("axis", axis),))
+    source = KernelRequest((*nodes, result), ("cat",), ("external",), (), "synthetic", constants=tuple(bindings))
+    folded, record = fold_source_constants(source, include_tensor_ops=True)
+    assert len(record["folds"]) == 1 and verify_constant_folding(folded, record).digest() == source.digest()
+    assert bytes.fromhex(next(c for c in folded.constants if c.node_id == "cat").data_hex) == expected.tobytes()
+    assert _evaluate(folded) == _evaluate(source)
