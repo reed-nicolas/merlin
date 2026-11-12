@@ -162,15 +162,17 @@ def test_constant_select_keeps_nan_payloads_and_signed_zero_bits(dtype, width):
     assert refused.digest() == wrong.digest() and not record["folds"] and record["deferred"]
 
 
-@pytest.mark.parametrize("operation", ["arith.andi", "arith.xori", "arith.extui"])
+@pytest.mark.parametrize("operation", ["arith.andi", "arith.xori", "arith.extui", "arith.uitofp"])
 def test_constant_boolean_operations_and_widening(operation):
     boolean = TensorType((4,), "i1", "boolean")
     inputs = tuple(SemanticNode(name, "constant", (), boolean, effect="constant") for name in ("a", "b"))
-    arity = 1 if operation == "arith.extui" else 2
+    arity = 1 if operation in {"arith.extui", "arith.uitofp"} else 2
     inputs = inputs[:arity]
+    widened = (TensorType((4,), "f32", "raw-bit-pattern") if operation == "arith.uitofp"
+               else TensorType((4,), "i64", "signed-i64"))
     result = SemanticNode(
         "result", "mask", tuple(n.id for n in inputs),
-        TensorType((4,), "i64", "signed-i64") if arity == 1 else boolean,
+        widened if arity == 1 else boolean,
         (("operation", operation), ("predicate", None)), index_maps=pointwise_identity_maps(1, arity),
     )
     source = KernelRequest(
@@ -359,3 +361,17 @@ def test_dead_elimination_never_evaluates_unqualified_computations_or_changes_in
     verify_constant_folding(pruned, receipt)
     with pytest.raises(ValueError):
         fold_source_constants(source, eliminate_dead=1)
+
+
+def test_constant_boolean_float_widening_is_exact_zero_and_one():
+    boolean = TensorType((4,), "i1", "boolean")
+    source = KernelRequest(
+        (SemanticNode("a", "constant", (), boolean, effect="constant"),
+         SemanticNode("result", "mask", ("a",), TensorType((4,), "f32", "raw-bit-pattern"),
+                      (("operation", "arith.uitofp"), ("predicate", None)), index_maps=pointwise_identity_maps(1, 1))),
+        ("result",), ("external",), (), "synthetic", constants=(ConstantBinding("a", "i1-raw", "00010100"),),
+    )
+    folded, receipt = fold_source_constants(source)
+    verify_constant_folding(folded, receipt)
+    binding = next(c for c in folded.constants if c.node_id == "result")
+    assert bytes.fromhex(binding.data_hex) == bytes.fromhex("00000000" "0000803f" "0000803f" "00000000")

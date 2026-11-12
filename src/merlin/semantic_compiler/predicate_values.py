@@ -50,11 +50,12 @@ def predicate_widths(node, operands):
         if not operands or operands[0].type.dtype not in {"f32", "f64"}:
             raise ValueError("constant floating comparison needs IEEE f32 or f64 operands")
         expected, arity = TensorType(shape, operands[0].type.dtype, "raw-bit-pattern"), 2
-    elif operation in {"arith.andi", "arith.xori", "arith.extui"} and predicate is None:
-        expected, arity = boolean, 1 if operation == "arith.extui" else 2
+    elif operation in {"arith.andi", "arith.xori", "arith.extui", "arith.uitofp"} and predicate is None:
+        expected, arity = boolean, 1 if operation in {"arith.extui", "arith.uitofp"} else 2
     else:
         raise ValueError("constant predicate or operation is not admitted")
-    output = TensorType(shape, "i64", "signed-i64") if operation == "arith.extui" else boolean
+    output = {"arith.extui": TensorType(shape, "i64", "signed-i64"),
+              "arith.uitofp": TensorType(shape, "f32", "raw-bit-pattern")}.get(operation, boolean)
     if len(operands) != arity or any(item.type != expected for item in operands) or node.type != output:
         raise ValueError("constant mask types differ from its operation")
     return (_WIDTHS[expected.dtype],) * arity, _WIDTHS[output.dtype]
@@ -76,5 +77,7 @@ def predicate_element(node, arguments, widths):
         return ordered_float_compare(*arguments, widths[0], attrs["predicate"])
     if operation == "arith.extui":
         return arguments[0]
+    if operation == "arith.uitofp":
+        return 0x3F800000 if arguments[0] else 0
     a, b = arguments
     return a & b if operation == "arith.andi" else a ^ b

@@ -395,7 +395,7 @@ def translate_linalg_text(
             and (
                 (str(getattr(op.results[0].type, "element_type", None)) == "i1" and len(op.inputs) == 2)
                 or (
-                    str(getattr(op.results[0].type, "element_type", None)) == "i64"
+                    str(getattr(op.results[0].type, "element_type", None)) in {"i64", "f32"}
                     and len(op.inputs) == 1
                     and str(getattr(op.inputs[0].type, "element_type", None)) == "i1"
                 )

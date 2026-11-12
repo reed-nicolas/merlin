@@ -13,7 +13,7 @@ def recognize_mask(op):
     from .linalg_recognition import _linear_affine_expression
 
     pattern = recognize_static_projected_pointwise(op)
-    if pattern.operation not in {"arith.cmpi", "arith.cmpf", "arith.andi", "arith.xori", "arith.extui"}:
+    if pattern.operation not in {"arith.cmpi", "arith.cmpf", "arith.andi", "arith.xori", "arith.extui", "arith.uitofp"}:
         raise InvalidLinalgPattern("mask operation is not a checked comparison, Boolean operation or widening cast")
     rank = len(pattern.shape)
     maps = tuple(
@@ -38,6 +38,9 @@ def evaluate_mask(node: SemanticNode, operands):
     if operation == "arith.extui":
         expected, predicates = ("i1", "boolean"), {None}
         output_type, arity = TensorType(node.type.shape, "i64", "signed-i64"), 1
+    elif operation == "arith.uitofp":
+        expected, predicates = ("i1", "boolean"), {None}
+        output_type, arity = TensorType(node.type.shape, "f32", "raw-bit-pattern"), 1
     elif operation == "arith.cmpi":
         expected, predicates = ("i64", "signed-i64"), {"eq", "ne", "slt", "sle", "sgt", "sge"}
     elif operation == "arith.cmpf":
@@ -49,7 +52,7 @@ def evaluate_mask(node: SemanticNode, operands):
         expected, predicates = ("i1", "boolean"), {None}
     else:
         raise ValueError("mask operation has no exact reference")
-    if operation != "arith.extui":
+    if operation not in {"arith.extui", "arith.uitofp"}:
         output_type, arity = TensorType(node.type.shape, "i1", "boolean"), 2
     if node.type != output_type or len(operands) != arity:
         raise ValueError("mask output type or operation arity differs")
@@ -98,6 +101,8 @@ def evaluate_mask(node: SemanticNode, operands):
         lhs, rhs = args if len(args) == 2 else (args[0], None)
         if operation == "arith.extui":
             value = lhs
+        elif operation == "arith.uitofp":
+            value = 0x3F800000 if lhs else 0  # exact: false is +0.0, true is 1.0
         elif operation == "arith.andi":
             value = lhs & rhs
         elif operation == "arith.xori":

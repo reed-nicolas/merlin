@@ -138,18 +138,19 @@ def emit_predicate_c(source, name, *, constant_fold_limit=65536):
             helper = _float_comparison_c(name, width)
             index = ("oeq", "one", "olt", "ole", "ogt", "oge").index(predicate)
             expression = f"{name}_compare(v0,v1,{index}u)"
-        elif operation in {"arith.andi", "arith.xori", "arith.extui"} and predicate is None:
-            if len(operands) != (1 if operation == "arith.extui" else 2):
+        elif operation in {"arith.andi", "arith.xori", "arith.extui", "arith.uitofp"} and predicate is None:
+            if len(operands) != (1 if operation in {"arith.extui", "arith.uitofp"} else 2):
                 raise ValueError("Boolean predicate has an incompatible arity")
             expected, c_type, width, boolean = ("i1", "boolean"), "uint8_t", 1, True
-            output_width = 8 if operation == "arith.extui" else 1
-            expression = "v0" if output_width == 8 else "v0 & v1" if operation == "arith.andi" else "v0 ^ v1"
+            output_width = {"arith.extui": 8, "arith.uitofp": 4}.get(operation, 1)
+            expression = ("v0" if output_width == 8 else "(v0 ? UINT32_C(0x3f800000) : UINT32_C(0))" if output_width == 4
+                          else "v0 & v1" if operation == "arith.andi" else "v0 ^ v1")
         else:
             raise ValueError("mask operation or predicate has no compiled implementation")
         if any(
             (item.type.dtype, item.type.numerical_policy) != expected for item in operands
         ) or node.type != TensorType(
-            node.type.shape, "i64" if output_width == 8 else "i1", "signed-i64" if output_width == 8 else "boolean"
+            node.type.shape, *{8: ("i64", "signed-i64"), 4: ("f32", "raw-bit-pattern")}.get(output_width, ("i1", "boolean"))
         ):
             raise ValueError("mask source or output types differ from its operation")
     else:
