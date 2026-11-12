@@ -9,7 +9,8 @@ Nothing in this preparation is Atlas computation. Binary32 framework
 equivalence and positions beyond 2047 are not qualified.
 
 Only the unmodified upstream binary32 `sinf.c` and `cosf.c`, MIT `LICENSE`, and
-revision marker are vendored in `third_party/core-math`. No upstream Makefile or
+revision marker are vendored in `third_party/core-math` for this gate; the binary64
+`sin.c` and `cos.c` beside them serve only `../smolvla/host-math`. No upstream Makefile or
 build script runs, and no target binary is committed. Our Python build step uses
 RV64GC/lp64d GCC 13.2, strict rounding flags, and deterministic archive creation.
 Implicit contraction is disabled; explicit upstream `__builtin_fmaf` stays fused.
