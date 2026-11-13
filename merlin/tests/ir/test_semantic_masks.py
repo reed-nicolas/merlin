@@ -45,6 +45,26 @@ def test_boolean_widening_keeps_true_as_one_and_rejects_signed_extension():
         translate_linalg_text(text.replace("arith.extui", "arith.extsi"), entry="forward", target_identity="synthetic")
 
 
+def test_boolean_float_widening_is_exact_zero_and_one():
+    text = """module {
+      func.func @forward(%input: tensor<4xi1>) -> tensor<4xf32> {
+        %empty = tensor.empty() : tensor<4xf32>
+        %result = linalg.generic {indexing_maps = [affine_map<(i)->(i)>, affine_map<(i)->(i)>],
+          iterator_types = ["parallel"]} ins(%input : tensor<4xi1>) outs(%empty : tensor<4xf32>) {
+          ^bb0(%value: i1, %unused: f32):
+            %wide = arith.uitofp %value : i1 to f32
+            linalg.yield %wide : f32
+        } -> tensor<4xf32>
+        return %result : tensor<4xf32>
+      }
+    }"""
+    request = translate_linalg_text(text, entry="forward", target_identity="synthetic").request
+    inputs = {"arg0": TensorValue(request.node("arg0").type, (0, 1, 1, 0))}
+    assert evaluate_graph(request, inputs)[0].elements == (0, 0x3F800000, 0x3F800000, 0)
+    widened = request.nodes[-1]
+    assert (widened.op, dict(widened.attrs)["operation"]) == ("mask", "arith.uitofp")
+
+
 @pytest.mark.parametrize(
     "predicate,expected",
     [

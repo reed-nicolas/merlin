@@ -72,11 +72,12 @@ def compile_c(directory, files, symbol, tag):
 def request_for(kind):
     truth = kind == "nonzero"
     integer = kind in {"eq", "ne", "slt", "sle", "sgt", "sge"}
-    output = TensorType((3, 4), "i64" if kind == "extui" else "i1", "signed-i64" if kind == "extui" else "boolean")
+    widened = {"extui": ("i64", "signed-i64"), "uitofp": ("f32", "raw-bit-pattern")}
+    output = TensorType((3, 4), *widened.get(kind, ("i1", "boolean")))
     dtype, policy = ("f32", "raw-bit-pattern") if truth else ("i64", "signed-i64") if integer else ("i1", "boolean")
     operands = tuple(
         SemanticNode(f"x{i}", "input", (), TensorType(shape, dtype, policy), effect="input")
-        for i, shape in enumerate(((3, 4),) if truth else ((3, 1),) if kind == "extui" else ((3, 1), (1, 4)))
+        for i, shape in enumerate(((3, 4),) if truth else ((3, 1),) if kind in widened else ((3, 1), (1, 4)))
     )
     maps = (
         pointwise_identity_maps(2, 1)
@@ -101,7 +102,10 @@ def request_for(kind):
     )
 
 
-@pytest.mark.parametrize("kind", ["nonzero", "eq", "ne", "slt", "sle", "sgt", "sge", "andi", "xori", "extui"])
+KINDS = ["nonzero", "eq", "ne", "slt", "sle", "sgt", "sge", "andi", "xori", "extui", "uitofp"]
+
+
+@pytest.mark.parametrize("kind", KINDS)
 def test_compiled_predicate_matches_independent_numpy_and_preserves_buffers(tmp_path, kind):
     request = request_for(kind)
     if kind == "nonzero":
@@ -150,10 +154,12 @@ def test_compiled_predicate_matches_independent_numpy_and_preserves_buffers(tmp_
             values = [np.roll(np.array([0, 1, 0], dtype="u1"), panel).reshape(3, 1)]
             if kind == "extui":
                 expected = np.broadcast_to(values[0], (3, 4))
+            elif kind == "uitofp":
+                expected = np.broadcast_to(np.where(values[0], np.uint32(0x3F800000), np.uint32(0)), (3, 4))
             else:
                 values.append(np.roll(np.array([0, 1, 1, 0], dtype="u1"), panel).reshape(1, 4))
                 expected = (np.bitwise_and if kind == "andi" else np.bitwise_xor)(*values)
-        expected = np.asarray(expected, dtype="<i8" if kind == "extui" else "u1").tobytes()
+        expected = np.asarray(expected, dtype={"extui": "<i8", "uitofp": "<u4"}.get(kind, "u1")).tobytes()
         storage = [ctypes.create_string_buffer(b"\xcd" + value.tobytes() + b"\xcd") for value in values]
         inputs = (ctypes.c_void_p * len(storage))(*(ctypes.addressof(value) + 1 for value in storage))
         output = ctypes.create_string_buffer(b"\xa7" * (len(expected) + 2))
@@ -262,7 +268,7 @@ def test_compiled_select_preserves_value_bits_and_checks_boolean_inputs(tmp_path
         emit_predicate_c(replace(request, nodes=(*inputs[:-1], bad, result)), "select_value")
 
 
-@pytest.mark.parametrize("kind", ["nonzero", "eq", "ne", "slt", "sle", "sgt", "sge", "andi", "xori", "extui"])
+@pytest.mark.parametrize("kind", KINDS)
 def test_declared_constant_predicates_fold_without_runtime_inputs(tmp_path, kind):
     from merlin.semantic_compiler.linalg_constants import read_tensor_bytes
     from merlin.semantic_compiler.reference import evaluate_graph
@@ -289,7 +295,7 @@ def test_declared_constant_predicates_fold_without_runtime_inputs(tmp_path, kind
     unfurled, _ = emit_predicate_c(source, "unfurled_predicate", constant_fold_limit=0)
     assert unfurled["inputs"] == list(source.nodes[-1].inputs) and "constant_folding" not in unfurled
     expected = evaluate_graph(source, {}, constants=values)[0]
-    width = 8 if kind == "extui" else 1
+    width = {"extui": 8, "uitofp": 4}.get(kind, 1)
     payload = b"".join(value.to_bytes(width, "little") for value in expected.elements)
     function = compile_c(tmp_path, files, "folded_predicate", "constant_" + kind)
     output = ctypes.create_string_buffer(b"\xa7" * (len(payload) + 2))
