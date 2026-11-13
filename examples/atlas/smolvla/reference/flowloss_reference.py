@@ -935,7 +935,9 @@ def main():
         outputs = outputs if isinstance(outputs, (tuple, list)) else (outputs,)
         arrays.update({f"output_{i}": value.raw for i, value in enumerate(outputs)})
         record["outputs"] = {f"output_{i}": {**info(value.raw), "logical_dtype": value.dtype} for i, value in enumerate(outputs)}
-    np.savez(args.out / "expected.npz", **arrays)
+    # Only a complete strict run produces expected words; refused or waived arrays are diagnostics.
+    arrays_name = "expected.npz" if status == "EXPECTED" else "diagnostic.npz"
+    np.savez(args.out / arrays_name, **arrays)
     for name, raw in program.state_dict.items():
         if name in interpreter.constants and info(raw_tensor(raw).raw)["sha256"] != interpreter.constants[name]["sha256"]:
             raise ValueError("authored lifted state changed during interpretation: " + name)
@@ -947,7 +949,7 @@ def main():
                           "dead_call_nodes_skipped": getattr(interpreter, "skipped", None),
                           "policy_dispatch": dict(sorted(interpreter.dispatch.items())),
                           "retained_arrays": len(arrays), "hashed_boundaries": len(interpreter.boundaries)},
-                  expected_npz_sha256=sha_file(args.out / "expected.npz"),
+                  arrays={"file": arrays_name, "sha256": sha_file(args.out / arrays_name)},
                   lifted_constants=interpreter.constants, boundaries=interpreter.boundaries,
                   position_ids_check=interpreter.position_ids_check,
                   diagnostic_waivers={"selected": sorted(interpreter.waivers), "applied": interpreter.waived,
