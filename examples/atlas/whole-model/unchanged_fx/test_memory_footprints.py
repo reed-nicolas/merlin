@@ -270,30 +270,35 @@ class MemoryFootprintTests(unittest.TestCase):
                 output_ranges(p, BASE, 16384)
 
 
+    def test_immutable_initial_load_and_call_write_separation(self):
+        import ctypes as ct
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+        import functional_runtime
+
+        with TemporaryDirectory() as temporary, \
+                patch('model_runtime.authenticate_model', return_value={}), \
+                patch('functional_runtime.authenticate_model', return_value={}):
+            root = Path(temporary)
+            (root / 'docs').mkdir()
+            (root / 'docs/selected-variant-inventory.json').write_text('{}')
+            runtime = functional_runtime.FunctionalModelRuntime(
+                root, root, [], root / 'execution', memory_base=BASE,
+                memory_bytes=64, immutable_loads=[(BASE + 128, b'immutable')],
+                capacity_base=BASE, capacity_bytes=256)
+            self.assertEqual(runtime.memory[128:137], b'immutable')
+            payload = ct.create_string_buffer(b'changed!!')
+            self.assertEqual(runtime.put(None, BASE, payload, 9), 0)
+            self.assertEqual(runtime.put(None, BASE + 128, payload, 9), 1)
+            self.assertEqual(runtime.memory[128:137], b'immutable')
+            self.assertEqual(len(runtime.transfers), 1)
+            with self.assertRaisesRegex(ValueError, 'capacity or overlaps'):
+                functional_runtime.FunctionalModelRuntime(
+                    root, root, [], root / 'bad', memory_base=BASE,
+                    memory_bytes=64, immutable_loads=[(BASE + 60, b'immutable')],
+                    capacity_base=BASE, capacity_bytes=256)
+
+
 if __name__ == '__main__':
     unittest.main()
-
-
-def test_immutable_initial_load_and_call_write_separation(tmp_path, monkeypatch):
-    import ctypes as ct
-    import model_runtime
-    import functional_runtime
-    monkeypatch.setattr(model_runtime, 'authenticate_model', lambda _: {})
-    monkeypatch.setattr(functional_runtime, 'authenticate_model', lambda _: {})
-    (tmp_path / 'docs').mkdir()
-    (tmp_path / 'docs/selected-variant-inventory.json').write_text('{}')
-    runtime = functional_runtime.FunctionalModelRuntime(
-        tmp_path, tmp_path, [], tmp_path / 'execution', memory_base=BASE,
-        memory_bytes=64, immutable_loads=[(BASE + 128, b'immutable')],
-        capacity_base=BASE, capacity_bytes=256)
-    assert runtime.memory[128:137] == b'immutable'
-    payload = ct.create_string_buffer(b'changed!!')
-    assert runtime.put(None, BASE, payload, 9) == 0
-    assert runtime.put(None, BASE + 128, payload, 9) == 1
-    assert runtime.memory[128:137] == b'immutable'
-    assert len(runtime.transfers) == 1
-    with pytest.raises(ValueError, match='capacity or overlaps'):
-        functional_runtime.FunctionalModelRuntime(
-            tmp_path, tmp_path, [], tmp_path / 'bad', memory_base=BASE,
-            memory_bytes=64, immutable_loads=[(BASE + 60, b'immutable')],
-            capacity_base=BASE, capacity_bytes=256)

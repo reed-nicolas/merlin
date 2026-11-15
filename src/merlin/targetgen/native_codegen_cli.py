@@ -11,7 +11,7 @@ def add_native_recipe_arguments(parser):
     )
 
     parser.add_argument("--application-residency", action="store_true",
-                        help="allocate immutable device operands once within declared physical capacity")
+                        help="allocate immutable device operands once within declared physical capacity; resident addresses are embedded in region programs, so sharing bodies across layers requires address parameterization; incompatible with --region-materialization-cache")
     parser.add_argument("--native-pipeline", choices=NATIVE_PIPELINES, default="mandatory")
     parser.add_argument("--adjacent-patterns", default="", help="explicit adjacent fusion pattern selection")
     parser.add_argument("--staging-storage", choices=STAGING_STORAGE, default="dram")
@@ -52,7 +52,7 @@ def add_io_memory_argument(parser):
         ("base", "device-visible I/O window base address"),
         ("alignment", "required alignment of the I/O window base in bytes"),
         ("capacity-base", "base address of the containing device-visible memory capacity"),
-        ("capacity-bytes", "byte size of the containing device-visible memory capacity; SophiaLake DDR board compiles must declare --io-memory-capacity-base 0x80000000 --io-memory-capacity-bytes 0x40000000 (1 GiB); without capacity, windows above 1 GiB are admitted"),
+        ("capacity-bytes", "byte size of the containing device-visible memory capacity; the declared arena must exclude host ELF, stack, and heap memory; SophiaLake DDR board compiles must stay within the physical 1 GiB; without capacity, windows above 1 GiB are admitted"),
     ):
         def memory_integer(text, *, option=name):
             try:

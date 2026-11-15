@@ -614,3 +614,58 @@ def test_publication_scope_failure_preserves_error_and_clears_stats(tmp_path):
             target_source=tmp_path, destination=tmp_path, limits={}, name="scope", capacity=1,
             deterministic_receipts=True, materialization_stats=stats)
     assert stats == {}
+
+
+@pytest.mark.parametrize("phase", ["compile", "verify"])
+def test_resident_binding_consumption_is_checked_during_compile_and_replay(tmp_path, monkeypatch, phase):
+    from contextlib import nullcontext
+    from merlin.compile import application_residency as residency
+    from merlin.compile import semantic_application as application
+    from merlin.semantic_compiler.codegen import CodegenOptions, codegen_options
+
+    source, adapter = graph(), SyntheticAdapter()
+    outlined = application.outline_semantic_regions(source, entry="test", plan=adapter.plan(source))
+    region = outlined.regions[0][1]
+    node_id = region.input_storages[0][0]
+    binding = {"address": 256, "bytes": 8, "immutable": True}
+    requested = {region.digest(): {node_id: binding}}
+    record = {
+        "bindings": requested,
+        "entries": [{"name": "asset", "role": "immutable_parameter", "address": 256, "bytes": 8}],
+        "loads": [{"name": "asset", "source_node": node_id}],
+    }
+    files = {"residency.json": json.dumps(record).encode()}
+    monkeypatch.setattr(application, "residency_scope", lambda *args: nullcontext())
+    monkeypatch.setattr(application, "residency_publication", lambda: files)
+    monkeypatch.setattr(residency, "publication", lambda: files)
+    export = adapter._export
+    adapter.ignore_bindings = phase == "compile"
+
+    def package(request, name, body):
+        compiled = export(request, name, body)
+        if request.digest() == region.digest() and not adapter.ignore_bindings:
+            compiled.description["resident_bindings"] = [dict(node_id=node_id, **binding)]
+        return compiled
+
+    adapter._export = package
+    snapshot_root = tmp_path / "snapshot"
+    snapshot_root.mkdir()
+    (snapshot_root / "manifest.json").write_text("{}")
+    snapshot = SimpleNamespace(root=snapshot_root)
+    output = tmp_path / "application"
+    with codegen_options(CodegenOptions(resident_bindings=requested)):
+        if phase == "compile":
+            with pytest.raises(ValueError, match="did not consume"):
+                application.compile_semantic_application(
+                    source, adapter=adapter, snapshot=snapshot, target_source=tmp_path,
+                    destination=output, limits=None, name="test", capacity=4096, allow_host_only=True)
+            assert not (output / "manifest.json").exists()
+        else:
+            application.compile_semantic_application(
+                source, adapter=adapter, snapshot=snapshot, target_source=tmp_path,
+                destination=output, limits=None, name="test", capacity=4096, allow_host_only=True)
+            adapter.ignore_bindings = True
+            with pytest.raises(ValueError, match="did not consume"):
+                application.verify_semantic_application(
+                    source, adapter=adapter, snapshot=snapshot, target_source=tmp_path,
+                    artifact=output, allow_host_only=True)

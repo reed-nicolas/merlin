@@ -19,6 +19,46 @@ def publication():
     return _PUBLICATION.get()
 
 
+def validate_region_bindings(regions, compiled):
+    """Require provider packages to consume the complete planned residency ABI."""
+    files = publication()
+    if files is None:
+        return
+    record = json.loads(files["residency.json"])
+    requested = current_codegen_options().resident_bindings or {}
+    if json.dumps(requested, sort_keys=True) != json.dumps(record["bindings"], sort_keys=True):
+        raise ValueError("resident bindings differ from the residency table")
+    consumed, seen = set(), set()
+    for (_, region), package in zip(regions, compiled, strict=True):
+        digest = region.digest()
+        seen.add(digest)
+        expected = requested.get(digest, {})
+        reported = package.description.get("resident_bindings", [])
+        actual = {}
+        if not isinstance(reported, list):
+            raise ValueError("region package resident bindings must be a list")
+        for item in reported:
+            if (not isinstance(item, dict) or not isinstance(item.get("node_id"), str)
+                    or item["node_id"] in actual
+                    or not {"address", "bytes", "immutable"} <= item.keys()):
+                raise ValueError("region package has invalid or duplicate resident bindings")
+            actual[item["node_id"]] = {key: item[key] for key in ("address", "bytes", "immutable")}
+        # JSON equality also distinguishes Boolean values from integer addresses.
+        if json.dumps(actual, sort_keys=True) != json.dumps(expected, sort_keys=True):
+            raise ValueError("region package did not consume its resident bindings: " + digest)
+        consumed.update((node_id, item["address"], item["bytes"]) for node_id, item in actual.items())
+    if set(requested) - seen:
+        raise ValueError("resident bindings refer to an uncompiled region")
+    entries = {row["name"]: row for row in record["entries"]}
+    assets = {row["name"] for row in record["entries"] if row["role"] == "immutable_parameter"}
+    if assets != {load["name"] for load in record["loads"]}:
+        raise ValueError("resident table assets differ from the initial-load inventory")
+    for load in record["loads"]:
+        row = entries[load["name"]]
+        if (load["source_node"], row["address"], row["bytes"]) not in consumed:
+            raise ValueError("resident table asset is not bound by any region: " + load["name"])
+
+
 @contextmanager
 def residency_scope(source, adapter, parameters, state):
     options = current_codegen_options()

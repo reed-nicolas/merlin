@@ -28,7 +28,7 @@ from merlin.xdsl_dialects.lowering.arena_plan import ArenaPlanError, ArenaRequir
 from merlin.xdsl_dialects.lowering.global_plan import GlobalPlan
 from merlin.xdsl_dialects.lowering.global_plan_emission import dispatch_digest
 
-from .application_residency import residency_scope, publication as residency_publication
+from .application_residency import residency_scope, publication as residency_publication, validate_region_bindings
 from .application_c import emit_application_c
 from .application_plan import application_plan
 from .application_views import IMPLEMENTATION as VIEW_IMPLEMENTATION, checked_view_aliases, compile_view
@@ -359,6 +359,8 @@ def compile_semantic_application(
         raise TypeError("materialization reuse needs an explicit Boolean")
     if type(reuse_region_materializations) is not bool:
         raise TypeError("region materialization reuse needs an explicit Boolean")
+    if reuse_region_materializations and current_codegen_options().application_residency:
+        raise ValueError("application residency cannot use the explicitly requested region materialization cache")
     enabled = reuse_materializations and getattr(adapter, "supports_materialization_cache", False) is True
     stats = {}
     try:
@@ -423,7 +425,7 @@ def _compile_semantic_application(
                 adapter, snapshot, region, alternative, target_source, limits, contract=contract)
             with materialization_region(region_key):
                 supports = getattr(adapter, "supports_region_materialization", None)
-                if (reuse_region_materializations and not current_codegen_options().application_residency
+                if (reuse_region_materializations
                         and getattr(adapter, "supports_materialization_cache", False) is True and supports is not None
                         and supports(region, alternative)):
                     materialized = cache.get(region_key)
@@ -453,6 +455,7 @@ def _compile_semantic_application(
                     _stats["region_compiles"] += 1
                     lowered.append(adapter.compile_region(
                         snapshot, region, alternative, f"region_{i:03d}", segments, target_source, limits))
+    validate_region_bindings(outlined.regions, lowered)
     _, summaries, interface, links, files = _render(
         source, adapter, name, capacity, lowered, state=state, parameters=parameters, native_root=destination,
         emit_region_loop=emit_region_loop,
@@ -630,6 +633,7 @@ def _verify_semantic_application(
             _stats["region_replays"] += 1
             compiled.append(adapter.export_region(
                 region, alternative, f"region_{i:03d}", artifact / "segments", target_source))
+    validate_region_bindings(outlined.regions, compiled)
     _, summaries, interface, links, files = _render(
         source,
         adapter,

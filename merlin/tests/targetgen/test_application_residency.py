@@ -272,3 +272,73 @@ def test_inventory_and_packing_receive_selected_alternative(inputs):
     inputs.adapter.pack_resident_input = selected_pack
     with _scope(inputs):
         assert residency.publication() is not None
+
+
+def _compiled_bindings(inputs):
+    binding = current_codegen_options().resident_bindings[inputs.region.digest()]["arg0"]
+    return SimpleNamespace(description={"resident_bindings": [dict(node_id="arg0", **binding)]})
+
+
+def test_provider_package_consumes_the_exact_planned_binding(inputs):
+    with _scope(inputs):
+        package = _compiled_bindings(inputs)
+        package.description["resident_bindings"][0]["provider_layout"] = "extra target metadata"
+        residency.validate_region_bindings((("device", inputs.region),), (package,))
+
+
+@pytest.mark.parametrize("change", [
+    {"address": 56}, {"bytes": 7}, {"immutable": False}, {"node_id": "other"},
+    {"address": True},
+])
+def test_provider_cannot_change_or_replace_a_requested_binding(inputs, change):
+    with _scope(inputs):
+        package = _compiled_bindings(inputs)
+        package.description["resident_bindings"][0].update(change)
+        with pytest.raises(ValueError, match="did not consume"):
+            residency.validate_region_bindings((("device", inputs.region),), (package,))
+
+
+@pytest.mark.parametrize("report", [None, [], [{"node_id": "arg0"}]])
+def test_provider_cannot_ignore_a_binding_or_report_an_incomplete_binding(inputs, report):
+    with _scope(inputs):
+        description = {} if report is None else {"resident_bindings": report}
+        with pytest.raises(ValueError, match="resident bindings"):
+            residency.validate_region_bindings((("device", inputs.region),), (SimpleNamespace(description=description),))
+
+
+def test_provider_cannot_report_duplicate_bindings(inputs):
+    with _scope(inputs):
+        package = _compiled_bindings(inputs)
+        package.description["resident_bindings"] *= 2
+        with pytest.raises(ValueError, match="duplicate"):
+            residency.validate_region_bindings((("device", inputs.region),), (package,))
+
+
+def test_table_asset_requires_at_least_one_consuming_region(inputs):
+    with _scope(inputs):
+        record = json.loads(residency.publication()["residency.json"])
+        # Model a planning regression that publishes an asset with no requests.
+        record["bindings"] = {}
+        residency.publication()["residency.json"] = json.dumps(record).encode()
+        with codegen_options(replace(current_codegen_options(), resident_bindings={})):
+            with pytest.raises(ValueError, match="asset is not bound"):
+                residency.validate_region_bindings((("device", inputs.region),),
+                                                  (SimpleNamespace(description={}),))
+
+
+def test_extra_region_bindings_are_rejected(inputs):
+    with _scope(inputs):
+        with pytest.raises(ValueError, match="uncompiled region"):
+            residency.validate_region_bindings((), ())
+
+
+def test_explicit_canonical_cache_refuses_residency_before_compilation(inputs):
+    from merlin.compile.semantic_application import compile_semantic_application
+
+    with codegen_options(inputs.options):
+        with pytest.raises(ValueError, match="explicitly requested region materialization cache"):
+            compile_semantic_application(inputs.source, adapter=inputs.adapter, snapshot=None,
+                target_source=None, destination=None, limits=None, name="test", capacity=16,
+                reuse_region_materializations=True)
+    assert not inputs.checked_sources
+    assert not inputs.packed_sources
