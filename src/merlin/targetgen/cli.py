@@ -741,6 +741,8 @@ def _native_compile_report_with_options(args: argparse.Namespace) -> dict:
     )
 
     try:
+        if getattr(args, "application_residency", False) and not getattr(args, "application", False):
+            raise ValueError("--application-residency requires --application")
         if getattr(args, "already_quantized", False) and not getattr(args, "application", False):
             raise ValueError("--already-quantized requires --application")
         if getattr(args, "application_common_values", False) and not getattr(args, "application", False):
@@ -1137,6 +1139,7 @@ def _cmd_native_verify(args: argparse.Namespace) -> int:
                 requested["exact_float_unroll"] = None
             budgets = application_budget_options(manifest, requested)
             args = copy(args)
+            args.application_residency = manifest.get("application_residency", False)
             for name, value in budgets.items():
                 setattr(args, name, value)
         except (ValueError, OSError, TypeError, KeyError) as error:

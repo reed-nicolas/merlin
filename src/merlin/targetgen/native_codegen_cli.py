@@ -10,6 +10,8 @@ def add_native_recipe_arguments(parser):
         STAGING_STORAGE,
     )
 
+    parser.add_argument("--application-residency", action="store_true",
+                        help="allocate immutable device operands once within declared physical capacity")
     parser.add_argument("--native-pipeline", choices=NATIVE_PIPELINES, default="mandatory")
     parser.add_argument("--adjacent-patterns", default="", help="explicit adjacent fusion pattern selection")
     parser.add_argument("--staging-storage", choices=STAGING_STORAGE, default="dram")

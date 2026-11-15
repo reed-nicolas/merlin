@@ -28,6 +28,7 @@ from merlin.xdsl_dialects.lowering.arena_plan import ArenaPlanError, ArenaRequir
 from merlin.xdsl_dialects.lowering.global_plan import GlobalPlan
 from merlin.xdsl_dialects.lowering.global_plan_emission import dispatch_digest
 
+from .application_residency import residency_scope, publication as residency_publication
 from .application_c import emit_application_c
 from .application_plan import application_plan
 from .application_views import IMPLEMENTATION as VIEW_IMPLEMENTATION, checked_view_aliases, compile_view
@@ -361,7 +362,7 @@ def compile_semantic_application(
     enabled = reuse_materializations and getattr(adapter, "supports_materialization_cache", False) is True
     stats = {}
     try:
-        with publication_scope, materialization_session(enabled=enabled) as stats:
+        with publication_scope, residency_scope(source, adapter, parameters, state), materialization_session(enabled=enabled) as stats:
             return _compile_semantic_application(**arguments, _stats=stats)
     finally:
         if materialization_stats is not None:
@@ -422,7 +423,7 @@ def _compile_semantic_application(
                 adapter, snapshot, region, alternative, target_source, limits, contract=contract)
             with materialization_region(region_key):
                 supports = getattr(adapter, "supports_region_materialization", None)
-                if (reuse_region_materializations
+                if (reuse_region_materializations and not current_codegen_options().application_residency
                         and getattr(adapter, "supports_materialization_cache", False) is True and supports is not None
                         and supports(region, alternative)):
                     materialized = cache.get(region_key)
@@ -459,6 +460,8 @@ def _compile_semantic_application(
     if parameters is not None:
         (destination / "handoff").mkdir(exist_ok=True)
         parameters.write_payload(destination / "handoff/parameters.bin")
+    if residency_publication() is not None:
+        files.update(residency_publication())
     for filename, data in files.items():
         path = destination / filename
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -507,6 +510,8 @@ def _compile_semantic_application(
         name: getattr(options, name) for name in IO_MEMORY_OPTIONS if getattr(options, name) is not None
     })
     manifest.update({name: getattr(options, name) for name in APPLICATION_BUDGET_OPTIONS})
+    if options.application_residency:
+        manifest["application_residency"] = True
     if emit_region_loop:
         manifest["dispatch_loop"] = True
     (destination / "manifest.json").write_bytes(_json(manifest))
@@ -548,7 +553,7 @@ def verify_semantic_application(
     if type(reuse_materializations) is not bool:
         raise TypeError("materialization reuse needs an explicit Boolean")
     try:
-        with materialization_session(enabled=False) as stats:
+        with residency_scope(source, adapter, parameters, state), materialization_session(enabled=False) as stats:
             return _verify_semantic_application(**arguments, _stats=stats)
     finally:
         if materialization_stats is not None:
@@ -563,6 +568,9 @@ def _verify_semantic_application(
     """Replay source partitioning, region exports, buffer planning and C generation."""
     manifest = json.loads((artifact / "manifest.json").read_bytes())
     options = current_codegen_options()
+    if (type(manifest.get("application_residency", False)) is not bool
+            or manifest.get("application_residency", False) != options.application_residency):
+        raise ValueError("application residency differs from compilation")
     selected_memory = {
         name: getattr(options, name) for name in IO_MEMORY_OPTIONS if getattr(options, name) is not None
     }
@@ -640,6 +648,8 @@ def _verify_semantic_application(
         or manifest["link_sources"] != links
     ):
         raise ValueError("application manifest differs from replayed region compilation")
+    if residency_publication() is not None:
+        files.update(residency_publication())
     for filename, data in files.items():
         if (artifact / filename).read_bytes() != data:
             raise ValueError("application artifact differs from replayed source: " + filename)

@@ -71,8 +71,14 @@ class CodegenOptions:
     exact_binary_routes: bool = False
     capture_postspill: bool = False
     kernel_library: bool = False
+    application_residency: bool = False
+    resident_bindings: dict | None = None
 
     def __post_init__(self):
+        if type(self.application_residency) is not bool:
+            raise ValueError("application residency must be Boolean")
+        if self.application_residency and (self.io_memory_capacity_base is None or self.io_memory_capacity_bytes is None):
+            raise ValueError("application residency requires declared physical capacity")
         if self.reduction_unroll not in ("auto", *(str(i) for i in FACTORS)):
             raise ValueError("reduction unroll must be auto, 1, 2, 4 or 8")
         if type(self.exact_float_unroll) is not bool:
@@ -119,6 +125,10 @@ class CodegenOptions:
     def identity_record(self):
         """Record active recipe choices without changing historical default identities."""
         record = asdict(self)
+        if not self.application_residency:
+            del record["application_residency"]
+        if self.resident_bindings is None:
+            del record["resident_bindings"]
         if not self.exact_float_unroll:
             del record["exact_float_unroll"]
         if self.execution_instruction_limit is None:
@@ -225,6 +235,7 @@ def options_from_args(args):
         exact_binary_routes=getattr(args, "exact_binary_routes", False),
         capture_postspill=getattr(args, "capture_postspill", False),
         kernel_library=getattr(args, "kernel_library", False),
+        application_residency=getattr(args, "application_residency", False),
     )
 
 
