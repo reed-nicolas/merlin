@@ -37,14 +37,6 @@ IO_MEMORY_OPTIONS = (
     "io_memory_capacity_bytes",
 )
 
-NATIVE_PIPELINES = ("mandatory", "optimized")
-STAGING_STORAGE = ("dram", "vmem", "vmem-inputs")
-LOOPED_OPERAND_REUSE = ("ordered", "resident-a")
-QUANTIZED_OPERAND_REUSE = (
-    "ordered", "row-cache", "prefix-cache", "wide-cache", "paired-cache", "panel-cache", "batch-panel-cache",
-)
-
-
 @dataclass(frozen=True)
 class CodegenOptions:
     reduction_unroll: str = "auto"
@@ -58,19 +50,6 @@ class CodegenOptions:
     io_memory_alignment: int | None = None
     io_memory_capacity_base: int | None = None
     io_memory_capacity_bytes: int | None = None
-    native_pipeline: str = "mandatory"
-    adjacent_patterns: str = ""
-    exponent_page_cache: bool = False
-    staging_storage: str = "dram"
-    looped_operand_reuse: str = "ordered"
-    quantized_operand_reuse: str = "ordered"
-    exact_binary_lane_groups: bool = False
-    exact_binary_vector_preflight: bool = False
-    exact_cast_vector_preflight: bool = False
-    static_quantizer_sizing: bool = False
-    exact_binary_routes: bool = False
-    capture_postspill: bool = False
-    kernel_library: bool = False
     application_residency: bool = False
     resident_bindings: dict | None = None
 
@@ -85,23 +64,6 @@ class CodegenOptions:
             raise ValueError("exact float unroll must be Boolean")
         if type(self.application_buffer_views) is not bool:
             raise ValueError("application buffer views must be Boolean")
-        for name, choices in (
-            ("native_pipeline", NATIVE_PIPELINES),
-            ("staging_storage", STAGING_STORAGE),
-            ("looped_operand_reuse", LOOPED_OPERAND_REUSE),
-            ("quantized_operand_reuse", QUANTIZED_OPERAND_REUSE),
-        ):
-            if getattr(self, name) not in choices:
-                raise ValueError(f"{name} must be one of {', '.join(choices)}")
-        if type(self.adjacent_patterns) is not str:
-            raise ValueError("adjacent_patterns must be a string")
-        for name in (
-            "exponent_page_cache", "exact_binary_lane_groups", "exact_binary_vector_preflight",
-            "exact_cast_vector_preflight", "static_quantizer_sizing", "exact_binary_routes",
-            "capture_postspill", "kernel_library",
-        ):
-            if type(getattr(self, name)) is not bool:
-                raise ValueError(f"{name} must be Boolean")
         if self.execution_instruction_limit is not None and (
             type(self.execution_instruction_limit) is not int or self.execution_instruction_limit <= 0
         ):
@@ -137,14 +99,6 @@ class CodegenOptions:
             del record["application_buffer_views"]
         for name in IO_MEMORY_OPTIONS[1:]:
             if record[name] is None:
-                del record[name]
-        for name in (
-            "native_pipeline", "adjacent_patterns", "exponent_page_cache", "staging_storage",
-            "looped_operand_reuse", "quantized_operand_reuse", "exact_binary_lane_groups",
-            "exact_binary_vector_preflight", "exact_cast_vector_preflight", "static_quantizer_sizing",
-            "exact_binary_routes", "capture_postspill", "kernel_library",
-        ):
-            if getattr(self, name) == getattr(type(self), name):
                 del record[name]
         return record
 
@@ -209,8 +163,14 @@ def materialization_cache():
 
 
 def options_from_args(args):
+    factory = getattr(args, "_codegen_options_type", CodegenOptions)
+    prepare = getattr(factory, "prepare_args", None)
+    if prepare is not None:
+        from copy import copy
+        args = copy(args)
+        prepare(args)
     path = getattr(args, "tuning_profile", None)
-    return CodegenOptions(
+    generic = CodegenOptions(
         getattr(args, "reduction_unroll", "auto"),
         getattr(args, "program_size_limit_bytes", None),
         json.loads(Path(path).read_text()) if path else None,
@@ -222,21 +182,17 @@ def options_from_args(args):
         io_memory_alignment=getattr(args, "io_memory_alignment", None),
         io_memory_capacity_base=getattr(args, "io_memory_capacity_base", None),
         io_memory_capacity_bytes=getattr(args, "io_memory_capacity_bytes", None),
-        native_pipeline=getattr(args, "native_pipeline", "mandatory"),
-        adjacent_patterns=getattr(args, "adjacent_patterns", ""),
-        exponent_page_cache=getattr(args, "exponent_page_cache", False),
-        staging_storage=getattr(args, "staging_storage", "dram"),
-        looped_operand_reuse=getattr(args, "looped_operand_reuse", "ordered"),
-        quantized_operand_reuse=getattr(args, "quantized_operand_reuse", "ordered"),
-        exact_binary_lane_groups=getattr(args, "exact_binary_lane_groups", False),
-        exact_binary_vector_preflight=getattr(args, "exact_binary_vector_preflight", False),
-        exact_cast_vector_preflight=getattr(args, "exact_cast_vector_preflight", False),
-        static_quantizer_sizing=getattr(args, "static_quantizer_sizing", False),
-        exact_binary_routes=getattr(args, "exact_binary_routes", False),
-        capture_postspill=getattr(args, "capture_postspill", False),
-        kernel_library=getattr(args, "kernel_library", False),
         application_residency=getattr(args, "application_residency", False),
     )
+    factory = getattr(args, "_codegen_options_type", CodegenOptions)
+    if factory is CodegenOptions:
+        return generic
+    from dataclasses import fields
+    supplied = asdict(generic)
+    supplied.update({field.name: getattr(args, field.name) for field in fields(factory)
+                     if field.name not in supplied and hasattr(args, field.name)})
+    return factory(**supplied)
+
 
 
 def choose_reduction_unroll(key: dict):

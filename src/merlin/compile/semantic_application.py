@@ -509,6 +509,7 @@ def _compile_semantic_application(
         },
     }
     options = current_codegen_options()
+    manifest["codegen_options"] = options.identity_record()
     manifest.update({
         name: getattr(options, name) for name in IO_MEMORY_OPTIONS if getattr(options, name) is not None
     })
@@ -571,6 +572,8 @@ def _verify_semantic_application(
     """Replay source partitioning, region exports, buffer planning and C generation."""
     manifest = json.loads((artifact / "manifest.json").read_bytes())
     options = current_codegen_options()
+    if "codegen_options" in manifest and _json(manifest["codegen_options"]) != _json(options.identity_record()):
+        raise ValueError("application code generation options differ from compilation")
     if (type(manifest.get("application_residency", False)) is not bool
             or manifest.get("application_residency", False) != options.application_residency):
         raise ValueError("application residency differs from compilation")
