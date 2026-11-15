@@ -119,7 +119,7 @@ def main():
         '--engine', 'merlin_native', '--support', 'atlas', '--snapshot', str(args.snapshot),
         '--target-source', str(args.atlas_root), '--compile-inputs', str(args.staged),
         '--application', '--already-quantized', '--application-parameters', 'external',
-        *memory_flags, *codegen_flags, '--mode', 'diagnostic',
+        *memory_flags, *codegen_flags, *(['--application-residency'] if manifest.get('application_residency') else []), '--mode', 'diagnostic',
         '--artifact', str(root / 'application'), '--out', str(root / 'application-verified.json'),
     ], check=True)
     if json.loads((root / 'application/manifest.json').read_text()) != manifest:
@@ -174,6 +174,20 @@ def main():
                   runtime_files={str(p.relative_to(root)): sha256(p.read_bytes()).hexdigest()
                                  for p in (package / 'shim.c', package / 'capsule.so')},
                   independent_comparison='PENDING')
+    if manifest.get('application_residency'):
+        record['application_residency'] = True
+        residency = json.loads((root / 'application/residency.json').read_text())
+        members = ['residency.json', *(row['path'] for row in residency['loads'])]
+        for member in members:
+            path = Path(member)
+            if path.is_absolute() or '..' in path.parts:
+                raise ValueError('unsafe immutable residency member')
+            name = 'application/' + member
+            expected = manifest['stage_artifacts'].get(member)
+            actual = sha256((root / name).read_bytes()).hexdigest()
+            if expected != actual:
+                raise ValueError('immutable residency member differs from verified publication')
+            record['runtime_files'][name] = actual
     if math_selection is not None:
         selection = package / 'execution-host-math.json'
         record['execution_host_math'] = json.loads(selection.read_text())

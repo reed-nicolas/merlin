@@ -90,17 +90,34 @@ class FunctionalModelRuntime(_CycleModelRuntime):
 
     def __init__(self, atlas_root: Path, model_root: Path, images: list[bytes], output: Path,
                  *, memory_bytes=262144, memory_base=None, image_plans=None, max_instructions=1_000_000, trace_payloads=True, compact_dram_prefix=None,
-                 math_proxy=None, memory_factory=None, execution_metadata=None):
+                 math_proxy=None, memory_factory=None, execution_metadata=None,
+                 immutable_loads=(), capacity_base=None, capacity_bytes=None):
         if type(max_instructions) is not int or max_instructions <= 0:
             raise ValueError("max_instructions must be a positive integer")
         if type(trace_payloads) is not bool:
             raise ValueError("trace_payloads must be Boolean")
         if (math_proxy is not None or memory_factory is not None) and not execution_metadata:
             raise ValueError("execution adapters require explicit qualified metadata")
+        immutable_loads = tuple(immutable_loads)
+        self.staging_bytes = memory_bytes
+        self.immutable_loads = []
+        selected_base = 0x90000000 if memory_base is None else memory_base
+        for address, data in immutable_loads:
+            end = address + len(data)
+            if (capacity_base is None or capacity_bytes is None or not data
+                    or not capacity_base <= selected_base <= address < end <= capacity_base + capacity_bytes
+                    or address < selected_base + self.staging_bytes
+                    or any(address < row["address"] + row["bytes"] and row["address"] < end
+                           for row in self.immutable_loads)):
+                raise ValueError("immutable initial load exceeds capacity or overlaps another range")
+            self.immutable_loads.append(dict(address=address, bytes=len(data), sha256=sha256(data).hexdigest()))
+            memory_bytes = max(memory_bytes, end - selected_base)
         self.math_proxy, self.memory_factory = math_proxy, memory_factory
         self.execution_metadata = execution_metadata
         super().__init__(atlas_root, model_root, images, output, memory_bytes=memory_bytes,
                          memory_base=memory_base, image_plans=image_plans)
+        for address, data in immutable_loads:
+            self.memory[address-self.base:address-self.base+len(data)] = data
         self.trace_payloads = trace_payloads
         self.compact_dram_prefix = not trace_payloads if compact_dram_prefix is None else compact_dram_prefix
         if type(self.compact_dram_prefix) is not bool or (trace_payloads and self.compact_dram_prefix):
@@ -141,6 +158,9 @@ class FunctionalModelRuntime(_CycleModelRuntime):
         temporary.replace(self.output/'progress.json')
 
     def _transfer(self, operation, address, value, count):
+        if (operation == "write" and self.immutable_loads
+                and not self.base <= address <= address + count <= self.base + self.staging_bytes):
+            raise AssertionError("per-call host write leaves regional staging")
         if self.trace_payloads:
             super()._transfer(operation,address,value,count)
         else:
@@ -225,6 +245,8 @@ class FunctionalModelRuntime(_CycleModelRuntime):
             total_instructions=sum(item['instructions'] for item in self.launches),
             image_plan_sha256={digest:sha256(json.dumps(plan,sort_keys=True,separators=(',',':')).encode()).hexdigest()
                                for digest,plan in self.image_plans.items()})
+        if self.immutable_loads:
+            record.update(immutable_initial_loads=self.immutable_loads, staging_bytes=self.staging_bytes)
         if self.execution_metadata is not None:
             record.update(backend="npu_model.functional.physical.qualified_native",
                 arithmetic=("original decoded instruction exec with separately qualified native MXU1 arithmetic"

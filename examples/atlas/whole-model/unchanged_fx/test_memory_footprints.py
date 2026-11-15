@@ -272,3 +272,28 @@ class MemoryFootprintTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_immutable_initial_load_and_call_write_separation(tmp_path, monkeypatch):
+    import ctypes as ct
+    import model_runtime
+    import functional_runtime
+    monkeypatch.setattr(model_runtime, 'authenticate_model', lambda _: {})
+    monkeypatch.setattr(functional_runtime, 'authenticate_model', lambda _: {})
+    (tmp_path / 'docs').mkdir()
+    (tmp_path / 'docs/selected-variant-inventory.json').write_text('{}')
+    runtime = functional_runtime.FunctionalModelRuntime(
+        tmp_path, tmp_path, [], tmp_path / 'execution', memory_base=BASE,
+        memory_bytes=64, immutable_loads=[(BASE + 128, b'immutable')],
+        capacity_base=BASE, capacity_bytes=256)
+    assert runtime.memory[128:137] == b'immutable'
+    payload = ct.create_string_buffer(b'changed!!')
+    assert runtime.put(None, BASE, payload, 9) == 0
+    assert runtime.put(None, BASE + 128, payload, 9) == 1
+    assert runtime.memory[128:137] == b'immutable'
+    assert len(runtime.transfers) == 1
+    with pytest.raises(ValueError, match='capacity or overlaps'):
+        functional_runtime.FunctionalModelRuntime(
+            tmp_path, tmp_path, [], tmp_path / 'bad', memory_base=BASE,
+            memory_bytes=64, immutable_loads=[(BASE + 60, b'immutable')],
+            capacity_base=BASE, capacity_bytes=256)
