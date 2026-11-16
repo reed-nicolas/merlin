@@ -1135,11 +1135,15 @@ def _cmd_native_verify(args: argparse.Namespace) -> int:
         try:
             manifest = json.loads((Path(args.artifact) / "manifest.json").read_bytes())
             requested = {name: getattr(args, name, None) for name in APPLICATION_BUDGET_OPTIONS}
-            if not requested["exact_float_unroll"]:
+            explicit = getattr(args, "_explicit_codegen_fields", ())
+            if not requested["exact_float_unroll"] and "exact_float_unroll" not in explicit:
                 requested["exact_float_unroll"] = None
             budgets = application_budget_options(manifest, requested)
             args = copy(args)
-            args.application_residency = manifest.get("application_residency", False)
+            published_residency = manifest.get("application_residency", False)
+            if "application_residency" in explicit and args.application_residency != published_residency:
+                raise ValueError("selected residency differs from compiled application")
+            args.application_residency = published_residency
             for name, value in budgets.items():
                 setattr(args, name, value)
         except (ValueError, OSError, TypeError, KeyError) as error:
