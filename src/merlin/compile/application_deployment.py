@@ -93,8 +93,6 @@ def place(source, adapter, regions, interface, native_root):
         _refuse("deployment_provider_contract", "provider host reservations exceed or differ from declared capacity")
     if host_reservations.get("context", 0) < provider["host_context_reservation_bytes"]:
         _refuse("deployment_provider_contract", "provider context budget exceeds its host reservation")
-    if provider.get("imem_address_convention") != "host_map.imem_address + image.imem_offset_bytes":
-        _refuse("deployment_provider_contract", "unsupported instruction address convention")
     published_regions = provider.get("regions")
     if not isinstance(published_regions, list) or len(published_regions) != len(regions):
         _refuse("deployment_provider_contract", "provider must publish every region launch count")
@@ -271,15 +269,18 @@ def publish(deployment, interface, files, native_root):
         payload = (root / path).read_bytes()
         if not _digest(row.get("sha256")) or sha256(payload).hexdigest() != row["sha256"] or len(payload) != row.get("bytes"):
             _refuse("deployment_provider_contract", "deployment image identity differs")
-        if (row.get("imem_offset_bytes") != 0 or row.get("capacity_bytes") != deployment["host_map"]["imem_bytes"]
-                or row.get("upload_convention") != "counted_ensure_loaded"):
-            _refuse("deployment_provider_contract", "unsupported deployment image upload convention")
-        # The counted loader uploads exactly these words; it appends no epilogue.
-        if len(payload) > row["capacity_bytes"]:
-            _refuse("deployment_imem_overflow", f"instruction image exceeds {row['capacity_bytes']} bytes")
+        offset = _integer(row.get("imem_offset_bytes"), "instruction image offset")
+        capacity = _integer(row.get("capacity_bytes"), "instruction image capacity", positive=True)
+        if capacity > deployment["host_map"]["imem_bytes"]:
+            _refuse("deployment_provider_contract", "instruction image capacity exceeds provider host map")
+        convention = row.get("upload_convention")
+        if not isinstance(convention, str) or not convention.strip():
+            _refuse("deployment_provider_contract", "provider image upload convention must be explicit")
+        if offset + len(payload) > capacity:
+            _refuse("deployment_imem_overflow", f"instruction image exceeds {capacity} bytes at offset {offset}")
         image_library[row["path"]] = {"operation": "install_image", **row, "source_offset": 0,
-                      "address": deployment["host_map"]["imem_address"] + row["imem_offset_bytes"], "owner": "generated_runtime",
-                      "completion": "ensure_loaded_before_start", "final_upload_bytes": len(payload)}
+                      "address": deployment["host_map"]["imem_address"] + offset, "owner": "generated_runtime",
+                      "completion": "image_ready_before_start", "final_upload_bytes": len(payload)}
     runtime_events = []
     for call in deployment["calls"]:
         if call["placement"] == "host":
@@ -317,7 +318,7 @@ def publish(deployment, interface, files, native_root):
         {"operation": "hash", "ranges": deployment["outputs"], "completion": "after_successful_run"},
     ])
     record = {**deployment, "steps": steps, "hash_ranges": deployment["outputs"],
-              "image_library": list(image_library.values()), "reload_policy": "generated counted ensure_loaded",
+              "image_library": list(image_library.values()), "reload_policy": "generated provider runtime",
               "adapter_header": "handoff/deployment_adapter.h", "timeout": "max_polls per synchronous device wait"}
     files["deployment.json"] = (json.dumps(record, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
     header = ("#pragma once\n#include \"" + Path(interface["header"]).name + "\"\n"

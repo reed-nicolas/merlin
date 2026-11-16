@@ -129,7 +129,9 @@ class DeploymentTest(unittest.TestCase):
         self.provider["reservations"][0]["address"] = base
         self.provider["host_map"] = dict(imem_address=0x30000, imem_bytes=64, csr_address=0x50000)
         self.provider["host_context_reservation_bytes"] = 1024
-        self.provider["images"][0]["capacity_bytes"] = 64
+        self.provider["images"][0].update(capacity_bytes=64, imem_offset_bytes=4,
+                                           upload_convention="provider_loader")
+        self.provider["imem_address_convention"] = "provider image offset metadata"
         deployment = self.placement()
         declarations, implementation = adapter_c("app", deployment)
         self.assertIn("merlin_deployment_bind(device_host *,device_io", declarations)
@@ -139,7 +141,8 @@ class DeploymentTest(unittest.TestCase):
         self.assertIn(b"#define MERLIN_DEPLOYMENT_WINDOW_BASE UINT64_C(2415919104)",
                       files["handoff/deployment_adapter.h"])
         record = json.loads(files["deployment.json"])
-        self.assertEqual(record["image_library"][0]["address"], 0x30000)
+        self.assertEqual(record["image_library"][0]["address"], 0x30004)
+        self.assertEqual(record["image_library"][0]["upload_convention"], "provider_loader")
         self.assertEqual(record["steps"][2]["runtime_events"][0]["events"][1]["events"][1]["entry"],
                          "device_start")
 
@@ -218,6 +221,21 @@ int main(void) {{
         self.provider["reservations"][1]["lifetime"]["context_index"] = 0
         with self.assertRaisesRegex(RuntimeError, "reservations overlap within a call"):
             self.placement()
+
+    def test_image_offset_bounds_and_upload_identity(self):
+        deployment = self.placement()
+        image = deployment["provider"]["images"][0]
+        image["imem_offset_bytes"] = -1
+        with self.assertRaisesRegex(RuntimeError, "invalid provider instruction image offset"):
+            publish(deployment, self.interface, {}, self.root)
+        image["imem_offset_bytes"] = 131069
+        with self.assertRaisesRegex(RuntimeError, "deployment_imem_overflow"):
+            publish(deployment, self.interface, {}, self.root)
+        image["imem_offset_bytes"] = 131068
+        publish(deployment, self.interface, {}, self.root)
+        image["upload_convention"] = ""
+        with self.assertRaisesRegex(RuntimeError, "upload convention must be explicit"):
+            publish(deployment, self.interface, {}, self.root)
 
     def test_counted_upload_accepts_exact_capacity_and_refuses_one_word_over(self):
         for size in (131072, 131076):
