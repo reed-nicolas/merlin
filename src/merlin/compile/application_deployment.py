@@ -337,6 +337,7 @@ def publish(deployment, interface, files, native_root):
               "image_library": list(image_library.values()), "reload_policy": deployment["provider"]["runtime"]["reload_policy"],
               "adapter_header": "handoff/deployment_adapter.h", "timeout": "max_polls per synchronous device wait"}
     if deployment.get("paging"):
+        files["handoff/refill-mailbox.bin"] = bytes(deployment["paging"]["mailbox"]["bytes"])
         record = _paged_record(record)
     files["deployment.json"] = (json.dumps(record, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
     header = ("#pragma once\n#include \"" + Path(interface["header"]).name + "\"\n"
@@ -432,6 +433,10 @@ def _paged_record(record):
     failure = "FAIL on wrong request id, timeout, or readback mismatch; no retry"
     steps = [s for s in record["steps"] if s["operation"] == "window_preload"]
     steps += [dict(operation="window_preload", **r) for r in paging["small_parameters"]]
+    mailbox = paging["mailbox"]
+    steps += [dict(operation="window_preload", path="handoff/refill-mailbox.bin", source_offset=0,
+                   address=mailbox["address"], bytes=mailbox["bytes"], alignment=mailbox["alignment"],
+                   sha256=sha256(bytes(mailbox["bytes"])).hexdigest())]
     segments = paging["segments"]
     invoke = next(s for s in record["steps"] if s["operation"] == "invoke")
     steps += [dict(operation="load_segment", **segments[0]), dict(operation="bind", entry="sp5_bind"),
