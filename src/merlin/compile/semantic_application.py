@@ -30,6 +30,7 @@ from merlin.xdsl_dialects.lowering.global_plan_emission import dispatch_digest
 
 from .application_residency import residency_scope, publication as residency_publication, validate_region_bindings
 from .application_c import emit_application_c
+from .application_deployment import adapter_c, place, publish
 from .application_plan import application_plan
 from .application_views import IMPLEMENTATION as VIEW_IMPLEMENTATION, checked_view_aliases, compile_view
 from .c_sources import c_source_pair
@@ -213,8 +214,6 @@ def _render(
                 link_sources.append(filename)
     region_link_sources = tuple(link_sources)
     combined_name = name + "_combined"
-    from .application_deployment import adapter_c, place, publish
-
     deployment = place(source, adapter, summaries, interface, native_root)
     binding_factory = getattr(adapter, "application_binding", None)
     binding = binding_factory(name, summaries, interface) if binding_factory else None

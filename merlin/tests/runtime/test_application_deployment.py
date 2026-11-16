@@ -1,6 +1,7 @@
 """Exercise publication bounds, image integrity, and the generated fixed ABI."""
 
 from copy import deepcopy
+from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -10,9 +11,18 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from merlin.compile.application_deployment import WINDOW_ADDRESS, WINDOW_BYTES, adapter_c, place, publish
+from merlin.compile.application_deployment import adapter_c, place, publish, selected
 from merlin.semantic_compiler.codegen import CodegenOptions, codegen_options
 from merlin.semantic_compiler.model import KernelRequest, SemanticNode, TensorType
+
+
+WINDOW_ADDRESS = 0x200C0000
+WINDOW_BYTES = 786432
+
+
+@dataclass(frozen=True)
+class DeploymentOptions(CodegenOptions):
+    application_deployment: str | None = None
 
 
 class DeploymentTest(unittest.TestCase):
@@ -28,7 +38,15 @@ class DeploymentTest(unittest.TestCase):
                               header="combined/app.h", platform_binding=dict(completion="synchronous", invoke="app_run"))
         payload = b"\x01\0\0\0"
         (self.root / "program.bin").write_bytes(payload)
-        self.provider = dict(schema="atlas.provider_deployment.v1",
+        self.provider = dict(schema="merlin.provider_deployment.v1",
+            host_map=dict(imem_address=0x20000, imem_bytes=131072, csr_address=0x40000),
+            host_allocation=dict(measurement="declared_reservations", address=0x08000000, bytes=65536,
+                                 reserved_bytes=65536, declared_reservations=[dict(name="context", bytes=4096),
+                                                                           dict(name="other", bytes=61440)]),
+            host_context_reservation_bytes=4096, allocation_alignment=64, max_polls=10000000,
+            imem_address_convention="host_map.imem_address + image.imem_offset_bytes",
+            runtime=dict(host_type="device_host", io_type="device_io", start="device_start", wait="device_wait"),
+            regions=[dict(context_index=0, placement="accelerator", launches_per_invocation=1)],
             window=dict(address=WINDOW_ADDRESS, bytes=WINDOW_BYTES),
             reservations=[dict(name="device_frame", address=WINDOW_ADDRESS, bytes=4096,
                                role="device_scratch", lifetime="through_run_completion", promotion_receipts=[])],
@@ -38,7 +56,7 @@ class DeploymentTest(unittest.TestCase):
         self.adapter = SimpleNamespace(deployment_requirements=lambda *_: deepcopy(self.provider))
         self.regions = [dict(id="r", context_index=0, placement="accelerator", native_programs=["."],
                              description=dict(launches_per_invocation=1))]
-        self.options = CodegenOptions(io_memory_base=WINDOW_ADDRESS, io_memory_bytes=WINDOW_BYTES,
+        self.options = DeploymentOptions(application_deployment="onchip", io_memory_base=WINDOW_ADDRESS, io_memory_bytes=WINDOW_BYTES,
             io_memory_capacity_base=WINDOW_ADDRESS, io_memory_capacity_bytes=WINDOW_BYTES)
 
     def placement(self):
@@ -50,7 +68,8 @@ class DeploymentTest(unittest.TestCase):
         before = deepcopy(self.interface)
         self.assertIsNone(place(self.source, self.adapter, [], self.interface, self.root))
         self.assertEqual(self.interface, before)
-        with codegen_options(CodegenOptions(io_memory_base=WINDOW_ADDRESS, io_memory_bytes=WINDOW_BYTES)):
+        with codegen_options(replace(self.options, application_deployment=None)):
+            self.assertFalse(selected())
             self.assertIsNone(place(self.source, self.adapter, [], self.interface, self.root))
 
     def test_disjoint_arrays_public_ranges_and_hash_roles(self):
@@ -64,7 +83,7 @@ class DeploymentTest(unittest.TestCase):
             cursor = row["address"] + row["bytes"]
         self.assertEqual([row["name"] for row in allocations[:3]], ["device_scratch", "conversion_scratch", "workspace"])
         self.assertEqual(deployment["outputs"][0]["role"], "persistent_state_update")
-        self.assertEqual(sum(row["bytes"] for row in deployment["host_allocation"]["reservations"]), 65536)
+        self.assertEqual(sum(row["bytes"] for row in deployment["host_allocation"]["declared_reservations"]), 65536)
         files = {}
         publish(deployment, self.interface, files, self.root)
         record = json.loads(files["deployment.json"])
@@ -74,9 +93,55 @@ class DeploymentTest(unittest.TestCase):
         self.assertEqual(record["steps"][2]["runtime_events"][0]["events"][0]["address"], 0x20000)
         self.assertEqual(record["hash_ranges"], deployment["outputs"])
         declarations, implementation = adapter_c("app", deployment)
-        self.assertIn("int sp5_bind(atlas_host *,atlas_tile_memory_io,size_t max_polls)", declarations)
-        self.assertIn("sizeof(sp5_context)<=4096u", implementation)
+        self.assertIn("int merlin_deployment_bind(device_host *,device_io,size_t max_polls)", declarations)
+        self.assertIn("sizeof(merlin_deployment_context)<=4096u", implementation)
         self.assertIn("persistent_state_update", implementation)
+
+    def test_explicit_selection_and_geometry_mismatch_refuse(self):
+        with codegen_options(self.options):
+            self.assertTrue(selected())
+        self.options = replace(self.options, io_memory_base=WINDOW_ADDRESS + 64)
+        with self.assertRaisesRegex(RuntimeError, "deployment_geometry_mismatch"):
+            self.placement()
+        self.adapter.deployment_requirements = lambda *_: None
+        with self.assertRaisesRegex(RuntimeError, "deployment_geometry_mismatch"):
+            self.placement()
+
+    def test_provider_must_publish_region_launch_counts(self):
+        del self.provider["regions"][0]["launches_per_invocation"]
+        with self.assertRaisesRegex(RuntimeError, "invalid provider region launch count"):
+            self.placement()
+
+    def test_provider_host_capacity_and_context_budget_refuse(self):
+        self.provider["host_allocation"]["bytes"] = 65535
+        with self.assertRaisesRegex(RuntimeError, "host reservations exceed or differ"):
+            self.placement()
+        self.provider["host_allocation"]["bytes"] = 65536
+        self.provider["host_context_reservation_bytes"] = 4097
+        with self.assertRaisesRegex(RuntimeError, "context budget exceeds"):
+            self.placement()
+
+    def test_provider_geometry_drives_generic_adapter(self):
+        base, size = 0x90000000, 65536
+        self.options = replace(self.options, io_memory_base=base, io_memory_bytes=size,
+                               io_memory_capacity_base=base, io_memory_capacity_bytes=size)
+        self.provider["window"] = dict(address=base, bytes=size)
+        self.provider["reservations"][0]["address"] = base
+        self.provider["host_map"] = dict(imem_address=0x30000, imem_bytes=64, csr_address=0x50000)
+        self.provider["host_context_reservation_bytes"] = 1024
+        self.provider["images"][0]["capacity_bytes"] = 64
+        deployment = self.placement()
+        declarations, implementation = adapter_c("app", deployment)
+        self.assertIn("merlin_deployment_bind(device_host *,device_io", declarations)
+        self.assertIn("sizeof(merlin_deployment_context)<=1024u", implementation)
+        files = {}
+        publish(deployment, self.interface, files, self.root)
+        self.assertIn(b"#define MERLIN_DEPLOYMENT_WINDOW_BASE UINT64_C(2415919104)",
+                      files["handoff/deployment_adapter.h"])
+        record = json.loads(files["deployment.json"])
+        self.assertEqual(record["image_library"][0]["address"], 0x30000)
+        self.assertEqual(record["steps"][2]["runtime_events"][0]["events"][1]["events"][1]["entry"],
+                         "device_start")
 
     def test_overflow_names_required_window_and_excess(self):
         self.provider["raw_scratch_bytes"] = WINDOW_BYTES
@@ -92,10 +157,10 @@ class DeploymentTest(unittest.TestCase):
         code = f"""
 #include <stdint.h>
 #include <stddef.h>
-typedef struct {{ int initialized; }} atlas_host;
-typedef struct {{ int unused; }} atlas_tile_memory_io;
+typedef struct {{ int initialized; }} device_host;
+typedef struct {{ int unused; }} device_io;
 typedef struct {{ int initialized; }} app_context;
-static int app_bind(app_context *ctx,atlas_host *host,atlas_tile_memory_io io,size_t polls) {{
+static int app_bind(app_context *ctx,device_host *host,device_io io,size_t polls) {{
   (void)io; ctx->initialized=host->initialized && polls; return !ctx->initialized;
 }}
 static int app_run(app_context *ctx,const void *const *inputs,void *const *outputs) {{
@@ -105,10 +170,10 @@ static int app_run(app_context *ctx,const void *const *inputs,void *const *outpu
 {declarations}
 {implementation}
 int main(void) {{
-  atlas_host host={{1}};
-  atlas_tile_memory_io io={{0}};
-  return sp5_bind(&host,io,100u) || sp5_run() || sp5_hash_count!=1u ||
-         sp5_hash_ranges[0].address!={expected_output}u || sp5_hash_ranges[0].bytes!=16u;
+  device_host host={{1}};
+  device_io io={{0}};
+  return merlin_deployment_bind(&host,io,100u) || merlin_deployment_run() || merlin_deployment_hash_count!=1u ||
+         merlin_deployment_hash_ranges[0].address!={expected_output}u || merlin_deployment_hash_ranges[0].bytes!=16u;
 }}
 """
         source = self.root / "adapter.c"
@@ -140,6 +205,7 @@ int main(void) {{
                                         "sha256": sha256(payload).hexdigest()})
         self.regions.append(dict(id="r2", context_index=1, placement="accelerator", native_programs=["second"],
                                  description=dict(streaming=dict(launch_count=3))))
+        self.provider["regions"].append(dict(context_index=1, placement="accelerator", launches_per_invocation=3))
         deployment = self.placement()
         self.assertEqual(deployment["allocations"][0]["address"], WINDOW_ADDRESS + 4096)
         files = {}
