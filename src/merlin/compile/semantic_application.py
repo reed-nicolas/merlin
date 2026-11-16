@@ -213,10 +213,20 @@ def _render(
                 link_sources.append(filename)
     region_link_sources = tuple(link_sources)
     combined_name = name + "_combined"
+    from .application_deployment import adapter_c, place, publish
+
+    deployment = place(source, adapter, summaries, interface, native_root)
     binding_factory = getattr(adapter, "application_binding", None)
     binding = binding_factory(name, summaries, interface) if binding_factory else None
     if binding is not None and not isinstance(binding, ApplicationCBinding):
         raise TypeError("application binding must contain C declarations, implementation and interface")
+    if deployment is not None:
+        if binding is None:
+            raise NativeCompilationError(
+                "unsupported_semantics", "deployment_provider_contract: on-chip deployment requires a C binding")
+        declarations, implementation = adapter_c(name, deployment)
+        binding = ApplicationCBinding(binding.declarations + declarations, binding.implementation + implementation,
+                                      binding.interface)
     combined = c_source_pair(
         combined_name,
         public_headers={
@@ -291,6 +301,8 @@ original-model accuracy or execution on an integrated SoC or FPGA.
         from .application_handoff import application_handoff
 
         files.update(application_handoff(source, interface, summaries, files, native_root))
+    if deployment is not None:
+        publish(deployment, interface, files, native_root)
     return outlined, summaries, interface, link_sources, files
 
 
