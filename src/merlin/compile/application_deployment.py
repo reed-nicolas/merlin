@@ -37,7 +37,7 @@ def _digest(value):
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
-def place(source, adapter, regions, interface, native_root):
+def place(source, adapter, regions, interface, native_root, parameters_object=None):
     """Choose bindings within the provider-published on-chip map."""
     if not selected():
         return None
@@ -177,14 +177,23 @@ def place(source, adapter, regions, interface, native_root):
     outputs = [boundary(key, i, "output") for i, key in enumerate(interface["outputs"])]
     parameters = interface.get("model_parameters")
     parameter = None
+    paging = None
     if parameters:
         parameter = {**allocate("parameters", parameters["payload_bytes"], "immutable_parameters"),
                      "path": "handoff/parameters.bin", "sha256": parameters["payload_sha256"]}
     required = cursor - window_address
+    if required > window_bytes and parameters and provider.get("refill_groups"):
+        allocations.pop()
+        names.remove("parameters")
+        cursor = parameter["address"]
+        paging, parameter = _page(provider, parameters, regions, allocate, parameters_object)
+        required = cursor - window_address
     if required > window_bytes:
         _refuse("deployment_window_overflow",
                 f"disjoint on-chip deployment requires {required} bytes; window {window_bytes} bytes; "
                 f"overflow {required - window_bytes} bytes")
+    if paging is None:
+        provider.pop("refill_groups", None)
     deployment = {
         "schema": "merlin.onchip_deployment.v1", "request_digest": source.digest(),
         "target_identity": source.target_identity, "window": provider["window"], "provider": provider,
@@ -196,6 +205,8 @@ def place(source, adapter, regions, interface, native_root):
         "polling_bound": "host polls per generated device wait; independent of functional-model instruction limit",
         "host_allocation": provider["host_allocation"],
     }
+    if paging is not None:
+        deployment.update(schema="merlin.onchip_deployment.v2", paging=paging, transport_timeout_seconds=60)
     interface["deployment"] = deployment
     return deployment
 
@@ -238,6 +249,9 @@ int merlin_deployment_run(void) {{
   return {name}_run(&merlin_deployment_context,inputs,outputs);
 }}
 """
+    if deployment.get("paging"):
+        declarations += "int sp5_kernel_status(void);\n"
+        implementation += "int sp5_kernel_status(void) { return sp5_context.state.kernel_status; }\n"
     return declarations, implementation
 
 
@@ -251,7 +265,7 @@ def publish(deployment, interface, files, native_root):
                       "source_offset": 0, "address": row["address"], "bytes": row["bytes"],
                       "alignment": row["alignment"], "role": row["role"], "lifetime": "through_run_completion",
                       "identity": "required_runtime_input", "completion": "before_bind"})
-    if deployment["parameters"]:
+    if deployment["parameters"] and not deployment.get("paging"):
         row = deployment["parameters"]
         steps.append({"operation": "window_preload", **row, "source_offset": 0,
                       "lifetime": "immutable_through_completion_and_recovery", "completion": "before_bind"})
@@ -322,6 +336,8 @@ def publish(deployment, interface, files, native_root):
     record = {**deployment, "steps": steps, "hash_ranges": deployment["outputs"],
               "image_library": list(image_library.values()), "reload_policy": deployment["provider"]["runtime"]["reload_policy"],
               "adapter_header": "handoff/deployment_adapter.h", "timeout": "max_polls per synchronous device wait"}
+    if deployment.get("paging"):
+        record = _paged_record(record)
     files["deployment.json"] = (json.dumps(record, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
     header = ("#pragma once\n#include \"" + Path(interface["header"]).name + "\"\n"
               f"#define MERLIN_DEPLOYMENT_WINDOW_BASE UINT64_C({deployment['window']['address']})\n"
@@ -330,5 +346,141 @@ def publish(deployment, interface, files, native_root):
               f"#define MERLIN_DEPLOYMENT_CSR_BASE UINT64_C({deployment['host_map']['csr_address']})\n"
               f"#define MERLIN_DEPLOYMENT_IMEM_BYTES {deployment['host_map']['imem_bytes']}u\n"
               f"#define MERLIN_DEPLOYMENT_MAX_POLLS {deployment['max_polls']}u\n").encode()
+    if deployment.get("paging"):
+        box = deployment["paging"]["mailbox"]
+        header += (f"#define SP6_REQUEST UINT64_C({box['address']})\n"
+                   f"#define SP6_ACK UINT64_C({box['address'] + 4})\n").encode()
     files["c-package/combined/deployment_adapter.h"] = header
     files["handoff/deployment_adapter.h"] = header
+
+
+def _partition(rows, size):
+    cursor = 0
+    for row in rows:
+        if (type(row.get("source_offset")) is not int or row["source_offset"] != cursor
+                or type(row.get("bytes")) is not int or row["bytes"] <= 0):
+            _refuse("deployment_partition", "operand segments must partition dense bytes in order")
+        cursor += row["bytes"]
+    if cursor != size:
+        _refuse("deployment_partition", "operand segments leave a gap or overlap")
+
+
+def _page(provider, parameters, regions, allocate, parameter_object):
+    facts = provider["refill_groups"]
+    if len(facts) != 1 or len(regions) != 1 or parameter_object is None:
+        _refuse("deployment_paging_contract", "paging requires one operand in one device call")
+    fact = facts[0]
+    ports = parameters["ports"]
+    matches = [p for p in ports if p["node_id"] == fact["operand"]]
+    if len(matches) != 1:
+        _refuse("deployment_paging_contract", "paged operand is not an immutable parameter")
+    paged = matches[0]
+    groups = fact["groups"]
+    _partition(groups, paged["nbytes"])
+    small, bindings = [], {}
+    for port in ports:
+        if port is not paged:
+            row = allocate("parameter:" + port["node_id"], port["nbytes"], "immutable_parameters")
+            small.append({**row, "source_offset": port["offset"], "path": parameters["path"]})
+            bindings[port["node_id"]] = row["address"]
+    mailbox = allocate("mailbox", 8, "refill_mailbox")
+    slot_address = (mailbox["address"] + mailbox["bytes"] + 63) // 64 * 64
+    available = provider["window"]["address"] + provider["window"]["bytes"] - slot_address
+    largest = max(g["bytes"] for g in groups)
+    if available < 2 * largest:
+        _refuse("deployment_slot_overflow", "parameter slot holds fewer than two refill groups")
+    slot = allocate("parameter_slot", available // largest * largest, "paged_parameter", 64)
+    bindings[paged["node_id"]] = slot["address"]
+    segments = []
+    for i, group in enumerate(groups):
+        if (not segments or segments[-1]["bytes"] + group["bytes"] > slot["bytes"]):
+            segments.append(dict(id=len(segments), operand_offset=group["source_offset"], bytes=0,
+                                 first_group=i, group_count=0, first_launch=group["first_launch"], launch_count=0))
+        segment = segments[-1]
+        segment["bytes"] += group["bytes"]
+        segment["group_count"] += 1
+        segment["launch_count"] += group["launch_count"]
+    _partition([dict(source_offset=s["operand_offset"], bytes=s["bytes"]) for s in segments], paged["nbytes"])
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        blob = Path(tmp) / "parameters.bin"
+        parameter_object.write_payload(blob)
+        payload = blob.read_bytes()
+    for row in [*small, *segments]:
+        offset = row.get("source_offset", paged["offset"] + row.get("operand_offset", 0))
+        row.update(path=parameters["path"], source_offset=offset, sha256=sha256(payload[offset:offset+row["bytes"]]).hexdigest(),
+                   destination=slot["address"] if "id" in row else row["address"], alignment=64)
+    base = min(bindings.values())
+    physical = slot["address"] + slot["bytes"] - base
+    parameter = dict(name="parameters", address=base, bytes=physical, role="paged_parameters",
+                     path=parameters["path"], sha256=parameters["payload_sha256"])
+    return dict(context_index=fact["context_index"], operand=paged["node_id"],
+                region_operand=fact.get("region_operand", fact["operand"]), slot=slot, mailbox=mailbox,
+                segments=segments, small_parameters=small, bindings=bindings,
+                source_parameters=parameters, physical_parameter_bytes=physical,
+                validation="per-segment runtime FP8 validation before use; later invalid segments return status 2 after earlier starts, with output unchanged",
+                integrity="per-segment driver readback SHA256; no whole-blob bind hash"), parameter
+
+
+def _paged_record(record):
+    paging = record["paging"]
+    protected = [r for r in record["allocations"] if r["role"] != "paged_parameter"]
+    protected += record["provider"]["reservations"]
+    protected += record["outputs"] + record["inputs"]
+    for segment in paging["segments"]:
+        segment["must_not_touch"] = protected
+    failure = "FAIL on wrong request id, timeout, or readback mismatch; no retry"
+    steps = [s for s in record["steps"] if s["operation"] == "window_preload"]
+    steps += [dict(operation="window_preload", **r) for r in paging["small_parameters"]]
+    segments = paging["segments"]
+    invoke = next(s for s in record["steps"] if s["operation"] == "invoke")
+    steps += [dict(operation="load_segment", **segments[0]), dict(operation="bind", entry="sp5_bind"),
+              {**invoke, "completion": "await_completion"}]
+    for segment in segments[1:]:
+        steps += [dict(operation="await_request", step_id=segment["id"]),
+                  dict(operation="load_segment", **segment),
+                  dict(operation="acknowledge", step_id=segment["id"])]
+    steps += [dict(operation="await_completion"), dict(operation="hash", ranges=record["hash_ranges"])]
+    for step in steps:
+        step["failure"] = failure
+    return {**record, "steps": steps}
+
+
+class PagedParameters:
+    """Bind the physical slot and whole small operands, without a fictitious blob scan."""
+    def __init__(self, original, deployment):
+        from dataclasses import replace
+        self.original, self.paging = original, deployment["paging"]
+        self.base = deployment["parameters"]["address"]
+        self.payload_bytes = deployment["parameters"]["bytes"]
+        self.node_ids = original.node_ids
+        self.entries = tuple(replace(e, offset=self.paging["bindings"][k] - self.base)
+                             for k, e in zip(original.node_ids, original.entries, strict=True))
+
+    def check(self, source):
+        self.original.check(source)
+
+    def record(self):
+        return dict(schema="merlin.paged_application_parameters.v1", payload_bytes=self.payload_bytes,
+                    source_blob=self.original.record(), physical_bindings=self.paging["bindings"],
+                    validation=self.paging["integrity"])
+
+    def emit_binding(self, name):
+        declarations, _, headers = self.original.emit_binding(name)
+        declarations = f"""
+typedef struct {{ const unsigned char *data; size_t bytes; uintptr_t seal; }} {name}_parameters;
+#define {name.upper()}_PARAMETER_BYTES {self.payload_bytes}u
+#define {name.upper()}_PARAMETER_ALIGNMENT 4u
+int {name}_parameters_bind({name}_parameters *,const void *,size_t);
+"""
+        implementation = f"""
+static int {name}_parameters_ready(const {name}_parameters *p) {{
+  return {name}_valid(p,sizeof(*p)) && p->data==(const unsigned char *)(uintptr_t){self.base}u && p->bytes=={self.payload_bytes}u && p->seal==1u;
+}}
+int {name}_parameters_bind({name}_parameters *p,const void *data,size_t bytes) {{
+  (void)merlin_output_sha256;
+  if (!{name}_valid(p,sizeof(*p)) || {name}_overlap(p,sizeof(*p),data,bytes) || data!=(const void *)(uintptr_t){self.base}u || bytes!={self.payload_bytes}u) return -1;
+  *p=({name}_parameters){{data,bytes,1u}}; return 0;
+}}
+"""
+        return declarations, implementation, headers

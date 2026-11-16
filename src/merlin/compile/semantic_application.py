@@ -75,7 +75,7 @@ def _sha(data):
 
 def _render(
     source, adapter, name, capacity, compiled, *, memory_plan=None, state=None, parameters=None, native_root=None,
-    emit_region_loop=False,
+    emit_region_loop=False, target_source=None,
 ):
     if type(emit_region_loop) is not bool:
         raise TypeError("region loop emission needs an explicit Boolean")
@@ -214,7 +214,24 @@ def _render(
                 link_sources.append(filename)
     region_link_sources = tuple(link_sources)
     combined_name = name + "_combined"
-    deployment = place(source, adapter, summaries, interface, native_root)
+    deployment = place(source, adapter, summaries, interface, native_root, parameters)
+    if deployment is not None and deployment.get("paging"):
+        from .application_deployment import PagedParameters
+        paging = deployment["paging"]
+        i = paging["context_index"]
+        label = f"region_{i:03d}"
+        record, region_files = adapter.deployment_region_package(
+            outlined.regions[i][1], Path(native_root) / "segments" / label, label, target_source, paging)
+        for member, data in region_files.items():
+            files[f"c-package/regions/{label}/{member}"] = data
+        summaries[i]["description"] = record
+        interface, interface_files = emit_application_c(
+            source, driver, driver_files, name, capacity=capacity,
+            parameters=PagedParameters(parameters, deployment))
+        interface["deployment"] = deployment
+        for filename, text in interface_files.items():
+            files["c-package/" + filename] = text.encode()
+
     binding_factory = getattr(adapter, "application_binding", None)
     binding = binding_factory(name, summaries, interface) if binding_factory else None
     if binding is not None and not isinstance(binding, ApplicationCBinding):
@@ -469,7 +486,7 @@ def _compile_semantic_application(
     validate_region_bindings(outlined.regions, lowered)
     _, summaries, interface, links, files = _render(
         source, adapter, name, capacity, lowered, state=state, parameters=parameters, native_root=destination,
-        emit_region_loop=emit_region_loop,
+        emit_region_loop=emit_region_loop, target_source=target_source,
     )
     if parameters is not None:
         (destination / "handoff").mkdir(exist_ok=True)
@@ -658,7 +675,7 @@ def _verify_semantic_application(
         state=state,
         parameters=parameters,
         native_root=artifact,
-        emit_region_loop=emit_region_loop,
+        emit_region_loop=emit_region_loop, target_source=target_source,
     )
     if (
         manifest["regions"] != summaries
