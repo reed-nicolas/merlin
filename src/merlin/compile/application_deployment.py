@@ -72,6 +72,9 @@ def place(source, adapter, regions, interface, native_root):
             not isinstance(runtime.get(key), str) or re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", runtime[key]) is None
             for key in ("host_type", "io_type", "start", "wait")):
         _refuse("deployment_provider_contract", "provider runtime identifiers must be explicit")
+    for key in ("image_completion", "reload_policy"):
+        if not isinstance(runtime.get(key), str) or not runtime[key].strip():
+            _refuse("deployment_provider_contract", "provider runtime " + key + " must be explicit")
     for key in ("host_context_reservation_bytes", "max_polls", "allocation_alignment"):
         _integer(provider.get(key), key, positive=True)
     host_allocation = provider.get("host_allocation")
@@ -280,7 +283,7 @@ def publish(deployment, interface, files, native_root):
             _refuse("deployment_imem_overflow", f"instruction image exceeds {capacity} bytes at offset {offset}")
         image_library[row["path"]] = {"operation": "install_image", **row, "source_offset": 0,
                       "address": deployment["host_map"]["imem_address"] + offset, "owner": "generated_runtime",
-                      "completion": "image_ready_before_start", "final_upload_bytes": len(payload)}
+                      "completion": deployment["provider"]["runtime"]["image_completion"], "final_upload_bytes": len(payload)}
     runtime_events = []
     for call in deployment["calls"]:
         if call["placement"] == "host":
@@ -318,7 +321,7 @@ def publish(deployment, interface, files, native_root):
         {"operation": "hash", "ranges": deployment["outputs"], "completion": "after_successful_run"},
     ])
     record = {**deployment, "steps": steps, "hash_ranges": deployment["outputs"],
-              "image_library": list(image_library.values()), "reload_policy": "generated provider runtime",
+              "image_library": list(image_library.values()), "reload_policy": deployment["provider"]["runtime"]["reload_policy"],
               "adapter_header": "handoff/deployment_adapter.h", "timeout": "max_polls per synchronous device wait"}
     files["deployment.json"] = (json.dumps(record, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
     header = ("#pragma once\n#include \"" + Path(interface["header"]).name + "\"\n"

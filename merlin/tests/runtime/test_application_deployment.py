@@ -45,7 +45,8 @@ class DeploymentTest(unittest.TestCase):
                                                                            dict(name="other", bytes=61440)]),
             host_context_reservation_bytes=4096, allocation_alignment=64, max_polls=10000000,
             imem_address_convention="host_map.imem_address + image.imem_offset_bytes",
-            runtime=dict(host_type="device_host", io_type="device_io", start="device_start", wait="device_wait"),
+            runtime=dict(host_type="device_host", io_type="device_io", start="device_start", wait="device_wait",
+                         image_completion="provider_image_ready", reload_policy="provider_image_reuse"),
             regions=[dict(context_index=0, placement="accelerator", launches_per_invocation=1)],
             window=dict(address=WINDOW_ADDRESS, bytes=WINDOW_BYTES),
             reservations=[dict(name="device_frame", address=WINDOW_ADDRESS, bytes=4096,
@@ -92,6 +93,8 @@ class DeploymentTest(unittest.TestCase):
         self.assertEqual(record["steps"][2]["runtime_events"][0]["events"][0]["final_upload_bytes"], 4)
         self.assertEqual(record["steps"][2]["runtime_events"][0]["events"][0]["address"], 0x20000)
         self.assertEqual(record["hash_ranges"], deployment["outputs"])
+        self.assertEqual(record["image_library"][0]["completion"], "provider_image_ready")
+        self.assertEqual(record["reload_policy"], "provider_image_reuse")
         declarations, implementation = adapter_c("app", deployment)
         self.assertIn("int merlin_deployment_bind(device_host *,device_io,size_t max_polls)", declarations)
         self.assertIn("sizeof(merlin_deployment_context)<=4096u", implementation)
@@ -120,6 +123,14 @@ class DeploymentTest(unittest.TestCase):
         self.provider["host_context_reservation_bytes"] = 4097
         with self.assertRaisesRegex(RuntimeError, "context budget exceeds"):
             self.placement()
+
+    def test_provider_runtime_image_policies_must_be_explicit(self):
+        for key in ("image_completion", "reload_policy"):
+            with self.subTest(key=key):
+                value = self.provider["runtime"].pop(key)
+                with self.assertRaisesRegex(RuntimeError, "provider runtime " + key + " must be explicit"):
+                    self.placement()
+                self.provider["runtime"][key] = value
 
     def test_provider_geometry_drives_generic_adapter(self):
         base, size = 0x90000000, 65536
