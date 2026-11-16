@@ -462,7 +462,8 @@ class PagedParameters:
 
     def record(self):
         return dict(schema="merlin.paged_application_parameters.v1", payload_bytes=self.payload_bytes,
-                    source_blob=self.original.record(), physical_bindings=self.paging["bindings"],
+                    source_blob=self.original.record(), payload_sha256=self.original.payload_sha256,
+                    physical_bindings=self.paging["bindings"],
                     validation=self.paging["integrity"])
 
     def emit_binding(self, name):
