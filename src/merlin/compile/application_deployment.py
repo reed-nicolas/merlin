@@ -385,6 +385,8 @@ def _page(provider, parameters, regions, allocate, parameter_object):
             small.append({**row, "source_offset": port["offset"], "path": parameters["path"]})
             bindings[port["node_id"]] = row["address"]
     mailbox = allocate("mailbox", 8, "refill_mailbox")
+    mailbox.update(request_address=mailbox["address"], acknowledge_address=mailbox["address"] + 4,
+                   word_bytes=4, byte_order="little")
     slot_address = (mailbox["address"] + mailbox["bytes"] + 63) // 64 * 64
     available = provider["window"]["address"] + provider["window"]["bytes"] - slot_address
     largest = max(g["bytes"] for g in groups)
