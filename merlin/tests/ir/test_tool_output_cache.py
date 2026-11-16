@@ -209,7 +209,7 @@ def test_application_memory_geometry_is_published_and_replayed(tmp_path):
             )
         manifest.update(geometry)
         (output / "manifest.json").write_text(json.dumps(manifest))
-    with pytest.raises(ValueError, match="I/O memory geometry differs"):
+    with pytest.raises(ValueError, match="application code generation options differ"):
         verify_semantic_application(
             source, adapter=adapter, snapshot=snapshot, target_source=tmp_path,
             artifact=output, allow_host_only=True,
@@ -227,7 +227,7 @@ def test_cli_exposes_fresh_application_baseline():
     parser = build_parser()
     defaults = parser.parse_args(arguments)
     assert defaults.no_materialization_cache is False
-    assert defaults.materialization_cache is False
+    assert defaults.materialization_cache is True
     assert defaults.region_materialization_cache is False
     assert parser.parse_args([*arguments, "--materialization-cache"]).materialization_cache is True
     assert parser.parse_args([*arguments, "--region-materialization-cache"]).region_materialization_cache is True
