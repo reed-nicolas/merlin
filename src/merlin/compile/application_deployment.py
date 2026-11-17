@@ -7,7 +7,6 @@ them without aliasing; execution and image changes stay in generated runtime C.
 from __future__ import annotations
 
 import json
-import re
 from hashlib import sha256
 from math import prod
 from pathlib import Path
@@ -69,7 +68,7 @@ def place(source, adapter, regions, interface, native_root):
         _integer(host_map.get(key), key, positive=key == "imem_bytes")
     runtime = provider.get("runtime")
     if not isinstance(runtime, dict) or any(
-            not isinstance(runtime.get(key), str) or re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", runtime[key]) is None
+            not isinstance(runtime.get(key), str) or not runtime[key].isascii() or not runtime[key].isidentifier()
             for key in ("host_type", "io_type", "start", "wait")):
         _refuse("deployment_provider_contract", "provider runtime identifiers must be explicit")
     for key in ("image_completion", "reload_policy"):
