@@ -4,7 +4,6 @@ import pytest
 from merlin.compile.application_deployment import _partition, handoff_interface, PagedParameters
 from merlin.semantic_compiler.target_binding import NativeCompilationError
 
-
 def test_partition_accepts_tail_and_rejects_gaps_overlaps_and_reordering():
     _partition([dict(source_offset=0, bytes=8), dict(source_offset=8, bytes=3)], 11)
     for rows in ([dict(source_offset=0, bytes=8), dict(source_offset=9, bytes=2)],
@@ -15,7 +14,6 @@ def test_partition_accepts_tail_and_rejects_gaps_overlaps_and_reordering():
         with pytest.raises(NativeCompilationError, match='deployment_partition'):
             _partition(rows, 11)
 
-
 @pytest.fixture
 def case():
     from merlin.tests.runtime.test_application_deployment import DeploymentTest
@@ -23,7 +21,6 @@ def case():
     instance.setUp()
     yield instance
     instance.doCleanups()
-
 
 def test_fitting_tiled_route_retains_exact_v1_publication(case):
     from merlin.compile.application_deployment import publish
@@ -41,8 +38,10 @@ def test_fitting_tiled_route_retains_exact_v1_publication(case):
     assert actual == expected and other == files
     assert "refill_groups" not in actual["provider"] and "paging" not in actual
 
-
-def test_paged_ranges_steps_and_separate_refill_deadline(case):
+@pytest.mark.parametrize("operations", [["future_operation"], ["invoke", "bind", "hash"],
+    ["bind", "bind", "invoke", "hash"], ["bind", "invoke", "invoke", "hash"], ["bind", "invoke", "hash", "hash"],
+    ["invoke", "hash"], ["bind", "hash"], ["bind", "invoke"]])
+def test_paged_ranges_steps_and_separate_refill_deadline(case, operations):
     from hashlib import sha256
     from types import SimpleNamespace
     from merlin.compile.application_deployment import _paged_record, place, publish
@@ -68,8 +67,8 @@ def test_paged_ranges_steps_and_separate_refill_deadline(case):
     record = json.loads(files["deployment.json"])
     mailbox = next(s for s in record["steps"] if s.get("name") == "mailbox")
     assert mailbox["role"] == "refill_mailbox"
-    with pytest.raises(NativeCompilationError, match="unsupported deployment step operation"):
-        _paged_record({**record, "steps": [dict(operation="future_operation")]})
+    with pytest.raises(NativeCompilationError, match="non-preload deployment steps must be bind, invoke, hash in order"):
+        _paged_record({**record, "steps": [dict(operation=op) for op in operations]})
     steps = {s["operation"]: s for s in record["steps"]}
     assert steps["bind"]["completion"] == steps["invoke"]["completion"] == "synchronous"
     assert steps["invoke"]["failure"] == "preserve buffers until device completion or reset"
@@ -88,7 +87,6 @@ def test_paged_ranges_steps_and_separate_refill_deadline(case):
         derived = place(case.source, case.adapter, case.regions, case.interface, case.root, parameter)
     assert derived["refill_wait"]["max_cycles"] == 7 * 123
 
-
 def test_paged_binding_reuses_parameter_abi(tmp_path):
     from dataclasses import replace
     from merlin.compile.application_handoff import application_handoff
@@ -102,7 +100,9 @@ def test_paged_binding_reuses_parameter_abi(tmp_path):
     interface = dict(source="app.c", header="app.h", entry="app", inputs=[], model_parameters=paged.record())
     handoff = application_handoff(source, handoff_interface(interface), [],
         {"c-package/app.c": b"", "c-package/app.h": b""}, tmp_path)
-    assert json.loads(handoff["handoff/abi.json"])["files"]["parameters.bin"] == original.payload_sha256
+    abi = json.loads(handoff["handoff/abi.json"])
+    assert abi["files"]["parameters.bin"] == original.payload_sha256
+    assert abi["model_parameters"]["placement"] == "../deployment.json#/paging"
     assert interface["model_parameters"] == paged.record()
     declarations, implementation, _ = paged.emit_binding("app")
     common, _, _ = replace(original, payload_bytes=128, entries=paged.entries).emit_binding("app")

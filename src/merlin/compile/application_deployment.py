@@ -436,8 +436,9 @@ def _page(provider, parameters, regions, allocate, parameter_object):
 
 
 def _paged_record(record):
-    if any(s["operation"] not in {"window_preload", "bind", "invoke", "hash"} for s in record["steps"]):
-        _refuse("deployment_paging_contract", "unsupported deployment step operation")
+    operations = [s["operation"] for s in record["steps"] if s["operation"] != "window_preload"]
+    if operations != ["bind", "invoke", "hash"]:
+        _refuse("deployment_paging_contract", "non-preload deployment steps must be bind, invoke, hash in order")
     paging = record["paging"]
     protected = [r for r in record["allocations"] if r["role"] != "paged_parameter"]
     protected += record["provider"]["reservations"]
@@ -499,5 +500,6 @@ def handoff_interface(interface):
     """Describe the complete parameters.bin source separately from physical bindings."""
     parameters = interface.get("model_parameters", {})
     if parameters.get("schema") == "merlin.paged_application_parameters.v1":
-        return {**interface, "model_parameters": parameters["source_blob"]}
+        return {**interface, "model_parameters": {**parameters["source_blob"],
+                "placement": "../deployment.json#/paging"}}
     return interface
