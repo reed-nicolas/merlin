@@ -1,6 +1,7 @@
 """Dense segment partitions must preserve every byte exactly once and in order."""
+import json
 import pytest
-from merlin.compile.application_deployment import _partition, PagedParameters
+from merlin.compile.application_deployment import _partition, handoff_interface, PagedParameters
 from merlin.semantic_compiler.target_binding import NativeCompilationError
 
 
@@ -43,7 +44,6 @@ def test_fitting_tiled_route_retains_exact_v1_publication(case):
 
 def test_paged_ranges_steps_and_separate_refill_deadline(case):
     from hashlib import sha256
-    import json
     from types import SimpleNamespace
     from merlin.compile.application_deployment import _paged_record, place, publish
     from merlin.semantic_compiler.codegen import codegen_options
@@ -91,13 +91,19 @@ def test_paged_ranges_steps_and_separate_refill_deadline(case):
 
 def test_paged_binding_reuses_parameter_abi(tmp_path):
     from dataclasses import replace
+    from merlin.compile.application_handoff import application_handoff
     from merlin.tests.runtime.test_application_parameters import setup
-    _, original = setup(tmp_path)
+    source, original = setup(tmp_path)
     addresses = {key: 0x1000 + i * 64 for i, key in enumerate(original.node_ids)}
     paged = PagedParameters(original, dict(parameters=dict(address=0x1000, bytes=128),
         paging=dict(bindings=addresses, integrity="driver authenticated")))
     assert paged.record()["source_bytes"] == original.payload_bytes and "payload_sha256" not in paged.record()
     assert paged.record()["source_sha256"] == original.payload_sha256
+    interface = dict(source="app.c", header="app.h", entry="app", inputs=[], model_parameters=paged.record())
+    handoff = application_handoff(source, handoff_interface(interface), [],
+        {"c-package/app.c": b"", "c-package/app.h": b""}, tmp_path)
+    assert json.loads(handoff["handoff/abi.json"])["files"]["parameters.bin"] == original.payload_sha256
+    assert interface["model_parameters"] == paged.record()
     declarations, implementation, _ = paged.emit_binding("app")
     common, _, _ = replace(original, payload_bytes=128, entries=paged.entries).emit_binding("app")
     assert declarations.split("/*", 1)[0] == common.split("/*", 1)[0]

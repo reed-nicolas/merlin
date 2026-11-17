@@ -30,7 +30,7 @@ from merlin.xdsl_dialects.lowering.global_plan_emission import dispatch_digest
 
 from .application_residency import residency_scope, publication as residency_publication, validate_region_bindings
 from .application_c import emit_application_c
-from .application_deployment import adapter_c, place, publish
+from .application_deployment import adapter_c, handoff_interface, place, publish
 from .application_plan import application_plan
 from .application_views import IMPLEMENTATION as VIEW_IMPLEMENTATION, checked_view_aliases, compile_view
 from .c_sources import c_source_pair
@@ -316,7 +316,7 @@ original-model accuracy or execution on an integrated SoC or FPGA.
     if native_root is not None:
         from .application_handoff import application_handoff
 
-        files.update(application_handoff(source, interface, summaries, files, native_root))
+        files.update(application_handoff(source, handoff_interface(interface), summaries, files, native_root))
     if deployment is not None:
         publish(deployment, interface, files, native_root)
     return outlined, summaries, interface, link_sources, files

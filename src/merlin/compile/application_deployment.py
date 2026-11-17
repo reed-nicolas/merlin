@@ -493,3 +493,11 @@ class PagedParameters:
         from dataclasses import replace
         return replace(self.original, payload_bytes=self.payload_bytes, entries=self.entries).emit_binding(
             name, physical_address=self.base)
+
+
+def handoff_interface(interface):
+    """Describe the complete parameters.bin source separately from physical bindings."""
+    parameters = interface.get("model_parameters", {})
+    if parameters.get("schema") == "merlin.paged_application_parameters.v1":
+        return {**interface, "model_parameters": parameters["source_blob"]}
+    return interface
