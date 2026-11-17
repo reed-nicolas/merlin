@@ -52,6 +52,8 @@ def place(source, adapter, regions, interface, native_root, parameters_object=No
     provider = json.loads(json.dumps(supplied, allow_nan=False))
     if not isinstance(provider, dict) or provider.get("schema") != "merlin.provider_deployment.v1":
         _refuse("deployment_provider_contract", "unsupported provider deployment schema")
+    transport_timeout = provider.pop("transport_timeout_seconds", None)
+    transport_clock = provider.pop("transport_clock_hz_bound", None)
     window = provider.get("window")
     if not isinstance(window, dict):
         _refuse("deployment_provider_contract", "provider deployment window must be explicit")
@@ -205,9 +207,11 @@ def place(source, adapter, regions, interface, native_root, parameters_object=No
         "host_allocation": provider["host_allocation"],
     }
     if paging is not None:
-        deployment.update(schema="merlin.onchip_deployment.v2", paging=paging, transport_timeout_seconds=60,
-                          refill_wait=dict(max_cycles=60 * 1_000_000_000, clock_hz=1_000_000_000,
-                                           clock_assumption="host cycle counter, core frequency at most 1 GHz; conservative 60-second minimum"))
+        timeout = _integer(transport_timeout, "transport timeout seconds", positive=True)
+        clock = _integer(transport_clock, "transport clock Hz bound", positive=True)
+        deployment.update(schema="merlin.onchip_deployment.v2", paging=paging, transport_timeout_seconds=timeout,
+                          refill_wait=dict(max_cycles=timeout * clock, clock_hz=clock,
+                                           clock_assumption=f"host cycle counter, core frequency at most {clock / 1_000_000_000:g} GHz; conservative {timeout}-second minimum"))
     interface["deployment"] = deployment
     return deployment
 
@@ -421,7 +425,8 @@ def _page(provider, parameters, regions, allocate, parameter_object):
     base = min(bindings.values())
     physical = slot["address"] + slot["bytes"] - base
     parameter = dict(name="parameters", address=base, bytes=physical, role="paged_parameters",
-                     path=parameters["path"], sha256=parameters["payload_sha256"])
+                     path=parameters["path"], source_sha256=parameters["payload_sha256"],
+                     source_bytes=parameters["payload_bytes"])
     return dict(context_index=fact["context_index"], operand=paged["node_id"],
                 region_operand=fact.get("region_operand", fact["operand"]), slot=slot, mailbox=mailbox,
                 segments=segments, small_parameters=small, bindings=bindings,
@@ -431,6 +436,8 @@ def _page(provider, parameters, regions, allocate, parameter_object):
 
 
 def _paged_record(record):
+    if any(s["operation"] not in {"window_preload", "bind", "invoke", "hash"} for s in record["steps"]):
+        _refuse("deployment_paging_contract", "unsupported deployment step operation")
     paging = record["paging"]
     protected = [r for r in record["allocations"] if r["role"] != "paged_parameter"]
     protected += record["provider"]["reservations"]
@@ -442,7 +449,8 @@ def _paged_record(record):
     steps += [dict(operation="window_preload", **r, lifetime="immutable_through_completion_and_recovery",
                    completion="before_bind") for r in paging["small_parameters"]]
     mailbox = paging["mailbox"]
-    steps += [dict(operation="window_preload", path="handoff/refill-mailbox.bin", source_offset=0,
+    steps += [dict(operation="window_preload", name=mailbox["name"], role=mailbox["role"],
+                   path="handoff/refill-mailbox.bin", source_offset=0,
                    address=mailbox["address"], bytes=mailbox["bytes"], alignment=mailbox["alignment"],
                    sha256=sha256(bytes(mailbox["bytes"])).hexdigest(),
                    lifetime="mutable_through_completion_and_recovery", completion="before_bind")]
@@ -476,7 +484,8 @@ class PagedParameters:
 
     def record(self):
         return dict(schema="merlin.paged_application_parameters.v1", payload_bytes=self.payload_bytes,
-                    source_blob=self.original.record(), payload_sha256=self.original.payload_sha256,
+                    source_blob=self.original.record(), source_sha256=self.original.payload_sha256,
+                    source_bytes=self.original.payload_bytes,
                     physical_bindings=self.paging["bindings"],
                     validation=self.paging["integrity"])
 

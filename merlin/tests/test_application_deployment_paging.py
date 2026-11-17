@@ -30,6 +30,7 @@ def test_fitting_tiled_route_retains_exact_v1_publication(case):
     expected = case.placement()
     files = {}
     publish(expected, case.interface, files, case.root)
+    case.provider.update(transport_timeout_seconds=60, transport_clock_hz_bound=1_000_000_000)
     case.provider["refill_groups"] = [dict(context_index=0, operand="arg0",
         groups=[dict(source_offset=0, bytes=64, first_launch=0, launch_count=1)])]
     case.regions[0]["description"] = dict(execution=dict(schema="k32_tiles"))
@@ -44,7 +45,7 @@ def test_paged_ranges_steps_and_separate_refill_deadline(case):
     from hashlib import sha256
     import json
     from types import SimpleNamespace
-    from merlin.compile.application_deployment import place, publish
+    from merlin.compile.application_deployment import _paged_record, place, publish
     from merlin.semantic_compiler.codegen import codegen_options
     payload = bytes(2 * 1024 * 1024 + 128)
     case.interface["model_parameters"] = dict(payload_bytes=len(payload),
@@ -55,13 +56,20 @@ def test_paged_ranges_steps_and_separate_refill_deadline(case):
         dict(source_offset=i * 32768, bytes=32768, first_launch=i, launch_count=1)
         for i in range(64)])]
     parameter = SimpleNamespace(write_payload=lambda path: path.write_bytes(payload))
+    case.provider.update(transport_timeout_seconds=60, transport_clock_hz_bound=1_000_000_000)
     with codegen_options(case.options):
         deployment = place(case.source, case.adapter, case.regions, case.interface, case.root, parameter)
     paging = deployment["paging"]
+    assert deployment["parameters"]["source_bytes"] == len(payload) and "sha256" not in deployment["parameters"]
+    assert deployment["parameters"]["source_sha256"] == sha256(payload).hexdigest()
     assert paging["mailbox"]["address"] + 8 <= deployment["parameters"]["address"]
     files = {}
     publish(deployment, case.interface, files, case.root)
     record = json.loads(files["deployment.json"])
+    mailbox = next(s for s in record["steps"] if s.get("name") == "mailbox")
+    assert mailbox["role"] == "refill_mailbox"
+    with pytest.raises(NativeCompilationError, match="unsupported deployment step operation"):
+        _paged_record({**record, "steps": [dict(operation="future_operation")]})
     steps = {s["operation"]: s for s in record["steps"]}
     assert steps["bind"]["completion"] == steps["invoke"]["completion"] == "synchronous"
     assert steps["invoke"]["failure"] == "preserve buffers until device completion or reset"
@@ -75,6 +83,10 @@ def test_paged_ranges_steps_and_separate_refill_deadline(case):
     header = files["handoff/deployment_adapter.h"]
     assert b"MERLIN_DEPLOYMENT_REFILL_MAX_CYCLES UINT64_C(60000000000)" in header
     assert b"SP5_" not in header and b"SP6_" not in header
+    case.provider.update(transport_timeout_seconds=7, transport_clock_hz_bound=123)
+    with codegen_options(case.options):
+        derived = place(case.source, case.adapter, case.regions, case.interface, case.root, parameter)
+    assert derived["refill_wait"]["max_cycles"] == 7 * 123
 
 
 def test_paged_binding_reuses_parameter_abi(tmp_path):
@@ -84,6 +96,8 @@ def test_paged_binding_reuses_parameter_abi(tmp_path):
     addresses = {key: 0x1000 + i * 64 for i, key in enumerate(original.node_ids)}
     paged = PagedParameters(original, dict(parameters=dict(address=0x1000, bytes=128),
         paging=dict(bindings=addresses, integrity="driver authenticated")))
+    assert paged.record()["source_bytes"] == original.payload_bytes and "payload_sha256" not in paged.record()
+    assert paged.record()["source_sha256"] == original.payload_sha256
     declarations, implementation, _ = paged.emit_binding("app")
     common, _, _ = replace(original, payload_bytes=128, entries=paged.entries).emit_binding("app")
     assert declarations.split("/*", 1)[0] == common.split("/*", 1)[0]
