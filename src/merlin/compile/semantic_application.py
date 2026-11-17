@@ -28,7 +28,9 @@ from merlin.xdsl_dialects.lowering.arena_plan import ArenaPlanError, ArenaRequir
 from merlin.xdsl_dialects.lowering.global_plan import GlobalPlan
 from merlin.xdsl_dialects.lowering.global_plan_emission import dispatch_digest
 
+from .application_residency import residency_scope, publication as residency_publication, validate_region_bindings
 from .application_c import emit_application_c
+from .application_deployment import adapter_c, handoff_interface, place, publish
 from .application_plan import application_plan
 from .application_views import IMPLEMENTATION as VIEW_IMPLEMENTATION, checked_view_aliases, compile_view
 from .c_sources import c_source_pair
@@ -73,7 +75,7 @@ def _sha(data):
 
 def _render(
     source, adapter, name, capacity, compiled, *, memory_plan=None, state=None, parameters=None, native_root=None,
-    emit_region_loop=False,
+    emit_region_loop=False, target_source=None,
 ):
     if type(emit_region_loop) is not bool:
         raise TypeError("region loop emission needs an explicit Boolean")
@@ -212,10 +214,35 @@ def _render(
                 link_sources.append(filename)
     region_link_sources = tuple(link_sources)
     combined_name = name + "_combined"
+    deployment = place(source, adapter, summaries, interface, native_root, parameters)
+    if deployment is not None and deployment.get("paging"):
+        from .application_deployment import PagedParameters
+        paging = deployment["paging"]
+        i = paging["context_index"]
+        label = f"region_{i:03d}"
+        record, region_files = adapter.deployment_region_package(
+            outlined.regions[i][1], Path(native_root) / "segments" / label, label, target_source, paging)
+        for member, data in region_files.items():
+            files[f"c-package/regions/{label}/{member}"] = data
+        summaries[i]["description"] = record
+        interface, interface_files = emit_application_c(
+            source, driver, driver_files, name, capacity=capacity,
+            parameters=PagedParameters(parameters, deployment))
+        interface["deployment"] = deployment
+        for filename, text in interface_files.items():
+            files["c-package/" + filename] = text.encode()
+
     binding_factory = getattr(adapter, "application_binding", None)
     binding = binding_factory(name, summaries, interface) if binding_factory else None
     if binding is not None and not isinstance(binding, ApplicationCBinding):
         raise TypeError("application binding must contain C declarations, implementation and interface")
+    if deployment is not None:
+        if binding is None:
+            raise NativeCompilationError(
+                "unsupported_semantics", "deployment_provider_contract: on-chip deployment requires a C binding")
+        declarations, implementation = adapter_c(name, deployment)
+        binding = ApplicationCBinding(binding.declarations + declarations, binding.implementation + implementation,
+                                      binding.interface)
     combined = c_source_pair(
         combined_name,
         public_headers={
@@ -289,7 +316,9 @@ original-model accuracy or execution on an integrated SoC or FPGA.
     if native_root is not None:
         from .application_handoff import application_handoff
 
-        files.update(application_handoff(source, interface, summaries, files, native_root))
+        files.update(application_handoff(source, handoff_interface(interface), summaries, files, native_root))
+    if deployment is not None:
+        publish(deployment, interface, files, native_root)
     return outlined, summaries, interface, link_sources, files
 
 
@@ -358,10 +387,12 @@ def compile_semantic_application(
         raise TypeError("materialization reuse needs an explicit Boolean")
     if type(reuse_region_materializations) is not bool:
         raise TypeError("region materialization reuse needs an explicit Boolean")
+    if reuse_region_materializations and current_codegen_options().application_residency:
+        raise ValueError("application residency cannot use the explicitly requested region materialization cache")
     enabled = reuse_materializations and getattr(adapter, "supports_materialization_cache", False) is True
     stats = {}
     try:
-        with publication_scope, materialization_session(enabled=enabled) as stats:
+        with publication_scope, residency_scope(source, adapter, parameters, state), materialization_session(enabled=enabled) as stats:
             return _compile_semantic_application(**arguments, _stats=stats)
     finally:
         if materialization_stats is not None:
@@ -452,13 +483,16 @@ def _compile_semantic_application(
                     _stats["region_compiles"] += 1
                     lowered.append(adapter.compile_region(
                         snapshot, region, alternative, f"region_{i:03d}", segments, target_source, limits))
+    validate_region_bindings(outlined.regions, lowered)
     _, summaries, interface, links, files = _render(
         source, adapter, name, capacity, lowered, state=state, parameters=parameters, native_root=destination,
-        emit_region_loop=emit_region_loop,
+        emit_region_loop=emit_region_loop, target_source=target_source,
     )
     if parameters is not None:
         (destination / "handoff").mkdir(exist_ok=True)
         parameters.write_payload(destination / "handoff/parameters.bin")
+    if residency_publication() is not None:
+        files.update(residency_publication())
     for filename, data in files.items():
         path = destination / filename
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -503,10 +537,13 @@ def _compile_semantic_application(
         },
     }
     options = current_codegen_options()
+    manifest["codegen_options"] = options.identity_record()
     manifest.update({
         name: getattr(options, name) for name in IO_MEMORY_OPTIONS if getattr(options, name) is not None
     })
     manifest.update({name: getattr(options, name) for name in APPLICATION_BUDGET_OPTIONS})
+    if options.application_residency:
+        manifest["application_residency"] = True
     if emit_region_loop:
         manifest["dispatch_loop"] = True
     (destination / "manifest.json").write_bytes(_json(manifest))
@@ -548,7 +585,7 @@ def verify_semantic_application(
     if type(reuse_materializations) is not bool:
         raise TypeError("materialization reuse needs an explicit Boolean")
     try:
-        with materialization_session(enabled=False) as stats:
+        with residency_scope(source, adapter, parameters, state), materialization_session(enabled=False) as stats:
             return _verify_semantic_application(**arguments, _stats=stats)
     finally:
         if materialization_stats is not None:
@@ -563,6 +600,11 @@ def _verify_semantic_application(
     """Replay source partitioning, region exports, buffer planning and C generation."""
     manifest = json.loads((artifact / "manifest.json").read_bytes())
     options = current_codegen_options()
+    if "codegen_options" in manifest and _json(manifest["codegen_options"]) != _json(options.identity_record()):
+        raise ValueError("application code generation options differ from compilation")
+    if (type(manifest.get("application_residency", False)) is not bool
+            or manifest.get("application_residency", False) != options.application_residency):
+        raise ValueError("application residency differs from compilation")
     selected_memory = {
         name: getattr(options, name) for name in IO_MEMORY_OPTIONS if getattr(options, name) is not None
     }
@@ -622,6 +664,7 @@ def _verify_semantic_application(
             _stats["region_replays"] += 1
             compiled.append(adapter.export_region(
                 region, alternative, f"region_{i:03d}", artifact / "segments", target_source))
+    validate_region_bindings(outlined.regions, compiled)
     _, summaries, interface, links, files = _render(
         source,
         adapter,
@@ -632,7 +675,7 @@ def _verify_semantic_application(
         state=state,
         parameters=parameters,
         native_root=artifact,
-        emit_region_loop=emit_region_loop,
+        emit_region_loop=emit_region_loop, target_source=target_source,
     )
     if (
         manifest["regions"] != summaries
@@ -640,6 +683,8 @@ def _verify_semantic_application(
         or manifest["link_sources"] != links
     ):
         raise ValueError("application manifest differs from replayed region compilation")
+    if residency_publication() is not None:
+        files.update(residency_publication())
     for filename, data in files.items():
         if (artifact / filename).read_bytes() != data:
             raise ValueError("application artifact differs from replayed source: " + filename)

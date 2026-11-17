@@ -741,6 +741,8 @@ def _native_compile_report_with_options(args: argparse.Namespace) -> dict:
     )
 
     try:
+        if getattr(args, "application_residency", False) and not getattr(args, "application", False):
+            raise ValueError("--application-residency requires --application")
         if getattr(args, "already_quantized", False) and not getattr(args, "application", False):
             raise ValueError("--already-quantized requires --application")
         if getattr(args, "application_common_values", False) and not getattr(args, "application", False):
@@ -1133,10 +1135,15 @@ def _cmd_native_verify(args: argparse.Namespace) -> int:
         try:
             manifest = json.loads((Path(args.artifact) / "manifest.json").read_bytes())
             requested = {name: getattr(args, name, None) for name in APPLICATION_BUDGET_OPTIONS}
-            if not requested["exact_float_unroll"]:
+            explicit = getattr(args, "_explicit_codegen_fields", ())
+            if not requested["exact_float_unroll"] and "exact_float_unroll" not in explicit:
                 requested["exact_float_unroll"] = None
             budgets = application_budget_options(manifest, requested)
             args = copy(args)
+            published_residency = manifest.get("application_residency", False)
+            if "application_residency" in explicit and args.application_residency != published_residency:
+                raise ValueError("selected residency differs from compiled application")
+            args.application_residency = published_residency
             for name, value in budgets.items():
                 setattr(args, name, value)
         except (ValueError, OSError, TypeError, KeyError) as error:
@@ -1340,7 +1347,7 @@ def _native_verify_with_options(args: argparse.Namespace) -> int:
     return 0 if report["status"] == "verified_artifacts" else 2
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(binding=None) -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(prog="merlin-targetgen", description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1439,14 +1446,25 @@ def build_parser() -> argparse.ArgumentParser:
             "native_bridge_graph": _cmd_native_bridge_graph,
             "native_verify": _cmd_native_verify,
         },
+        binding=binding,
     )
 
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
+    # Parse only the provider selector first, then let that provider register its options.
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--support")
+    selected, _ = bootstrap.parse_known_args(argv)
+    binding = None
+    if selected.support:
+        from merlin.semantic_compiler.target_binding import load_native_target_binding
+        binding = load_native_target_binding(selected.support)
+    parser = build_parser(binding=binding)
     args = parser.parse_args(argv)
+    from .native_codegen_cli import prepare_native_arguments
+    prepare_native_arguments(args, binding)
     return args.func(args)
 
 

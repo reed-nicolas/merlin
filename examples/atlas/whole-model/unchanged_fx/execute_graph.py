@@ -169,6 +169,32 @@ def main():
     if args.program_residency:
         from resident_runtime import ResidentFunctionalModelRuntime
         runtime_type = ResidentFunctionalModelRuntime
+    residency_path = root / "application/residency.json"
+    if bool(record.get("application_residency")) != residency_path.exists():
+        raise ValueError("immutable residency table differs from execution publication")
+    if record.get("application_residency"):
+        if "application/residency.json" not in record.get("runtime_files", {}):
+            raise ValueError("immutable residency table is not bound to execution publication")
+        if args.backend not in {"functional", "qualified_native"}:
+            raise ValueError("immutable residency validation requires a functional backend")
+        table = json.loads(residency_path.read_text())
+        entries = {row["name"]: row for row in table["entries"]}
+        loads = []
+        for load in table["loads"]:
+            member = Path(load["path"])
+            if member.is_absolute() or ".." in member.parts:
+                raise ValueError("unsafe immutable load path")
+            if "application/" + str(member) not in record["runtime_files"]:
+                raise ValueError("immutable asset is not bound to execution publication")
+            data = (root / "application" / member).read_bytes()
+            entry = entries[load["name"]]
+            if (sha256(data).hexdigest() != load["sha256"] or len(data) != entry["bytes"]
+                    or entry["load_protocol"] != "once_at_load"):
+                raise ValueError("immutable initial load identity differs")
+            loads.append((entry["address"], data))
+        options.update(immutable_loads=loads,
+                       capacity_base=record["io_memory_capacity_base"],
+                       capacity_bytes=record["io_memory_capacity_bytes"])
     runtime = runtime_type(args.atlas_root.resolve(), args.model_root.resolve(), images, execution_root / "execution",
                            image_plans=plans, memory_bytes=record.get("io_memory_bytes") or 262144,
                            memory_base=record.get("io_memory_base"), **options)
