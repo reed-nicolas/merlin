@@ -179,15 +179,14 @@ def place(source, adapter, regions, interface, native_root, parameters_object=No
     parameter = None
     paging = None
     if parameters:
-        parameter = {**allocate("parameters", parameters["payload_bytes"], "immutable_parameters"),
-                     "path": "handoff/parameters.bin", "sha256": parameters["payload_sha256"]}
+        alignment = provider["allocation_alignment"]
+        full_end = (cursor + alignment - 1) // alignment * alignment + parameters["payload_bytes"]
+        if full_end - window_address > window_bytes and provider.get("refill_groups"):
+            paging, parameter = _page(provider, parameters, regions, allocate, parameters_object)
+        else:
+            parameter = {**allocate("parameters", parameters["payload_bytes"], "immutable_parameters"),
+                         "path": "handoff/parameters.bin", "sha256": parameters["payload_sha256"]}
     required = cursor - window_address
-    if required > window_bytes and parameters and provider.get("refill_groups"):
-        allocations.pop()
-        names.remove("parameters")
-        cursor = parameter["address"]
-        paging, parameter = _page(provider, parameters, regions, allocate, parameters_object)
-        required = cursor - window_address
     if required > window_bytes:
         _refuse("deployment_window_overflow",
                 f"disjoint on-chip deployment requires {required} bytes; window {window_bytes} bytes; "
@@ -206,7 +205,9 @@ def place(source, adapter, regions, interface, native_root, parameters_object=No
         "host_allocation": provider["host_allocation"],
     }
     if paging is not None:
-        deployment.update(schema="merlin.onchip_deployment.v2", paging=paging, transport_timeout_seconds=60)
+        deployment.update(schema="merlin.onchip_deployment.v2", paging=paging, transport_timeout_seconds=60,
+                          refill_wait=dict(max_cycles=60 * 1_000_000_000, clock_hz=1_000_000_000,
+                                           clock_assumption="host cycle counter, core frequency at most 1 GHz; conservative 60-second minimum"))
     interface["deployment"] = deployment
     return deployment
 
@@ -250,8 +251,8 @@ int merlin_deployment_run(void) {{
 }}
 """
     if deployment.get("paging"):
-        declarations += "int sp5_kernel_status(void);\n"
-        implementation += "int sp5_kernel_status(void) { return sp5_context.state.kernel_status; }\n"
+        declarations += "int merlin_deployment_kernel_status(void);\n"
+        implementation += "int merlin_deployment_kernel_status(void) { return merlin_deployment_context.state.kernel_status; }\n"
     return declarations, implementation
 
 
@@ -349,8 +350,11 @@ def publish(deployment, interface, files, native_root):
               f"#define MERLIN_DEPLOYMENT_MAX_POLLS {deployment['max_polls']}u\n").encode()
     if deployment.get("paging"):
         box = deployment["paging"]["mailbox"]
-        header += (f"#define SP6_REQUEST UINT64_C({box['address']})\n"
-                   f"#define SP6_ACK UINT64_C({box['address'] + 4})\n").encode()
+        header += (f"#define MERLIN_DEPLOYMENT_REQUEST UINT64_C({box['address']})\n"
+                   f"#define MERLIN_DEPLOYMENT_ACK UINT64_C({box['address'] + 4})\n"
+                   f"#define MERLIN_DEPLOYMENT_REFILL_MAX_CYCLES UINT64_C({deployment['refill_wait']['max_cycles']})\n"
+                   f"#define MERLIN_DEPLOYMENT_REFILL_CLOCK_HZ UINT64_C({deployment['refill_wait']['clock_hz']})\n"
+                   f"#define MERLIN_DEPLOYMENT_TRANSPORT_TIMEOUT_SECONDS {deployment['transport_timeout_seconds']}u\n").encode()
     files["c-package/combined/deployment_adapter.h"] = header
     files["handoff/deployment_adapter.h"] = header
 
@@ -378,16 +382,17 @@ def _page(provider, parameters, regions, allocate, parameter_object):
     paged = matches[0]
     groups = fact["groups"]
     _partition(groups, paged["nbytes"])
+    mailbox = allocate("mailbox", 8, "refill_mailbox")
     small, bindings = [], {}
     for port in ports:
         if port is not paged:
             row = allocate("parameter:" + port["node_id"], port["nbytes"], "immutable_parameters")
             small.append({**row, "source_offset": port["offset"], "path": parameters["path"]})
             bindings[port["node_id"]] = row["address"]
-    mailbox = allocate("mailbox", 8, "refill_mailbox")
     mailbox.update(request_address=mailbox["address"], acknowledge_address=mailbox["address"] + 4,
                    word_bytes=4, byte_order="little")
-    slot_address = (mailbox["address"] + mailbox["bytes"] + 63) // 64 * 64
+    last = small[-1] if small else mailbox
+    slot_address = (last["address"] + last["bytes"] + 63) // 64 * 64
     available = provider["window"]["address"] + provider["window"]["bytes"] - slot_address
     largest = max(g["bytes"] for g in groups)
     if available < 2 * largest:
@@ -434,22 +439,24 @@ def _paged_record(record):
         segment["must_not_touch"] = protected
     failure = "FAIL on wrong request id, timeout, or readback mismatch; no retry"
     steps = [s for s in record["steps"] if s["operation"] == "window_preload"]
-    steps += [dict(operation="window_preload", **r) for r in paging["small_parameters"]]
+    steps += [dict(operation="window_preload", **r, lifetime="immutable_through_completion_and_recovery",
+                   completion="before_bind") for r in paging["small_parameters"]]
     mailbox = paging["mailbox"]
     steps += [dict(operation="window_preload", path="handoff/refill-mailbox.bin", source_offset=0,
                    address=mailbox["address"], bytes=mailbox["bytes"], alignment=mailbox["alignment"],
-                   sha256=sha256(bytes(mailbox["bytes"])).hexdigest())]
+                   sha256=sha256(bytes(mailbox["bytes"])).hexdigest(),
+                   lifetime="mutable_through_completion_and_recovery", completion="before_bind")]
     segments = paging["segments"]
-    invoke = next(s for s in record["steps"] if s["operation"] == "invoke")
-    steps += [dict(operation="load_segment", **segments[0]), dict(operation="bind", entry="sp5_bind"),
-              {**invoke, "completion": "await_completion"}]
+    original = {s["operation"]: s for s in record["steps"] if s["operation"] != "window_preload"}
+    steps += [dict(operation="load_segment", **segments[0]), dict(original["bind"]),
+              {**original["invoke"], "transport_completion": "await_completion"}]
     for segment in segments[1:]:
         steps += [dict(operation="await_request", step_id=segment["id"]),
                   dict(operation="load_segment", **segment),
                   dict(operation="acknowledge", step_id=segment["id"])]
-    steps += [dict(operation="await_completion"), dict(operation="hash", ranges=record["hash_ranges"])]
+    steps += [dict(operation="await_completion"), dict(original["hash"])]
     for step in steps:
-        step["failure"] = failure
+        step["transport_failure"] = failure
     return {**record, "steps": steps}
 
 
@@ -474,21 +481,6 @@ class PagedParameters:
                     validation=self.paging["integrity"])
 
     def emit_binding(self, name):
-        declarations, _, headers = self.original.emit_binding(name)
-        declarations = f"""
-typedef struct {{ const unsigned char *data; size_t bytes; uintptr_t seal; }} {name}_parameters;
-#define {name.upper()}_PARAMETER_BYTES {self.payload_bytes}u
-#define {name.upper()}_PARAMETER_ALIGNMENT 4u
-int {name}_parameters_bind({name}_parameters *,const void *,size_t);
-"""
-        implementation = f"""
-static int {name}_parameters_ready(const {name}_parameters *p) {{
-  return {name}_valid(p,sizeof(*p)) && p->data==(const unsigned char *)(uintptr_t){self.base}u && p->bytes=={self.payload_bytes}u && p->seal==1u;
-}}
-int {name}_parameters_bind({name}_parameters *p,const void *data,size_t bytes) {{
-  (void)merlin_output_sha256;
-  if (!{name}_valid(p,sizeof(*p)) || {name}_overlap(p,sizeof(*p),data,bytes) || data!=(const void *)(uintptr_t){self.base}u || bytes!={self.payload_bytes}u) return -1;
-  *p=({name}_parameters){{data,bytes,1u}}; return 0;
-}}
-"""
-        return declarations, implementation, headers
+        from dataclasses import replace
+        return replace(self.original, payload_bytes=self.payload_bytes, entries=self.entries).emit_binding(
+            name, physical_address=self.base)
