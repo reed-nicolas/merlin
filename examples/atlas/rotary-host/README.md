@@ -72,7 +72,8 @@ v3, with output SHA-256
 
 For the fixed64 capture, `whole-model-policy.json` records the complete precision
 policy including `host_preparation_scope`; its source digest must match the capture.
-Deriving this scope automatically from the capture is a follow-up.
+It is temporary: a hand-recorded policy for one capture, to be replaced by a precision
+policy derived from the capture itself. Do not copy it for another model.
 From this example directory, with `CAPTURE`, `STAGED`, `COMPILED`, `SNAPSHOT`,
 `ATLAS_ROOT`, `BOUNDARY`, `BOUNDARY_SHA256`, `INPUTS`, `MODEL_ROOT`,
 `ARITHMETIC_QUALIFICATION`, `MEMORY_QUALIFICATION`, and `NATIVE_CACHE` set:

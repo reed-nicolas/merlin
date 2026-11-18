@@ -1,5 +1,9 @@
 # Reference v3: rotary, head, and whole-model caches
 
+Temporary: these generators were written and qualified for one captured model
+(its source graph and the rotary domain below). A generic reference evaluator over
+any captured source graph replaces them; do not copy them for another model.
+
 `whole_reference.py` computes rotary preparation in its original-ATen
 interpreter. `rotary_source.py` reads the dependency slice of a complete captured
 source FX trace, scalar arguments, tensor metadata, and unchanged lifted
