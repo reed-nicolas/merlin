@@ -10,20 +10,32 @@ import attention_reference as attention
 
 POLICY = "bf16-minfinite-zero-rowspan80-nonempty-v1"
 DOMAIN = "bf16-row-relative-span80-pad32-v1"
+POLICY96 = "bf16-minfinite-zero-rowspan96-nonempty-v1"
+DOMAIN96 = "bf16-row-relative-span96-pad32-v1"
 
 
-def check_domain(scores, keep):
+def _span_limit(policy):
+    if policy == POLICY:
+        return 80
+    if policy == POLICY96:
+        return 96
+    raise ValueError("unsupported row-relative softmax policy: " + str(policy))
+
+
+def check_domain(scores, keep, *, policy=POLICY):
+    limit = _span_limit(policy)
+    label = f"rowspan{limit}"
     scores = attention._raw_bf16(scores)
     keep = np.asarray(keep)
     if keep.dtype != np.bool_ or keep.shape != scores.shape or scores.ndim < 2 or not 0 < scores.shape[-1] <= 1024:
-        raise ValueError("rowspan80 softmax requires a same-shape Boolean keep mask and 1..1024 keys")
+        raise ValueError(f"{label} softmax requires a same-shape Boolean keep mask and 1..1024 keys")
     if not np.all(np.any(keep, axis=-1)):
-        raise ValueError("rowspan80 softmax requires every row to retain at least one key")
+        raise ValueError(f"{label} softmax requires every row to retain at least one key")
     exponent = (scores >> 7) & 255
     magnitude = scores & 0x7fff
     values = (scores.astype(np.uint32) << 16).view(np.float32)
     if np.any(keep & ((magnitude != 0) & (exponent < 8))) or np.any(keep & (~np.isfinite(values))):
-        raise ValueError("rowspan80 kept scores must be normal with exponent>=8 or signed zero")
+        raise ValueError(f"{label} kept scores must be normal with exponent>=8 or signed zero")
     maximum = np.max(np.where(keep, values, -np.inf), axis=-1)
     minimum = np.min(np.where(keep, values, np.inf), axis=-1)
     span = maximum.astype(np.float64) - minimum.astype(np.float64)
@@ -34,26 +46,28 @@ def check_domain(scores, keep):
         exponent, fraction = (code >> 7) & 255, code & 127
         magnitude = fraction if not exponent else (128 + fraction) << (exponent - 1)
         return -magnitude if code & 0x8000 else magnitude
-    span_exceeds = any(units(high) - units(low) > (80 << 133)
+    span_exceeds = any(units(high) - units(low) > (limit << 133)
                        for high, low in zip(maximum_codes.flat, minimum_codes.flat, strict=True))
     if np.any((maximum < -32) | (maximum > 48)) or span_exceeds:
-        raise ValueError("rowspan80 kept row maximum or span leaves its explicit domain: "
+        raise ValueError(f"{label} kept row maximum or span leaves its explicit domain: "
                          + str({"rowmax_min": float(maximum.min()), "rowmax_max": float(maximum.max()),
-                                "span_max_approximate": float(span.max()), "exact_span_exceeds80": span_exceeds,
+                                "span_max_approximate": float(span.max()), f"exact_span_exceeds{limit}": span_exceeds,
                                 "score_min": float(minimum.min())}))
     # Exact instruction subtraction rounds to F32, then chops to BF16.
     shifted = (values - maximum[..., None]).view(np.uint32) >> 16
     shifted_values = (shifted.astype(np.uint32) << 16).view(np.float32)
-    if np.any(keep & ((shifted_values < -80) | (shifted_values > 0))):
-        raise ValueError("rowspan80 actual chopped subtraction leaves [-80,0]")
+    if np.any(keep & ((shifted_values < -limit) | (shifted_values > 0))):
+        raise ValueError(f"{label} actual chopped subtraction leaves [-{limit},0]")
     return scores, keep
 
 
-def normalized_softmax(scores, keep):
+def normalized_softmax(scores, keep, *, policy=POLICY):
     """Compose pinned model primitives; keep the inherited -32 masked pad."""
     from npu_model.configs.numerics import RtlNumerics as rtl
 
-    scores, keep = check_domain(scores, keep)
+    limit = _span_limit(policy)
+    label = f"rowspan{limit}"
+    scores, keep = check_domain(scores, keep, policy=policy)
     tiles, masks, maxima = [], [], []
     for start in range(0, scores.shape[-1], 32):
         count = min(32, scores.shape[-1] - start)
@@ -73,8 +87,8 @@ def normalized_softmax(scores, keep):
         offset = rtl.sub(tile, maximum)
         raw_offset = attention._bits(offset)
         offset_values = (raw_offset.astype(np.uint32) << 16).view(np.float32)
-        if np.any(~np.isfinite(offset_values)) or np.any(offset_values < -80) or np.any(offset_values > 0):
-            raise ValueError("rowspan80 instruction subtraction leaves [-80,0]")
+        if np.any(~np.isfinite(offset_values)) or np.any(offset_values < -limit) or np.any(offset_values > 0):
+            raise ValueError(f"{label} instruction subtraction leaves [-{limit},0]")
         exponential = rtl.mul(rtl.unary("exp", offset), mask)
         shifted.append(offset)
         exponentials.append(exponential)
